@@ -1,5 +1,5 @@
 const providerConfig = JSON.parse(localStorage.getItem('yingji.providers') || '{"emby":[]}');
-const live = { rankings: null, library: [], active: null };
+const live = { rankings: null, library: [], active: null, heroIndex: 0, detail: null };
 let discoverySyncing = false;
 const saveProviders = () => localStorage.setItem('yingji.providers', JSON.stringify(providerConfig));
 const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json' });
@@ -34,9 +34,13 @@ async function syncDiscovery() {
     const tmdb = path => tmdbRequest(path, tmdbKey);
     const sources = [
       ['国内热门电视剧', '/discover/tv?with_origin_country=CN&sort_by=popularity.desc'],
+      ['国内热门电影', '/discover/movie?with_origin_country=CN&sort_by=popularity.desc'],
       ['全球热门电影', '/trending/movie/week'],
       ['全球热门剧集', '/trending/tv/week'],
-      ['全球高分剧集', '/tv/top_rated']
+      ['全球高分电影', '/movie/top_rated'],
+      ['全球高分剧集', '/tv/top_rated'],
+      ['即将上线电影', '/movie/upcoming'],
+      ['近期热播剧集', '/tv/on_the_air']
     ];
     const settled = await Promise.all(sources.map(async ([name, path]) => {
       try {
@@ -52,7 +56,7 @@ async function syncDiscovery() {
         const id = entry.show?.ids?.tmdb;
         try { return id ? await tmdb(`/tv/${id}`) : null; } catch { return null; }
       }))).filter(Boolean);
-      if (items.length) live.rankings[3] = ['Trakt 热门剧集', items];
+      if (items.length) live.rankings.splice(4, 0, ['Trakt 热门剧集', items]);
     } catch {}
     localStorage.setItem('yingji.discovery-cache', JSON.stringify(live.rankings));
     home(); notify(`榜单同步完成${live.rankings.length < sources.length ? '（部分模块稍后重试）' : ''}`);
@@ -72,9 +76,14 @@ home = function () {
     const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '';
     return `<button class="live-card" data-live-detail="${item.id}" data-kind="${item.title ? 'movie' : 'tv'}"><span class="live-poster" style="background-image:url('${poster}')"><i>${index + 1}</i></span><b>${esc(title)}</b><small>TMDB ${(item.vote_average || 0).toFixed(1)}</small></button>`;
   }).join('');
-  const rows = live.rankings.map(([name, items], index) => `<section class="module"><div class="head"><h2>${esc(name)}</h2><p>TMDB · 实时数据</p><button class="ranking-more" data-live-more="${index}">更多</button></div><div class="rankrow">${cards(items.slice(0, 8))}</div></section>`).join('');
-  const feature = live.rankings[1]?.[1]?.[0];
-  app.innerHTML = shell(`<section class="hero live-hero" style="--live-backdrop:url('https://image.tmdb.org/t/p/original${feature?.backdrop_path || ''}')"><div class="meta"><b>实时榜单</b>　TMDB / Trakt</div><h1>${esc(feature?.title || feature?.name || '发现新片')}</h1><p>${esc(feature?.overview || '已连接真实影视发现数据。')}</p><div class="actions"><button class="primary" data-live-detail="${feature?.id}" data-kind="${feature?.title ? 'movie' : 'tv'}">查看详情</button><button class="secondary" data-sync-discovery>刷新榜单</button></div></section><main class="content">${rows}</main>`, 'home');
+  const rows = live.rankings.map(([name, items], index) => `<section class="module"><div class="head"><div><h2>${esc(name)}</h2><p>${name.startsWith('Trakt') ? 'Trakt · 实时趋势' : 'TMDB · 实时数据'} · ${items.length} 部</p></div><button class="ranking-more" data-live-more="${index}">更多 <span>→</span></button></div><div class="rankrow">${cards(items.slice(0, 12))}</div></section>`).join('');
+  const heroItems = live.rankings.flatMap(group => group[1]).filter(item => item.backdrop_path || item.poster_path).slice(0, 12);
+  live.heroIndex = ((live.heroIndex % heroItems.length) + heroItems.length) % heroItems.length;
+  const feature = heroItems[live.heroIndex] || live.rankings[0]?.[1]?.[0];
+  const title = feature?.title || feature?.name || '发现新片';
+  const date = feature?.release_date || feature?.first_air_date || '';
+  const heroBackdrop = feature?.backdrop_path || feature?.poster_path || '';
+  app.innerHTML = shell(`<section class="hero live-hero" style="--live-backdrop:url('https://image.tmdb.org/t/p/original${heroBackdrop}')"><div class="hero-copy"><div class="meta"><b>正在热映</b><span>TMDB / Trakt 实时榜单</span></div><h1>${esc(title)}</h1><div class="hero-facts"><span>${date ? esc(date.slice(0, 4)) : '最新'}</span><span>TMDB ${(feature?.vote_average || 0).toFixed(1)}</span><span>${feature?.title ? '电影' : '剧集'}</span></div><p>${esc(feature?.overview || '已连接真实影视发现数据，中文标题与简介将自动保存到本机缓存。')}</p><div class="actions"><button class="primary" data-live-detail="${feature?.id}" data-kind="${feature?.title ? 'movie' : 'tv'}">查看详情</button><button class="secondary" data-live-watch="${feature?.id}">＋ 加入待看</button><button class="hero-sync" data-sync-discovery title="刷新榜单">↻</button></div></div><div class="hero-controls"><button data-hero-prev aria-label="上一张海报">←</button><span>${String(live.heroIndex + 1).padStart(2, '0')} / ${String(heroItems.length).padStart(2, '0')}</span><button data-hero-next aria-label="下一张海报">→</button></div></section><main class="content"><div class="discovery-note">榜单由 TMDB 提供；连接 Trakt 后会加入其趋势数据。榜单完整列表可进入“更多”。</div>${rows}</main>`, 'home');
 };
 
 function showLiveRanking(index) {
@@ -109,23 +118,96 @@ library = function () {
   app.innerHTML = shell(`<main class="simple-page"><div class="page-heading"><div><h1>媒体库</h1><p>来自你已登录的 Emby 服务器，视频将直接从服务器播放。</p></div><button class="primary" data-load-library>同步媒体库</button></div><section class="panel">${servers}</section><section class="live-library" data-live-library><div class="empty">点击“同步媒体库”读取真实内容。</div></section></main>`, 'library');
 };
 
-async function showLiveDetail(id) {
-  const item = live.rankings?.flatMap(group => group[1]).find(entry => String(entry.id) === String(id));
-  if (!item) return;
-  const title = item.title || item.name;
-  const backdrop = item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : '';
-  app.innerHTML = shell(`<main class="detail live-detail" style="background-image:linear-gradient(90deg,#080a0df5 0,#080a0de2 48%,#080a0d70 82%),url('${backdrop}')"><button class="back" data-go="home">← 返回首页</button><h1>${esc(title)}</h1><div class="meta">TMDB ${(item.vote_average || 0).toFixed(1)} · ${esc(item.release_date || item.first_air_date || '日期未知')}</div><p class="desc">${esc(item.overview || 'TMDB 暂无中文简介。')}</p><section class="sources"><div class="page-heading compact"><div><h2>我的 Emby 资源</h2><p>正在聚合所有已连接服务器中的同名资源。</p></div></div><div data-live-sources><div class="empty">正在搜索…</div></div></section></main>`, 'home');
-  const target = document.querySelector('[data-live-sources]');
+const image = (path, size = 'w500') => path ? `https://image.tmdb.org/t/p/${size}${path}` : '';
+const itemKind = item => item?.title ? 'movie' : 'tv';
+const sourceQuality = source => {
+  const video = source?.MediaStreams?.find(stream => stream.Type === 'Video') || source?.VideoStream || {};
+  const height = video.Height || source?.Height || 0;
+  if (height >= 2000) return '2160p';
+  if (height >= 1000) return '1080p';
+  if (height >= 700) return '720p';
+  return height ? `${height}p` : '原始规格';
+};
+const sourceCodec = source => {
+  const video = source?.MediaStreams?.find(stream => stream.Type === 'Video') || source?.VideoStream || {};
+  const audio = source?.MediaStreams?.find(stream => stream.Type === 'Audio') || {};
+  return [video.DisplayTitle || video.Codec, audio.DisplayTitle || audio.Codec].filter(Boolean).join(' · ') || '媒体信息待读取';
+};
+const episodeLabel = episode => episode.movie ? '正片' : `S${String(episode.season).padStart(2, '0')} · E${String(episode.number).padStart(2, '0')}`;
+
+function renderLiveDetail() {
+  const context = live.detail;
+  if (!context) return;
+  const { item, detail, kind, episodes, resources, selectedEpisode, selectedResolution, selectedResource } = context;
+  const title = detail.name || detail.title || item.name || item.title;
+  const backdrop = image(detail.backdrop_path || item.backdrop_path, 'original');
+  const poster = image(detail.poster_path || item.poster_path);
+  const date = detail.first_air_date || detail.release_date || item.first_air_date || item.release_date;
+  const year = date ? date.slice(0, 4) : '日期未知';
+  const genres = (detail.genres || []).map(genre => genre.name).join(' · ');
+  const runtime = kind === 'movie' ? detail.runtime : (episodes.find(ep => ep.number === selectedEpisode)?.runtime || detail.episode_run_time?.[0]);
+  const selected = episodes.find(ep => ep.number === selectedEpisode) || episodes[0];
+  const resolutions = ['全部', ...new Set(resources.map(resource => sourceQuality(resource.MediaSources?.[0])))];
+  const shownResources = resources.filter(resource => selectedResolution === '全部' || sourceQuality(resource.MediaSources?.[0]) === selectedResolution);
+  const selectedMatch = shownResources[selectedResource] || shownResources[0];
+  const cast = (detail.credits?.cast || []).slice(0, 12);
+  const trailer = (detail.videos?.results || []).find(video => video.site === 'YouTube' && (video.type === 'Trailer' || video.type === 'Teaser'));
+  const posters = (detail.images?.posters || []).slice(0, 8);
+  const episodeCards = episodes.map(episode => `<button class="live-episode ${episode.number === selectedEpisode ? 'on' : ''}" data-select-episode="${episode.number}"><span class="episode-thumb" style="background-image:url('${image(episode.still_path, 'w500')}')"><i>${episodeLabel(episode)}</i></span><span class="episode-body"><b>${esc(episode.name || episodeLabel(episode))}</b><small>${esc(episode.air_date || '播出日期待定')} · ${episode.runtime ? `${episode.runtime} 分钟` : '时长待定'}</small><em>${esc(episode.overview || 'TMDB 暂无本集简介。')}</em></span></button>`).join('');
+  const resourceCards = shownResources.map((resource, index) => {
+    const source = resource.MediaSources?.[0] || {};
+    const libraryIndex = live.library.indexOf(resource);
+    return `<button class="resource-option ${resource === selectedMatch ? 'on' : ''}" data-select-resource="${index}"><span><b>${esc(resource.server.name)}</b><small>${esc(resource.Name || selected?.name || title)} · ${sourceQuality(source)} · ${source.SupportsDirectPlay === false ? '需要转码' : '可直连'}</small></span><strong>${sourceQuality(source)}</strong></button>${resource === selectedMatch ? `<div class="resource-inspector"><div><small>视频 / 音频</small><b>${esc(sourceCodec(source))}</b></div><div><small>资源规格</small><b>${esc(source.Container || source.VideoType || 'Emby')}</b></div><button class="primary" data-emby-play="${libraryIndex}">播放此资源</button></div>` : ''}`;
+  }).join('');
+  app.innerHTML = shell(`<main class="live-detail"><section class="detail-intro" style="--detail-backdrop:url('${backdrop}')"><button class="back" data-go="home">← 返回首页</button><div class="detail-heading"><img class="detail-poster" src="${poster}" alt=""><div><div class="meta"><b>TMDB ${(detail.vote_average || item.vote_average || 0).toFixed(1)}</b><span>${esc(year)}</span><span>${esc(genres || (kind === 'movie' ? '电影' : '剧集'))}</span></div><h1>${esc(title)}</h1><p>${esc(detail.overview || item.overview || 'TMDB 暂无中文简介。')}</p><div class="detail-actions"><button class="primary" data-scroll-episodes>查看${kind === 'movie' ? '正片' : '剧集'}</button><button class="secondary" data-live-watch="${item.id}">＋ 加入待看</button></div></div></div></section><div class="detail-flow"><section class="detail-section episode-section" id="episode-section"><div class="section-title"><div><span>剧集与预览</span><h2>${kind === 'movie' ? '正片信息' : `第 ${context.seasonNumber} 季`}</h2></div><p>${kind === 'movie' ? '电影正片的可用资源会在下方聚合显示。' : '默认选中最早未播放的一集；选择后将重新聚合该集资源。'}</p></div><div class="episode-rail">${episodeCards || '<div class="empty">剧集资料加载中…</div>'}</div>${selected ? `<div class="selected-episode"><span>${episodeLabel(selected)}</span><div><b>${esc(selected.name || '正片')}</b><small>${esc(selected.air_date || '日期待定')} · ${selected.runtime || runtime || '—'} 分钟</small></div><p>${esc(selected.overview || 'TMDB 暂无本集简介。')}</p></div>` : ''}</section><section class="detail-section resource-section"><div class="section-title"><div><span>聚合资源</span><h2>我的 Emby 服务器</h2></div><p>${providerConfig.emby?.length ? `已搜索 ${providerConfig.emby.length} 个已连接服务器` : '请先在媒体库中添加 Emby 服务器'}</p></div><div class="resolution-filter">${resolutions.map(resolution => `<button class="${resolution === selectedResolution ? 'on' : ''}" data-resolution="${esc(resolution)}">${esc(resolution)}</button>`).join('')}</div><div class="resource-list">${resources.length ? (shownResources.length ? resourceCards : '<div class="empty">这个清晰度暂无资源，请切换筛选。</div>') : '<div class="empty">正在聚合服务器资源；如果没有结果，可能是服务器未收录该集或标题未匹配。</div>'}</div></section><section class="detail-section people-section"><div class="section-title"><div><span>创作人员</span><h2>演员与主创</h2></div><p>${cast.length ? `${cast.length} 位主要演职员` : 'TMDB 暂无演职员资料'}</p></div><div class="cast-strip">${cast.map(person => `<article class="cast-person"><img src="${image(person.profile_path, 'w185')}" alt=""><b>${esc(person.name)}</b><small>${esc(person.character || person.job || '')}</small></article>`).join('') || '<div class="empty">暂无资料</div>'}</div></section><section class="detail-section extras-section"><div class="section-title"><div><span>更多内容</span><h2>预告片与海报</h2></div><p>来自 TMDB 的官方媒体资料</p></div><div class="extras-grid">${trailer ? `<a class="trailer-card" href="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}" data-open-external="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}"><span style="background-image:url('https://img.youtube.com/vi/${trailer.key}/hqdefault.jpg')"></span><b>▶ ${esc(trailer.name || '官方预告片')}</b><small>YouTube · ${esc(trailer.type || 'Trailer')}</small></a>` : '<div class="empty">暂无官方预告片</div>'}<div class="poster-gallery">${posters.map(entry => `<img src="${image(entry.file_path, 'w342')}" alt="${esc(title)} 海报">`).join('') || `<img src="${poster}" alt="${esc(title)} 海报">`}</div></div></section></div></main>`, 'home');
+}
+
+async function loadDetailResources(context) {
+  const selected = context.episodes.find(episode => episode.number === context.selectedEpisode) || context.episodes[0];
+  const title = context.detail.name || context.detail.title || context.item.name || context.item.title;
   try {
     const groups = await Promise.all((providerConfig.emby || []).map(async server => {
       const token = await window.yingjiDesktop.getSecret(`emby-${server.id}`);
-      const data = await request(`${server.url}/Users/${server.userId}/Items?Recursive=true&IncludeItemTypes=Movie,Episode&SearchTerm=${encodeURIComponent(title)}&Fields=Overview,ProviderIds,MediaSources&Limit=20`, { headers: embyHeaders(token) });
-      return (data.Items || []).map(found => ({ ...found, server, token }));
+      const type = context.kind === 'movie' ? 'Movie' : 'Episode';
+      const data = await request(`${server.url}/Users/${server.userId}/Items?Recursive=true&IncludeItemTypes=${type}&SearchTerm=${encodeURIComponent(title)}&Fields=Overview,ProviderIds,MediaSources,ParentIndexNumber,IndexNumber,RunTimeTicks&Limit=100`, { headers: embyHeaders(token) });
+      return (data.Items || []).filter(found => context.kind === 'movie' || (Number(found.ParentIndexNumber) === Number(context.seasonNumber) && Number(found.IndexNumber) === Number(selected.number))).map(found => ({ ...found, server, token }));
     }));
-    const matches = groups.flat();
-    matches.forEach(match => live.library.push(match));
-    target.innerHTML = matches.length ? matches.map(match => `<div class="source"><div><b>${esc(match.Name)}</b><br><small>${esc(match.server.name)}</small></div><span>${esc(match.MediaSources?.[0]?.VideoType || 'Emby')}</span><span>${match.MediaSources?.[0]?.SupportsDirectPlay === false ? '转码' : '直连'}</span><button class="primary" data-emby-play="${live.library.indexOf(match)}">播放</button></div>`).join('') : '<div class="empty">所有服务器中暂未找到该影片。</div>';
-  } catch (error) { target.innerHTML = `<div class="error-state"><b>资源搜索失败</b><span>${esc(error.message)}</span></div>`; }
+    if (live.detail !== context) return;
+    context.resources = groups.flat();
+    context.resources.forEach(found => { if (!live.library.some(item => item.Id === found.Id && item.server?.id === found.server.id)) live.library.push(found); });
+  } catch (error) {
+    if (live.detail !== context) return;
+    context.resourceError = error.message || '资源读取失败';
+  }
+  renderLiveDetail();
+}
+
+async function showLiveDetail(id, preferredKind) {
+  const item = live.rankings?.flatMap(group => group[1]).find(entry => String(entry.id) === String(id));
+  if (!item) return;
+  const kind = preferredKind || itemKind(item);
+  app.innerHTML = shell(`<main class="simple-page"><div class="empty">正在加载《${esc(item.title || item.name)}》的详细资料…</div></main>`, 'home');
+  try {
+    let tmdbKey = '';
+    try { tmdbKey = await window.yingjiDesktop.getSecret('tmdb-key'); } catch {}
+    const detail = await tmdbRequest(`/${kind}/${item.id}?append_to_response=credits,videos,images`, tmdbKey);
+    let seasonNumber = 1;
+    let episodes = [];
+    if (kind === 'tv') {
+      const regular = (detail.seasons || []).filter(season => season.season_number > 0 && season.episode_count > 0);
+      seasonNumber = regular[0]?.season_number || 1;
+      const season = await tmdbRequest(`/tv/${item.id}/season/${seasonNumber}`, tmdbKey);
+      episodes = (season.episodes || []).map(episode => ({ ...episode, season: seasonNumber, number: episode.episode_number }));
+    } else {
+      episodes = [{ movie: true, number: 1, season: 0, name: '正片', overview: detail.overview, air_date: detail.release_date, runtime: detail.runtime, still_path: detail.backdrop_path }];
+    }
+    const context = { item, detail, kind, seasonNumber, episodes, selectedEpisode: episodes[0]?.number || 1, resources: [], selectedResolution: '全部', selectedResource: 0 };
+    live.detail = context;
+    renderLiveDetail();
+    loadDetailResources(context);
+  } catch (error) {
+    app.innerHTML = shell(`<main class="simple-page"><button class="back" data-go="home">← 返回首页</button><div class="error-state"><b>详情加载失败</b><span>${esc(error.message || '请检查网络后重试')}</span><button class="secondary" data-live-detail="${item.id}" data-kind="${kind}">重试</button></div></main>`, 'home');
+  }
 }
 
 settingsV2 = function () {
@@ -191,15 +273,36 @@ async function playEmby(item) {
 }
 
 document.addEventListener('click', event => {
-  const target = event.target.closest('[data-sync-discovery],[data-load-library],[data-emby-play],[data-live-detail],[data-live-more],[data-trakt-auth],[data-sync-calendar]');
+  const target = event.target.closest('[data-sync-discovery],[data-load-library],[data-emby-play],[data-live-detail],[data-live-more],[data-trakt-auth],[data-sync-calendar],[data-hero-prev],[data-hero-next],[data-select-episode],[data-resolution],[data-select-resource],[data-scroll-episodes],[data-live-watch]');
   if (!target) return;
   if (target.hasAttribute('data-sync-discovery')) syncDiscovery();
   if (target.hasAttribute('data-load-library')) loadLibrary();
   if (target.dataset.embyPlay !== undefined) playEmby(live.library[Number(target.dataset.embyPlay)]).catch(error => notify(`播放失败：${error.message}`));
-  if (target.dataset.liveDetail !== undefined) showLiveDetail(target.dataset.liveDetail);
+  if (target.dataset.liveDetail !== undefined) showLiveDetail(target.dataset.liveDetail, target.dataset.kind);
   if (target.dataset.liveMore !== undefined) showLiveRanking(target.dataset.liveMore);
   if (target.hasAttribute('data-trakt-auth')) authorizeTrakt();
   if (target.hasAttribute('data-sync-calendar')) syncTraktCalendar();
+  if (target.hasAttribute('data-hero-prev')) { live.heroIndex--; home(); }
+  if (target.hasAttribute('data-hero-next')) { live.heroIndex++; home(); }
+  if (target.hasAttribute('data-scroll-episodes')) document.querySelector('#episode-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (target.dataset.liveWatch !== undefined) notify('已加入待看，后续会同步到追剧日历');
+  if (target.dataset.selectEpisode !== undefined && live.detail) {
+    live.detail.selectedEpisode = Number(target.dataset.selectEpisode);
+    live.detail.resources = [];
+    live.detail.selectedResolution = '全部';
+    live.detail.selectedResource = 0;
+    renderLiveDetail();
+    loadDetailResources(live.detail);
+  }
+  if (target.dataset.resolution !== undefined && live.detail) {
+    live.detail.selectedResolution = target.dataset.resolution;
+    live.detail.selectedResource = 0;
+    renderLiveDetail();
+  }
+  if (target.dataset.selectResource !== undefined && live.detail) {
+    live.detail.selectedResource = Number(target.dataset.selectResource);
+    renderLiveDetail();
+  }
 });
 
 document.addEventListener('submit', async event => {
