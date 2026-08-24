@@ -7,19 +7,19 @@ const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json
 const connectionBadge = connected => `<span class="connection ${connected ? 'connected' : ''}">${connected ? '已连接' : '未配置'}</span>`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const metadataEndpoint = (window.YINGJI_CONFIG?.metadataEndpoint || '').replace(/\/$/, '');
-const tmdbRequest = async (path, key = '') => metadataEndpoint
-  ? request(`${metadataEndpoint}/tmdb${path}`)
-  : request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`);
+const tmdbRequest = async (path, key = '') => key
+  ? request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`)
+  : request(`${metadataEndpoint}/tmdb${path}`);
 
 async function syncDiscovery() {
   if (discoverySyncing) return;
   discoverySyncing = true;
   notify('正在同步 TMDB 榜单…');
   try {
-    const [tmdbKey, traktId] = await Promise.all([
-      window.yingjiDesktop.getSecret('tmdb-key'),
-      window.yingjiDesktop.getSecret('trakt-client-id')
-    ]);
+    let tmdbKey = '';
+    try { tmdbKey = await window.yingjiDesktop.getSecret('tmdb-key'); } catch {}
+    let traktId = '';
+    try { traktId = await window.yingjiDesktop.getSecret('trakt-client-id'); } catch {}
     if (!tmdbKey && !metadataEndpoint) throw new Error('请先配置影视元数据服务');
     const tmdb = path => tmdbRequest(path, tmdbKey);
     const [trakt, cnTv, movies, tv, topTv] = await Promise.all([
@@ -35,14 +35,14 @@ async function syncDiscovery() {
       try { return await tmdb(`/tv/${id}`); } catch { return null; }
     }));
     live.rankings = [
-      ['国内热门电视剧', cnTv.results.slice(0, 8)],
-      ['全球热门电影', movies.results.slice(0, 8)],
-      ['全球热门剧集', tv.results.slice(0, 8)],
-      [traktItems.some(Boolean) ? 'Trakt 热门剧集' : '全球高分剧集', (traktItems.some(Boolean) ? traktItems.filter(Boolean) : topTv.results).slice(0, 8)]
+      ['国内热门电视剧', cnTv.results],
+      ['全球热门电影', movies.results],
+      ['全球热门剧集', tv.results],
+      [traktItems.some(Boolean) ? 'Trakt 热门剧集' : '全球高分剧集', traktItems.some(Boolean) ? traktItems.filter(Boolean) : topTv.results]
     ];
     localStorage.setItem('yingji.discovery-cache', JSON.stringify(live.rankings));
     home(); notify('榜单同步完成');
-  } catch (error) { notify(error.message); } finally { discoverySyncing = false; }
+  } catch (error) { notify(`榜单同步失败：${error.message || '请检查网络后重试'}`); } finally { discoverySyncing = false; }
 }
 
 const demoHome = home;
@@ -58,10 +58,22 @@ home = function () {
     const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '';
     return `<button class="live-card" data-live-detail="${item.id}" data-kind="${item.title ? 'movie' : 'tv'}"><span class="live-poster" style="background-image:url('${poster}')"><i>${index + 1}</i></span><b>${esc(title)}</b><small>TMDB ${(item.vote_average || 0).toFixed(1)}</small></button>`;
   }).join('');
-  const rows = live.rankings.map(([name, items]) => `<section class="module"><div class="head"><h2>${esc(name)}</h2><p>TMDB / Trakt · 实时数据</p></div><div class="rankrow">${cards(items)}</div></section>`).join('');
+  const rows = live.rankings.map(([name, items], index) => `<section class="module"><div class="head"><h2>${esc(name)}</h2><p>TMDB · 实时数据</p><button class="ranking-more" data-live-more="${index}">更多</button></div><div class="rankrow">${cards(items.slice(0, 8))}</div></section>`).join('');
   const feature = live.rankings[1]?.[1]?.[0];
   app.innerHTML = shell(`<section class="hero live-hero" style="--live-backdrop:url('https://image.tmdb.org/t/p/original${feature?.backdrop_path || ''}')"><div class="meta"><b>实时榜单</b>　TMDB / Trakt</div><h1>${esc(feature?.title || feature?.name || '发现新片')}</h1><p>${esc(feature?.overview || '已连接真实影视发现数据。')}</p><div class="actions"><button class="primary" data-live-detail="${feature?.id}" data-kind="${feature?.title ? 'movie' : 'tv'}">查看详情</button><button class="secondary" data-sync-discovery>刷新榜单</button></div></section><main class="content">${rows}</main>`, 'home');
 };
+
+function showLiveRanking(index) {
+  const ranking = live.rankings?.[Number(index)];
+  if (!ranking) return;
+  const [name, items] = ranking;
+  const cards = items.map((item, itemIndex) => {
+    const title = item.title || item.name || item.original_title || item.original_name;
+    const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '';
+    return `<button class="live-card" data-live-detail="${item.id}" data-kind="${item.title ? 'movie' : 'tv'}"><span class="live-poster" style="background-image:url('${poster}')"><i>${itemIndex + 1}</i></span><b>${esc(title)}</b><small>TMDB ${(item.vote_average || 0).toFixed(1)}</small></button>`;
+  }).join('');
+  app.innerHTML = shell(`<main class="ranking-page"><div class="page-heading"><div><button class="back" data-go="home">← 返回首页</button><h1>${esc(name)}</h1><p>来自 TMDB 的完整实时榜单</p></div><span class="page-stat">${items.length} 部作品</span></div><div class="ranking-grid">${cards}</div></main>`, 'home');
+}
 
 async function loadLibrary() {
   const target = document.querySelector('[data-live-library]');
@@ -104,7 +116,7 @@ async function showLiveDetail(id) {
 
 settingsV2 = function () {
   const servers = (providerConfig.emby || []).map(server => `<div class="config"><div><b>${esc(server.name)}</b><br><small>${esc(server.url)} · ${esc(server.userName)}</small></div>${connectionBadge(true)}</div>`).join('') || '<div class="empty">尚未连接服务器。</div>';
-  app.innerHTML = shell(`<main class="settings"><div class="page-heading"><div><h1>连接设置</h1><p>密钥和 Emby 令牌使用 Windows 数据保护加密保存。</p></div></div><div class="provider-grid"><section class="panel provider"><div class="provider-title"><h2>TMDB</h2>${connectionBadge(!!metadataEndpoint || !!providerConfig.tmdb)}</div><p>${metadataEndpoint ? '已由映迹元数据服务提供中文资料、海报和榜单，无需填写 Key。' : '中文资料、海报、演职员与热门榜单。'}</p>${metadataEndpoint ? '<div class="managed-source">由应用服务安全托管</div>' : '<form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key"><button>保存并测试</button></form>'}</section><section class="panel provider"><div class="provider-title"><h2>Trakt</h2>${connectionBadge(!!providerConfig.traktAuthorized)}</div><p>热门趋势、观看记录与追剧日历。</p><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存应用凭据</button></form>${providerConfig.trakt ? `<button class="secondary authorize" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button>` : ''}<div data-trakt-device></div></section><section class="panel provider emby-provider"><div class="provider-title"><h2>Emby 服务器</h2>${connectionBadge((providerConfig.emby || []).length > 0)}</div>${servers}<form data-provider="emby"><input name="name" required placeholder="服务器名称"><input name="url" type="url" required placeholder="https://emby.example.com"><input name="username" required placeholder="用户名"><input name="password" type="password" required placeholder="密码"><button>登录并添加</button></form></section></div></main>`, 'settings');
+  app.innerHTML = shell(`<main class="settings"><div class="page-heading"><div><h1>连接设置</h1><p>密钥和 Emby 令牌使用 Windows 数据保护加密保存。</p></div></div><div class="provider-grid"><section class="panel provider"><div class="provider-title"><h2>TMDB</h2>${connectionBadge(!!metadataEndpoint || !!providerConfig.tmdb)}</div><p>${metadataEndpoint ? '默认由映迹元数据服务提供中文资料、海报和榜单。' : '中文资料、海报、演职员与热门榜单。'}</p>${metadataEndpoint ? '<div class="managed-source">托管模式已启用 · 可选填入自己的 Key 覆盖使用</div>' : ''}<form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key（可选覆盖托管模式）"><button>保存并测试</button></form></section><section class="panel provider"><div class="provider-title"><h2>Trakt</h2>${connectionBadge(!!providerConfig.traktAuthorized)}</div><p>热门趋势、观看记录与追剧日历。</p><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存应用凭据</button></form>${providerConfig.trakt ? `<button class="secondary authorize" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button>` : ''}<div data-trakt-device></div></section><section class="panel provider emby-provider"><div class="provider-title"><h2>Emby 服务器</h2>${connectionBadge((providerConfig.emby || []).length > 0)}</div>${servers}<form data-provider="emby"><input name="name" required placeholder="服务器名称"><input name="url" type="url" required placeholder="https://emby.example.com"><input name="username" required placeholder="用户名"><input name="password" type="password" required placeholder="密码"><button>登录并添加</button></form></section></div></main>`, 'settings');
 };
 
 async function authorizeTrakt() {
@@ -165,12 +177,13 @@ async function playEmby(item) {
 }
 
 document.addEventListener('click', event => {
-  const target = event.target.closest('[data-sync-discovery],[data-load-library],[data-emby-play],[data-live-detail],[data-trakt-auth],[data-sync-calendar]');
+  const target = event.target.closest('[data-sync-discovery],[data-load-library],[data-emby-play],[data-live-detail],[data-live-more],[data-trakt-auth],[data-sync-calendar]');
   if (!target) return;
   if (target.hasAttribute('data-sync-discovery')) syncDiscovery();
   if (target.hasAttribute('data-load-library')) loadLibrary();
   if (target.dataset.embyPlay !== undefined) playEmby(live.library[Number(target.dataset.embyPlay)]).catch(error => notify(`播放失败：${error.message}`));
   if (target.dataset.liveDetail !== undefined) showLiveDetail(target.dataset.liveDetail);
+  if (target.dataset.liveMore !== undefined) showLiveRanking(target.dataset.liveMore);
   if (target.hasAttribute('data-trakt-auth')) authorizeTrakt();
   if (target.hasAttribute('data-sync-calendar')) syncTraktCalendar();
 });
