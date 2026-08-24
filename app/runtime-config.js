@@ -1,3 +1,3 @@
 window.YINGJI_CONFIG = {
-  metadataEndpoint: ''
+  metadataEndpoint: 'https://yingji-metadata.gctykxy.workers.dev'
 };
