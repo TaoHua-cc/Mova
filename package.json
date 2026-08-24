@@ -1,6 +1,6 @@
 {
   "name": "yingji",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "映迹 Windows 观影客户端",
   "main": "main.cjs",
   "author": "Yingji",
@@ -9,7 +9,6 @@
     "start": "electron .",
     "fetch:mpv": "powershell -ExecutionPolicy Bypass -File scripts/fetch-mpv.ps1",
     "dist:installer": "electron-builder --win nsis",
-    "dist:portable": "electron-builder --win portable",
     "dist:store": "electron-builder --win appx"
   },
   "devDependencies": {
@@ -36,7 +35,6 @@
       "icon": "build/icon.ico",
       "target": [
         "nsis",
-        "portable",
         "appx"
       ],
       "signAndEditExecutable": false

@@ -22,9 +22,7 @@ jobs:
       - run: pnpm run fetch:mpv
       - run: pnpm run dist:installer
       - run: $v = (Get-Content package.json | ConvertFrom-Json).version; Move-Item "dist/Yingji-$v-Windows-x64.exe" "dist/Yingji-$v-Setup-x64.exe"
-      - run: pnpm run dist:portable
-      - run: $v = (Get-Content package.json | ConvertFrom-Json).version; Move-Item "dist/Yingji-$v-Windows-x64.exe" "dist/Yingji-$v-Portable-x64.exe"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: $v = (Get-Content package.json | ConvertFrom-Json).version; gh release create $env:GITHUB_REF_NAME "dist/Yingji-$v-Setup-x64.exe" "dist/Yingji-$v-Portable-x64.exe" --generate-notes --title "映迹 $v"
+        run: $v = (Get-Content package.json | ConvertFrom-Json).version; gh release create $env:GITHUB_REF_NAME "dist/Yingji-$v-Setup-x64.exe" --generate-notes --title "映迹 $v"
