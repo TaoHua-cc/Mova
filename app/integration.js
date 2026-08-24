@@ -11,19 +11,20 @@ const tmdbRequest = async (path, key = '') => metadataEndpoint
   : request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`);
 
 async function syncDiscovery() {
-  notify('正在同步 TMDB 与 Trakt…');
+  notify('正在同步 TMDB 榜单…');
   try {
     const [tmdbKey, traktId] = await Promise.all([
       window.yingjiDesktop.getSecret('tmdb-key'),
       window.yingjiDesktop.getSecret('trakt-client-id')
     ]);
-    if ((!tmdbKey && !metadataEndpoint) || !traktId) throw new Error('请先配置影视元数据服务和 Trakt Client ID');
+    if (!tmdbKey && !metadataEndpoint) throw new Error('请先配置影视元数据服务');
     const tmdb = path => tmdbRequest(path, tmdbKey);
-    const trakt = await request('https://api.trakt.tv/shows/trending?limit=8&extended=full', { headers: { 'trakt-api-version': '2', 'trakt-api-key': traktId } });
-    const [cnTv, movies, tv] = await Promise.all([
+    const [trakt, cnTv, movies, tv, topTv] = await Promise.all([
+      traktId ? request('https://api.trakt.tv/shows/trending?limit=8&extended=full', { headers: { 'trakt-api-version': '2', 'trakt-api-key': traktId } }) : [],
       tmdb('/discover/tv?with_origin_country=CN&sort_by=popularity.desc'),
       tmdb('/trending/movie/week'),
-      tmdb('/trending/tv/week')
+      tmdb('/trending/tv/week'),
+      tmdb('/tv/top_rated')
     ]);
     const traktItems = await Promise.all(trakt.map(async entry => {
       const id = entry.show?.ids?.tmdb;
@@ -34,7 +35,7 @@ async function syncDiscovery() {
       ['国内热门电视剧', cnTv.results.slice(0, 8)],
       ['全球热门电影', movies.results.slice(0, 8)],
       ['全球热门剧集', tv.results.slice(0, 8)],
-      ['Trakt 热门剧集', traktItems.filter(Boolean).slice(0, 8)]
+      [traktItems.some(Boolean) ? 'Trakt 热门剧集' : '全球高分剧集', (traktItems.some(Boolean) ? traktItems.filter(Boolean) : topTv.results).slice(0, 8)]
     ];
     localStorage.setItem('yingji.discovery-cache', JSON.stringify(live.rankings));
     home(); notify('榜单同步完成');
@@ -46,7 +47,7 @@ home = function () {
   live.rankings ||= JSON.parse(localStorage.getItem('yingji.discovery-cache') || 'null');
   if (!live.rankings) {
     demoHome();
-    document.querySelector('.content')?.insertAdjacentHTML('afterbegin', `<div class="sync-banner"><div><b>连接真实榜单</b><span>配置 TMDB 与 Trakt 后，用真实热门内容替换演示数据。</span></div><button class="primary" data-sync-discovery>立即同步</button></div>`);
+    document.querySelector('.content')?.insertAdjacentHTML('afterbegin', `<div class="sync-banner"><div><b>连接真实榜单</b><span>已托管 TMDB 数据；配置 Trakt 后可额外显示其热门趋势。</span></div><button class="primary" data-sync-discovery>立即同步</button></div>`);
     return;
   }
   const cards = items => items.map((item, index) => {
