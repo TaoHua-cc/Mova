@@ -21,7 +21,7 @@ const http = require('node:http');
     theme: document.body.className,
     railWidth: getComputedStyle(document.querySelector('.bar')).width
   }));
-  if (!result.desktopBridge || result.navItems !== 7 || result.railWidth !== '72px') throw new Error(JSON.stringify(result));
+  if (!result.desktopBridge || result.navItems !== 7 || result.railWidth !== '62px') throw new Error(JSON.stringify(result));
   const bridge = await page.evaluate(async port => {
     await window.yingjiDesktop.setSecret('verification-only', 'encrypted-value');
     return {
@@ -40,7 +40,7 @@ const http = require('node:http');
   await page.locator('.nav button').first().hover();
   await page.waitForTimeout(300);
   const expandedWidth = await page.locator('.bar').evaluate(element => getComputedStyle(element).width);
-  if (expandedWidth !== '236px') throw new Error(`Rail did not expand: ${expandedWidth}`);
+  if (expandedWidth !== '228px') throw new Error(`Rail did not expand: ${expandedWidth}`);
   await page.screenshot({ path: '../../outputs/yingji-windows-nav-expanded.png' });
   await page.locator('[data-go="settings"]').click();
   await page.waitForSelector('[data-provider="emby"]');
