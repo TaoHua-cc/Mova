@@ -22,26 +22,30 @@ async function syncDiscovery() {
     try { traktId = await window.yingjiDesktop.getSecret('trakt-client-id'); } catch {}
     if (!tmdbKey && !metadataEndpoint) throw new Error('请先配置影视元数据服务');
     const tmdb = path => tmdbRequest(path, tmdbKey);
-    const [trakt, cnTv, movies, tv, topTv] = await Promise.all([
-      traktId ? request('https://api.trakt.tv/shows/trending?limit=8&extended=full', { headers: { 'trakt-api-version': '2', 'trakt-api-key': traktId } }) : [],
-      tmdb('/discover/tv?with_origin_country=CN&sort_by=popularity.desc'),
-      tmdb('/trending/movie/week'),
-      tmdb('/trending/tv/week'),
-      tmdb('/tv/top_rated')
-    ]);
-    const traktItems = await Promise.all(trakt.map(async entry => {
-      const id = entry.show?.ids?.tmdb;
-      if (!id) return null;
-      try { return await tmdb(`/tv/${id}`); } catch { return null; }
-    }));
-    live.rankings = [
-      ['国内热门电视剧', cnTv.results],
-      ['全球热门电影', movies.results],
-      ['全球热门剧集', tv.results],
-      [traktItems.some(Boolean) ? 'Trakt 热门剧集' : '全球高分剧集', traktItems.some(Boolean) ? traktItems.filter(Boolean) : topTv.results]
+    const sources = [
+      ['国内热门电视剧', '/discover/tv?with_origin_country=CN&sort_by=popularity.desc'],
+      ['全球热门电影', '/trending/movie/week'],
+      ['全球热门剧集', '/trending/tv/week'],
+      ['全球高分剧集', '/tv/top_rated']
     ];
+    const settled = await Promise.all(sources.map(async ([name, path]) => {
+      try {
+        const data = await tmdb(path);
+        return Array.isArray(data.results) && data.results.length ? [name, data.results] : null;
+      } catch { return null; }
+    }));
+    live.rankings = settled.filter(Boolean);
+    if (!live.rankings.length) throw new Error('TMDB 暂时没有返回榜单，请稍后重试');
+    if (traktId) try {
+      const trakt = await request('https://api.trakt.tv/shows/trending?limit=8&extended=full', { headers: { 'trakt-api-version': '2', 'trakt-api-key': traktId } });
+      const items = (await Promise.all(trakt.map(async entry => {
+        const id = entry.show?.ids?.tmdb;
+        try { return id ? await tmdb(`/tv/${id}`) : null; } catch { return null; }
+      }))).filter(Boolean);
+      if (items.length) live.rankings[3] = ['Trakt 热门剧集', items];
+    } catch {}
     localStorage.setItem('yingji.discovery-cache', JSON.stringify(live.rankings));
-    home(); notify('榜单同步完成');
+    home(); notify(`榜单同步完成${live.rankings.length < sources.length ? '（部分模块稍后重试）' : ''}`);
   } catch (error) { notify(`榜单同步失败：${error.message || '请检查网络后重试'}`); } finally { discoverySyncing = false; }
 }
 
