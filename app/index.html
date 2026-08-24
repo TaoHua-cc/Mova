@@ -31,4 +31,4 @@ document.addEventListener('click',e=>{const t=e.target.closest('[data-go],[data-
 document.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.matches('[data-detail]'))e.target.click();if(e.key==='Escape'&&state.view==='player'){state.view='detail';render()}});
 document.addEventListener('submit',e=>{e.preventDefault();const type=e.target.dataset.form;if(!type)return;const f=new FormData(e.target),name=f.get('name').trim(),url=f.get('url').trim();try{new URL(url)}catch{return notify('请输入完整的 http 或 https 地址')}state[type].push(type==='servers'?{name,url,online:false}:{name,url});localStorage.setItem('yingji.'+type,JSON.stringify(state[type]));render();notify('已添加 '+name)});
 render();
-</script><script src="integration.js"></script><script src="desktop.js"></script></body></html>
+</script><script src="runtime-config.js"></script><script src="integration.js"></script><script src="desktop.js"></script></body></html>

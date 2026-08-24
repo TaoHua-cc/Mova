@@ -5,6 +5,10 @@ const request = (url, options = {}) => window.yingjiDesktop.request({ url, ...op
 const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json' });
 const connectionBadge = connected => `<span class="connection ${connected ? 'connected' : ''}">${connected ? '已连接' : '未配置'}</span>`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const metadataEndpoint = (window.YINGJI_CONFIG?.metadataEndpoint || '').replace(/\/$/, '');
+const tmdbRequest = async (path, key = '') => metadataEndpoint
+  ? request(`${metadataEndpoint}/tmdb${path}`)
+  : request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`);
 
 async function syncDiscovery() {
   notify('正在同步 TMDB 与 Trakt…');
@@ -13,8 +17,8 @@ async function syncDiscovery() {
       window.yingjiDesktop.getSecret('tmdb-key'),
       window.yingjiDesktop.getSecret('trakt-client-id')
     ]);
-    if (!tmdbKey || !traktId) throw new Error('请先在设置中填写 TMDB API Key 和 Trakt Client ID');
-    const tmdb = async path => request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(tmdbKey)}&language=zh-CN`);
+    if ((!tmdbKey && !metadataEndpoint) || !traktId) throw new Error('请先配置影视元数据服务和 Trakt Client ID');
+    const tmdb = path => tmdbRequest(path, tmdbKey);
     const trakt = await request('https://api.trakt.tv/shows/trending?limit=8&extended=full', { headers: { 'trakt-api-version': '2', 'trakt-api-key': traktId } });
     const [cnTv, movies, tv] = await Promise.all([
       tmdb('/discover/tv?with_origin_country=CN&sort_by=popularity.desc'),
@@ -96,7 +100,7 @@ async function showLiveDetail(id) {
 
 settingsV2 = function () {
   const servers = (providerConfig.emby || []).map(server => `<div class="config"><div><b>${esc(server.name)}</b><br><small>${esc(server.url)} · ${esc(server.userName)}</small></div>${connectionBadge(true)}</div>`).join('') || '<div class="empty">尚未连接服务器。</div>';
-  app.innerHTML = shell(`<main class="settings"><div class="page-heading"><div><h1>连接设置</h1><p>密钥和 Emby 令牌使用 Windows 数据保护加密保存。</p></div></div><div class="provider-grid"><section class="panel provider"><div class="provider-title"><h2>TMDB</h2>${connectionBadge(!!providerConfig.tmdb)}</div><p>中文资料、海报、演职员与热门榜单。</p><form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key"><button>保存并测试</button></form></section><section class="panel provider"><div class="provider-title"><h2>Trakt</h2>${connectionBadge(!!providerConfig.traktAuthorized)}</div><p>热门趋势、观看记录与追剧日历。</p><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存应用凭据</button></form>${providerConfig.trakt ? `<button class="secondary authorize" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button>` : ''}<div data-trakt-device></div></section><section class="panel provider emby-provider"><div class="provider-title"><h2>Emby 服务器</h2>${connectionBadge((providerConfig.emby || []).length > 0)}</div>${servers}<form data-provider="emby"><input name="name" required placeholder="服务器名称"><input name="url" type="url" required placeholder="https://emby.example.com"><input name="username" required placeholder="用户名"><input name="password" type="password" required placeholder="密码"><button>登录并添加</button></form></section></div></main>`, 'settings');
+  app.innerHTML = shell(`<main class="settings"><div class="page-heading"><div><h1>连接设置</h1><p>密钥和 Emby 令牌使用 Windows 数据保护加密保存。</p></div></div><div class="provider-grid"><section class="panel provider"><div class="provider-title"><h2>TMDB</h2>${connectionBadge(!!metadataEndpoint || !!providerConfig.tmdb)}</div><p>${metadataEndpoint ? '已由映迹元数据服务提供中文资料、海报和榜单，无需填写 Key。' : '中文资料、海报、演职员与热门榜单。'}</p>${metadataEndpoint ? '<div class="managed-source">由应用服务安全托管</div>' : '<form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key"><button>保存并测试</button></form>'}</section><section class="panel provider"><div class="provider-title"><h2>Trakt</h2>${connectionBadge(!!providerConfig.traktAuthorized)}</div><p>热门趋势、观看记录与追剧日历。</p><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存应用凭据</button></form>${providerConfig.trakt ? `<button class="secondary authorize" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button>` : ''}<div data-trakt-device></div></section><section class="panel provider emby-provider"><div class="provider-title"><h2>Emby 服务器</h2>${connectionBadge((providerConfig.emby || []).length > 0)}</div>${servers}<form data-provider="emby"><input name="name" required placeholder="服务器名称"><input name="url" type="url" required placeholder="https://emby.example.com"><input name="username" required placeholder="用户名"><input name="password" type="password" required placeholder="密码"><button>登录并添加</button></form></section></div></main>`, 'settings');
 };
 
 async function authorizeTrakt() {
@@ -128,7 +132,7 @@ async function syncTraktCalendar() {
     const date = start.toISOString().slice(0, 10);
     const events = await request(`https://api.trakt.tv/calendars/my/shows/${date}/10?extended=full`, { headers: { Authorization: `Bearer ${token}`, 'trakt-api-version': '2', 'trakt-api-key': clientId } });
     const posters = {};
-    if (tmdbKey) await Promise.all(events.map(async event => { const id = event.show?.ids?.tmdb; if (!id || posters[id]) return; try { const info = await request(`https://api.themoviedb.org/3/tv/${id}?api_key=${encodeURIComponent(tmdbKey)}&language=zh-CN`); posters[id] = info.poster_path; } catch {} }));
+    if (tmdbKey || metadataEndpoint) await Promise.all(events.map(async event => { const id = event.show?.ids?.tmdb; if (!id || posters[id]) return; try { const info = await tmdbRequest(`/tv/${id}?language=zh-CN`, tmdbKey); posters[id] = info.poster_path; } catch {} }));
     const byDate = Object.groupBy(events, event => event.first_aired.slice(0, 10));
     target.innerHTML = Array.from({ length: 10 }, (_, index) => {
       const day = new Date(start); day.setDate(day.getDate() + index); const key = day.toISOString().slice(0, 10); const items = byDate[key] || [];

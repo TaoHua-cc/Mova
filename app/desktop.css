@@ -5,3 +5,4 @@ body.nav-left .bar{width:72px;padding:20px 12px;overflow:hidden;z-index:40;trans
 .page-heading.compact{margin-bottom:10px}.page-heading.compact h2{margin:0}.live-detail .sources{margin-top:34px}
 .authorize{margin-top:14px}.device-code{display:grid;gap:8px;margin-top:14px;padding:14px;border-radius:12px;background:var(--surface2)}.device-code strong{font-size:28px;letter-spacing:.16em;color:var(--focus)}
 .player-handoff{max-width:860px}.player-handoff .panel{margin-top:28px}.player-handoff .panel p{color:var(--sub)}
+.managed-source{margin-top:16px;padding:12px 14px;border-radius:12px;background:var(--surface2);color:var(--focus)}

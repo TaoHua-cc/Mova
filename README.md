@@ -31,3 +31,7 @@ TMDB、Trakt 和 Emby 凭据均由用户在应用设置页填写，不应提交�
 - `appx`：Microsoft Store 包；提交前必须把 `package.json` 中的 AppX Identity 和 Publisher 替换为 Partner Center 提供的准确值
 
 第三方组件信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本仓库当前未授予额外源代码许可证。
+
+## 让用户免填 TMDB Key
+
+`metadata-worker` 提供一个最小代理。将 TMDB Read Access Token 保存为 Worker Secret，部署后把地址写入 `app/runtime-config.js`。最终用户无需接触或填写 TMDB Key，客户端也不会包含开发者 Token。
