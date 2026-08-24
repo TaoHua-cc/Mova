@@ -6,7 +6,7 @@ const titles=['边界来信','山海之间','轨道之外','归途','逆风而�
 const modules=[['国内热门电视剧',[4,5,0,1,2,3,6,7]],['国内热门电影',[4,6,5,7,1,0,3,2]],['全球热门剧集',[2,3,6,0,1,7,5,4]],['全球热门电影',[7,5,3,2,6,4,1,0]],['高分口碑新作',[1,4,0,6,5,2,7,3]],['片库可播放榜',[0,1,2,3,4,5,6,7]]];
 const media={title:'边界来信',year:2026,desc:'调查员在废弃卫星中发现来自未来的私人通信。每一次接收，都在改变当下的现实。',watched:[1,2,3,4],episodes:[1,2,3,4,5,6,7,8]};
 const defaults=[{name:'家庭影库',url:'https://home.example.com',online:true},{name:'云端媒体库',url:'https://cloud.example.com',online:true},{name:'朋友共享库',url:'https://friend.example.com',online:false}];
-const state={view:'home',episode:5,theme:localStorage.getItem('yingji.theme')||'dark',layout:'left',moduleOrder:JSON.parse(localStorage.getItem('yingji.moduleOrder')||'null')||modules.map((_,i)=>i),watchlist:JSON.parse(localStorage.getItem('yingji.watchlist')||'[0,2,4]'),servers:JSON.parse(localStorage.getItem('yingji.servers')||'null')||[],danmaku:JSON.parse(localStorage.getItem('yingji.danmu')||'null')||[]};
+const state={view:'home',episode:5,theme:localStorage.getItem('yingji.theme')||'light',layout:localStorage.getItem('yingji.layout')||'left',moduleOrder:JSON.parse(localStorage.getItem('yingji.moduleOrder')||'null')||modules.map((_,i)=>i),watchlist:JSON.parse(localStorage.getItem('yingji.watchlist')||'[0,2,4]'),servers:JSON.parse(localStorage.getItem('yingji.servers')||'null')||[],danmaku:JSON.parse(localStorage.getItem('yingji.danmu')||'null')||[]};
 document.head.insertAdjacentHTML('beforeend','<link rel="stylesheet" href="yingji-theme.css">');
 const app=document.querySelector('#app'),status=document.querySelector('#status');
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

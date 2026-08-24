@@ -401,3 +401,10 @@ document.addEventListener('submit', event => {
 
 render();
 if (metadataEndpoint) syncDiscovery();
+
+// Keep the first viewport alive without interrupting detail work or keyboard navigation.
+setInterval(() => {
+  if (state.view !== 'home' || !live.rankings?.length || document.hidden) return;
+  live.heroIndex += 1;
+  home();
+}, 8000);
