@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
@@ -20,6 +20,10 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true
     }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\/(www\.)?youtube\.com\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
   });
   win.loadFile(path.join(__dirname, 'app', 'index.html'));
   win.once('ready-to-show', () => win.show());
