@@ -1,0 +1,58 @@
+{
+  "name": "yingji",
+  "version": "1.0.0",
+  "description": "映迹 Windows 观影客户端",
+  "main": "main.cjs",
+  "author": "Yingji",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "fetch:mpv": "powershell -ExecutionPolicy Bypass -File scripts/fetch-mpv.ps1",
+    "dist:installer": "electron-builder --win nsis",
+    "dist:portable": "electron-builder --win portable",
+    "dist:store": "electron-builder --win appx"
+  },
+  "devDependencies": {
+    "electron": "39.2.7",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.yingji.desktop",
+    "productName": "映迹",
+    "artifactName": "Yingji-${version}-Windows-${arch}.${ext}",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "THIRD_PARTY_NOTICES.md",
+      "app/**/*"
+    ],
+    "asarUnpack": [
+      "app/mpv/**/*"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable",
+        "appx"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "appx": {
+      "applicationId": "Yingji",
+      "displayName": "映迹",
+      "publisherDisplayName": "Yingji",
+      "identityName": "Yingji.Desktop",
+      "publisher": "CN=Yingji"
+    }
+  }
+}

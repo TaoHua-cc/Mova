@@ -1,0 +1,10 @@
+node_modules/
+dist/
+app/mpv/*.exe
+app/mpv/*.com
+app/mpv/*.dll
+app/mpv/doc/
+app/mpv/installer/
+app/mpv/*.bat
+app/mpv/mpv/
+*.log
