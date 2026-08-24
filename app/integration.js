@@ -1,5 +1,6 @@
 const providerConfig = JSON.parse(localStorage.getItem('yingji.providers') || '{"emby":[]}');
 const live = { rankings: null, library: [], active: null };
+let discoverySyncing = false;
 const saveProviders = () => localStorage.setItem('yingji.providers', JSON.stringify(providerConfig));
 const request = (url, options = {}) => window.yingjiDesktop.request({ url, ...options });
 const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json' });
@@ -11,6 +12,8 @@ const tmdbRequest = async (path, key = '') => metadataEndpoint
   : request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`);
 
 async function syncDiscovery() {
+  if (discoverySyncing) return;
+  discoverySyncing = true;
   notify('正在同步 TMDB 榜单…');
   try {
     const [tmdbKey, traktId] = await Promise.all([
@@ -39,7 +42,7 @@ async function syncDiscovery() {
     ];
     localStorage.setItem('yingji.discovery-cache', JSON.stringify(live.rankings));
     home(); notify('榜单同步完成');
-  } catch (error) { notify(error.message); }
+  } catch (error) { notify(error.message); } finally { discoverySyncing = false; }
 }
 
 const demoHome = home;
@@ -203,3 +206,4 @@ document.addEventListener('submit', async event => {
 }, true);
 
 render();
+if (metadataEndpoint) syncDiscovery();
