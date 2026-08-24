@@ -2,14 +2,24 @@ const providerConfig = JSON.parse(localStorage.getItem('yingji.providers') || '{
 const live = { rankings: null, library: [], active: null };
 let discoverySyncing = false;
 const saveProviders = () => localStorage.setItem('yingji.providers', JSON.stringify(providerConfig));
-const request = (url, options = {}) => window.yingjiDesktop.request({ url, ...options });
 const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json' });
 const connectionBadge = connected => `<span class="connection ${connected ? 'connected' : ''}">${connected ? '已连接' : '未配置'}</span>`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const metadataEndpoint = (window.YINGJI_CONFIG?.metadataEndpoint || '').replace(/\/$/, '');
+const request = async (url, options = {}) => {
+  if (metadataEndpoint && url.startsWith(metadataEndpoint)) {
+    const response = await fetch(url, { method: options.method || 'GET', headers: options.headers || {}, body: options.body ? JSON.stringify(options.body) : undefined });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+    if (options.acceptErrors) return { status: response.status, data };
+    if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 180)}`);
+    return data;
+  }
+  return window.yingjiDesktop.request({ url, ...options });
+};
 const tmdbRequest = async (path, key = '') => key
   ? request(`https://api.themoviedb.org/3${path}${path.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}&language=zh-CN`)
-  : request(`${metadataEndpoint}/tmdb${path}`);
+  : request(`${metadataEndpoint}/tmdb${path}${path.includes('?') ? '&' : '?'}client=yingji-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`);
 
 async function syncDiscovery() {
   if (discoverySyncing) return;
