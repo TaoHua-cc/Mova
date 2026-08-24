@@ -25,10 +25,9 @@ function createWindow() {
   win.once('ready-to-show', () => win.show());
 }
 
-ipcMain.on('window-action', event => {
+ipcMain.on('window-action', (event, action) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return;
-  const action = event.args?.[0];
   if (action === 'minimize') win.minimize();
   if (action === 'maximize') win.isMaximized() ? win.unmaximize() : win.maximize();
   if (action === 'close') win.close();
