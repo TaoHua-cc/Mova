@@ -1,0 +1,17 @@
+{
+  "source": "outputs/yingji-ios-card-sidebar-v5.png",
+  "source_size": { "width": 1680, "height": 945 },
+  "target_size": { "width": 1680, "height": 945 },
+  "scale": 1,
+  "layers": [
+    { "id": "windows-chrome", "type": "vector", "source_bbox": { "x": 0, "y": 0, "width": 1680, "height": 38 }, "scaled_bbox": { "x": 0, "y": 0, "width": 1680, "height": 38 }, "z_index": 90 },
+    { "id": "navigation-rail", "type": "vector", "source_bbox": { "x": 0, "y": 38, "width": 230, "height": 907 }, "scaled_bbox": { "x": 0, "y": 38, "width": 230, "height": 907 }, "z_index": 80 },
+    { "id": "home-toolbar", "type": "text-vector", "source_bbox": { "x": 282, "y": 67, "width": 1288, "height": 58 }, "scaled_bbox": { "x": 282, "y": 67, "width": 1288, "height": 58 }, "z_index": 10 },
+    { "id": "hero", "type": "dynamic-bitmap", "source_bbox": { "x": 282, "y": 143, "width": 980, "height": 316 }, "scaled_bbox": { "x": 282, "y": 143, "width": 980, "height": 316 }, "z_index": 5, "asset": "TMDB backdrop or app/yingji-hero-original.png" },
+    { "id": "continue-shelf", "type": "dynamic-bitmap-text", "source_bbox": { "x": 282, "y": 483, "width": 980, "height": 232 }, "scaled_bbox": { "x": 282, "y": 483, "width": 980, "height": 232 }, "z_index": 4, "asset": "TMDB poster/backdrop" },
+    { "id": "recommendation-shelf", "type": "dynamic-bitmap-text", "source_bbox": { "x": 282, "y": 734, "width": 980, "height": 211 }, "scaled_bbox": { "x": 282, "y": 734, "width": 980, "height": 211 }, "z_index": 4, "asset": "TMDB poster" },
+    { "id": "updates-card", "type": "vector-text-dynamic-bitmap", "source_bbox": { "x": 1288, "y": 143, "width": 332, "height": 321 }, "scaled_bbox": { "x": 1288, "y": 143, "width": 332, "height": 321 }, "z_index": 6 },
+    { "id": "playback-card", "type": "vector-text", "source_bbox": { "x": 1288, "y": 477, "width": 332, "height": 252 }, "scaled_bbox": { "x": 1288, "y": 477, "width": 332, "height": 252 }, "z_index": 6 },
+    { "id": "downloads-card", "type": "vector-text", "source_bbox": { "x": 1288, "y": 743, "width": 332, "height": 135 }, "scaled_bbox": { "x": 1288, "y": 743, "width": 332, "height": 135 }, "z_index": 6 }
+  ]
+}
