@@ -4,6 +4,11 @@ const fs = require('node:fs');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 let mpvProcess;
+const mpvControls = [
+  '--osd-font=Segoe UI Variable', '--osd-font-size=22', '--osd-bold=yes',
+  '--osd-color=#F7F8FC', '--osd-border-size=0', '--osd-shadow-offset=0',
+  '--osd-margin-x=30', '--osd-margin-y=30', '--osd-on-seek=msg-bar'
+];
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -22,7 +27,7 @@ function createWindow() {
     }
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https:\/\/(www\.)?youtube\.com\//.test(url)) shell.openExternal(url);
+    if (/^https:\/\/(www\.)?(youtube\.com|trakt\.tv)\//.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
   win.loadFile(path.join(__dirname, 'app', 'index.html'));
@@ -46,11 +51,11 @@ ipcMain.handle('api-request', async (_event, request) => {
     const response = await fetch(url, {
       method: request.method || 'GET',
       headers: request.headers || {},
-      body: request.body ? JSON.stringify(request.body) : undefined,
+      body: request.rawBody ?? (request.body ? JSON.stringify(request.body) : undefined),
       signal: controller.signal
     });
     const text = await response.text();
-    const data = text ? JSON.parse(text) : null;
+    const data = request.responseType === 'text' ? text : text ? JSON.parse(text) : null;
     if (request.acceptErrors) return { status: response.status, data };
     if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 180)}`);
     return data;
@@ -85,6 +90,7 @@ ipcMain.handle('mpv-play', async (_event, playback) => {
     `--input-ipc-server=${pipe}`,
     '--fullscreen',
     '--force-window=yes',
+    ...mpvControls,
     `--force-media-title=${String(playback.title || '映迹').replace(/[\r\n]/g, ' ')}`,
     `--start=${Math.max(0, Number(playback.position || 0))}`,
     mediaUrl.href
@@ -120,6 +126,20 @@ ipcMain.handle('mpv-play', async (_event, playback) => {
     });
   }).catch(() => {});
   mpvProcess.once('exit', () => { report('/Stopped', position, paused); mpvProcess = null; });
+  return true;
+});
+
+ipcMain.handle('mpv-open-url', async (_event, playback) => {
+  const mediaUrl = new URL(playback.url);
+  if (!['http:', 'https:'].includes(mediaUrl.protocol)) throw new Error('仅支持 HTTP 或 HTTPS 媒体地址');
+  if (mpvProcess) mpvProcess.kill();
+  const mpv = app.isPackaged ? path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'mpv', 'mpv.exe') : path.join(__dirname, 'app', 'mpv', 'mpv.exe');
+  if (!fs.existsSync(mpv)) throw new Error('未找到 mpv 播放器内核');
+  const args = ['--fullscreen', '--force-window=yes', ...mpvControls, `--force-media-title=${String(playback.title || '映迹').replace(/[\r\n]/g, ' ')}`];
+  if (playback.authorization && /^Basic [A-Za-z0-9+/=]+$/.test(playback.authorization)) args.push(`--http-header-fields=Authorization: ${playback.authorization}`);
+  args.push(mediaUrl.href);
+  mpvProcess = spawn(mpv, args, { windowsHide: false, stdio: 'ignore' });
+  mpvProcess.once('exit', () => { mpvProcess = null; });
   return true;
 });
 
