@@ -446,7 +446,7 @@ showLiveRanking = function yjRanking(index, options = {}) {
   if (options.preserveScroll) yjRestoreScroll(scrollTop); else window.scrollTo(0,0);
 };
 
-renderLiveDetail = function yjDetail() {
+window.renderLiveDetail = function yjDetail() {
   const data = live.detail;
   if (!data) return;
   const item = data.item, details = data.detail || item, episodes = data.episodes || [], calendarId = data.tmdbId || item.id;
@@ -510,12 +510,17 @@ renderLiveDetail = function yjDetail() {
       list.innerHTML = serverGroups.map((group, groupIndex) => {
         const chosen = group.choices.find(choice => choice.index === data.selectedResource)?.source || group.choices[0].source;
         const versions = group.choices.map(({source,index}) => `<button class="yj-version-choice ${index === data.selectedResource ? 'is-active' : ''}" data-select-resource="${index}"><span><b>${esc(sourceVersion(source))}</b><small>${esc(sourceSize(source))} · ${esc(sourceBitrate(source))}</small></span><span><b>${esc(sourceRange(source))}</b><small>${esc(sourceAudioLabel(source))}</small></span>${index === data.selectedResource ? `<em>已选择</em>` : ''}</button>`).join('');
-        return `<div class="yj-server-version-group"><button class="yj-resource yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceRange(chosen))} · ${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>${pickerIndex === groupIndex ? `<div class="yj-version-backdrop" data-close-server-versions><section class="yj-version-sheet" role="dialog" aria-modal="true" aria-label="${esc(group.name)} 的播放版本" data-version-dialog><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section></div>` : ''}</div>`;
+        return `<div class="yj-server-version-group"><button class="yj-resource yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><span class="yj-resource-server"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceSize(chosen))} · ${esc(sourceBitrate(chosen))}</small></span><span><b>${esc(sourceRange(chosen))}</b><small>${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>${pickerIndex === groupIndex ? `<div class="yj-version-backdrop" data-close-server-versions><section class="yj-version-sheet" role="dialog" aria-modal="true" aria-label="${esc(group.name)} 的播放版本" data-version-dialog><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section></div>` : ''}</div>`;
       }).join('');
     }
   }
   yjApplyPosterTheme(details, '.yj-detail');
 };
+
+// Make the app router use this renderer too; otherwise a later route render can
+// fall back to the legacy detail function after the initial UI override.
+detailV2 = window.renderLiveDetail;
+detail = window.renderLiveDetail;
 
 const yjLoadDetailSeason = async seasonNumber => {
   const data = live.detail;
@@ -722,5 +727,13 @@ const yjNormalizeBackButtons = () => document.querySelectorAll('button[data-go],
   button.setAttribute('aria-label', '返回');
   button.innerHTML = `${ico('chevron')} 返回`;
 });
+
 new MutationObserver(yjNormalizeBackButtons).observe(app, { childList:true, subtree:true });
+const yjEnsureResourceCardStructure = () => {
+  const list = document.querySelector('.yj-resource-list.is-server-view');
+  if (!list || !live?.detail) return;
+  const legacyCard = [...list.querySelectorAll('.yj-resource-server-card')].find(card => !card.querySelector('.yj-resource-server'));
+  if (legacyCard) window.renderLiveDetail?.();
+};
+new MutationObserver(yjEnsureResourceCardStructure).observe(app, { childList:true, subtree:true });
 render();

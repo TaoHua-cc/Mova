@@ -423,7 +423,10 @@ const sourceSize = source => source?.Size ? `${(source.Size / 1073741824).toFixe
 const sourceBitrate = source => source?.Bitrate ? `${(source.Bitrate / 1000000).toFixed(2)} Mbps` : '码率未知';
 const episodeLabel = episode => episode.movie ? '正片' : `S${String(episode.season).padStart(2, '0')} · E${String(episode.number).padStart(2, '0')}`;
 
-function renderLiveDetail() {
+/* Legacy detail renderer kept only as a fallback for older integrations.
+   The active detail view is owned by ui.js; keeping a second function with the
+   same global name allowed async resource updates to repaint the old layout. */
+function renderLiveDetailLegacy() {
   const context = live.detail;
   if (!context) return;
   document.body.classList.add('detail-mode');
@@ -586,7 +589,7 @@ async function loadDetailResources(context) {
     context.resourceError = error.message || '资源读取失败';
   }
   if (live.detail !== context || context.detailLoadKey !== live.detailLoadKey || state.view !== 'detail') return;
-  renderLiveDetail();
+  window.renderLiveDetail?.();
 }
 async function showLiveDetail(subject, preferredKind) {
   if (state.view !== 'detail') yjRememberRoute();
@@ -642,7 +645,7 @@ async function showLiveDetail(subject, preferredKind) {
     const selectedEpisode = cachedEpisodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (cached.context.selectedEpisode || cachedEpisodes[0]?.number || 1);
     const context = { ...cached.context, item, kind, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
     live.detail = context;
-    renderLiveDetail();
+    window.renderLiveDetail?.();
     loadDetailResources(context);
     return;
   }
@@ -667,7 +670,7 @@ async function showLiveDetail(subject, preferredKind) {
     const selectedEpisode = episodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (episodes[0]?.number || 1);
     const context = { item, detail, kind, seasonNumber, episodes, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
     live.detail = context;
-    renderLiveDetail();
+    window.renderLiveDetail?.();
     loadDetailResources(context);
   } catch (error) {
     if (live.detailLoadKey !== detailLoadKey || state.view !== 'detail') return;
@@ -1025,33 +1028,33 @@ document.addEventListener('click', async event => {
     live.detail.resources = [];
     live.detail.selectedResolution = '';
     live.detail.selectedResource = 0;
-    renderLiveDetail();
+    window.renderLiveDetail?.();
     loadDetailResources(live.detail);
   }
   if (target.dataset.resolution !== undefined && live.detail) {
     live.detail.selectedResolution = target.dataset.resolution;
     live.detail.selectedResource = 0;
     live.detail.resourceServerPicker = null;
-    renderLiveDetail();
+    window.renderLiveDetail?.();
   }
   if (target.dataset.resourceView !== undefined && live.detail) {
     live.detail.resourceView = target.dataset.resourceView === 'server' ? 'server' : 'resource';
     localStorage.setItem('yingji.resource-view', live.detail.resourceView);
     live.detail.resourceServerPicker = null;
-    renderLiveDetail(); return;
+    window.renderLiveDetail?.(); return;
   }
   if (target.dataset.openServerVersions !== undefined && live.detail) {
     live.detail.resourceServerPicker = Number(target.dataset.openServerVersions);
-    renderLiveDetail(); return;
+    window.renderLiveDetail?.(); return;
   }
   if (target.hasAttribute('data-close-server-versions') && live.detail) {
     live.detail.resourceServerPicker = null;
-    renderLiveDetail(); return;
+    window.renderLiveDetail?.(); return;
   }
   if (target.dataset.selectResource !== undefined && live.detail) {
     live.detail.selectedResource = Number(target.dataset.selectResource);
     live.detail.resourceServerPicker = null;
-    renderLiveDetail();
+    window.renderLiveDetail?.();
   }
 });
 
