@@ -80,7 +80,7 @@ const saveRankings = () => {
 async function loadMoreRanking(index) {
   const ranking = live.rankings?.[Number(index)], meta = ranking?.[2];
   if (!ranking || meta?.source !== 'TMDB' || !meta.path || meta.loadingMore || Number(meta.page || 1) >= Number(meta.totalPages || 1)) return;
-  meta.loadingMore = true; showLiveRanking(Number(index));
+  meta.loadingMore = true; showLiveRanking(Number(index), { preserveScroll: true });
   try {
     let tmdbKey = ''; try { tmdbKey = await window.yingjiDesktop.getSecret('tmdb-key'); } catch {}
     const nextPage = Number(meta.page || 1) + 1, separator = meta.path.includes('?') ? '&' : '?';
@@ -89,8 +89,8 @@ async function loadMoreRanking(index) {
     ranking[1].push(...normalizeRankingItems(data.results, meta.kind).filter(item => !known.has(`${item.kind}:${item.id}`)));
     meta.page = Number(data.page || nextPage); meta.totalPages = Number(data.total_pages || meta.totalPages || meta.page); meta.totalResults = Number(data.total_results || meta.totalResults || ranking[1].length);
     saveRankings();
-  } catch (error) { notify(`加载更多失败：${error.message || '请检查网络'}`); }
-  finally { meta.loadingMore = false; showLiveRanking(Number(index)); }
+  } catch (error) { meta.loadMoreFailed = true; meta.loadMoreError = error.message || '请检查网络'; notify(`加载更多失败：${meta.loadMoreError}`); }
+  finally { meta.loadingMore = false; showLiveRanking(Number(index), { preserveScroll: true }); }
 }
 const saveLiveWatchlist = () => localStorage.setItem('yingji.live-watchlist', JSON.stringify(live.watchlist));
 const saveSuppressedCalendar = () => localStorage.setItem('yingji.calendar-suppressed', JSON.stringify(live.suppressedCalendar));
@@ -599,6 +599,8 @@ async function showLiveDetail(subject, preferredKind) {
   if (!item) return;
   state.view = 'detail';
   const kind = preferredKind || itemKind(item) || (Number(id) ? 'tv' : 'movie');
+  const requestedSeason = kind === 'tv' ? Number(item.ParentIndexNumber || item.SeasonIndex || 0) : 0;
+  const requestedEpisode = kind === 'tv' ? Number(item.IndexNumber || item.EpisodeIndex || 0) : 0;
   const isEmbyItem = !!(item?.server?.url && item?.Id);
   let tmdbId = isEmbyItem ? null : (item.id ?? item.ProviderIds?.Tmdb ?? (Number.isFinite(Number(id)) ? id : null));
   /* Emby 的条目 ID 不是 TMDB ID。电影查自身；剧集单集必须查所属 Series。 */
@@ -635,8 +637,10 @@ async function showLiveDetail(subject, preferredKind) {
   }
   const cacheKey = `yingji.detail-cache-${kind}-${tmdbId}`;
   const cached = readLocalJson(cacheKey, null);
-  if (cached?.context && Date.now() - (cached.savedAt || 0) < 7 * 86400000) {
-    const context = { ...cached.context, item, kind, tmdbId, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
+  if (cached?.context && Date.now() - (cached.savedAt || 0) < 7 * 86400000 && (!requestedSeason || Number(cached.context.seasonNumber) === requestedSeason)) {
+    const cachedEpisodes = cached.context.episodes || [];
+    const selectedEpisode = cachedEpisodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (cached.context.selectedEpisode || cachedEpisodes[0]?.number || 1);
+    const context = { ...cached.context, item, kind, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
     live.detail = context;
     renderLiveDetail();
     loadDetailResources(context);
@@ -652,7 +656,7 @@ async function showLiveDetail(subject, preferredKind) {
     let episodes = [];
     if (kind === 'tv') {
       const regular = (detail.seasons || []).filter(season => season.season_number > 0 && season.episode_count > 0);
-      seasonNumber = regular[0]?.season_number || 1;
+      seasonNumber = regular.some(season => Number(season.season_number) === requestedSeason) ? requestedSeason : (regular[0]?.season_number || 1);
       const season = await tmdbRequest(`/tv/${tmdbId}/season/${seasonNumber}`, tmdbKey);
       episodes = (season.episodes || []).map(episode => ({ ...episode, season: seasonNumber, number: episode.episode_number }));
     } else {
@@ -660,7 +664,8 @@ async function showLiveDetail(subject, preferredKind) {
     }
     try { localStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), context: { detail, seasonNumber, episodes } })); } catch {}
     if (live.detailLoadKey !== detailLoadKey || state.view !== 'detail') return;
-    const context = { item, detail, kind, seasonNumber, episodes, tmdbId, selectedEpisode: episodes[0]?.number || 1, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
+    const selectedEpisode = episodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (episodes[0]?.number || 1);
+    const context = { item, detail, kind, seasonNumber, episodes, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
     live.detail = context;
     renderLiveDetail();
     loadDetailResources(context);
@@ -789,14 +794,19 @@ async function searchDiscovery(query) {
 }
 
 async function playEmby(item) {
+  if (!item?.Id || !item?.server?.url || !item?.token) throw new Error('当前播放资源已失效，请重新选择版本后再试');
   live.active = item;
   const info = await request(`${item.server.url}/Items/${item.Id}/PlaybackInfo?UserId=${item.server.userId}`, { method: 'POST', headers: { ...embyHeaders(item.token), 'Content-Type': 'application/json' }, body: { UserId: item.server.userId, AutoOpenLiveStream: true } });
   const source = info.MediaSources?.find(entry => String(entry.Id) === String(item.selectedMediaSourceId)) || info.MediaSources?.[0];
   if (!source) throw new Error('Emby 没有返回可播放媒体源');
   const title = item.SeriesName ? `${item.SeriesName} · ${item.Name}` : item.Name;
-  const url = `${item.server.url}/Videos/${item.Id}/stream?Static=true&MediaSourceId=${encodeURIComponent(source.Id)}&api_key=${encodeURIComponent(item.token)}`;
+  const url = new URL(`${item.server.url.replace(/\/$/, '')}/Videos/${item.Id}/stream`);
+  url.searchParams.set('Static', 'true');
+  url.searchParams.set('MediaSourceId', source.Id);
+  url.searchParams.set('api_key', item.token);
+  if (info.PlaySessionId) url.searchParams.set('PlaySessionId', info.PlaySessionId);
   await window.yingjiDesktop.playMpv({
-    url, title, token: item.token, serverUrl: item.server.url, userId: item.server.userId,
+    url: url.href, title, token: item.token, serverUrl: item.server.url, userId: item.server.userId,
     itemId: item.Id, mediaSourceId: source.Id, playSessionId: info.PlaySessionId,
     position: (item.UserData?.PlaybackPositionTicks || 0) / 10000000
   });
@@ -811,10 +821,61 @@ const runBusy = async (button, task) => {
   }
 };
 
+let yjShelfPress;
+const yjClearShelfPress = commit => {
+  const press = yjShelfPress;
+  if (!press) return;
+  clearTimeout(press.timer);
+  press.option.classList.remove('is-holding', 'is-dragging');
+  press.option.style.removeProperty('transform');
+  press.target?.classList.remove('is-drop-target');
+  if (commit && press.dragging) {
+    if (press.target) press.root.insertBefore(press.option, press.after ? press.target.nextSibling : press.target);
+    yjCommitShelfOrder([...press.root.querySelectorAll('[data-shelf-option]')].map(item => item.dataset.shelfOption));
+  }
+  yjShelfPress = null;
+};
+document.addEventListener('pointerdown', event => {
+  const option = event.target.closest('[data-shelf-option]');
+  if (!option || event.button !== 0 || event.target.closest('button, a, input')) return;
+  const root = option.closest('.yj-atv-rank-options');
+  if (!root) return;
+  const press = yjShelfPress = { option, root, pointerId:event.pointerId, startX:event.clientX, startY:event.clientY, target:null, after:false, dragging:false };
+  option.classList.add('is-holding');
+  press.timer = setTimeout(() => {
+    if (yjShelfPress !== press) return;
+    press.dragging = true;
+    option.classList.remove('is-holding');
+    option.classList.add('is-dragging');
+    navigator.vibrate?.(10);
+  }, 360);
+});
+document.addEventListener('pointermove', event => {
+  const press = yjShelfPress;
+  if (!press || event.pointerId !== press.pointerId) return;
+  const deltaX = event.clientX - press.startX, deltaY = event.clientY - press.startY;
+  if (!press.dragging) {
+    if (Math.hypot(deltaX, deltaY) > 8) yjClearShelfPress(false);
+    return;
+  }
+  event.preventDefault();
+  press.option.style.transform = `translateY(${deltaY}px) scale(1.015)`;
+  const candidate = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-shelf-option]');
+  const target = candidate && candidate !== press.option && candidate.parentElement === press.root ? candidate : null;
+  if (target === press.target) { if (target) press.after = event.clientY > target.getBoundingClientRect().top + target.offsetHeight / 2; return; }
+  press.target?.classList.remove('is-drop-target');
+  press.target = target;
+  press.after = target ? event.clientY > target.getBoundingClientRect().top + target.offsetHeight / 2 : false;
+  target?.classList.add('is-drop-target');
+});
+document.addEventListener('pointerup', event => { if (yjShelfPress?.pointerId === event.pointerId) yjClearShelfPress(true); });
+document.addEventListener('pointercancel', event => { if (yjShelfPress?.pointerId === event.pointerId) yjClearShelfPress(false); });
+
 document.addEventListener('click', async event => {
-  const target = event.target.closest('[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance]');
+  const target = event.target.closest('[data-yj-back],[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance]');
   if (!target) return;
   if (target.dataset.loadRankingMore !== undefined) return runBusy(target, () => loadMoreRanking(Number(target.dataset.loadRankingMore)));
+  if (target.hasAttribute('data-yj-back')) { if (typeof yjBack === 'function') yjBack(); else { state.view = 'home'; if (typeof live !== 'undefined') live.detail = null; render(); } return; }
   if (target.hasAttribute('data-sync-discovery')) return runBusy(target, syncDiscovery);
   if (target.dataset.appearance) { localStorage.setItem('yingji.appearance', target.dataset.appearance); document.documentElement.dataset.appearance = target.dataset.appearance; settingsV2(); notify(`外观已切换为${target.dataset.appearance === 'light' ? '浅色' : target.dataset.appearance === 'dark' ? '深色' : '跟随系统'}`); return; }
   if (target.hasAttribute('data-load-library')) return runBusy(target, loadLibrary);
@@ -825,7 +886,12 @@ document.addEventListener('click', async event => {
     if (!item) return notify('当前没有可播放版本');
     return runBusy(target, () => playEmby(item).catch(error => notify(`播放失败：${error.message}`)));
   }
-  if (target.dataset.continuePlay !== undefined) return runBusy(target, () => playEmby(live.continueItems[Number(target.dataset.continuePlay)]).catch(error => notify(`播放失败：${error.message}`)));
+  if (target.dataset.continuePlay !== undefined) {
+    const item = live.continueItems[Number(target.dataset.continuePlay)];
+    if (!item) return notify('继续观看记录已失效，请刷新服务器');
+    showLiveDetail(item, item.Type === 'Movie' ? 'movie' : 'tv');
+    return playEmby(item).catch(error => notify(`播放失败：${error.message}`));
+  }
   if (target.dataset.embyPlay !== undefined) return runBusy(target, () => playEmby(live.library[Number(target.dataset.embyPlay)]).catch(error => notify(`播放失败：${error.message}`)));
   if (target.dataset.urlPlay !== undefined) {
     const item = live.fileItems[Number(target.dataset.urlPlay)];
@@ -854,15 +920,40 @@ document.addEventListener('click', async event => {
   if (target.dataset.preference === 'quality') { live.ui.downloadQuality = live.ui.downloadQuality === '优先 1080p' ? '保持原画' : '优先 1080p'; saveUi(); downloads(); notify(`下载清晰度：${live.ui.downloadQuality}`); return; }
   if (target.dataset.preference === 'subtitle') { notify('字幕优先语言将在播放器语言设置中开放'); return; }
   if (target.hasAttribute('data-shelf-panel')) { live.shelfPanelOpen = true; renderShelfPanel(); return; }
-  if (target.hasAttribute('data-shelf-panel-close')) { live.shelfPanelOpen = false; renderShelfPanel(); return; }
+  if (target.hasAttribute('data-shelf-panel-close')) {
+    const explicitClose = event.target.closest('.yj-panel-close');
+    if (!explicitClose && event.target !== target) return;
+    const scrollTop = window.scrollY;
+    live.shelfPanelOpen = false;
+    renderShelfPanel();
+    yjApplyShelfOrder(readLocalJson('yingji.shelf-order', []));
+    requestAnimationFrame(() => window.scrollTo({ top:scrollTop, behavior:'instant' }));
+    return;
+  }
   if (target.dataset.shelfFilter) { live.shelfFilter = target.dataset.shelfFilter; renderShelfPanel(); return; }
   if (target.dataset.shelfToggle !== undefined) {
     const toggles = readLocalJson('yingji.shelf-toggles', {});
-    toggles[target.dataset.shelfToggle] = target.matches('input') ? target.checked : target.getAttribute('aria-checked') !== 'true';
+    const enabled = target.matches('input') ? target.checked : target.getAttribute('aria-checked') !== 'true';
+    toggles[target.dataset.shelfToggle] = enabled;
     localStorage.setItem('yingji.shelf-toggles', JSON.stringify(toggles));
-    const scrollY = window.scrollY;
-    home();
-    yjRestoreScroll(scrollY);
+    target.setAttribute('aria-checked', String(enabled));
+    target.querySelector('em').textContent = enabled ? '显示' : '隐藏';
+    const option = target.closest('[data-shelf-option]');
+    option?.classList.toggle('is-enabled', enabled);
+    const options = option?.parentElement;
+    if (option && options?.classList.contains('yj-atv-rank-options')) {
+      if (enabled) {
+        const firstHidden = [...options.children].find(node => node !== option && !node.classList.contains('is-enabled'));
+        options.insertBefore(option, firstHidden || null);
+      } else {
+        options.append(option);
+      }
+      localStorage.setItem('yingji.shelf-order', JSON.stringify([...options.querySelectorAll('[data-shelf-option]')].map(node => node.dataset.shelfOption)));
+    }
+    const row = [...document.querySelectorAll('.yj-atv-rank-row')].find(node => node.dataset.shelfName === target.dataset.shelfToggle);
+    if (row) row.hidden = !enabled;
+    const count = document.querySelector('[data-shelf-count]');
+    if (count) count.textContent = `${document.querySelectorAll('.yj-atv-rank-row:not([hidden])').length} 个轨道`;
     return;
   }
   if (target.hasAttribute('data-hero-prev')) { live.heroIndex--; updateHero(); return; }
@@ -907,7 +998,13 @@ document.addEventListener('click', async event => {
   if (target.hasAttribute('data-remove-address')) { if (document.querySelectorAll('.yj-address-row').length > 1) target.closest('.yj-address-row')?.remove(); return; }
   if (target.dataset.serverLine !== undefined) { const server = providerConfig.emby.find(item => String(item.id) === String(target.dataset.serverLine)); if (server) { server.activeAddress = Number(target.value); server.url = server.addresses[server.activeAddress]; saveProviders(); library(); notify(`已切换到线路 ${server.activeAddress + 1}`); } return; }
   if (target.dataset.selectEpisode !== undefined && live.detail) {
-    live.detail.selectedEpisode = Number(target.dataset.selectEpisode);
+    const episode = Number(target.dataset.selectEpisode);
+    if (episode === Number(live.detail.selectedEpisode) && live.detail.resources?.length) {
+      const matches = live.detail.resources.filter(source => sourceQuality(source) === live.detail.selectedResolution).sort((a,b) => Number(b.Bitrate || 0) - Number(a.Bitrate || 0));
+      const item = matches[live.detail.selectedResource] || matches[0];
+      if (item) return playEmby(item).catch(error => notify(`播放失败：${error.message}`));
+    }
+    live.detail.selectedEpisode = episode;
     live.detail.resources = [];
     live.detail.selectedResolution = '';
     live.detail.selectedResource = 0;
@@ -922,6 +1019,7 @@ document.addEventListener('click', async event => {
   }
   if (target.dataset.resourceView !== undefined && live.detail) {
     live.detail.resourceView = target.dataset.resourceView === 'server' ? 'server' : 'resource';
+    localStorage.setItem('yingji.resource-view', live.detail.resourceView);
     live.detail.resourceServerPicker = null;
     renderLiveDetail(); return;
   }

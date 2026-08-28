@@ -1,110 +1,78 @@
-/* Dedicated final navigation layer: loaded after the legacy stylesheet. */
+/* Legacy expanding sidebar rules were removed. The live shell is reset at the
+   end of apple-tv-rankings.css so it cannot regain a panel in any theme. */
+
+/* Full-bleed poster canvas: navigation and every route sit on the same visual plane. */
 @media (min-width: 841px) {
-  body.yj-ui { --yj-side: 6rem !important; }
+  body.yj-ui { --sidebar: 0px !important; --yj-side: 0px !important; background: #080a10 !important; }
+  body.yj-ui .app { position: relative; isolation: isolate; min-height: 100vh; overflow: hidden; background: transparent !important; }
+  body.yj-ui .app::before { content: ""; position: fixed; z-index: -2; inset: -4rem; background: linear-gradient(90deg,rgba(5,8,14,.84) 0%,rgba(7,10,17,.42) 42%,rgba(5,8,14,.78) 100%),linear-gradient(0deg,rgba(5,8,14,.92),rgba(5,8,14,.12) 65%),var(--yj-page-art) center/cover no-repeat,#0a0d14; filter: blur(26px) saturate(1.16); transform: scale(1.08); opacity: 1; pointer-events: none; }
+  body.yj-ui .app::after { content: ""; position: fixed; z-index: -1; inset: 0; background: radial-gradient(60rem 40rem at 52% 35%,rgba(var(--yj-page-rgb,41,76,111),.18),transparent 66%); pointer-events: none; }
+  body.yj-ui .chrome { z-index: 80 !important; height: 6.5rem !important; padding: 0 2rem !important; border: 0 !important; background: linear-gradient(180deg,rgba(5,7,11,.38),transparent) !important; box-shadow: none !important; backdrop-filter: none !important; }
+  body.yj-ui .chrome .brand { display: grid !important; width: 3rem !important; height: 3rem !important; place-items: center !important; border-radius: 1rem !important; background: rgba(255,255,255,.94) !important; color: #12151b !important; font-size: .92rem !important; font-weight: 850 !important; letter-spacing: -.08em !important; }
+  body.yj-ui .chrome .win { gap: .5rem !important; }
+  body.yj-ui .chrome .win span { width: 3rem !important; height: 3rem !important; border: 1px solid rgba(255,255,255,.12) !important; border-radius: 50% !important; background: rgba(7,10,15,.58) !important; color: #fff !important; backdrop-filter: blur(16px) !important; }
+  body.yj-ui .bar { position: fixed !important; z-index: 75 !important; top: 10.5rem !important; bottom: 1.65rem !important; left: 1.7rem !important; display: flex !important; width: 3.5rem !important; padding: 0 !important; align-items: center !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; backdrop-filter: none !important; }
+  body.yj-ui .bar:hover, body.yj-ui .bar:focus-within { width: 3.5rem !important; box-shadow: none !important; }
+  body.yj-ui .bar .sidebar-title { display: none !important; }
+  body.yj-ui .bar .nav { display: grid !important; width: 100% !important; gap: .72rem !important; }
+  body.yj-ui .bar .nav button, body.yj-ui .bar .sidebar-source, body.yj-ui .bar .nav-tools button { display: grid !important; width: 3.5rem !important; height: 3.5rem !important; min-height: 3.5rem !important; padding: 0 !important; place-items: center !important; border: 1px solid rgba(255,255,255,.10) !important; border-radius: 50% !important; background: rgba(5,8,13,.58) !important; color: rgba(255,255,255,.9) !important; box-shadow: 0 .7rem 1.8rem rgba(0,0,0,.16) !important; backdrop-filter: blur(17px) saturate(135%) !important; transition: transform .18s cubic-bezier(.2,.8,.2,1),background .18s ease,box-shadow .18s ease !important; }
+  body.yj-ui .bar .nav button:hover, body.yj-ui .bar .nav button.on, body.yj-ui .bar .nav button:focus-visible, body.yj-ui .bar .sidebar-source:hover, body.yj-ui .bar .nav-tools button:hover { background: rgba(255,255,255,.93) !important; color: #11141a !important; box-shadow: 0 .75rem 2rem rgba(0,0,0,.28),0 0 0 .2rem rgba(255,255,255,.16) !important; transform: scale(1.08) !important; }
+  body.yj-ui .bar .nav button span, body.yj-ui .bar .sidebar-source>span:last-child, body.yj-ui .bar .profile-button b { display: none !important; }
+  body.yj-ui .bar .nav button svg, body.yj-ui .bar .sidebar-source svg, body.yj-ui .bar .nav-tools svg { width: 1.28rem !important; height: 1.28rem !important; }
+  body.yj-ui .bar .sidebar-source { margin: 1.1rem 0 0 !important; }
+  body.yj-ui .bar .sidebar-source>span:first-child { width: auto !important; height: auto !important; flex: auto !important; border-radius: 0 !important; background: transparent !important; color: inherit !important; }
+  body.yj-ui .bar .nav-tools { display: grid !important; width: 100% !important; gap: .72rem !important; margin-top: auto !important; padding: 0 !important; border: 0 !important; }
+  body.yj-ui .bar .profile-button { display: grid !important; }
+  body.yj-ui .bar .profile-button>span { display: grid !important; width: 1.55rem !important; height: 1.55rem !important; place-items: center !important; background: transparent !important; color: inherit !important; font-size: .7rem !important; }
+  body.yj-ui .app>main, body.yj-ui .app>.detail, body.yj-ui .app>.play { position: relative !important; z-index: 1 !important; margin-left: 0 !important; background: transparent !important; }
+  body.yj-ui .app>main:not(.yj-home) { padding-left: clamp(8.5rem,10vw,11rem) !important; }
+  body.yj-ui .simple-page, body.yj-ui .calendar-page, body.yj-ui .settings, body.yj-ui .search-page, body.yj-ui .ranking-page, body.yj-ui .yj-atv-ranking-page, body.yj-ui .continue-list-page { background: transparent !important; }
+  body.yj-ui .panel, body.yj-ui .ios-card, body.yj-ui .best-match, body.yj-ui .calendar-event, body.yj-ui .resource-panel, body.yj-ui .server-card, body.yj-ui .yj-server-card, body.yj-ui .yj-setting-group { border-color: rgba(255,255,255,.16) !important; background: linear-gradient(145deg,rgba(20,24,33,.70),rgba(8,11,17,.56)) !important; box-shadow: inset 0 1px rgba(255,255,255,.15),0 1.5rem 4rem rgba(0,0,0,.22) !important; backdrop-filter: blur(28px) saturate(135%) !important; }
+}
 
-  body.yj-ui .yj-sidebar {
-    position: fixed !important;
-    inset: var(--yj-top) auto 0 0 !important;
-    box-sizing: border-box !important;
-    display: flex !important;
-    width: var(--yj-side) !important;
-    min-width: var(--yj-side) !important;
-    padding: 0 !important;
-    align-items: stretch !important;
-    border: 0 !important;
-    border-right: 1px solid rgba(255,255,255,.12) !important;
-    border-radius: 0 !important;
-    overflow: hidden !important;
-    background: linear-gradient(180deg,rgba(14,17,26,.78),rgba(10,12,18,.62) 52%,rgba(7,9,14,.8)) !important;
-    box-shadow: 12px 0 36px rgba(0,0,0,.14) !important;
-    backdrop-filter: blur(46px) saturate(160%) !important;
-    -webkit-backdrop-filter: blur(46px) saturate(160%) !important;
-  }
+@media (min-width: 841px) and (prefers-color-scheme: light) {
+  html[data-appearance="system"] body.yj-ui .app::before { background: linear-gradient(90deg,rgba(239,244,252,.78),rgba(237,243,252,.35) 44%,rgba(238,244,252,.74)),linear-gradient(0deg,rgba(242,246,252,.90),rgba(242,246,252,.12) 65%),var(--yj-page-art) center/cover no-repeat,#eaf0f8 !important; }
+  html[data-appearance="system"] body.yj-ui .bar .nav button, html[data-appearance="system"] body.yj-ui .bar .sidebar-source, html[data-appearance="system"] body.yj-ui .bar .nav-tools button { border-color: rgba(31,46,70,.12) !important; background: rgba(248,251,255,.64) !important; color: #17202d !important; }
+}
+@media (min-width: 841px) {
+  html[data-appearance="light"] body.yj-ui .app::before { background: linear-gradient(90deg,rgba(239,244,252,.78),rgba(237,243,252,.35) 44%,rgba(238,244,252,.74)),linear-gradient(0deg,rgba(242,246,252,.90),rgba(242,246,252,.12) 65%),var(--yj-page-art) center/cover no-repeat,#eaf0f8 !important; }
+  html[data-appearance="light"] body.yj-ui .bar .nav button, html[data-appearance="light"] body.yj-ui .bar .sidebar-source, html[data-appearance="light"] body.yj-ui .bar .nav-tools button { border-color: rgba(31,46,70,.12) !important; background: rgba(248,251,255,.64) !important; color: #17202d !important; }
+  html[data-appearance="light"] body.yj-ui .panel, html[data-appearance="light"] body.yj-ui .ios-card, html[data-appearance="light"] body.yj-ui .calendar-event, html[data-appearance="light"] body.yj-ui .server-card, html[data-appearance="light"] body.yj-ui .yj-server-card, html[data-appearance="light"] body.yj-ui .yj-setting-group { border-color: rgba(42,56,79,.14) !important; background: linear-gradient(145deg,rgba(255,255,255,.72),rgba(242,247,255,.58)) !important; box-shadow: inset 0 1px rgba(255,255,255,.86),0 1.5rem 4rem rgba(43,62,92,.13) !important; }
+}
 
-  body.yj-ui .yj-sidebar .yj-brand { display: none !important; }
-  body.yj-ui .yj-sidebar .yj-nav {
-    display: flex !important;
-    width: 100% !important;
-    flex-direction: column !important;
-    align-items: center !important;
-    gap: .5rem !important;
-    padding: 1rem 0 0 !important;
-    margin: 0 !important;
-  }
-  body.yj-ui .yj-sidebar .yj-nav-item {
-    box-sizing: border-box !important;
-    display: grid !important;
-    width: 3.5rem !important;
-    min-width: 3.5rem !important;
-    height: 3.5rem !important;
-    min-height: 3.5rem !important;
-    padding: 0 !important;
-    place-items: center !important;
-    gap: 0 !important;
-    border-radius: 1rem !important;
-  }
-  body.yj-ui .yj-sidebar .yj-nav-item > span { display: none !important; }
-  body.yj-ui .yj-sidebar .yj-nav-item svg { width: 1.2rem !important; height: 1.2rem !important; }
-
-  body.yj-ui .yj-sidebar .yj-source-dock {
-    display: flex !important;
-    width: 100% !important;
-    flex-direction: column !important;
-    align-items: center !important;
-    gap: .55rem !important;
-    margin: auto 0 0 !important;
-    padding: 0 0 1.1rem !important;
-    border: 0 !important;
-    opacity: 1 !important;
-    visibility: visible !important;
-    pointer-events: auto !important;
-  }
-  body.yj-ui .yj-sidebar .yj-source-dock > header { display: none !important; }
-  body.yj-ui .yj-sidebar .yj-source-dock > button {
-    display: grid !important;
-    width: 3.25rem !important;
-    min-height: 3.25rem !important;
-    padding: 0 !important;
-    place-items: center !important;
-    grid-template-columns: 1fr !important;
-    border-radius: .9rem !important;
-  }
-  body.yj-ui .yj-sidebar .yj-source-dock > button > i {
-    display: grid !important;
-    width: 2.25rem !important;
-    height: 2.25rem !important;
-    place-items: center !important;
-    border-radius: .72rem !important;
-    background-position: center !important;
-    background-size: cover !important;
-  }
-  body.yj-ui .yj-sidebar .yj-source-dock > button > span,
-  body.yj-ui .yj-sidebar .yj-source-dock > button > em { display: none !important; }
-
-  body.yj-ui .yj-sidebar:hover,
-  body.yj-ui .yj-sidebar:focus-within { width: 15.5rem !important; min-width: 15.5rem !important; }
-  body.yj-ui .yj-sidebar:hover .yj-brand,
-  body.yj-ui .yj-sidebar:focus-within .yj-brand { display: flex !important; margin: 1rem 1rem .4rem !important; padding: 0 !important; }
-  body.yj-ui .yj-sidebar:hover .yj-nav,
-  body.yj-ui .yj-sidebar:focus-within .yj-nav { align-items: stretch !important; padding: .25rem .75rem 0 !important; }
-  body.yj-ui .yj-sidebar:hover .yj-nav-item,
-  body.yj-ui .yj-sidebar:focus-within .yj-nav-item { width: 100% !important; justify-items: start !important; padding: 0 .85rem !important; grid-template-columns: 1.2rem 1fr !important; gap: .75rem !important; }
-  body.yj-ui .yj-sidebar:hover .yj-nav-item > span,
-  body.yj-ui .yj-sidebar:focus-within .yj-nav-item > span { display: block !important; opacity: 1 !important; visibility: visible !important; }
-  body.yj-ui .yj-sidebar:hover .yj-source-dock,
-  body.yj-ui .yj-sidebar:focus-within .yj-source-dock { align-items: stretch !important; padding: 0 .75rem 1rem !important; }
-  body.yj-ui .yj-sidebar:hover .yj-source-dock > header,
-  body.yj-ui .yj-sidebar:focus-within .yj-source-dock > header { display: flex !important; }
-  body.yj-ui .yj-sidebar:hover .yj-source-dock > button,
-  body.yj-ui .yj-sidebar:focus-within .yj-source-dock > button { width: 100% !important; min-height: 2.9rem !important; padding: .35rem .55rem !important; grid-template-columns: 2.25rem minmax(0,1fr) .5rem !important; justify-items: stretch !important; }
-  body.yj-ui .yj-sidebar:hover .yj-source-dock > button > span,
-  body.yj-ui .yj-sidebar:focus-within .yj-source-dock > button > span,
-  body.yj-ui .yj-sidebar:hover .yj-source-dock > button > em,
-  body.yj-ui .yj-sidebar:focus-within .yj-source-dock > button > em { display: grid !important; }
-
-  html[data-appearance="light"] body.yj-ui .yj-sidebar {
-    border-right-color: rgba(42,55,78,.13) !important;
-    background: linear-gradient(180deg,rgba(250,252,255,.88),rgba(238,243,251,.76) 55%,rgba(248,250,255,.92)) !important;
-    box-shadow: 12px 0 36px rgba(45,58,82,.1) !important;
-  }
+/* The live application shell is yj-sidebar/yj-titlebar. Keep every route action,
+   but remove the old expanding rail and its opaque visual slab. */
+@media (min-width: 841px) {
+  body.yj-ui { --yj-side: 4.75rem !important; }
+  body.yj-ui .yj-titlebar { z-index: 200 !important; height: 5rem !important; padding: 1rem 1.65rem !important; border: 0 !important; background: transparent !important; box-shadow: none !important; backdrop-filter: none !important; }
+  body.yj-ui .yj-titlebar .win { gap: .55rem !important; }
+  body.yj-ui .yj-titlebar .win span { display: grid !important; width: 2.7rem !important; height: 2.7rem !important; place-items: center !important; border: 0 !important; border-radius: 50% !important; background: rgba(8,11,17,.56) !important; color: #fff !important; box-shadow: 0 .55rem 1.6rem rgba(0,0,0,.18) !important; backdrop-filter: none !important; }
+  body.yj-ui .yj-sidebar, body.yj-ui .yj-sidebar:hover, body.yj-ui .yj-sidebar:focus-within { position: fixed !important; z-index: 190 !important; top: 0 !important; bottom: 0 !important; left: 0 !important; display: flex !important; width: 4.75rem !important; min-width: 4.75rem !important; padding: 1rem !important; align-items: center !important; border: 0 !important; border-radius: 0 !important; overflow: visible !important; background: transparent !important; box-shadow: none !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+  body.yj-ui .yj-sidebar .yj-brand, body.yj-ui .yj-sidebar:hover .yj-brand, body.yj-ui .yj-sidebar:focus-within .yj-brand { position: absolute !important; top: 1rem !important; left: 1rem !important; display: grid !important; width: 2.7rem !important; height: 2.7rem !important; margin: 0 !important; padding: 0 !important; place-items: center !important; border-radius: .86rem !important; background: rgba(255,255,255,.94) !important; color: #11141a !important; box-shadow: 0 .55rem 1.6rem rgba(0,0,0,.17) !important; }
+  body.yj-ui .yj-sidebar .yj-brandmark { display: grid !important; place-items: center !important; font-size: .88rem !important; font-weight: 850 !important; letter-spacing: -.08em !important; }
+  body.yj-ui .yj-sidebar .yj-nav, body.yj-ui .yj-sidebar:hover .yj-nav, body.yj-ui .yj-sidebar:focus-within .yj-nav { display: grid !important; width: 100% !important; margin: 5.4rem 0 0 !important; padding: 0 !important; align-items: center !important; justify-items: center !important; gap: .78rem !important; }
+  body.yj-ui .yj-sidebar .yj-nav-item, body.yj-ui .yj-sidebar:hover .yj-nav-item, body.yj-ui .yj-sidebar:focus-within .yj-nav-item { display: grid !important; width: 2.7rem !important; min-width: 2.7rem !important; height: 2.7rem !important; min-height: 2.7rem !important; padding: 0 !important; place-items: center !important; border: 0 !important; border-radius: 50% !important; background: rgba(8,11,17,.56) !important; color: rgba(255,255,255,.92) !important; box-shadow: 0 .55rem 1.6rem rgba(0,0,0,.18) !important; opacity: 1 !important; transform: none !important; transition: transform .18s cubic-bezier(.2,.8,.2,1),background .18s ease,color .18s ease,box-shadow .18s ease !important; }
+  body.yj-ui .yj-sidebar .yj-nav-item>span, body.yj-ui .yj-sidebar:hover .yj-nav-item>span, body.yj-ui .yj-sidebar:focus-within .yj-nav-item>span { display: none !important; opacity: 0 !important; visibility: hidden !important; }
+  body.yj-ui .yj-sidebar .yj-nav-item svg { width: 1.16rem !important; height: 1.16rem !important; }
+  body.yj-ui .yj-sidebar .yj-nav-item:hover, body.yj-ui .yj-sidebar .yj-nav-item:focus-visible, body.yj-ui .yj-sidebar .yj-nav-item.is-active { background: rgba(255,255,255,.94) !important; color: #11141a !important; box-shadow: 0 .65rem 1.85rem rgba(0,0,0,.25),0 0 0 .16rem rgba(255,255,255,.16) !important; transform: scale(1.07) !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock, body.yj-ui .yj-sidebar:hover .yj-source-dock, body.yj-ui .yj-sidebar:focus-within .yj-source-dock { position: absolute !important; bottom: 1rem !important; left: 1rem !important; display: grid !important; width: 2.7rem !important; max-height: 13rem !important; margin: 0 !important; padding: 0 !important; align-content: end !important; justify-items: center !important; gap: .7rem !important; border: 0 !important; background: transparent !important; opacity: 1 !important; visibility: visible !important; pointer-events: auto !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>header { display: grid !important; width: 2.7rem !important; height: 2.7rem !important; padding: 0 !important; place-items: center !important; border: 0 !important; border-radius: 50% !important; background: rgba(8,11,17,.56) !important; color: transparent !important; box-shadow: 0 .55rem 1.6rem rgba(0,0,0,.18) !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>header>span { display: none !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>header>button, body.yj-ui .yj-sidebar .yj-source-dock>button { display: grid !important; width: 2.7rem !important; min-height: 2.7rem !important; height: 2.7rem !important; padding: 0 !important; place-items: center !important; border: 0 !important; border-radius: 50% !important; background: rgba(8,11,17,.56) !important; color: #fff !important; box-shadow: 0 .55rem 1.6rem rgba(0,0,0,.18) !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>header>button svg { width: 1rem !important; height: 1rem !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>button>span, body.yj-ui .yj-sidebar .yj-source-dock>button>em { display: none !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>button>i { display: grid !important; width: 1.38rem !important; height: 1.38rem !important; place-items: center !important; border-radius: .43rem !important; background-position: center !important; background-size: cover !important; font-size: .63rem !important; font-style: normal !important; }
+  body.yj-ui .yj-sidebar .yj-source-dock>header>button:hover, body.yj-ui .yj-sidebar .yj-source-dock>button:hover { background: rgba(255,255,255,.94) !important; color: #11141a !important; transform: scale(1.07) !important; }
+  body.yj-ui .app>main, body.yj-ui .app>.yj-detail { background: transparent !important; }
+  body.yj-ui .app .yj-home, body.yj-ui .app .yj-detail { background: transparent !important; }
+  body.yj-ui .app .yj-home:before, body.yj-ui .app .yj-detail:before { display: none !important; }
+  body.yj-ui .app>.yj-page, body.yj-ui .app>.yj-detail { padding-left: calc(var(--yj-side) + clamp(2rem,4vw,4.5rem)) !important; }
+  body.yj-ui .yj-detail-body, body.yj-ui .yj-home-content, body.yj-ui .yj-tv-home-content { background: transparent !important; box-shadow: none !important; }
+  body.yj-ui .yj-page-back, body.yj-ui .yj-detail-return, body.yj-ui .yj-detail .yj-back { position: fixed !important; z-index: 210 !important; top: 1.2rem !important; left: calc(var(--yj-side) + 1rem) !important; min-height: 2.6rem !important; margin: 0 !important; padding: 0 .85rem !important; border: 0 !important; border-radius: 999px !important; background: rgba(8,11,17,.62) !important; color: #fff !important; box-shadow: 0 .65rem 1.7rem rgba(0,0,0,.2) !important; backdrop-filter: none !important; }
+  body.yj-ui .panel, body.yj-ui .ios-card, body.yj-ui .best-match, body.yj-ui .calendar-event, body.yj-ui .resource-panel, body.yj-ui .yj-setting-group, body.yj-ui .yj-server-card, body.yj-ui .yj-calendar-main, body.yj-ui .yj-date-column { border-color: rgba(255,255,255,.18) !important; background: rgba(8,11,17,.38) !important; box-shadow: 0 1.1rem 3.2rem rgba(0,0,0,.18) !important; backdrop-filter: none !important; }
+}
+@media (min-width: 841px) {
+  html[data-appearance="light"] body.yj-ui .yj-titlebar .win span, html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-nav-item, html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-source-dock>header, html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-source-dock>header>button, html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-source-dock>button, html[data-appearance="light"] body.yj-ui .yj-page-back, html[data-appearance="light"] body.yj-ui .yj-detail .yj-back { background: rgba(250,252,255,.68) !important; color: #17202c !important; box-shadow: 0 .65rem 1.7rem rgba(40,53,78,.14) !important; }
+  html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-nav-item:hover, html[data-appearance="light"] body.yj-ui .yj-sidebar .yj-nav-item.is-active { background: #17202c !important; color: #fff !important; }
+  html[data-appearance="light"] body.yj-ui .panel, html[data-appearance="light"] body.yj-ui .ios-card, html[data-appearance="light"] body.yj-ui .calendar-event, html[data-appearance="light"] body.yj-ui .yj-setting-group, html[data-appearance="light"] body.yj-ui .yj-server-card, html[data-appearance="light"] body.yj-ui .yj-calendar-main, html[data-appearance="light"] body.yj-ui .yj-date-column { border-color: rgba(35,49,73,.14) !important; background: rgba(249,252,255,.42) !important; box-shadow: 0 1.1rem 3.2rem rgba(40,53,78,.12) !important; }
 }

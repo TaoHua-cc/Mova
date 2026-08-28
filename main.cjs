@@ -7,8 +7,26 @@ let mpvProcess;
 const mpvControls = [
   '--osd-font=Segoe UI Variable', '--osd-font-size=22', '--osd-bold=yes',
   '--osd-color=#F7F8FC', '--osd-border-size=0', '--osd-shadow-offset=0',
-  '--osd-margin-x=30', '--osd-margin-y=30', '--osd-on-seek=msg-bar'
+  '--osd-margin-x=30', '--osd-margin-y=30', '--osd-on-seek=no'
 ];
+const mpvExecutable = () => app.isPackaged
+  ? path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'mpv', 'mpv.exe')
+  : path.join(__dirname, 'app', 'mpv', 'mpv.exe');
+const launchMpv = async args => {
+  const mpv = mpvExecutable();
+  if (!fs.existsSync(mpv)) throw new Error('未找到 mpv 播放器内核');
+  const child = spawn(mpv, args, { cwd:path.dirname(mpv), windowsHide:false, stdio:['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-2000); });
+  child.getLaunchError = () => stderr.trim();
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', error => reject(new Error(`播放器启动失败：${error.message}`))); });
+  await new Promise((resolve, reject) => {
+    const onExit = code => { clearTimeout(timer); reject(new Error(stderr.trim() || `mpv 启动后立即退出（代码 ${code ?? '未知'}）`)); };
+    const timer = setTimeout(() => { child.off('exit', onExit); resolve(); }, 700);
+    child.once('exit', onExit);
+  });
+  return child;
+};
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -81,10 +99,6 @@ ipcMain.handle('mpv-play', async (_event, playback) => {
   const serverUrl = new URL(playback.serverUrl);
   if (!['http:', 'https:'].includes(mediaUrl.protocol) || mediaUrl.origin !== serverUrl.origin) throw new Error('播放器地址不属于当前 Emby 服务器');
   if (mpvProcess) mpvProcess.kill();
-  const mpv = app.isPackaged
-    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'mpv', 'mpv.exe')
-    : path.join(__dirname, 'app', 'mpv', 'mpv.exe');
-  if (!fs.existsSync(mpv)) throw new Error('未找到 mpv 播放器内核');
   const pipe = `\\\\.\\pipe\\yingji-mpv-${process.pid}-${Date.now()}`;
   const args = [
     `--input-ipc-server=${pipe}`,
@@ -93,9 +107,10 @@ ipcMain.handle('mpv-play', async (_event, playback) => {
     ...mpvControls,
     `--force-media-title=${String(playback.title || '映迹').replace(/[\r\n]/g, ' ')}`,
     `--start=${Math.max(0, Number(playback.position || 0))}`,
+    `--http-header-fields=X-Emby-Token: ${playback.token}`,
     mediaUrl.href
   ];
-  mpvProcess = spawn(mpv, args, { windowsHide: false, stdio: 'ignore' });
+  mpvProcess = await launchMpv(args);
   const report = async (suffix, position, paused) => {
     try {
       await fetch(`${serverUrl.href.replace(/\/$/, '')}/Sessions/Playing${suffix}`, {
@@ -104,12 +119,12 @@ ipcMain.handle('mpv-play', async (_event, playback) => {
       });
     } catch {}
   };
-  await report('', playback.position || 0, false);
   let position = Number(playback.position || 0), paused = false, lastReport = -1;
   const connect = attempt => new Promise((resolve, reject) => {
     const socket = net.connect(pipe, () => resolve(socket));
     socket.once('error', error => attempt < 30 ? setTimeout(() => connect(attempt + 1).then(resolve, reject), 200) : reject(error));
   });
+  await report('', playback.position || 0, false);
   connect(0).then(socket => {
     socket.write('{"command":["observe_property",1,"time-pos"]}\n{"command":["observe_property",2,"pause"]}\n');
     let buffer = '';
@@ -133,12 +148,10 @@ ipcMain.handle('mpv-open-url', async (_event, playback) => {
   const mediaUrl = new URL(playback.url);
   if (!['http:', 'https:'].includes(mediaUrl.protocol)) throw new Error('仅支持 HTTP 或 HTTPS 媒体地址');
   if (mpvProcess) mpvProcess.kill();
-  const mpv = app.isPackaged ? path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'mpv', 'mpv.exe') : path.join(__dirname, 'app', 'mpv', 'mpv.exe');
-  if (!fs.existsSync(mpv)) throw new Error('未找到 mpv 播放器内核');
   const args = ['--fullscreen', '--force-window=yes', ...mpvControls, `--force-media-title=${String(playback.title || '映迹').replace(/[\r\n]/g, ' ')}`];
   if (playback.authorization && /^Basic [A-Za-z0-9+/=]+$/.test(playback.authorization)) args.push(`--http-header-fields=Authorization: ${playback.authorization}`);
   args.push(mediaUrl.href);
-  mpvProcess = spawn(mpv, args, { windowsHide: false, stdio: 'ignore' });
+  mpvProcess = await launchMpv(args);
   mpvProcess.once('exit', () => { mpvProcess = null; });
   return true;
 });

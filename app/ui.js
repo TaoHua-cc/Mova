@@ -33,9 +33,22 @@ const yjRestoreScroll = value => {
   if (!Number.isFinite(value)) return;
   requestAnimationFrame(() => window.scrollTo({ top:value, behavior:'instant' }));
 };
+let yjRankingLoadObserver;
+const yjObserveRankingLoad = () => {
+  yjRankingLoadObserver?.disconnect();
+  const sentinel = document.querySelector('[data-ranking-load-sentinel]');
+  if (!sentinel || !('IntersectionObserver' in window)) return;
+  yjRankingLoadObserver = new IntersectionObserver(entries => {
+    if (!entries.some(entry => entry.isIntersecting)) return;
+    yjRankingLoadObserver?.disconnect();
+    loadMoreRanking(Number(sentinel.dataset.rankingIndex));
+  }, { rootMargin:'420px 0px' });
+  yjRankingLoadObserver.observe(sentinel);
+};
 const yjApplyPosterTheme = (item, selector = '.yj-home') => {
   const url = yjArt(item, 'poster', 'w185');
   if (!url) return;
+  document.querySelector('#app')?.style.setProperty('--yj-page-art', `url('${url}')`);
   const cacheKey = `yingji.poster-color-${item.id}`, cached = localStorage.getItem(cacheKey);
   if (cached) { document.querySelector(selector)?.style.setProperty('--poster-rgb', cached); document.documentElement.style.setProperty('--yj-page-rgb', cached); return; }
   const img = new Image(); img.crossOrigin = 'anonymous'; img.src = url;
@@ -56,11 +69,10 @@ const yjNav = [
 ];
 const yjShell = (content, active = 'home', options = {}) => {
   const sources = yjSources();
-  const nav = yjNav.map(([route, icon, label]) => `<button class="yj-nav-item ${active === route ? 'is-active' : ''}" data-go="${route}" aria-current="${active === route ? 'page' : 'false'}">${ico(icon)}<span>${label}</span></button>`).join('');
-  return `<header class="yj-titlebar"><b>映迹</b><span>${options.title || '私人媒体库'}</span><div class="win"><span>—</span><span>□</span><span>×</span></div></header>
-    <aside class="yj-sidebar"><div class="yj-brand"><span class="yj-brandmark">映</span><span><b>映迹</b><small>MEDIA SPACE</small></span></div><nav class="yj-nav" aria-label="主导航">${nav}</nav>
-      <section class="yj-source-dock"><header><span>媒体来源</span><button data-go="library" aria-label="添加来源">${ico('plus')}</button></header>${sources.length ? sources.slice(0, 3).map(source => { const status=live.sourceStats[source.id]?.state || 'pending'; return `<button data-open-source="${esc(source.id)}"><i class="yj-dock-logo" ${source.customIcon || live.sourceIcons[source.id] ? `style="background-image:url('${esc(source.customIcon || live.sourceIcons[source.id])}')"` : ''}>${source.customIcon || live.sourceIcons[source.id] ? '' : esc((source.name || '源')[0])}</i><span><b>${esc(source.name)}</b><small>${esc(source.kind || 'Emby')} · ${status === 'connected' ? '已连接' : status === 'error' ? '连接异常' : '等待连接'}</small></span><em class="is-${status}" aria-label="${status === 'connected' ? '已连接' : status === 'error' ? '连接异常' : '等待连接'}"></em></button>`; }).join('') : '<button data-go="library" class="is-empty"><i>＋</i><span><b>连接来源</b><small>Emby · Jellyfin · WebDAV</small></span></button>'}</section>
-      </aside>
+  const nav = yjNav.map(([route, icon, label]) => `<button class="yj-nav-item ${active === route ? 'is-active' : ''}" data-go="${route}" aria-current="${active === route ? 'page' : 'false'}" aria-label="${label}" data-tooltip="${label}">${ico(icon)}<span>${label}</span></button>`).join('');
+  const sourceDock = sources.length ? `<section class="yj-source-dock" aria-label="已添加媒体来源">${sources.slice(0, 3).map(source => { const status=live.sourceStats[source.id]?.state || 'pending'; const name=esc(source.name || '媒体来源'); return `<button data-open-source="${esc(source.id)}" aria-label="${name}" data-tooltip="${name}"><i class="yj-dock-logo" ${source.customIcon || live.sourceIcons[source.id] ? `style="background-image:url('${esc(source.customIcon || live.sourceIcons[source.id])}')"` : ''}>${source.customIcon || live.sourceIcons[source.id] ? '' : esc((source.name || '源')[0])}</i><span><b>${name}</b><small>${esc(source.kind || 'Emby')} · ${status === 'connected' ? '已连接' : status === 'error' ? '连接异常' : '等待连接'}</small></span><em class="is-${status}" aria-label="${status === 'connected' ? '已连接' : status === 'error' ? '连接异常' : '等待连接'}"></em></button>`; }).join('')}</section>` : '';
+  return `<header class="yj-titlebar" aria-label="窗口控制"><div class="win"><span>—</span><span>□</span><span>×</span></div></header>
+    <aside class="yj-sidebar"><nav class="yj-nav" aria-label="主导航">${nav}</nav>${sourceDock}</aside>
     <div class="network-status">当前离线，保留本机内容与配置。</div>${content}`;
 };
 const yjEmpty = (title, text, action = '') => `<section class="yj-empty"><span>${ico('library')}</span><h2>${title}</h2><p>${text}</p>${action}</section>`;
@@ -70,23 +82,56 @@ const yjPoster = (item, index = 0) => {
 };
 // Rank has its own hierarchy: the order is content, while each card remains
 // one accessible route into the same real detail data used elsewhere.
-const yjRankingCard = (item, position, meta = {}, variant = 'rail') => {
+const yjRankingCard = (item, position, meta = {}, variant = 'rail', showRank = true) => {
   const kind = item.kind || itemKind(item), art = yjArt(item, 'poster', 'w500');
   const source = meta.source === 'Trakt' ? 'Trakt 热度' : `TMDB ${(item.vote_average || 0).toFixed(1)}`;
   const type = kind === 'movie' ? '电影' : '剧集';
-  return `<button class="yj-atv-rank-card yj-atv-rank-card--${variant}" data-live-detail="${esc(item.id)}" data-kind="${kind}" aria-label="第 ${position} 名，${esc(yjTitle(item))}"><span class="yj-atv-rank-art" ${art ? `style="background-image:url('${art}')"` : ''}><i class="yj-atv-rank-no">${String(position).padStart(2, '0')}</i><span class="yj-atv-rank-sheen" aria-hidden="true"></span></span><span class="yj-atv-rank-copy"><b>${esc(yjTitle(item))}</b><small>${esc(yjYear(item) || type)} · ${esc(source)}</small></span></button>`;
+  return `<button class="yj-atv-rank-card yj-atv-rank-card--${variant}" data-live-detail="${esc(item.id)}" data-kind="${kind}" aria-label="${showRank ? `第 ${position} 名，` : ''}${esc(yjTitle(item))}"><span class="yj-atv-rank-art" ${art ? `style="background-image:url('${art}')"` : ''}>${showRank ? `<i class="yj-atv-rank-no">${String(position).padStart(2, '0')}</i>` : ''}<span class="yj-atv-rank-sheen" aria-hidden="true"></span></span><span class="yj-atv-rank-copy"><b>${esc(yjTitle(item))}</b><small>${esc(yjYear(item) || type)} · ${esc(source)}</small></span></button>`;
+};
+const yjOrderRankings = groups => {
+  const saved = readLocalJson('yingji.shelf-order', []);
+  const position = new Map(saved.map((name, index) => [name, index]));
+  return [...groups].sort((left, right) => {
+    const leftPosition = position.has(left[0]) ? position.get(left[0]) : Number.MAX_SAFE_INTEGER;
+    const rightPosition = position.has(right[0]) ? position.get(right[0]) : Number.MAX_SAFE_INTEGER;
+    return leftPosition - rightPosition || groups.indexOf(left) - groups.indexOf(right);
+  });
+};
+const yjAllRankings = () => yjOrderRankings((live.rankings || []).reduce((rows, group, index) => {
+  if (group?.[1]?.length && !['IMDb', '豆瓣'].includes(group[2]?.source)) rows.push([...group, index]);
+  return rows;
+}, []));
+const yjApplyShelfOrder = order => {
+  const home = document.querySelector('.yj-tv-home-content');
+  if (home) order.forEach(name => {
+    const row = [...home.querySelectorAll('.yj-atv-rank-row')].find(node => node.dataset.shelfName === name);
+    if (row) home.appendChild(row);
+  });
+  const options = document.querySelector('.yj-atv-rank-options');
+  if (options) order.forEach(name => {
+    const option = [...options.querySelectorAll('[data-shelf-option]')].find(node => node.dataset.shelfOption === name);
+    if (option) options.appendChild(option);
+  });
+};
+const yjCommitShelfOrder = visibleOrder => {
+  const current = yjAllRankings().map(group => group[0]);
+  const visible = new Set(visibleOrder);
+  let position = 0;
+  const order = current.map(name => visible.has(name) ? visibleOrder[position++] : name);
+  localStorage.setItem('yingji.shelf-order', JSON.stringify(order));
+  if (!live.shelfPanelOpen) yjApplyShelfOrder(order);
+  return order;
 };
 const yjWideCard = (item, label = '') => `<button class="yj-wide-card" data-live-detail="${item.id}" data-kind="${item.kind || itemKind(item)}"><span class="yj-wide-art" ${yjArt(item) ? `style="background-image:url('${yjArt(item)}')"` : ''}>${label ? `<em>${esc(label)}</em>` : ''}</span><span><b>${esc(yjTitle(item))}</b><small>${esc(yjYear(item) || (itemKind(item) === 'movie' ? '电影' : '剧集'))}</small></span></button>`;
 const heroMarkup = (feature, featureKind, heroes, heroIndex) => `<section class="yj-feature yj-tv-hero" data-live-detail="${esc(feature.id)}" data-kind="${featureKind}" style="--art:url('${yjArt(feature, 'backdrop', 'original')}')"><button class="yj-hero-arrow is-prev" data-hero-prev aria-label="上一部作品">${ico('chevron')}</button><div class="yj-feature-copy"><h1>${esc(yjTitle(feature))}</h1><div class="yj-feature-meta"><b>${esc(yjYear(feature) || '最新')}</b><span>${featureKind === 'movie' ? '电影' : '剧集'}</span><span>TMDB ${(feature.vote_average || 0).toFixed(1)}</span></div><p>${esc(feature.overview || '查看作品资料并匹配你的私人媒体来源。')}</p><small class="yj-hero-hint">点击主视觉查看详情</small></div><button class="yj-hero-arrow is-next" data-hero-next aria-label="下一部作品">${ico('chevron')}</button><div class="yj-feature-switch">${heroes.map((_, index) => `<button class="${index === heroIndex ? 'is-active' : ''}" data-hero-dot="${index}" aria-label="第 ${index + 1} 项"></button>`).join('')}</div></section>`;
 
 const yjRankingsForHome = groups => {
   const toggles = readLocalJson('yingji.shelf-toggles', {});
-  return groups.map((group, index) => {
+  return yjOrderRankings(groups).map((group, index) => {
     const [name, items, meta = {}, sourceIndex = index] = group;
     const enabled = Object.hasOwn(toggles, name) ? toggles[name] : meta.featured !== false;
-    if (!enabled) return null;
     const preview = (items || []).slice(0, 10);
-    return preview.length ? { index: sourceIndex, name, items: preview, meta } : null;
+    return preview.length ? { index: sourceIndex, name, items: preview, meta, enabled } : null;
   }).filter(Boolean);
 };
 
@@ -95,26 +140,22 @@ const yjRankingsForHome = groups => {
 renderShelfPanel = function yjRankingShelfPanel() {
   let root = document.getElementById('yj-shelf-panel-root');
   if (!live.shelfPanelOpen) { root?.remove(); return; }
-  const groups = (live.rankings || []).reduce((rows, group, index) => {
-    if (group?.[1]?.length && !['IMDb', '豆瓣'].includes(group[2]?.source)) rows.push([...group, index]);
-    return rows;
-  }, []);
+  const groups = yjAllRankings();
   const toggles = readLocalJson('yingji.shelf-toggles', {});
   const filters = ['all', '热度', '地区', '类型', '平台', '档期', '口碑', 'Trakt'];
   const activeFilter = filters.includes(live.shelfFilter) ? live.shelfFilter : 'all';
-  const shown = groups.filter(([, , meta = {}]) => activeFilter === 'all' || meta.family === activeFilter || meta.source === activeFilter);
+  const enabled = ([name, , meta = {}]) => Object.hasOwn(toggles, name) ? toggles[name] : meta.featured !== false;
+  const shown = groups.filter(([, , meta = {}]) => activeFilter === 'all' || meta.family === activeFilter || meta.source === activeFilter).sort((left, right) => Number(enabled(right)) - Number(enabled(left)));
   if (!root) { root = document.createElement('div'); root.id = 'yj-shelf-panel-root'; document.body.appendChild(root); }
-  root.innerHTML = `<section class="yj-atv-rank-sheet-backdrop" data-shelf-panel-close><section class="yj-atv-rank-sheet" role="dialog" aria-modal="true" aria-label="定制首页榜单"><header><div><h2>定制首页榜单</h2><p>选择要出现在首页的真实数据轨道；不会改变数据源本身。</p></div><button class="yj-panel-close" data-shelf-panel-close aria-label="关闭">${ico('close')}</button></header><nav class="yj-atv-rank-filter" aria-label="榜单分类">${filters.map(filter => `<button class="${activeFilter === filter ? 'on' : ''}" data-shelf-filter="${filter}">${filter === 'all' ? `全部 ${groups.length}` : `${filter} ${groups.filter(([, , meta = {}]) => meta.family === filter || meta.source === filter).length}`}</button>`).join('')}</nav><div class="yj-atv-rank-options">${shown.map(([name, , meta = {}]) => { const checked = Object.hasOwn(toggles, name) ? toggles[name] : meta.featured !== false; return `<article class="${checked ? 'is-enabled' : ''}"><span><b>${esc(name)}</b><small>${esc(meta.source || 'TMDB')} · ${esc(meta.summary || '实时影视榜单')}</small></span><button type="button" class="yj-atv-rank-toggle" role="switch" aria-checked="${checked}" data-shelf-toggle="${esc(name)}"><i></i><em>${checked ? '显示' : '隐藏'}</em></button></article>`; }).join('')}</div></section></section>`;
+  root.innerHTML = `<section class="yj-atv-rank-sheet-backdrop" data-shelf-panel-close><section class="yj-atv-rank-sheet" role="dialog" aria-modal="true" aria-label="定制首页榜单"><header><div><h2>定制首页榜单</h2><p>选择要出现在首页的真实数据轨道；长按任一榜单后拖动即可排序。</p></div><button class="yj-panel-close" data-shelf-panel-close aria-label="关闭">${ico('close')}</button></header><nav class="yj-atv-rank-filter" aria-label="榜单分类">${filters.map(filter => `<button class="${activeFilter === filter ? 'on' : ''}" data-shelf-filter="${filter}">${filter === 'all' ? `全部 ${groups.length}` : `${filter} ${groups.filter(([, , meta = {}]) => meta.family === filter || meta.source === filter).length}`}</button>`).join('')}</nav><div class="yj-atv-rank-options">${shown.map(([name, , meta = {}]) => { const checked = Object.hasOwn(toggles, name) ? toggles[name] : meta.featured !== false; return `<article data-shelf-option="${esc(name)}" class="${checked ? 'is-enabled' : ''}" tabindex="0" aria-label="${esc(name)}，长按后拖动排序"><span class="yj-atv-rank-drag-mark" aria-hidden="true"><svg viewBox="0 0 12 18"><circle cx="3" cy="3" r="1.25"/><circle cx="9" cy="3" r="1.25"/><circle cx="3" cy="9" r="1.25"/><circle cx="9" cy="9" r="1.25"/><circle cx="3" cy="15" r="1.25"/><circle cx="9" cy="15" r="1.25"/></svg></span><span><b>${esc(name)}</b><small>${esc(meta.source || 'TMDB')} · ${esc(meta.summary || '实时影视榜单')}</small></span><div class="yj-atv-rank-option-actions"><button type="button" class="yj-atv-rank-toggle" role="switch" aria-checked="${checked}" data-shelf-toggle="${esc(name)}"><i></i><em>${checked ? '显示' : '隐藏'}</em></button></div></article>`; }).join('')}</div></section></section>`;
 };
 
 home = function yjHome() {
   const sameView = !!document.querySelector('.yj-home');
-  live.rankings ||= readLocalJson('yingji.discovery-cache', null);
-  const groups = (live.rankings || []).reduce((rows, group, index) => {
-    if (group?.[1]?.length && !['IMDb', '豆瓣'].includes(group[2]?.source)) rows.push([...group, index]);
-    return rows;
-  }, []);
+  if (!live.rankings?.length) live.rankings = readLocalJson('yingji.discovery-cache', null) || [];
+  const groups = yjAllRankings();
   const visibleShelves = yjRankingsForHome(groups);
+  const enabledShelves = visibleShelves.filter(shelf => shelf.enabled);
   const items = groups.flatMap(group => group[1]);
   if (!items.length) {
     const sources = yjSources();
@@ -134,10 +175,10 @@ home = function yjHome() {
   }).join('');
   app.innerHTML = yjShell(`<main class="yj-home ${sameView ? 'yj-no-anim' : ''}" style="--home-art:url('${yjArt(feature, 'backdrop', 'original')}')"><div class="yj-hero-wrap">${heroMarkup(feature, featureKind, heroes, live.heroIndex)}</div>
     <section class="yj-home-content yj-tv-home-content">${continueItems.length ? `<section class="yj-home-shelf yj-home-continue"><header class="yj-section-head"><h2>继续观看</h2><button data-open-shelf="continue">查看全部 ${ico('chevron')}</button></header><div class="yj-shelf-viewport yj-continue-viewport"><button class="yj-shelf-arrow is-prev" data-shelf-scroll="-1" aria-label="向左浏览继续观看">${ico('chevron')}</button><div class="yj-wide-rail" data-shelf-rail>${continueCards}</div><button class="yj-shelf-arrow is-next" data-shelf-scroll="1" aria-label="向右浏览继续观看">${ico('chevron')}</button></div></section>` : ''}
-    <section class="yj-atv-rank-hub"><div><h2>影视榜单</h2><p>以真实热度、播出档期与口碑整理，随时回到正在发生的影视世界。</p></div><div class="yj-atv-rank-hub-actions"><span>${visibleShelves.length} 个轨道</span><button class="yj-atv-rank-manage" data-shelf-panel>${ico('settings')} 定制</button></div></section>
-    ${visibleShelves.map(({index, name, items: group, meta}, groupIndex) => `<section class="yj-atv-rank-row" style="--yj-shelf-delay:${Math.min(220, groupIndex * 45)}ms"><header><div><h2>${esc(name)}</h2><p>${esc(meta?.summary || 'TMDB · 实时影视榜单')}</p></div><button class="yj-atv-rank-more" data-live-more="${index}">查看全部 ${ico('chevron')}</button></header><div class="yj-shelf-viewport yj-atv-rank-viewport"><button class="yj-shelf-arrow is-prev" data-shelf-scroll="-1" aria-label="向左浏览 ${esc(name)}">${ico('chevron')}</button><div class="yj-atv-rank-rail" data-shelf-rail>${group.map((item, position) => yjRankingCard(item, position + 1, meta)).join('')}</div><button class="yj-shelf-arrow is-next" data-shelf-scroll="1" aria-label="向右浏览 ${esc(name)}">${ico('chevron')}</button></div></section>`).join('')}
+    <section class="yj-atv-rank-hub"><div><h2>影视榜单</h2><p>以真实热度、播出档期与口碑整理，随时回到正在发生的影视世界。</p></div><div class="yj-atv-rank-hub-actions"><span data-shelf-count>${enabledShelves.length} 个轨道</span><button class="yj-atv-rank-manage" data-shelf-panel>${ico('settings')} 定制</button></div></section>
+    ${visibleShelves.map(({index, name, items: group, meta, enabled}, groupIndex) => `<section class="yj-atv-rank-row" data-shelf-name="${esc(name)}" ${enabled ? '' : 'hidden'} style="--yj-shelf-delay:${Math.min(220, groupIndex * 45)}ms"><header><div><h2>${esc(name)}</h2><p>${esc(meta?.summary || 'TMDB · 实时影视榜单')}</p></div><button class="yj-atv-rank-more" data-live-more="${index}">查看全部 ${ico('chevron')}</button></header><div class="yj-atv-rank-viewport"><button class="yj-rank-edge is-prev" data-rank-scroll="-1" aria-label="向左浏览 ${esc(name)}">${ico('chevron')}</button><div class="yj-atv-rank-scroll"><div class="yj-atv-rank-rail">${group.map((item, position) => yjRankingCard(item, position + 1, meta, 'rail', false)).join('')}</div></div><button class="yj-rank-edge is-next" data-rank-scroll="1" aria-label="向右浏览 ${esc(name)}">${ico('chevron')}</button></div></section>`).join('')}
     </section></main>`, 'home', { hideSearch:true });
-  yjApplyPosterTheme(feature); yjWarmContinueArt(); renderShelfPanel();
+  try { yjApplyPosterTheme(feature); yjWarmContinueArt(); renderShelfPanel(); } catch {}
 };
 
 searchPage = function yjSearch() {
@@ -275,19 +316,22 @@ showLiveCollection = function yjCollection(kind) {
   window.scrollTo(0,0);
 };
 
-showLiveRanking = function yjRanking(index) {
+showLiveRanking = function yjRanking(index, options = {}) {
   if (state.view !== 'ranking') yjRememberRoute();
+  const scrollTop = options.preserveScroll ? window.scrollY : 0;
   live.rankingIndex = Number(index);
   state.view = 'ranking';
   const group = live.rankings?.[Number(index)];
   if (!group) return;
   const [name, items, meta = {}] = group;
   const lead = items[0] || {};
-  const leadArt = yjArt(lead, 'backdrop', 'original') || yjArt(lead, 'poster', 'original');
+  const leadPoster = yjArt(lead, 'poster', 'w780') || yjArt(lead, 'backdrop', 'original');
+  const leadBackdrop = yjArt(lead, 'backdrop', 'original') || leadPoster;
   const total = Math.max(Number(meta.totalResults || 0), items.length);
   const canLoadMore = meta.source === 'TMDB' && meta.path && Number(meta.page || 1) < Number(meta.totalPages || 1);
-  app.innerHTML = yjShell(`<main class="yj-page yj-list-page yj-atv-ranking-page" style="--yj-ranking-art:url('${leadArt}')"><button class="yj-page-back" data-yj-back>${ico('chevron')} 返回</button><section class="yj-atv-ranking-intro"><div><p class="yj-atv-ranking-source">${esc(meta.source || 'TMDB')} · ${esc(meta.family || '实时榜单')}</p><h1>${esc(name)}</h1><p>${esc(meta.summary || '来自 TMDB 的实时影视榜单。')}</p></div><span>已加载 ${items.length} / ${total} 部</span></section><section class="yj-atv-ranking-feature" aria-label="榜首作品"><div class="yj-atv-ranking-feature-art" ${leadArt ? `style="background-image:url('${leadArt}')"` : ''}></div><div><b>本榜第 1 名</b><h2>${esc(yjTitle(lead))}</h2><p>${esc(lead.overview || '打开作品详情，查看资料、剧集与可播放版本。')}</p><button data-live-detail="${esc(lead.id)}" data-kind="${lead.kind || itemKind(lead)}">查看详情 ${ico('chevron')}</button></div></section><section class="yj-atv-ranking-grid" aria-label="${esc(name)}完整榜单">${items.map((item, position) => yjRankingCard(item, position + 1, meta, 'grid')).join('')}</section>${canLoadMore ? `<footer class="yj-atv-ranking-load"><span>该榜单还有 ${Math.max(0, total - items.length)} 部作品</span><button data-load-ranking-more="${Number(index)}" ${meta.loadingMore ? 'disabled aria-busy="true"' : ''}>${meta.loadingMore ? '正在加载…' : '加载更多'} ${ico('chevron')}</button></footer>` : `<footer class="yj-atv-ranking-load is-complete"><span>已显示该榜单的全部 ${items.length} 部作品</span></footer>`}</main>`, 'home', { title:name });
-  window.scrollTo(0,0);
+  app.innerHTML = yjShell(`<main class="yj-page yj-list-page yj-atv-ranking-page" style="--yj-ranking-art:url('${leadBackdrop}')"><button class="yj-page-back" data-yj-back>${ico('chevron')} 返回</button><section class="yj-atv-ranking-intro"><div><p class="yj-atv-ranking-source">${esc(meta.source || 'TMDB')} · ${esc(meta.family || '实时榜单')}</p><h1>${esc(name)}</h1><p>${esc(meta.summary || '来自 TMDB 的实时影视榜单。')}</p></div><span>已加载 ${items.length} / ${total} 部</span></section><section class="yj-atv-ranking-feature" aria-label="榜首作品"><div class="yj-atv-ranking-feature-art" ${leadPoster ? `style="background-image:url('${leadPoster}')"` : ''}>${leadPoster ? '' : `<span>${esc(yjTitle(lead))}</span>`}</div><div><b>本榜第 1 名</b><h2>${esc(yjTitle(lead))}</h2><p>${esc(lead.overview || '打开作品详情，查看资料、剧集与可播放版本。')}</p><button data-live-detail="${esc(lead.id)}" data-kind="${lead.kind || itemKind(lead)}">查看详情 ${ico('chevron')}</button></div></section><section class="yj-atv-ranking-grid" aria-label="${esc(name)}完整榜单">${items.map((item, position) => yjRankingCard(item, position + 1, meta, 'grid', false)).join('')}</section>${canLoadMore ? `<footer class="yj-atv-ranking-load" data-ranking-load-sentinel data-ranking-index="${Number(index)}" aria-live="polite"><span>${meta.loadingMore ? '正在加载下一批作品…' : `继续向下浏览，自动加载另外 ${Math.max(0, total - items.length)} 部`}</span><i aria-hidden="true"></i></footer>` : `<footer class="yj-atv-ranking-load is-complete"><span>已显示该榜单的全部 ${items.length} 部作品</span></footer>`}</main>`, 'home', { title:name });
+  yjObserveRankingLoad();
+  if (options.preserveScroll) yjRestoreScroll(scrollTop); else window.scrollTo(0,0);
 };
 
 renderLiveDetail = function yjDetail() {
@@ -296,11 +340,13 @@ renderLiveDetail = function yjDetail() {
   const item = data.item, details = data.detail || item, episodes = data.episodes || [], calendarId = data.tmdbId || item.id;
   if (item.id == null) item.id = calendarId;
   const inWatchlist = live.watchlist.some(entry => String(entry.id) === String(calendarId));
-  data.episodeSort ||= 'asc'; data.showAllEpisodes ||= false; data.episodePage ||= 0; data.resourceView ||= 'resource';
+  data.episodeSort ||= 'asc'; data.showAllEpisodes ||= false; data.episodePage ||= 0; data.resourceView ||= localStorage.getItem('yingji.resource-view') || 'server';
   const sortedEpisodes = [...episodes].sort((a,b) => data.episodeSort === 'asc' ? a.number - b.number : b.number - a.number);
   const episodePageSize = 60, episodePages = Math.max(1, Math.ceil(sortedEpisodes.length / episodePageSize));
   data.episodePage = Math.min(data.episodePage, episodePages - 1);
-  const visibleEpisodes = data.showAllEpisodes ? sortedEpisodes.slice(data.episodePage * episodePageSize, (data.episodePage + 1) * episodePageSize) : sortedEpisodes.slice(0, 12);
+  const selectedIndex = sortedEpisodes.findIndex(episode => Number(episode.number) === Number(data.selectedEpisode));
+  const episodeWindowStart = selectedIndex >= 12 ? Math.min(Math.max(0, selectedIndex - 4), Math.max(0, sortedEpisodes.length - 12)) : 0;
+  const visibleEpisodes = data.showAllEpisodes ? sortedEpisodes.slice(data.episodePage * episodePageSize, (data.episodePage + 1) * episodePageSize) : sortedEpisodes.slice(episodeWindowStart, episodeWindowStart + 12);
   const selected = episodes.find(episode => Number(episode.number) === Number(data.selectedEpisode));
   const qualities = [...new Set((data.resources || []).map(sourceQuality))].filter(Boolean).sort((a,b) => qualityRank(b) - qualityRank(a));
   if (!qualities.includes(data.selectedResolution)) data.selectedResolution = qualities[0] || '';
@@ -312,7 +358,7 @@ renderLiveDetail = function yjDetail() {
   const seasons = (details.seasons || []).filter(season => season.season_number > 0 && season.episode_count > 0);
   const episodeCards = visibleEpisodes.map(episode => { const hasStill = !!episode.still_path; const still = hasStill ? image(episode.still_path,'w500') : yjArt(details,'poster','w500'); const played = (data.playedEpisodes || []).includes(Number(episode.number)); const matchingProgress = (live.continueItems || []).find(entry => Number(entry.ParentIndexNumber) === Number(data.seasonNumber) && Number(entry.IndexNumber) === Number(episode.number) && String(entry.SeriesName || '') === String(yjTitle(details))); const progress = matchingProgress ? Math.min(100, Math.round((matchingProgress.UserData?.PlaybackPositionTicks || 0) / Math.max(matchingProgress.RunTimeTicks || 1, 1) * 100)) : played ? 100 : 0; const aired=episode.air_date ? new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'long',day:'numeric'}).format(new Date(`${episode.air_date}T12:00:00`)) : '播出日期待定'; return `<button class="yj-episode ${Number(episode.number) === Number(data.selectedEpisode) ? 'is-active' : ''} ${played ? 'is-played' : ''}" data-select-episode="${episode.number}"><span class="yj-episode-art ${hasStill ? '' : 'is-poster-fallback'}" ${still ? `style="background-image:url('${still}')"` : ''}><i>第 ${episode.number} 集</i>${progress ? `<em class="yj-episode-progress" style="--yj-episode-progress:${progress}%"><span></span></em>` : ''}${played ? `<em class="yj-played-badge" title="已播放">${ico('check')}<span>已播放</span></em>` : ''}</span><span><b>第 ${episode.number} 集</b><small>${esc(episode.name || '未命名剧集')}</small><time datetime="${esc(episode.air_date || '')}">${esc(aired)}</time></span></button>`; }).join('');
   const resourceCards = resources.map((source,index) => { const filename = source.Name || source.Path?.split(/[\\/]/).at(-1) || '媒体文件'; const direct = source.SupportsDirectPlay !== false; return `<button class="yj-resource ${index === data.selectedResource ? 'is-active' : ''}" data-select-resource="${index}" aria-label="选择 ${esc(source.server?.name || '媒体服务器')} 的 ${esc(sourceVersion(source))} 版本"><span class="yj-resource-server"><i>${esc((source.server?.name || '源')[0])}</i><span><b>${esc(source.server?.name || '媒体服务器')}</b><small>${esc(source.server?.kind || 'Emby')} · ${esc(filename)}</small></span></span><span><b>${esc(sourceVersion(source))}</b><small>${esc(sourceSize(source))} · ${esc(sourceBitrate(source))}</small></span><span><b>${esc(sourceRange(source))}</b><small>${esc(sourceAudioLabel(source))}</small></span><em>${index === data.selectedResource ? '已选择' : direct ? '可直连' : '需转码'}</em></button>`; }).join('');
-  app.innerHTML = yjShell(`<main class="yj-detail" style="--detail-art:url('${yjArt(details,'backdrop','original')}')"><button class="yj-back" data-yj-back>${ico('chevron')} 返回</button><section class="yj-detail-hero"><div class="yj-detail-copy"><span class="yj-eyebrow">${itemKind(item) === 'movie' ? 'FILM' : 'SERIES'}</span><h1>${esc(yjTitle(details))}</h1><div class="yj-feature-meta"><b>${esc(yjYear(details) || '年份未知')}</b><span>TMDB ${(details.vote_average || 0).toFixed(1)}</span><span>${episodes.length ? `${episodes.length} 集` : '电影'}</span></div><p>${esc(details.overview || '暂无剧情简介。')}</p><div class="yj-actions">${resources.length ? `<button class="primary" data-detail-play>${ico('play')} 播放所选版本${selected && !selected.movie ? ` · 第 ${selected.number} 集` : ''}</button>` : `<button class="primary" data-go="library">${ico('plus')} 连接播放来源</button>`}${inWatchlist ? `<button class="secondary" data-calendar-remove="${item.id}">${ico('close')} 移出日历</button>` : `<button class="secondary" data-live-watch="${item.id}">${ico('watch')} 加入待看</button>`}</div></div></section><section class="yj-detail-body">${episodes.length ? `<header class="yj-section-head yj-episode-head"><div><button data-episode-sort>${data.episodeSort === 'asc' ? '正序 ↑' : '倒序 ↓'}</button><button data-toggle-all-episodes>${data.showAllEpisodes ? '收起' : `查看全部 ${episodes.length} 集`} ${ico('chevron')}</button></div></header><div class="yj-episode-rail ${data.showAllEpisodes ? 'is-all' : ''}">${episodeCards}</div>${data.showAllEpisodes && episodePages > 1 ? `<nav class="yj-episode-pages"><button data-episode-page="${Math.max(0,data.episodePage-1)}" ${data.episodePage === 0 ? 'disabled' : ''}>上一页</button><span>第 ${data.episodePage + 1} / ${episodePages} 页 · ${data.episodePage * episodePageSize + 1}–${Math.min(episodes.length,(data.episodePage+1)*episodePageSize)} 集</span><button data-episode-page="${Math.min(episodePages-1,data.episodePage+1)}" ${data.episodePage === episodePages-1 ? 'disabled' : ''}>下一页</button></nav>` : ''}` : ''}<section class="yj-resource-zone"><header class="yj-section-head"><div><span>SOURCES</span><h2>播放版本</h2></div><small>${resources.length} 个匹配资源</small></header>${qualities.length ? `<div class="yj-resource-filters">${qualities.map(label => `<button class="${data.selectedResolution === label ? 'is-active' : ''}" data-resolution="${label}">${label}</button>`).join('')}</div>` : ''}${resourceCards ? `<div class="yj-resource-list">${resourceCards}</div>` : yjEmpty('当前分辨率没有资源', qualities.length ? '切换其他分辨率查看可播放线路。' : '扫描资料库后显示真实可用版本。', '<button class="primary" data-go="library">连接服务器</button>')}</section><section class="yj-credits"><header class="yj-section-head"><div><span>CAST & CREW</span><h2>演职人员</h2></div></header>${cast.length ? `<div class="yj-cast-rail">${cast.map(person => `<article><span ${person.profile_path ? `style="background-image:url('${image(person.profile_path,'w342')}')"` : ''}></span><b>${esc(person.name)}</b><small>${esc(person.character || person.known_for_department || '')}</small></article>`).join('')}</div>` : yjEmpty('暂无演职人员资料','TMDB 没有返回相关信息。')}</section><section class="yj-media-extras"><header class="yj-section-head"><div><span>EXTRAS</span><h2>预告片与海报</h2></div></header><div>${trailer ? `<a class="yj-trailer" href="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}" target="_blank" rel="noreferrer"><span style="background-image:url('https://img.youtube.com/vi/${trailer.key}/hqdefault.jpg')">${ico('play')}</span><b>${esc(trailer.name || '官方预告片')}</b></a>` : yjEmpty('暂无预告片','TMDB 没有返回官方预告。')}${posters.length ? `<div class="yj-poster-gallery">${posters.map(poster => `<img src="${image(poster.file_path,'w342')}" alt="${esc(yjTitle(details))} 海报">`).join('')}</div>` : ''}</div></section></section></main>`, 'home', { title: yjTitle(item), hideSearch: true });
+  app.innerHTML = yjShell(`<main class="yj-detail" style="--detail-art:url('${yjArt(details,'backdrop','original')}')"><button class="yj-page-back yj-detail-return" data-detail-return data-yj-back aria-label="返回">${ico('chevron')} 返回</button><section class="yj-detail-hero"><div class="yj-detail-copy"><span class="yj-eyebrow">${itemKind(item) === 'movie' ? 'FILM' : 'SERIES'}</span><h1>${esc(yjTitle(details))}</h1><div class="yj-feature-meta"><b>${esc(yjYear(details) || '年份未知')}</b><span>TMDB ${(details.vote_average || 0).toFixed(1)}</span><span>${episodes.length ? `${episodes.length} 集` : '电影'}</span></div><p>${esc(details.overview || '暂无剧情简介。')}</p><div class="yj-actions">${resources.length ? `<button class="primary" data-detail-play>${ico('play')} 播放所选版本${selected && !selected.movie ? ` · 第 ${selected.number} 集` : ''}</button>` : `<button class="primary" data-go="library">${ico('plus')} 连接播放来源</button>`}${inWatchlist ? `<button class="secondary" data-calendar-remove="${item.id}">${ico('close')} 移出日历</button>` : `<button class="secondary" data-live-watch="${item.id}">${ico('watch')} 加入待看</button>`}</div></div></section><section class="yj-detail-body">${episodes.length ? `<header class="yj-section-head yj-episode-head"><div><button data-episode-sort>${data.episodeSort === 'asc' ? '正序 ↑' : '倒序 ↓'}</button><button data-toggle-all-episodes>${data.showAllEpisodes ? '收起' : `查看全部 ${episodes.length} 集`} ${ico('chevron')}</button></div></header><div class="yj-episode-rail ${data.showAllEpisodes ? 'is-all' : ''}">${episodeCards}</div>${data.showAllEpisodes && episodePages > 1 ? `<nav class="yj-episode-pages"><button data-episode-page="${Math.max(0,data.episodePage-1)}" ${data.episodePage === 0 ? 'disabled' : ''}>上一页</button><span>第 ${data.episodePage + 1} / ${episodePages} 页 · ${data.episodePage * episodePageSize + 1}–${Math.min(episodes.length,(data.episodePage+1)*episodePageSize)} 集</span><button data-episode-page="${Math.min(episodePages-1,data.episodePage+1)}" ${data.episodePage === episodePages-1 ? 'disabled' : ''}>下一页</button></nav>` : ''}` : ''}<section class="yj-resource-zone"><header class="yj-section-head"><div><span>SOURCES</span><h2>播放版本</h2></div><small>${resources.length} 个匹配资源</small></header>${qualities.length ? `<div class="yj-resource-filters">${qualities.map(label => `<button class="${data.selectedResolution === label ? 'is-active' : ''}" data-resolution="${label}">${label}</button>`).join('')}</div>` : ''}${resourceCards ? `<div class="yj-resource-list">${resourceCards}</div>` : yjEmpty('当前分辨率没有资源', qualities.length ? '切换其他分辨率查看可播放线路。' : '扫描资料库后显示真实可用版本。', '<button class="primary" data-go="library">连接服务器</button>')}</section><section class="yj-credits"><header class="yj-section-head"><div><span>CAST & CREW</span><h2>演职人员</h2></div></header>${cast.length ? `<div class="yj-cast-rail">${cast.map(person => `<article><span ${person.profile_path ? `style="background-image:url('${image(person.profile_path,'w342')}')"` : ''}></span><b>${esc(person.name)}</b><small>${esc(person.character || person.known_for_department || '')}</small></article>`).join('')}</div>` : yjEmpty('暂无演职人员资料','TMDB 没有返回相关信息。')}</section><section class="yj-media-extras"><header class="yj-section-head"><div><span>EXTRAS</span><h2>预告片与海报</h2></div></header><div>${trailer ? `<a class="yj-trailer" href="https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}" target="_blank" rel="noreferrer"><span style="background-image:url('https://img.youtube.com/vi/${trailer.key}/hqdefault.jpg')">${ico('play')}</span><b>${esc(trailer.name || '官方预告片')}</b></a>` : yjEmpty('暂无预告片','TMDB 没有返回官方预告。')}${posters.length ? `<div class="yj-poster-gallery">${posters.map(poster => `<img src="${image(poster.file_path,'w342')}" alt="${esc(yjTitle(details))} 海报">`).join('')}</div>` : ''}</div></section></section></main>`, 'home', { title: yjTitle(item), hideSearch: true });
   const episodeHead = document.querySelector('.yj-episode-head');
   if (episodeHead) {
     const controls = episodeHead.firstElementChild; controls?.classList.add('yj-episode-controls');
@@ -346,18 +392,14 @@ renderLiveDetail = function yjDetail() {
     header?.querySelector('small')?.replaceWith(Object.assign(document.createElement('div'), { className:'yj-resource-summary', innerHTML:`<b>${esc(data.selectedResolution || '自动')}</b><small>${resources.length} 个匹配资源</small>` }));
     resourceZone.querySelector('.yj-resource-filters')?.insertAdjacentHTML('afterend', `<div class="yj-resource-viewbar"><span>匹配结果</span><div role="group" aria-label="播放版本展示方式"><button class="${data.resourceView === 'resource' ? 'is-active' : ''}" data-resource-view="resource">按资源</button><button class="${data.resourceView === 'server' ? 'is-active' : ''}" data-resource-view="server">按服务器</button></div></div>`);
     const list = resourceZone.querySelector('.yj-resource-list');
+    const pickerIndex = data.resourceServerPicker === null || data.resourceServerPicker === undefined || data.resourceServerPicker === '' ? Number.NaN : Number(data.resourceServerPicker);
     if (list && data.resourceView === 'server') {
       list.classList.add('is-server-view');
       list.innerHTML = serverGroups.map((group, groupIndex) => {
         const chosen = group.choices.find(choice => choice.index === data.selectedResource)?.source || group.choices[0].source;
-        return `<button class="yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceRange(chosen))} · ${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>`;
+        const versions = group.choices.map(({source,index}) => `<button class="yj-version-choice ${index === data.selectedResource ? 'is-active' : ''}" data-select-resource="${index}"><span><b>${esc(sourceVersion(source))}</b><small>${esc(sourceSize(source))} · ${esc(sourceBitrate(source))}</small></span><span><b>${esc(sourceRange(source))}</b><small>${esc(sourceAudioLabel(source))}</small></span>${index === data.selectedResource ? `<em>已选择</em>` : ''}</button>`).join('');
+        return `<div class="yj-server-version-group"><button class="yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceRange(chosen))} · ${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>${pickerIndex === groupIndex ? `<section class="yj-version-sheet yj-version-sheet-inline" aria-label="${esc(group.name)} 的播放版本"><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section>` : ''}</div>`;
       }).join('');
-    }
-    const pickerIndex = data.resourceServerPicker === null || data.resourceServerPicker === undefined || data.resourceServerPicker === '' ? Number.NaN : Number(data.resourceServerPicker);
-    if (Number.isInteger(pickerIndex) && serverGroups[pickerIndex]) {
-      const group = serverGroups[pickerIndex];
-      const versions = group.choices.map(({source,index}) => `<button class="yj-version-choice ${index === data.selectedResource ? 'is-active' : ''}" data-select-resource="${index}"><span><b>${esc(sourceVersion(source))}</b><small>${esc(sourceSize(source))} · ${esc(sourceBitrate(source))}</small></span><span><b>${esc(sourceRange(source))}</b><small>${esc(sourceAudioLabel(source))}</small></span>${index === data.selectedResource ? `<em>已选择</em>` : ''}</button>`).join('');
-      resourceZone.insertAdjacentHTML('beforeend', `<section class="yj-version-sheet" role="dialog" aria-modal="true" aria-label="${esc(group.name)} 的播放版本"><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section>`);
     }
   }
   yjApplyPosterTheme(details, '.yj-detail');
@@ -397,6 +439,72 @@ syncTraktCalendar = async function yjSyncCalendar() {
 };
 
 document.body.classList.add('yj-ui');
+// Final spatial layer: keep the navigation as floating controls, never as a rail.
+// This is injected after the legacy styles so every page shares the same full-bleed canvas.
+if (!document.getElementById('yj-final-spatial-layer')) {
+  const style = document.createElement('style');
+  style.id = 'yj-final-spatial-layer';
+  style.textContent = `
+    body.yj-ui #app.app { --yj-content-start:clamp(7rem,6vw,10rem); --yj-content-end:clamp(1.25rem,3vw,3.5rem); }
+    body.yj-ui #app.app > .yj-detail { position:relative !important; isolation:isolate !important; box-sizing:border-box !important; width:100% !important; margin-left:0 !important; padding:0 !important; min-height:100vh !important; overflow:hidden !important; background:linear-gradient(180deg,rgba(8,10,15,.04) 0,rgba(8,10,15,.2) 31rem,rgba(8,10,15,.75) 49rem,#08090d 76rem) !important; }
+    body.yj-ui #app.app > .yj-detail::before { content:"" !important; position:fixed !important; z-index:0 !important; inset:-2.5rem !important; display:block !important; background:var(--detail-art) center top/cover no-repeat !important; filter:blur(30px) saturate(1.16) !important; opacity:.62 !important; transform:scale(1.055) !important; transform-origin:top center !important; pointer-events:none !important; }
+    body.yj-ui #app.app > .yj-detail::after { content:"" !important; position:fixed !important; z-index:0 !important; inset:0 !important; display:block !important; background:linear-gradient(180deg,rgba(7,9,14,.04) 0,rgba(7,9,14,.12) 34vh,rgba(7,9,14,.58) 67vh,rgba(7,9,14,.93) 100vh,#08090d 150vh) !important; pointer-events:none !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-hero, body.yj-ui #app.app > .yj-detail > .yj-detail-body { position:relative !important; z-index:1 !important; width:100% !important; margin-left:0 !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-hero { min-height:clamp(31rem,48vw,46rem) !important; background:transparent !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-hero::after { content:"" !important; position:absolute !important; z-index:0 !important; inset:0 !important; display:block !important; background:linear-gradient(180deg,rgba(8,10,15,.02) 0,rgba(8,10,15,.07) 40%,rgba(8,10,15,.56) 74%,rgba(8,10,15,.94) 100%),linear-gradient(90deg,rgba(8,10,15,.76) 0,rgba(8,10,15,.22) 62%,transparent 100%),var(--detail-art) center top/cover no-repeat !important; -webkit-mask-image:linear-gradient(to bottom,#000 0,#000 58%,rgba(0,0,0,.78) 76%,transparent 100%) !important; mask-image:linear-gradient(to bottom,#000 0,#000 58%,rgba(0,0,0,.78) 76%,transparent 100%) !important; pointer-events:none !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-hero > * { position:relative !important; z-index:2 !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-hero .yj-detail-copy { padding-left:var(--yj-content-start) !important; padding-right:var(--yj-content-end) !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-body { max-width:none !important; padding-inline:var(--yj-content-start) var(--yj-content-end) !important; background:transparent !important; box-shadow:none !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-back { position:fixed !important; z-index:2000 !important; top:calc(var(--yj-top) + .85rem) !important; left:var(--yj-content-start) !important; display:grid !important; width:3.15rem !important; height:3.15rem !important; min-width:3.15rem !important; min-height:3.15rem !important; padding:0 !important; place-items:center !important; border:1px solid rgba(255,255,255,.28) !important; border-radius:999px !important; background:rgba(11,14,20,.56) !important; box-shadow:0 .75rem 2rem rgba(0,0,0,.33) !important; color:#fff !important; cursor:pointer !important; touch-action:manipulation !important; backdrop-filter:blur(18px) saturate(1.2) !important; pointer-events:auto !important; transform:none !important; -webkit-app-region:no-drag !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-return { position:fixed !important; z-index:2001 !important; top:calc(var(--yj-top) + .85rem) !important; left:var(--yj-content-start) !important; display:flex !important; align-items:center !important; gap:.42rem !important; min-width:auto !important; min-height:2.65rem !important; padding:.15rem .9rem !important; margin:0 !important; border:1px solid rgba(255,255,255,.24) !important; border-radius:999px !important; background:rgba(11,14,20,.58) !important; box-shadow:0 .7rem 1.8rem rgba(0,0,0,.28) !important; color:#fff !important; font:inherit !important; font-weight:650 !important; cursor:pointer !important; pointer-events:auto !important; touch-action:manipulation !important; transform:none !important; transition:background .16s ease,color .16s ease,box-shadow .16s ease !important; -webkit-app-region:no-drag !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-return svg { width:1rem !important; height:1rem !important; transform:rotate(180deg) !important; stroke-width:2 !important; stroke-linecap:round !important; stroke-linejoin:round !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-detail-return:hover, body.yj-ui #app.app > .yj-detail > .yj-detail-return:focus-visible { background:rgba(255,255,255,.96) !important; color:#11151d !important; box-shadow:0 .85rem 2rem rgba(0,0,0,.34) !important; transform:none !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-back span { display:none !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-back svg { width:1.22rem !important; height:1.22rem !important; transform:rotate(180deg) !important; stroke-width:2.15 !important; stroke-linecap:round !important; stroke-linejoin:round !important; }
+    body.yj-ui #app.app > .yj-detail > .yj-back:hover, body.yj-ui #app.app > .yj-detail > .yj-back:focus-visible { background:rgba(255,255,255,.96) !important; color:#131820 !important; transform:scale(1.07) !important; }
+    @media (min-width:841px) {
+      body.yj-ui #app.app .yj-sidebar, body.yj-ui #app.app .yj-sidebar:hover, body.yj-ui #app.app .yj-sidebar:focus-within { display:contents !important; width:auto !important; min-width:0 !important; padding:0 !important; margin:0 !important; border:0 !important; background:transparent !important; box-shadow:none !important; backdrop-filter:none !important; transition:none !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav { position:fixed !important; z-index:510 !important; top:50% !important; right:auto !important; bottom:auto !important; left:1rem !important; display:flex !important; width:2.8rem !important; height:auto !important; padding:0 !important; margin:0 !important; flex-direction:column !important; align-items:center !important; gap:.4rem !important; overflow:visible !important; border:0 !important; background:transparent !important; box-shadow:none !important; pointer-events:none !important; transform:translateY(-50%) !important; -webkit-app-region:no-drag !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav-item, body.yj-ui #app.app .yj-sidebar .yj-nav-item[data-go="settings"] { position:relative !important; z-index:511 !important; top:auto !important; right:auto !important; bottom:auto !important; left:auto !important; display:grid !important; width:2.8rem !important; height:2.8rem !important; min-width:2.8rem !important; min-height:2.8rem !important; padding:0 !important; margin:0 !important; place-items:center !important; border:1px solid rgba(255,255,255,.18) !important; border-radius:999px !important; background:rgba(9,12,18,.58) !important; box-shadow:0 .5rem 1.45rem rgba(0,0,0,.26) !important; color:rgba(255,255,255,.94) !important; opacity:1 !important; pointer-events:auto !important; translate:none !important; transform:none !important; will-change:auto !important; transition:background .16s ease,color .16s ease,box-shadow .16s ease !important; -webkit-app-region:no-drag !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav-item:hover, body.yj-ui #app.app .yj-sidebar .yj-nav-item:focus-visible { top:auto !important; right:auto !important; bottom:auto !important; left:auto !important; translate:none !important; transform:none !important; background:rgba(255,255,255,.94) !important; color:#11151d !important; box-shadow:0 .75rem 1.8rem rgba(0,0,0,.32) !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav-item.is-active { border-color:rgba(255,255,255,.92) !important; background:rgba(255,255,255,.98) !important; color:#11151d !important; box-shadow:0 .6rem 1.75rem rgba(0,0,0,.3) !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav-item span { display:none !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-nav-item svg { width:1.16rem !important; height:1.16rem !important; stroke-width:1.8 !important; stroke-linecap:round !important; stroke-linejoin:round !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-source-dock { position:fixed !important; z-index:509 !important; top:calc(50% + 9.5rem) !important; left:1rem !important; display:flex !important; flex-direction:column !important; gap:.65rem !important; width:2.8rem !important; padding-top:1rem !important; margin:0 !important; border-top:1px solid rgba(255,255,255,.3) !important; background:transparent !important; box-shadow:none !important; pointer-events:auto !important; -webkit-app-region:no-drag !important; }
+      body.yj-ui #app.app .yj-sidebar .yj-source-dock button, body.yj-ui #app.app .yj-sidebar .yj-source-dock button:hover, body.yj-ui #app.app .yj-sidebar .yj-source-dock button:focus-visible { width:2.8rem !important; height:2.8rem !important; min-width:2.8rem !important; padding:0 !important; border-radius:999px !important; translate:none !important; transform:none !important; will-change:auto !important; transition:background .16s ease,color .16s ease,box-shadow .16s ease !important; }
+      body.yj-ui #app.app > .yj-home .yj-tv-hero .yj-feature-copy { padding-left:var(--yj-content-start) !important; padding-right:var(--yj-content-end) !important; }
+      body.yj-ui #app.app > .yj-home .yj-tv-hero .yj-feature-switch { position:absolute !important; right:clamp(7rem,13vw,13rem) !important; left:auto !important; }
+      body.yj-ui #app.app > .yj-home .yj-home-content, body.yj-ui #app.app > .yj-home .yj-tv-home-content { box-sizing:border-box !important; width:auto !important; max-width:none !important; margin-right:var(--yj-content-end) !important; margin-left:var(--yj-content-start) !important; padding-right:0 !important; padding-left:0 !important; }
+      body.yj-ui #app.app > .yj-atv-ranking-page { box-sizing:border-box !important; width:100% !important; max-width:none !important; margin-left:0 !important; padding-inline:var(--yj-content-start) var(--yj-content-end) !important; }
+      body.yj-ui #app.app > .yj-atv-ranking-page .yj-atv-ranking-intro, body.yj-ui #app.app > .yj-atv-ranking-page .yj-atv-ranking-feature, body.yj-ui #app.app > .yj-atv-ranking-page .yj-atv-ranking-grid { width:100% !important; max-width:none !important; margin-left:0 !important; margin-right:0 !important; }
+      body.yj-ui #app.app > .yj-atv-ranking-page .yj-atv-ranking-intro { padding-inline:0 !important; }
+      body.yj-ui #app.app > .yj-atv-ranking-page .yj-atv-ranking-grid { grid-template-columns:repeat(auto-fill,minmax(clamp(8.8rem,9vw,11.5rem),1fr)) !important; gap:clamp(1.25rem,1.7vw,2rem) clamp(.9rem,1.2vw,1.4rem) !important; padding-inline:0 !important; }
+      html[data-appearance="light"] body.yj-ui #app.app .yj-sidebar .yj-nav-item { border-color:rgba(24,33,49,.18) !important; background:rgba(255,255,255,.66) !important; color:#19212e !important; box-shadow:0 .55rem 1.5rem rgba(34,48,72,.18) !important; }
+      html[data-appearance="light"] body.yj-ui #app.app .yj-sidebar .yj-nav-item.is-active, html[data-appearance="light"] body.yj-ui #app.app .yj-sidebar .yj-nav-item:hover { background:rgba(255,255,255,.98) !important; color:#101720 !important; }
+      html[data-appearance="light"] body.yj-ui #app.app > .yj-detail > .yj-back, html[data-appearance="light"] body.yj-ui #app.app > .yj-detail > .yj-detail-return { border-color:rgba(24,33,49,.16) !important; background:rgba(255,255,255,.8) !important; color:#151c27 !important; box-shadow:0 .7rem 1.8rem rgba(35,50,70,.18) !important; }
+    }
+    @media (min-width:1600px) {
+      body.yj-ui #app.app > .yj-home .yj-home-content, body.yj-ui #app.app > .yj-home .yj-tv-home-content { margin-right:var(--yj-content-end) !important; margin-left:var(--yj-content-start) !important; }
+      body.yj-ui #app.app > .yj-detail > .yj-detail-body { padding-inline:var(--yj-content-start) var(--yj-content-end) !important; }
+    }
+    @media (max-width:840px) {
+      body.yj-ui #app.app > .yj-detail > .yj-detail-body { padding-inline:1rem !important; }
+      body.yj-ui #app.app > .yj-detail > .yj-back, body.yj-ui #app.app > .yj-detail > .yj-detail-return { top:.85rem !important; left:.85rem !important; }
+    }
+  `;
+  document.head.append(style);
+}
+// Every compact icon control exposes the same plain-language hover label as the
+// sidebar. Text buttons already describe their action in place.
+const yjSyncButtonTitles = root => (root || document).querySelectorAll?.('button[aria-label]').forEach(button => {
+  if (!button.title) button.title = button.getAttribute('aria-label');
+});
+yjSyncButtonTitles(document);
+new MutationObserver(records => records.forEach(record => record.addedNodes.forEach(node => {
+  if (node.nodeType !== Node.ELEMENT_NODE) return;
+  if (node.matches?.('button[aria-label]') && !node.title) node.title = node.getAttribute('aria-label');
+  yjSyncButtonTitles(node);
+}))).observe(app, { childList:true, subtree:true });
 document.addEventListener('click', event => {
   const edit = event.target.closest('[data-edit-server],[data-edit-file]');
   if (!edit) return;
@@ -443,6 +551,12 @@ document.addEventListener('click', event => {
   if (serverMedia) { const item = live.serverItems?.[live.openSourceId]?.[Number(serverMedia.dataset.serverMedia)]; if (item) showLiveDetail(item, item.Type === 'Movie' ? 'movie' : 'tv'); }
   const rankingScroll = event.target.closest('[data-scroll-ranking]');
   if (rankingScroll) document.querySelector('.yj-ranking-rail')?.scrollBy({ left: Number(rankingScroll.dataset.scrollRanking) * Math.max(320, window.innerWidth * .72), behavior:'smooth' });
+  const rankScroll = event.target.closest('[data-rank-scroll]');
+  if (rankScroll) {
+    const rail = rankScroll.closest('.yj-atv-rank-viewport')?.querySelector('.yj-atv-rank-scroll');
+    rail?.scrollBy({ left:Number(rankScroll.dataset.rankScroll) * Math.max(300, rail.clientWidth * .78), behavior:'smooth' });
+    return;
+  }
   const shelfScroll = event.target.closest('[data-shelf-scroll]');
   if (shelfScroll) { const viewport=shelfScroll.closest('.yj-shelf-viewport'); const rail=viewport?.querySelector('[data-shelf-rail]'); viewport?.setAttribute('data-edge','none'); rail?.scrollBy({ left:Number(shelfScroll.dataset.shelfScroll) * Math.max(300, rail.clientWidth * .78), behavior:'smooth' }); }
 });
@@ -461,7 +575,7 @@ document.addEventListener('pointermove', event => {
 }, { passive:true });
 document.addEventListener('pointerleave', event => {
   const viewport = event.target.closest?.('.yj-shelf-viewport');
-  if (viewport) viewport.dataset.edge = 'none';
+  if (viewport && !viewport.classList.contains('yj-atv-rank-viewport')) viewport.dataset.edge = 'none';
   const hero = event.target.closest?.('.yj-tv-hero');
   if (hero) delete hero.dataset.heroEdge;
 }, true);
@@ -485,6 +599,7 @@ document.addEventListener('click', event => {
   if (event.target.closest('[data-context-icon]') && source) { const input=document.createElement('input'); input.type='file'; input.accept='image/png,image/jpeg,image/webp'; input.onchange=()=>{const file=input.files?.[0]; if(!file || file.size>2*1024*1024) return notify('请选择小于 2 MB 的图片'); const reader=new FileReader(); reader.onload=()=>{source.customIcon=reader.result;saveProviders();menu.remove();library();notify('服务器图标已更新');};reader.readAsDataURL(file);};input.click(); }
 }, true);
 const yjNormalizeBackButtons = () => document.querySelectorAll('button[data-go],button[data-library-home]').forEach(button => {
+  if (button.hasAttribute('data-detail-return')) return;
   if (!/^返回/.test(button.textContent.trim())) return;
   button.removeAttribute('data-go');
   button.removeAttribute('data-library-home');
