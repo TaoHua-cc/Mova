@@ -173,7 +173,8 @@ home = function yjHome() {
     const detailId = esc(item.Id), kind = item.Type === 'Movie' ? 'movie' : 'tv', images = yjContinueImages(item);
     return `<article class="yj-continue-card" style="--yj-continue-delay:${index * 55}ms"><div class="yj-continue-art" data-live-detail="${detailId}" data-kind="${kind}"><span class="yj-wide-art" data-continue-art="${esc(images.join('|'))}" ${images[0] ? `style="--yj-continue-fallback:url('${images[0]}')"` : ''}>${item.ParentIndexNumber ? `<em class="yj-cont-episode-tag">第 ${item.IndexNumber || '—'} 集</em>` : ''}<em class="yj-cont-progress">${progress}%</em><i class="yj-continue-progress" style="--yj-progress:${progress}%"></i><button class="yj-continue-play" data-continue-play="${index}" aria-label="继续播放 ${esc(item.Name || item.SeriesName || '当前内容')}">${ico('play')}</button></span></div><button class="yj-continue-copy" data-live-detail="${detailId}" data-kind="${kind}"><b>${esc(item.SeriesName ? `${item.SeriesName} · ${item.Name}` : item.Name)}</b><small>${esc(last)} · ${esc(item.server.name)}</small></button></article>`;
   }).join('');
-  app.innerHTML = yjShell(`<main class="yj-home ${sameView ? 'yj-no-anim' : ''}" style="--home-art:url('${yjArt(feature, 'backdrop', 'original')}')"><div class="yj-hero-wrap">${heroMarkup(feature, featureKind, heroes, live.heroIndex)}</div>
+  const homeArt = yjArt(feature, 'backdrop', 'original') || yjArt(feature, 'poster', 'original');
+  app.innerHTML = yjShell(`<main class="yj-home ${sameView ? 'yj-no-anim' : ''}" ${homeArt ? `style="--home-art:url('${homeArt}')"` : ''}><div class="yj-hero-wrap">${heroMarkup(feature, featureKind, heroes, live.heroIndex)}</div>
     <section class="yj-home-content yj-tv-home-content">${continueItems.length ? `<section class="yj-home-shelf yj-home-continue"><header class="yj-section-head"><h2>继续观看</h2><button data-open-shelf="continue">查看全部 ${ico('chevron')}</button></header><div class="yj-shelf-viewport yj-continue-viewport"><button class="yj-shelf-arrow is-prev" data-shelf-scroll="-1" aria-label="向左浏览继续观看">${ico('chevron')}</button><div class="yj-wide-rail" data-shelf-rail>${continueCards}</div><button class="yj-shelf-arrow is-next" data-shelf-scroll="1" aria-label="向右浏览继续观看">${ico('chevron')}</button></div></section>` : ''}
     <section class="yj-atv-rank-hub"><div><h2>影视榜单</h2><p>以真实热度、播出档期与口碑整理，随时回到正在发生的影视世界。</p></div><div class="yj-atv-rank-hub-actions"><span data-shelf-count>${enabledShelves.length} 个轨道</span><button class="yj-atv-rank-manage" data-shelf-panel>${ico('settings')} 定制</button></div></section>
     ${visibleShelves.map(({index, name, items: group, meta, enabled}, groupIndex) => `<section class="yj-atv-rank-row" data-shelf-name="${esc(name)}" ${enabled ? '' : 'hidden'} style="--yj-shelf-delay:${Math.min(220, groupIndex * 45)}ms"><header><div><h2>${esc(name)}</h2><p>${esc(meta?.summary || 'TMDB · 实时影视榜单')}</p></div><button class="yj-atv-rank-more" data-live-more="${index}">查看全部 ${ico('chevron')}</button></header><div class="yj-atv-rank-viewport"><button class="yj-rank-edge is-prev" data-rank-scroll="-1" aria-label="向左浏览 ${esc(name)}">${ico('chevron')}</button><div class="yj-atv-rank-scroll"><div class="yj-atv-rank-rail">${group.map((item, position) => yjRankingCard(item, position + 1, meta, 'rail', false)).join('')}</div></div><button class="yj-rank-edge is-next" data-rank-scroll="1" aria-label="向右浏览 ${esc(name)}">${ico('chevron')}</button></div></section>`).join('')}
@@ -270,9 +271,84 @@ library = function yjLibrary() {
   yjRestoreScroll(restoreScroll);
 };
 
+const yjMpvStyle = () => {
+  if (document.getElementById('yj-mpv-style')) return;
+  const style = document.createElement('style');
+  style.id = 'yj-mpv-style';
+  style.textContent = `
+    .yj-setting-select { align-items:flex-start !important; }
+    .yj-setting-select > span:last-of-type { flex:1 1 auto; }
+    .yj-setting-select select { margin-left:auto; min-width:8.5rem; max-width:14rem; padding:.45rem .6rem; border-radius:.6rem; background:rgba(255,255,255,.07); color:inherit; border:1px solid rgba(255,255,255,.14); font:inherit; font-size:.82rem; }
+    .yj-setting-select select:focus-visible { outline:2px solid #6ea8ff; outline-offset:1px; }
+    body.light .yj-setting-select select { background:rgba(8,12,20,.06); border-color:rgba(8,12,20,.18); }
+    .yj-setting-sub { font-size:.72rem; opacity:.55; margin:.1rem 0 .2rem; }
+    .yj-media-info { display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; margin:1.1rem 0 1.5rem; }
+    .yj-media-chip { display:inline-flex; flex-direction:column; align-items:flex-start; gap:.1rem; padding:.4rem .7rem; border-radius:.7rem; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1); min-width:4.2rem; }
+    .yj-media-chip b { font-size:.62rem; opacity:.58; font-weight:600; letter-spacing:.05em; text-transform:uppercase; }
+    .yj-media-chip i { font-style:normal; font-size:.92rem; font-weight:650; }
+    .yj-media-chip.yj-media-empty, .yj-media-chip.yj-media-ended { opacity:.6; font-size:.82rem; }
+    body.light .yj-media-chip { background:rgba(8,12,20,.05); border-color:rgba(8,12,20,.12); }
+    /* Home page without hero banner */
+    body.yj-ui .app .yj-home.yj-no-hero { padding-top: clamp(2rem, 4vh, 3.5rem); }
+    body.yj-ui .app .yj-home.yj-no-hero::before { display:none !important; }
+  `;
+  document.head.appendChild(style);
+};
+const selectControl = (key, label, hint, options) => `<article class="yj-setting-select"><span>${ico('chip')}</span><span><b>${esc(label)}</b><small>${esc(hint)}</small></span><select data-setting="${key}">${options.map(([value, text]) => `<option value="${esc(value)}" ${String(live.ui[key] ?? '') === String(value) ? 'selected' : ''}>${esc(text)}</option>`).join('')}</select></article>`;
+const yjPixelDepth = format => {
+  const f = String(format || '');
+  if (/p12/.test(f)) return '12-bit';
+  if (/p10/.test(f)) return '10-bit';
+  if (/p16/.test(f)) return '16-bit';
+  if (/p8|420p|422p|444p/.test(f)) return '8-bit';
+  return '';
+};
+const yjHdrLabel = v => {
+  if (!v) return '';
+  if (v.dovi || v.hdr === 'dovi') return 'Dolby Vision';
+  const gamma = v.gamma || '';
+  if (v.hdr === 'smpte2084' || gamma === 'smpte2084') return 'HDR10';
+  if (v.hdr === 'arib-std-b67' || gamma === 'arib-std-b67') return 'HLG';
+  if (v.hdr && v.hdr !== 'no') return String(v.hdr).toUpperCase();
+  if (v.primaries === 'bt.2020' && gamma === 'smpte2084') return 'HDR10';
+  return '';
+};
+const yjRenderMediaInfo = info => {
+  const host = document.querySelector('[data-mpv-info]');
+  if (!host) return;
+  if (info?.ended) { host.innerHTML = '<span class="yj-media-chip yj-media-ended">播放已结束</span>'; return; }
+  const v = info.video || {}, a = info.audio || {};
+  const chips = [];
+  const res = v.dw && v.dh ? `${v.dw}×${v.dh}` : (v.w && v.h ? `${v.w}×${v.h}` : null);
+  if (res) chips.push(['分辨率', res]);
+  if (v.codec) chips.push(['编码', String(v.codec).toUpperCase()]);
+  const depth = yjPixelDepth(v.format);
+  if (depth) chips.push(['位深', depth]);
+  const fps = info.fps || v.fps;
+  if (fps) chips.push(['帧率', `${Number(fps).toFixed(3).replace(/\.?0+$/, '')} fps`]);
+  const hdr = yjHdrLabel(v);
+  if (hdr) chips.push(['动态范围', hdr]);
+  if (info.bitrate) chips.push(['码率', `${(info.bitrate / 1000).toFixed(0)} kbps`]);
+  if (a.codec) chips.push(['音频编码', String(a.codec).toUpperCase()]);
+  if (a.channels) chips.push(['声道', a.channels]);
+  if (a.samplerate) chips.push(['采样率', `${(a.samplerate / 1000).toFixed(1)} kHz`]);
+  host.innerHTML = chips.length
+    ? chips.map(([k, val]) => `<span class="yj-media-chip"><b>${esc(k)}</b><i>${esc(val)}</i></span>`).join('')
+    : '<span class="yj-media-chip yj-media-empty">正在读取媒体信息…</span>';
+};
+
 settingsV2 = function yjSettings() {
   const servers = providerConfig.emby || [];
-  app.innerHTML = yjShell(`<main class="yj-page"><header class="yj-page-head"><span class="yj-eyebrow">PREFERENCES</span><h1>设置</h1><p>连接服务、播放器和本机隐私选项。</p></header><div class="yj-settings-layout"><nav class="yj-settings-nav"><button class="is-active">账户与服务</button><button>播放</button><button>字幕</button><button>网络与缓存</button><button>关于映迹</button></nav><section class="yj-settings-content"><section class="yj-setting-group"><header><h2>元数据与追剧</h2></header><article><span class="yj-service-badge">T</span><span><b>TMDB</b><small>中文资料、海报与搜索</small></span>${connectionBadge(!!metadataEndpoint || !!providerConfig.tmdb)}</article><form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key（托管模式可选）"><button>保存并测试</button></form><article><span class="yj-service-badge">Tr</span><span><b>Trakt</b><small>观看记录与追剧日历</small></span>${connectionBadge(!!providerConfig.traktAuthorized)}</article><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存凭据</button></form>${providerConfig.trakt ? `<button class="secondary" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button><div data-trakt-device></div>` : ''}</section><section class="yj-setting-group"><header><h2>播放器</h2><span>mpv</span></header><article><span>${ico('smart')}</span><span><b>硬件解码</b><small>D3D11 与 gpu-next</small></span>${toggleControl('hardware','硬件解码')}</article><article><span>${ico('play')}</span><span><b>HDR 与 Dolby Vision</b><small>跟随显示器能力</small></span>${toggleControl('hdr','HDR 与 Dolby Vision')}</article><article><span>${ico('library')}</span><span><b>已连接服务器</b><small>${servers.length} 个 Emby / Jellyfin 来源</small></span><button class="yj-inline" data-go="library">管理 ${ico('chevron')}</button></article></section></section></div></main>`, 'settings', { title: '设置' });
+  app.innerHTML = yjShell(`<main class="yj-page"><header class="yj-page-head"><span class="yj-eyebrow">PREFERENCES</span><h1>设置</h1><p>连接服务、播放器和本机隐私选项。</p></header><div class="yj-settings-layout"><nav class="yj-settings-nav"><button class="is-active">账户与服务</button><button>播放</button><button>字幕</button><button>网络与缓存</button><button>关于映迹</button></nav><section class="yj-settings-content"><section class="yj-setting-group"><header><h2>元数据与追剧</h2></header><article><span class="yj-service-badge">T</span><span><b>TMDB</b><small>中文资料、海报与搜索</small></span>${connectionBadge(!!metadataEndpoint || !!providerConfig.tmdb)}</article><form data-provider="tmdb"><input name="key" type="password" required placeholder="TMDB API Key（托管模式可选）"><button>保存并测试</button></form><article><span class="yj-service-badge">Tr</span><span><b>Trakt</b><small>观看记录与追剧日历</small></span>${connectionBadge(!!providerConfig.traktAuthorized)}</article><form data-provider="trakt"><input name="key" type="password" required placeholder="Trakt Client ID"><input name="secret" type="password" required placeholder="Trakt Client Secret"><button>保存凭据</button></form>${providerConfig.trakt ? `<button class="secondary" data-trakt-auth>${providerConfig.traktAuthorized ? '重新授权 Trakt' : '授权 Trakt 账户'}</button><div data-trakt-device></div>` : ''}</section><section class="yj-setting-group"><header><h2>播放器</h2><span>mpv</span></header><article><span>${ico('smart')}</span><span><b>硬件解码</b><small>D3D11 与 gpu-next</small></span>${toggleControl('hardware','硬件解码')}</article>${selectControl('hwdec', '硬解模式', '自动安全优先兼容，D3D11VA Copy 用于多显卡', [['auto-safe','自动安全'],['d3d11va','D3D11VA'],['d3d11va-copy','D3D11VA Copy'],['no','软解 (CPU)']])}${selectControl('renderer', '渲染器', 'gpu-next 支持 HDR 与色调映射', [['gpu-next','gpu-next'],['gpu','gpu']])}${selectControl('gpu', 'GPU 选择', '指定 D3D11 适配器，留空自动', [['','自动（系统默认）']])}<article><span>${ico('play')}</span><span><b>HDR 与 Dolby Vision</b><small>跟随显示器能力</small></span>${toggleControl('hdr','HDR 与 Dolby Vision')}</article><article><span>${ico('audio')}</span><span><b>立体声下混</b><small>多声道压缩为立体声</small></span>${toggleControl('downmix','立体声下混')}</article><article><span>${ico('audio')}</span><span><b>人声增强</b><small>提升对白清晰度</small></span>${toggleControl('vocal','人声增强')}</article><article><span>${ico('audio')}</span><span><b>夜间模式</b><small>压缩动态范围，避免忽大忽小</small></span>${toggleControl('night','夜间模式')}</article><article><span>${ico('library')}</span><span><b>已连接服务器</b><small>${servers.length} 个 Emby / Jellyfin 来源</small></span><button class="yj-inline" data-go="library">管理 ${ico('chevron')}</button></article></section></section></div></main>`, 'settings', { title: '设置' });
+  yjMpvStyle();
+  if (!prototypeMode && window.yingjiDesktop?.listAdapters) {
+    window.yingjiDesktop.listAdapters().then(adapters => {
+      const sel = document.querySelector('select[data-setting="gpu"]');
+      if (!sel) return;
+      const current = live.ui.gpu || '';
+      sel.innerHTML = ['<option value="">自动（系统默认）</option>'].concat((adapters || []).map(name => `<option value="${esc(name)}" ${current === name ? 'selected' : ''}>${esc(name)}</option>`)).join('');
+    }).catch(() => {});
+  }
 };
 
 const yjSettingsWithAppearance = settingsV2;
@@ -291,7 +367,43 @@ settingsV2 = function yjSettingsAppearance() {
   if (document.documentElement.dataset.appearance === 'light') nav?.querySelector('.is-active')?.style.setProperty('color','#183a66','important');
 };
 
+const yjSettingsWithMediaPreferences = settingsV2;
+settingsV2 = function yjSettingsMediaPreferences() {
+  yjSettingsWithMediaPreferences();
+  const content = document.querySelector('.yj-settings-content');
+  const nav = document.querySelector('.yj-settings-nav');
+  if (!content || !nav) return;
+  const servers = providerConfig.emby || [];
+  content.insertAdjacentHTML('beforeend', `<section id="settings-subtitles" class="yj-setting-group"><header><h2>字幕</h2><span>播放器偏好</span></header><article><span>${ico('audio')}</span><span><b>显示字幕</b><small>播放时允许 mpv 自动载入和切换字幕</small></span>${toggleControl('subtitleEnabled','显示字幕')}</article>${selectControl('subtitleLanguage','优先语言','媒体含有多个字幕时优先选择', [['auto','自动'],['chi','简体中文'],['zho','中文'],['eng','English'],['jpn','日本語']])}${selectControl('subtitleScale','字幕大小','仅调整播放器字幕缩放', [['85','小'],['100','标准'],['115','大'],['130','特大']])}</section><section id="settings-danmaku" class="yj-setting-group"><header><h2>弹幕</h2><span>本地显示偏好</span></header><article><span>${ico('more')}</span><span><b>启用弹幕</b><small>为已连接弹幕源保留播放时显示开关</small></span>${toggleControl('danmakuEnabled','启用弹幕')}</article>${selectControl('danmakuMode','显示模式','按视频时间轴显示已连接的弹幕源', [['smart','智能避让'],['top','顶部优先'],['bottom','底部优先']])}${selectControl('danmakuDensity','显示密度','控制同时出现的弹幕数量', [['low','稀疏'],['normal','标准'],['high','密集']])}</section><section id="settings-servers" class="yj-setting-group"><header><h2>服务器</h2><span>${servers.length} 个已添加来源</span></header>${servers.length ? servers.map(server => `<article><span>${ico('library')}</span><span><b>${esc(server.name || '媒体服务器')}</b><small>${esc(server.kind || 'Emby')} · ${server.aggregate === false ? '不参与详情页聚合' : '参与详情页聚合'}</small></span><button class="switch ${server.aggregate === false ? 'off' : ''}" type="button" role="switch" aria-checked="${server.aggregate !== false}" aria-label="${esc(server.name || '媒体服务器')} 聚合搜索" data-server-aggregate="${esc(server.id)}"></button></article>`).join('') : yjEmpty('尚未添加服务器','在资料库中连接 Emby、Jellyfin 或 WebDAV。','<button class="primary" data-go="library">前往资料库</button>')}<button class="secondary yj-settings-library" data-go="library">管理媒体服务器 ${ico('chevron')}</button></section>`);
+  const danmaku = providerConfig.danmaku || {};
+  content.querySelector('#settings-danmaku')?.insertAdjacentHTML('beforeend', `<form class="yj-danmaku-api-form" data-danmaku-api><label><b>弹幕 API</b><small>使用 {tmdbId}、{season}、{episode}、{title} 作为 URL 占位符。</small><input name="urlTemplate" value="${esc(danmaku.urlTemplate || '')}" placeholder="https://example.com/danmaku/{tmdbId}/{episode}"></label><label><b>API Token（可选）</b><input name="token" type="password" placeholder="${danmaku.token ? '已保存，留空则不修改' : 'Bearer Token'}"></label><button class="secondary" type="submit">保存弹幕 API</button></form>`);
+  nav.innerHTML = `<button class="is-active" data-settings-section="settings-services">账户与服务</button><button data-settings-section="settings-playback">播放</button><button data-settings-section="settings-subtitles">字幕</button><button data-settings-section="settings-danmaku">弹幕</button><button data-settings-section="settings-servers">服务器</button><button data-settings-section="settings-appearance">外观</button>`;
+};
+
+document.addEventListener('submit', event => {
+  const form = event.target.closest('[data-danmaku-api]');
+  if (!form) return;
+  event.preventDefault();
+  const data = new FormData(form), urlTemplate = String(data.get('urlTemplate') || '').trim(), token = String(data.get('token') || '').trim();
+  if (urlTemplate && !/^https?:\/\//i.test(urlTemplate)) { notify('弹幕 API 必须使用 HTTP 或 HTTPS 地址'); return; }
+  providerConfig.danmaku = { ...(providerConfig.danmaku || {}), urlTemplate };
+  if (token) providerConfig.danmaku.token = token;
+  saveProviders();
+  notify(urlTemplate ? '弹幕 API 已保存' : '已移除弹幕 API');
+}, true);
+
 document.addEventListener('click', event => {
+  const aggregate = event.target.closest('[data-server-aggregate]');
+  if (aggregate) {
+    const source = (providerConfig.emby || []).find(server => String(server.id) === String(aggregate.dataset.serverAggregate));
+    if (!source) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    source.aggregate = !(source.aggregate !== false); saveProviders();
+    aggregate.classList.toggle('off', source.aggregate === false); aggregate.setAttribute('aria-checked', String(source.aggregate !== false));
+    const copy = aggregate.closest('article')?.querySelector('small'); if (copy) copy.textContent = `${source.kind || 'Emby'} · ${source.aggregate === false ? '不参与详情页聚合' : '参与详情页聚合'}`;
+    notify(`${source.name || '媒体服务器'}已${source.aggregate === false ? '退出' : '加入'}详情页聚合`);
+    return;
+  }
   const target = event.target.closest('[data-settings-section]');
   if (!target) return;
   const section = document.getElementById(target.dataset.settingsSection);
@@ -398,7 +510,7 @@ renderLiveDetail = function yjDetail() {
       list.innerHTML = serverGroups.map((group, groupIndex) => {
         const chosen = group.choices.find(choice => choice.index === data.selectedResource)?.source || group.choices[0].source;
         const versions = group.choices.map(({source,index}) => `<button class="yj-version-choice ${index === data.selectedResource ? 'is-active' : ''}" data-select-resource="${index}"><span><b>${esc(sourceVersion(source))}</b><small>${esc(sourceSize(source))} · ${esc(sourceBitrate(source))}</small></span><span><b>${esc(sourceRange(source))}</b><small>${esc(sourceAudioLabel(source))}</small></span>${index === data.selectedResource ? `<em>已选择</em>` : ''}</button>`).join('');
-        return `<div class="yj-server-version-group"><button class="yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceRange(chosen))} · ${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>${pickerIndex === groupIndex ? `<section class="yj-version-sheet yj-version-sheet-inline" aria-label="${esc(group.name)} 的播放版本"><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section>` : ''}</div>`;
+        return `<div class="yj-server-version-group"><button class="yj-resource yj-resource-server-card ${group.choices.some(choice => choice.index === data.selectedResource) ? 'is-active' : ''}" data-open-server-versions="${groupIndex}" aria-label="查看 ${esc(group.name)} 的 ${group.choices.length} 个版本"><i>${esc(group.name[0])}</i><span><b>${esc(group.name)}</b><small>${esc(group.kind)} · ${group.choices.length} 个 ${esc(data.selectedResolution || '')} 版本</small></span><span><b>${esc(sourceVersion(chosen))}</b><small>${esc(sourceRange(chosen))} · ${esc(sourceAudioLabel(chosen))}</small></span><em>选择版本 ${ico('chevron')}</em></button>${pickerIndex === groupIndex ? `<div class="yj-version-backdrop" data-close-server-versions><section class="yj-version-sheet" role="dialog" aria-modal="true" aria-label="${esc(group.name)} 的播放版本" data-version-dialog><header><div><h3>${esc(group.name)}</h3><p>${group.choices.length} 个 ${esc(data.selectedResolution || '')} 匹配版本</p></div><button data-close-server-versions aria-label="关闭版本选择">${ico('close')}</button></header><div class="yj-version-choices">${versions}</div></section></div>` : ''}</div>`;
       }).join('');
     }
   }
@@ -422,7 +534,9 @@ const yjLoadDetailSeason = async seasonNumber => {
 };
 
 showPlayerHandoff = function yjPlayerHandoff(title) {
-  app.innerHTML = yjShell(`<main class="yj-page yj-handoff"><span class="yj-handoff-icon">${ico('play')}</span><span class="yj-eyebrow">NOW PLAYING IN MPV</span><h1>${esc(title)}</h1><p>mpv 已接管高品质播放。关闭播放器后可以返回资料库继续选择内容。</p><button class="primary" data-go="library">返回资料库</button></main>`, 'library', { title: '正在播放' });
+  app.innerHTML = yjShell(`<main class="yj-page yj-handoff"><span class="yj-handoff-icon">${ico('play')}</span><span class="yj-eyebrow">NOW PLAYING IN MPV</span><h1>${esc(title)}</h1><p>mpv 已接管高品质播放。关闭播放器后可以返回资料库继续选择内容。</p><div class="yj-media-info" data-mpv-info aria-live="polite"><span class="yj-media-chip yj-media-empty">等待播放器媒体信息…</span></div><button class="primary" data-go="library">返回资料库</button></main>`, 'library', { title: '正在播放' });
+  yjMpvStyle();
+  if (!prototypeMode && window.yingjiDesktop?.mediaInfo) window.yingjiDesktop.mediaInfo(info => yjRenderMediaInfo(info));
 };
 
 syncTraktCalendar = async function yjSyncCalendar() {
@@ -586,7 +700,7 @@ document.addEventListener('contextmenu', event => {
   const source = yjSources().find(item => String(item.id) === String(card.dataset.serverCard));
   if (!source) return;
   const lines = source.kind === 'WebDAV' ? '' : (source.addresses || [source.url]).map((address,index) => `<button data-context-line="${index}"><span>线路 ${index + 1}</span><small>${esc(new URL(address).host)}</small>${index === source.activeAddress ? '<em>当前</em>' : ''}</button>`).join('');
-  document.body.insertAdjacentHTML('beforeend', `<menu class="yj-server-menu" data-server-menu data-server-id="${esc(source.id)}" style="--menu-x:${event.clientX}px;--menu-y:${event.clientY}px"><button data-context-edit>${ico('settings')} 编辑此服务器</button><button data-context-refresh>${ico('refresh')} 重新连接并刷新</button><button data-context-icon>${ico('library')} 修改图标</button>${lines}</menu>`);
+  document.body.insertAdjacentHTML('beforeend', `<menu class="yj-server-menu" data-server-menu data-server-id="${esc(source.id)}" style="--menu-x:${event.clientX}px;--menu-y:${event.clientY}px"><button data-context-edit>${ico('settings')} 编辑此服务器</button><button data-context-refresh>${ico('refresh')} 重新连接并刷新</button><button data-context-icon>${ico('library')} 修改图标</button><button data-context-aggregate>${ico('library')} ${source.aggregate === false ? '加入详情页聚合' : '退出详情页聚合'}</button>${lines}</menu>`);
 });
 document.addEventListener('click', event => {
   const menu = event.target.closest('[data-server-menu]');
@@ -594,6 +708,7 @@ document.addEventListener('click', event => {
   const source = yjSources().find(item => String(item.id) === String(menu.dataset.serverId));
   if (event.target.closest('[data-context-edit]') && source) { live.editingServerId = source.kind === 'WebDAV' ? null : source.id; live.editingFileId = source.kind === 'WebDAV' ? source.id : null; live.addingServer=true; live.preserveLibraryScroll=window.scrollY; menu.remove(); library(); return; }
   if (event.target.closest('[data-context-refresh]') && source) { const button=event.target.closest('[data-context-refresh]'); button.disabled=true; button.textContent='正在重新连接…'; refreshSource(source.id).then(() => { menu.remove(); notify(`${source.name} 已重新连接并更新信息`); }).catch(error => { button.disabled=false; notify(`刷新失败：${error.message}`); }); return; }
+  if (event.target.closest('[data-context-aggregate]') && source) { source.aggregate = !(source.aggregate !== false); saveProviders(); menu.remove(); library(); notify(`${source.name}已${source.aggregate === false ? '退出' : '加入'}详情页聚合`); return; }
   const line = event.target.closest('[data-context-line]');
   if (line && source) { source.activeAddress = Number(line.dataset.contextLine); source.url = source.addresses[source.activeAddress]; saveProviders(); menu.remove(); library(); notify(`已切换到线路 ${source.activeAddress + 1}`); return; }
   if (event.target.closest('[data-context-icon]') && source) { const input=document.createElement('input'); input.type='file'; input.accept='image/png,image/jpeg,image/webp'; input.onchange=()=>{const file=input.files?.[0]; if(!file || file.size>2*1024*1024) return notify('请选择小于 2 MB 的图片'); const reader=new FileReader(); reader.onload=()=>{source.customIcon=reader.result;saveProviders();menu.remove();library();notify('服务器图标已更新');};reader.readAsDataURL(file);};input.click(); }

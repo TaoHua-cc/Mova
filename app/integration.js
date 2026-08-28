@@ -2,7 +2,7 @@ const readLocalJson = (key, fallback) => {
   try { const value = JSON.parse(localStorage.getItem(key)); return value ?? fallback; }
   catch { localStorage.removeItem(key); return fallback; }
 };
-const defaultUi = { calendarFilter: 'all', calendarDay: 2, searchFilter: 'all', recentSearches: ['群星','深海之门','逆时之焰','边境集'], toggles: { hardware: true, hdr: true, traktOnly: false, tmdb: true, emby: true, trakt: false, wifi: true } };
+const defaultUi = { calendarFilter: 'all', calendarDay: 2, searchFilter: 'all', recentSearches: ['群星','深海之门','逆时之焰','边境集'], hwdec: 'auto-safe', renderer: 'gpu-next', gpu: '', subtitleLanguage: 'auto', subtitleScale: '100', danmakuMode: 'smart', danmakuDensity: 'normal', toggles: { hardware: true, hdr: true, downmix: false, vocal: false, night: false, subtitleEnabled: true, danmakuEnabled: false, traktOnly: false, tmdb: true, emby: true, trakt: false, wifi: true } };
 const storedUi = readLocalJson('yingji.ui', {});
 const providerConfig = readLocalJson('yingji.providers', { emby: [] });
 providerConfig.emby = Array.isArray(providerConfig.emby) ? providerConfig.emby : [];
@@ -533,7 +533,7 @@ async function loadDetailResources(context) {
   const title = context.detail.name || context.detail.title || context.item.name || context.item.title;
   const tmdbId = context.tmdbId;
   try {
-    const groups = await Promise.all((providerConfig.emby || []).map(async server => {
+    const groups = await Promise.all((providerConfig.emby || []).filter(server => server.aggregate !== false).map(async server => {
       const token = await window.yingjiDesktop.getSecret(`emby-${server.id}`);
       const base = `${server.url}/Users/${server.userId}/Items`;
       const headers = embyHeaders(token);
@@ -805,10 +805,27 @@ async function playEmby(item) {
   url.searchParams.set('MediaSourceId', source.Id);
   url.searchParams.set('api_key', item.token);
   if (info.PlaySessionId) url.searchParams.set('PlaySessionId', info.PlaySessionId);
+  let danmaku = '';
+  const template = String(providerConfig.danmaku?.urlTemplate || '').trim();
+  if (live.ui.toggles.danmakuEnabled && template) {
+    const endpoint = template
+      .replaceAll('{tmdbId}', encodeURIComponent(item.ProviderIds?.Tmdb || item.tmdbId || ''))
+      .replaceAll('{season}', encodeURIComponent(item.ParentIndexNumber || '0'))
+      .replaceAll('{episode}', encodeURIComponent(item.IndexNumber || '0'))
+      .replaceAll('{title}', encodeURIComponent(item.SeriesName || item.Name || ''));
+    try {
+      danmaku = await request(endpoint, { responseType:'text', headers: providerConfig.danmaku?.token ? { Authorization:`Bearer ${providerConfig.danmaku.token}` } : {} });
+    } catch (error) { notify(`弹幕加载失败：${error.message || '请检查 API 设置'}`); }
+  }
   await window.yingjiDesktop.playMpv({
     url: url.href, title, token: item.token, serverUrl: item.server.url, userId: item.server.userId,
     itemId: item.Id, mediaSourceId: source.Id, playSessionId: info.PlaySessionId,
-    position: (item.UserData?.PlaybackPositionTicks || 0) / 10000000
+    position: (item.UserData?.PlaybackPositionTicks || 0) / 10000000,
+    bitrate: Number(source.Bitrate || 0),
+    hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu,
+    downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night,
+    subtitleEnabled: live.ui.toggles.subtitleEnabled, subtitleLanguage: live.ui.subtitleLanguage, subtitleScale: live.ui.subtitleScale,
+    danmakuEnabled: live.ui.toggles.danmakuEnabled, danmakuDensity: live.ui.danmakuDensity, danmaku
   });
 }
 
@@ -895,7 +912,7 @@ document.addEventListener('click', async event => {
   if (target.dataset.embyPlay !== undefined) return runBusy(target, () => playEmby(live.library[Number(target.dataset.embyPlay)]).catch(error => notify(`播放失败：${error.message}`)));
   if (target.dataset.urlPlay !== undefined) {
     const item = live.fileItems[Number(target.dataset.urlPlay)];
-    return runBusy(target, () => window.yingjiDesktop.openUrl({ url: item.url, title: item.name, authorization: item.authorization }).catch(error => notify(`播放失败：${error.message}`)));
+    return runBusy(target, () => window.yingjiDesktop.openUrl({ url: item.url, title: item.name, authorization: item.authorization, hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu, downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night }).catch(error => notify(`播放失败：${error.message}`)));
   }
   if (target.dataset.liveDetail !== undefined) showLiveDetail(target.dataset.liveDetail, target.dataset.kind);
   if (target.dataset.liveMore !== undefined) return showLiveRanking(target.dataset.liveMore);
@@ -1035,6 +1052,19 @@ document.addEventListener('click', async event => {
     live.detail.selectedResource = Number(target.dataset.selectResource);
     live.detail.resourceServerPicker = null;
     renderLiveDetail();
+  }
+});
+
+// Settings selects (hardware decoder / renderer / GPU) persist to live.ui.
+document.addEventListener('change', event => {
+  const select = event.target.closest('select[data-setting]');
+  if (!select) return;
+  const key = select.dataset.setting;
+  const value = select.value;
+  if (['hwdec', 'renderer', 'gpu', 'subtitleLanguage', 'subtitleScale', 'danmakuMode', 'danmakuDensity'].includes(key)) {
+    live.ui[key] = value; saveUi();
+    const label = { hwdec:'硬解模式', renderer:'渲染器', gpu:'GPU', subtitleLanguage:'字幕语言', subtitleScale:'字幕大小', danmakuMode:'弹幕模式', danmakuDensity:'弹幕密度' }[key];
+    notify(`${label}已更新，下次播放生效`);
   }
 });
 
