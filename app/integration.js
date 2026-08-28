@@ -421,6 +421,13 @@ const sourceCodec = source => {
 };
 const sourceSize = source => source?.Size ? `${(source.Size / 1073741824).toFixed(1)} GB` : '大小未知';
 const sourceBitrate = source => source?.Bitrate ? `${(source.Bitrate / 1000000).toFixed(2)} Mbps` : '码率未知';
+const resourceSortRanks = { 'Dolby Vision': 4, 'HDR10+': 3, HDR10: 2, HLG: 1, SDR: 0 };
+window.yjSortResourceList = (list, context = {}) => {
+  const key = context.resourceSort || 'bitrate';
+  const direction = context.resourceSortDirection === 'asc' ? 1 : -1;
+  const value = source => key === 'resolution' ? qualityRank(sourceQuality(source)) : key === 'range' ? (resourceSortRanks[sourceRange(source)] ?? 0) : key === 'size' ? Number(source.Size || 0) : Number(source.Bitrate || 0);
+  return [...(list || [])].sort((a, b) => direction * (value(a) - value(b)) || Number(b.Bitrate || 0) - Number(a.Bitrate || 0));
+};
 const episodeLabel = episode => episode.movie ? '正片' : `S${String(episode.season).padStart(2, '0')} · E${String(episode.number).padStart(2, '0')}`;
 
 /* Legacy detail renderer kept only as a fallback for older integrations.
@@ -532,6 +539,8 @@ const addressUrlsFromForm = form => [...form.querySelectorAll('[data-address-row
 const sourceAddressRowMarkup = () => `<div class="yj-address-row" data-address-row><div class="yj-address-protocol"><button type="button" class="is-active" data-address-protocol="https">HTTPS</button><button type="button" data-address-protocol="http">HTTP</button></div><input name="hosts" required placeholder="media.example.com" aria-label="服务器地址"><input name="ports" inputmode="numeric" value="8096" placeholder="端口" aria-label="端口"><input name="paths" placeholder="路径（可选，例如 /emby）" aria-label="路径"><button type="button" data-remove-address aria-label="移除地址">×</button></div>`;
 
 async function loadDetailResources(context) {
+  context.resourceLoading = true;
+  context.resourceError = null;
   const selected = context.episodes.find(episode => episode.number === context.selectedEpisode) || context.episodes[0];
   const title = context.detail.name || context.detail.title || context.item.name || context.item.title;
   const tmdbId = context.tmdbId;
@@ -589,6 +598,7 @@ async function loadDetailResources(context) {
     context.resourceError = error.message || '资源读取失败';
   }
   if (live.detail !== context || context.detailLoadKey !== live.detailLoadKey || state.view !== 'detail') return;
+  context.resourceLoading = false;
   window.renderLiveDetail?.();
 }
 async function showLiveDetail(subject, preferredKind) {
@@ -643,7 +653,7 @@ async function showLiveDetail(subject, preferredKind) {
   if (cached?.context && Date.now() - (cached.savedAt || 0) < 7 * 86400000 && (!requestedSeason || Number(cached.context.seasonNumber) === requestedSeason)) {
     const cachedEpisodes = cached.context.episodes || [];
     const selectedEpisode = cachedEpisodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (cached.context.selectedEpisode || cachedEpisodes[0]?.number || 1);
-    const context = { ...cached.context, item, kind, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
+    const context = { ...cached.context, item, kind, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, resourceLoading: true, resourceError: null, detailLoadKey };
     live.detail = context;
     window.renderLiveDetail?.();
     loadDetailResources(context);
@@ -668,7 +678,7 @@ async function showLiveDetail(subject, preferredKind) {
     try { localStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), context: { detail, seasonNumber, episodes } })); } catch {}
     if (live.detailLoadKey !== detailLoadKey || state.view !== 'detail') return;
     const selectedEpisode = episodes.some(episode => Number(episode.number) === requestedEpisode) ? requestedEpisode : (episodes[0]?.number || 1);
-    const context = { item, detail, kind, seasonNumber, episodes, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, detailLoadKey };
+    const context = { item, detail, kind, seasonNumber, episodes, tmdbId, selectedEpisode, resources: [], selectedResolution: '全部', selectedResource: 0, resourceLoading: true, resourceError: null, detailLoadKey };
     live.detail = context;
     window.renderLiveDetail?.();
     loadDetailResources(context);
@@ -892,7 +902,7 @@ document.addEventListener('pointerup', event => { if (yjShelfPress?.pointerId ==
 document.addEventListener('pointercancel', event => { if (yjShelfPress?.pointerId === event.pointerId) yjClearShelfPress(false); });
 
 document.addEventListener('click', async event => {
-  const target = event.target.closest('[data-yj-back],[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance]');
+  const target = event.target.closest('[data-yj-back],[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-resource-sort],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance]');
   if (!target) return;
   if (target.dataset.loadRankingMore !== undefined) return runBusy(target, () => loadMoreRanking(Number(target.dataset.loadRankingMore)));
   if (target.hasAttribute('data-yj-back')) { if (typeof yjBack === 'function') yjBack(); else { state.view = 'home'; if (typeof live !== 'undefined') live.detail = null; render(); } return; }
@@ -901,7 +911,7 @@ document.addEventListener('click', async event => {
   if (target.hasAttribute('data-load-library')) return runBusy(target, loadLibrary);
   if (target.hasAttribute('data-retry-search')) return runBusy(target, () => searchDiscovery(live.search?.query || ''));
   if (target.hasAttribute('data-detail-play') && live.detail) {
-    const matches = (live.detail.resources || []).filter(source => sourceQuality(source) === live.detail.selectedResolution).sort((a,b) => Number(b.Bitrate || 0) - Number(a.Bitrate || 0));
+    const matches = window.yjSortResourceList((live.detail.resources || []).filter(source => sourceQuality(source) === live.detail.selectedResolution), live.detail);
     const item = matches[live.detail.selectedResource] || matches[0];
     if (!item) return notify('当前没有可播放版本');
     return runBusy(target, () => playEmby(item).catch(error => notify(`播放失败：${error.message}`)));
@@ -1020,7 +1030,7 @@ document.addEventListener('click', async event => {
   if (target.dataset.selectEpisode !== undefined && live.detail) {
     const episode = Number(target.dataset.selectEpisode);
     if (episode === Number(live.detail.selectedEpisode) && live.detail.resources?.length) {
-      const matches = live.detail.resources.filter(source => sourceQuality(source) === live.detail.selectedResolution).sort((a,b) => Number(b.Bitrate || 0) - Number(a.Bitrate || 0));
+      const matches = window.yjSortResourceList(live.detail.resources.filter(source => sourceQuality(source) === live.detail.selectedResolution), live.detail);
       const item = matches[live.detail.selectedResource] || matches[0];
       if (item) return playEmby(item).catch(error => notify(`播放失败：${error.message}`));
     }
@@ -1028,11 +1038,21 @@ document.addEventListener('click', async event => {
     live.detail.resources = [];
     live.detail.selectedResolution = '';
     live.detail.selectedResource = 0;
+    live.detail.resourceLoading = true;
+    live.detail.resourceError = null;
     window.renderLiveDetail?.();
     loadDetailResources(live.detail);
   }
   if (target.dataset.resolution !== undefined && live.detail) {
     live.detail.selectedResolution = target.dataset.resolution;
+    live.detail.selectedResource = 0;
+    live.detail.resourceServerPicker = null;
+    window.renderLiveDetail?.();
+  }
+  if (target.dataset.resourceSort !== undefined && live.detail) {
+    const key = target.dataset.resourceSort;
+    live.detail.resourceSortDirection = live.detail.resourceSort === key && live.detail.resourceSortDirection === 'desc' ? 'asc' : 'desc';
+    live.detail.resourceSort = key;
     live.detail.selectedResource = 0;
     live.detail.resourceServerPicker = null;
     window.renderLiveDetail?.();
