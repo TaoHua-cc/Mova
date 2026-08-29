@@ -1,0 +1,8 @@
+{
+  "approved": true,
+  "approvedAt": "2026-08-29",
+  "surface": "mpv desktop player",
+  "mode": "operate",
+  "image": "player-c-playback-console.png",
+  "prompt": "Yingji Playback Console: full-bleed video; small top title and native window actions; one 104px translucent lower console whose top edge is the scrubber; metadata left, transport centered, utilities right; the selected episode control opens one wide shallow horizontal episode tray upward; near-black canvas, restrained structural glass, white selected state, system typography and coherent outline icons."
+}

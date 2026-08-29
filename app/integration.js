@@ -2,11 +2,128 @@ const readLocalJson = (key, fallback) => {
   try { const value = JSON.parse(localStorage.getItem(key)); return value ?? fallback; }
   catch { localStorage.removeItem(key); return fallback; }
 };
-const defaultUi = { calendarFilter: 'all', calendarDay: 2, searchFilter: 'all', recentSearches: ['群星','深海之门','逆时之焰','边境集'], hwdec: 'auto-safe', renderer: 'gpu-next', gpu: '', subtitleLanguage: 'auto', subtitleScale: '100', danmakuMode: 'smart', danmakuDensity: 'normal', toggles: { hardware: true, hdr: true, downmix: false, vocal: false, night: false, subtitleEnabled: true, danmakuEnabled: false, traktOnly: false, tmdb: true, emby: true, trakt: false, wifi: true } };
+const defaultUi = { calendarFilter: 'all', calendarDay: 2, searchFilter: 'all', recentSearches: ['群星','深海之门','逆时之焰','边境集'], hwdec: 'auto-safe', renderer: 'gpu-next', gpu: '', subtitleLanguage: 'auto', subtitleScale: '100', danmakuMode: 'smart', danmakuDensity: 'normal', danmakuFontScale: '100', danmakuOpacity: '86', danmakuDuration: '5', danmakuMaxCount: '1500', danmakuOutline: 'soft', toggles: { hardware: true, hdr: true, downmix: false, vocal: false, night: false, subtitleEnabled: true, danmakuEnabled: false, chapterAutoSkip: true, traktOnly: false, tmdb: true, emby: true, trakt: false, wifi: true } };
 const storedUi = readLocalJson('yingji.ui', {});
 const providerConfig = readLocalJson('yingji.providers', { emby: [] });
 providerConfig.emby = Array.isArray(providerConfig.emby) ? providerConfig.emby : [];
 providerConfig.files = Array.isArray(providerConfig.files) ? providerConfig.files : [];
+if (!providerConfig.playerPreferences || typeof providerConfig.playerPreferences !== 'object' || Array.isArray(providerConfig.playerPreferences)) providerConfig.playerPreferences = {};
+const normalizeDanmakuTemplate = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw), path = parsed.pathname.replace(/\/+$/, '');
+    if (/\/api\/v2$/i.test(path)) return `${parsed.origin}${path}/fongmi/danmaku?name={name}&episode={episode}`;
+    if (/\/api\/v2\/fongmi\/danmaku$/i.test(path)) {
+      if (!parsed.searchParams.has('name')) parsed.searchParams.set('name','{name}');
+      if (!parsed.searchParams.has('episode')) parsed.searchParams.set('episode','{episode}');
+      return parsed.href;
+    }
+    if (!parsed.search && !/\/api\/v2\/(?:comment|search|match|bangumi|fongmi)\b/i.test(path)) return `${raw.replace(/\/+$/, '')}/api/v2/fongmi/danmaku?name={name}&episode={episode}`;
+  } catch {}
+  return raw;
+};
+const yjDanmakuApis = () => {
+  const value = providerConfig.danmaku;
+  const entries = Array.isArray(value) ? value : Array.isArray(value?.apis) ? value.apis : value?.urlTemplate ? [value] : [];
+  return entries.map((entry, index) => ({ id:String(entry?.id || `danmaku-${index + 1}`), name:String(entry?.name || `弹幕 API ${index + 1}`), urlTemplate:normalizeDanmakuTemplate(entry?.urlTemplate), token:String(entry?.token || '') })).filter(entry => entry.urlTemplate);
+};
+const defaultChapterApis = [
+  { id:'theintrodb', name:'TheIntroDB', urlTemplate:'https://api.theintrodb.org/v3/media?tmdb_id={tmdbid}&season={season}&episode={episode}', token:'', priority:1, enabled:true, builtin:true },
+  { id:'introdb', name:'IntroDB', urlTemplate:'https://api.introdb.app/intro?imdb_id={imdbid}&season={season}&episode={episode}', token:'', priority:2, enabled:true, builtin:true }
+];
+const yjChapterApis = () => {
+  const source = Array.isArray(providerConfig.chapterApis) ? providerConfig.chapterApis : defaultChapterApis;
+  return source.map((entry, index) => ({
+    id:String(entry?.id || `chapter-${index + 1}`), name:String(entry?.name || `片头片尾源 ${index + 1}`), urlTemplate:String(entry?.urlTemplate || '').trim(), token:String(entry?.token || ''), priority:Number(entry?.priority || index + 1), enabled:entry?.enabled !== false, builtin:!!entry?.builtin
+  })).filter(entry => entry.urlTemplate).sort((left,right) => left.priority-right.priority);
+};
+const yjChapterRules = () => Array.isArray(providerConfig.chapterRules) ? providerConfig.chapterRules : [];
+const yjMediaKey = values => `${values.tmdbid || values.seriesid || values.id || values.title}|${Number(values.season || 0)}|${Number(values.episode || 0)}`;
+// Playback choices are intentionally keyed to a title/series, not an episode:
+// language, speed, danmaku, and skip choices should survive the next episode.
+const yjPlayerPreferenceKey = values => `series:${String(values.tmdbid || values.seriesid || values.id || values.title || '').trim().slice(0, 180)}`;
+const normalizeChapterRule = (raw, source='手动') => {
+  const item=raw?.data || raw?.result || raw || {};
+  const first = value => Array.isArray(value) ? value[0] : value;
+  const intro = first(item.intro || item.opening);
+  const credits = Array.isArray(item.credits) ? item.credits[item.credits.length - 1] : first(item.outro || item.ending || item.credits);
+  const seconds = value => { const number=Number(value); return Number.isFinite(number) ? (Math.abs(number) > 100000 ? number / 1000 : number) : NaN; };
+  const introEnd=seconds(item.introEnd ?? item.intro_end ?? item.openingEnd ?? item.opening_end ?? item.end_ms ?? item.endMs ?? item.end ?? intro?.end_ms ?? intro?.endMs ?? intro?.end);
+  const outroStart=seconds(item.outroStart ?? item.outro_start ?? item.endingStart ?? item.ending_start ?? item.start_ms ?? item.startMs ?? item.start ?? credits?.start_ms ?? credits?.startMs ?? credits?.start);
+  return { introEnd:Number.isFinite(introEnd)&&introEnd>=0?introEnd:null, outroStart:Number.isFinite(outroStart)&&outroStart>=0?outroStart:null, source:String(item.source || source), updatedAt:String(item.updatedAt || new Date().toISOString()) };
+};
+const expandDanmakuUrl = (template, values) => String(template || '')
+  .replace(/%7B(tmdbid|imdbid|tvdbid|seriesid|id|season|episode|title|name|url|videourl)%7D/gi, (_match, key) => encodeURIComponent(values[key.toLowerCase()] ?? ''))
+  .replace(/\{(tmdbid|imdbid|tvdbid|seriesid|id|season|episode|title|name|url|videourl)\}/gi, (_match, key) => encodeURIComponent(values[key.toLowerCase()] ?? ''));
+const templateValuesAvailable = (template, values) => [...String(template || '').matchAll(/\{(tmdbid|imdbid|tvdbid|seriesid|id|season|episode|title|name|url|videourl)\}/gi)].every(match => String(values[match[1].toLowerCase()] ?? '').trim() !== '');
+const danmakuFailureStatus = error => {
+  const message=String(error?.message || '');
+  if (/超时|abort/i.test(message)) return '超时';
+  const code=message.match(/\b(4\d{2}|5\d{2})\b/)?.[1];
+  return code ? `失败（HTTP ${code}）` : '失败';
+};
+const parseDanmakuJson = raw => {
+  if (raw && typeof raw === 'object') return raw;
+  const text=String(raw || '').replace(/^\uFEFF/, '').trim();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+};
+const danmakuSourceList = raw => {
+  const parsed=parseDanmakuJson(raw);
+  const candidate=Array.isArray(parsed) ? parsed : parsed?.sources ?? parsed?.data ?? parsed?.result ?? parsed?.danmaku;
+  if (!Array.isArray(candidate)) return [];
+  return candidate.filter(item => {
+    if (!item || typeof item !== 'object') return false;
+    const hasUrl=String(item.url ?? item.URL ?? item.link ?? item.src ?? item.path ?? '').trim() !== '';
+    const looksLikeComment=['p','text','content','m','message','time','progress','t','start','startTime'].some(key => item[key] != null);
+    return hasUrl && !looksLikeComment;
+  });
+};
+const resolveDanmakuSourceUrl = (source, endpoint) => {
+  const value=String(source?.url ?? source?.URL ?? source?.link ?? source?.src ?? source?.path ?? '').trim();
+  if (!value) return '';
+  try { return new URL(value, endpoint).href; } catch { return ''; }
+};
+const fetchDanmakuPayload = async (endpoint, api) => {
+  const headers=api.token ? { Authorization:`Bearer ${api.token}` } : {};
+  const root=await request(endpoint, { responseType:'text', timeoutMs:45000, headers });
+  if (!root) return { payloads:[], sourceCount:0, loadedCount:0 };
+  const sources=danmakuSourceList(root);
+  if (!sources.length) return { payloads:[root], sourceCount:0, loadedCount:1 };
+  const results=await Promise.all(sources.slice(0, 24).map(async source => {
+    const url=resolveDanmakuSourceUrl(source, endpoint);
+    if (!url) return '';
+    try {
+      const data=await request(url, { responseType:'text', timeoutMs:45000, headers });
+      return data || '';
+    } catch { return ''; }
+  }));
+  const payloads=results.filter(Boolean);
+  return { payloads, sourceCount:sources.length, loadedCount:payloads.length };
+};
+const danmakuResultStatus = result => {
+  if (!result?.sourceCount) return result?.loadedCount ? '已返回，待解析' : '无数据';
+  return result.loadedCount ? `已返回 ${result.sourceCount} 个源，已加载 ${result.loadedCount} 个` : `已返回 ${result.sourceCount} 个源，加载失败`;
+};
+const fetchDanmakuForContext = async context => {
+  const apis=yjDanmakuApis();
+  const results=await Promise.all(apis.map(async api => {
+    try { const endpoint=expandDanmakuUrl(api.urlTemplate,context); const result=await fetchDanmakuPayload(endpoint,api); return { data:result.payloads, source:{name:api.name,status:danmakuResultStatus(result)} }; }
+    catch (error) { const status=danmakuFailureStatus(error); return { data:[], source:{name:api.name,status} }; }
+  }));
+  return { data:results.flatMap(result=>result.data).filter(Boolean), sources:results.map(result=>result.source) };
+};
+const mediaSpecPattern = /(?:\b(?:2160p|1080p|720p|4k|8k|hevc|h\.?26[45]|avc|hdr10|dv|dolby[ .-]?vision|sdr|web[- .]?dl|blu[- .]?ray|remux|mpeg|mkv|mp4|aac|flac|ddp|eac3|truehd|\d+(?:\.\d+)?\s*mbps)\b|(?:\bS\d{1,2}E\d{1,3}\b))/i;
+const cleanEpisodeName = (entry, context = live.detail) => {
+  const meta = context?.episodes?.find(ep => Number(ep.number) === Number(entry?.IndexNumber ?? entry?.episode));
+  const candidates = [meta?.name, entry?.EpisodeTitle, entry?.EpisodeName, entry?.episodeName, entry?.Name, entry?.name];
+  const value = candidates.find(candidate => String(candidate || '').trim() && !mediaSpecPattern.test(String(candidate)));
+  return String(value || '').trim();
+};
+const seriesTitleFor = (entry, context = live.detail) => String(
+  context?.detail?.name || context?.detail?.title || entry?.SeriesName || entry?.seriesName || entry?.SeriesTitle || entry?.ParentName || ''
+).trim();
 providerConfig.emby.forEach(server => {
   server.addresses = [...new Set((Array.isArray(server.addresses) ? server.addresses : [server.url]).filter(Boolean))];
   server.activeAddress = Math.min(Number(server.activeAddress) || 0, Math.max(0, server.addresses.length - 1));
@@ -22,6 +139,38 @@ let discoverySyncing = false;
 const discoveryCacheVersion = 5;
 const discoveryCacheMeta = readLocalJson('yingji.discovery-meta', {});
 const saveProviders = () => localStorage.setItem('yingji.providers', JSON.stringify(providerConfig));
+const playerPreferencesFor = key => key && typeof providerConfig.playerPreferences?.[key] === 'object' ? providerConfig.playerPreferences[key] : {};
+const effectivePlayerSettings = key => {
+  const saved=playerPreferencesFor(key), ui=live.ui;
+  return {
+    speed: Math.max(.25, Math.min(3, Number(saved.speed) || 1)),
+    audioTrack: saved.audioTrack || null,
+    subtitleTrack: saved.subtitleTrack || null,
+    audioDelay: Math.max(-10, Math.min(10, Number(saved.audioDelay) || 0)),
+    subtitleScale: Math.max(.7, Math.min(1.6, Number(saved.subtitleScale) || Number(ui.subtitleScale) / 100 || 1)),
+    subtitlePos: Math.max(0, Math.min(100, Number(saved.subtitlePos) || 92)),
+    subtitleDelay: Math.max(-10, Math.min(10, Number(saved.subtitleDelay) || 0)),
+    subtitleBorder: Math.max(0, Math.min(6, Number(saved.subtitleBorder) || 1.5)),
+    videoAspect: ['auto','16:9','4:3','2.35:1'].includes(saved.videoAspect) ? saved.videoAspect : 'auto',
+    videoZoom: Math.max(0, Math.min(2, Number(saved.videoZoom) || 0)),
+    videoRotate: [0,90,180,270].includes(Number(saved.videoRotate)) ? Number(saved.videoRotate) : 0,
+    loopFile: saved.loopFile === true,
+    danmakuEnabled: typeof saved.danmakuEnabled === 'boolean' ? saved.danmakuEnabled : !!ui.toggles.danmakuEnabled,
+    danmakuDensity: ['low','normal','high'].includes(saved.danmakuDensity) ? saved.danmakuDensity : ui.danmakuDensity,
+    danmakuMode: ['smart','top','bottom'].includes(saved.danmakuMode) ? saved.danmakuMode : ui.danmakuMode,
+    danmakuFontScale: Number(saved.danmakuFontScale) || Number(ui.danmakuFontScale),
+    danmakuOpacity: Number(saved.danmakuOpacity) || Number(ui.danmakuOpacity),
+    danmakuDuration: Number(saved.danmakuDuration) || Number(ui.danmakuDuration),
+    danmakuMaxCount: Number(saved.danmakuMaxCount) || Number(ui.danmakuMaxCount),
+    danmakuOutline: ['none','soft','strong'].includes(saved.danmakuOutline) ? saved.danmakuOutline : ui.danmakuOutline,
+    chapterAutoSkip: typeof saved.chapterAutoSkip === 'boolean' ? saved.chapterAutoSkip : ui.toggles.chapterAutoSkip !== false
+  };
+};
+const savePlayerPreference = (key, patch) => {
+  if (!key) return;
+  providerConfig.playerPreferences[key] = { ...playerPreferencesFor(key), ...patch, updatedAt:new Date().toISOString() };
+  saveProviders();
+};
 const embyHeaders = token => ({ 'X-Emby-Token': token, Accept: 'application/json' });
 const connectionBadge = connected => `<span class="connection ${connected ? 'connected' : ''}">${connected ? '已连接' : '未配置'}</span>`;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -541,6 +690,7 @@ const sourceAddressRowMarkup = () => `<div class="yj-address-row" data-address-r
 async function loadDetailResources(context) {
   context.resourceLoading = true;
   context.resourceError = null;
+  context.episodeSources = [];
   const selected = context.episodes.find(episode => episode.number === context.selectedEpisode) || context.episodes[0];
   const title = context.detail.name || context.detail.title || context.item.name || context.item.title;
   const tmdbId = context.tmdbId;
@@ -562,6 +712,7 @@ async function loadDetailResources(context) {
             if (series?.Id) {
               const epsData = await request(`${base}?Recursive=true&IncludeItemTypes=Episode&ParentId=${series.Id}&Fields=Overview,ProviderIds,MediaSources,ParentIndexNumber,IndexNumber,RunTimeTicks,UserData&Limit=500`, { headers });
               const seasonEpisodes = (epsData.Items || []).filter(ep => Number(ep.ParentIndexNumber) === Number(context.seasonNumber));
+              context.episodeSources.push(...seasonEpisodes.flatMap(ep => (ep.MediaSources || []).slice(0, 1).map(media => ({ ...ep, server, token, selectedMediaSourceId:media.Id, Container:media.Container || ep.Container, Bitrate:media.Bitrate || ep.Bitrate }))));
               context.playedEpisodes = [...new Set([...(context.playedEpisodes || []), ...seasonEpisodes.filter(ep => ep.UserData?.Played || Number(ep.UserData?.PlayedPercentage || 0) >= 90).map(ep => Number(ep.IndexNumber))])];
               found = seasonEpisodes.filter(ep => Number(ep.IndexNumber) === Number(selected.number));
             }
@@ -581,7 +732,7 @@ async function loadDetailResources(context) {
           if (playback.MediaSources?.length) sources = playback.MediaSources;
         } catch {}
         if (!sources.length) sources = [null];
-        return sources.map(source => ({ ...foundItem, server, token, selectedMediaSourceId: source?.Id || '', MediaStreams: source?.MediaStreams || foundItem.MediaStreams || [], Container: source?.Container || foundItem.Container, Path: source?.Path || foundItem.Path, Size: source?.Size || foundItem.Size, Bitrate: source?.Bitrate || foundItem.Bitrate, Name: source?.Name || foundItem.Name, SupportsDirectPlay: source?.SupportsDirectPlay, SupportsDirectStream: source?.SupportsDirectStream, SupportsTranscoding: source?.SupportsTranscoding }));
+        return sources.map(source => ({ ...foundItem, server, token, selectedMediaSourceId: source?.Id || '', EpisodeName: foundItem.EpisodeName || foundItem.Name || '', MediaSources: source ? [source] : (foundItem.MediaSources || []), MediaStreams: source?.MediaStreams || foundItem.MediaStreams || [], Container: source?.Container || foundItem.Container, Path: source?.Path || foundItem.Path, Size: source?.Size || foundItem.Size, Bitrate: source?.Bitrate || foundItem.Bitrate, SupportsDirectPlay: source?.SupportsDirectPlay, SupportsDirectStream: source?.SupportsDirectStream, SupportsTranscoding: source?.SupportsTranscoding }));
       }));
       return hydrated.flat();
     }));
@@ -806,41 +957,154 @@ async function searchDiscovery(query) {
   searchPage();
 }
 
-async function playEmby(item) {
+async function playEmby(item, resourceChoices = []) {
   if (!item?.Id || !item?.server?.url || !item?.token) throw new Error('当前播放资源已失效，请重新选择版本后再试');
   live.active = item;
   const info = await request(`${item.server.url}/Items/${item.Id}/PlaybackInfo?UserId=${item.server.userId}`, { method: 'POST', headers: { ...embyHeaders(item.token), 'Content-Type': 'application/json' }, body: { UserId: item.server.userId, AutoOpenLiveStream: true } });
   const source = info.MediaSources?.find(entry => String(entry.Id) === String(item.selectedMediaSourceId)) || info.MediaSources?.[0];
   if (!source) throw new Error('Emby 没有返回可播放媒体源');
   const title = item.SeriesName ? `${item.SeriesName} · ${item.Name}` : item.Name;
-  const url = new URL(`${item.server.url.replace(/\/$/, '')}/Videos/${item.Id}/stream`);
-  url.searchParams.set('Static', 'true');
-  url.searchParams.set('MediaSourceId', source.Id);
-  url.searchParams.set('api_key', item.token);
-  if (info.PlaySessionId) url.searchParams.set('PlaySessionId', info.PlaySessionId);
-  let danmaku = '';
-  const template = String(providerConfig.danmaku?.urlTemplate || '').trim();
-  if (live.ui.toggles.danmakuEnabled && template) {
-    const endpoint = template
-      .replaceAll('{tmdbId}', encodeURIComponent(item.ProviderIds?.Tmdb || item.tmdbId || ''))
-      .replaceAll('{season}', encodeURIComponent(item.ParentIndexNumber || '0'))
-      .replaceAll('{episode}', encodeURIComponent(item.IndexNumber || '0'))
-      .replaceAll('{title}', encodeURIComponent(item.SeriesName || item.Name || ''));
-    try {
-      danmaku = await request(endpoint, { responseType:'text', headers: providerConfig.danmaku?.token ? { Authorization:`Bearer ${providerConfig.danmaku.token}` } : {} });
-    } catch (error) { notify(`弹幕加载失败：${error.message || '请检查 API 设置'}`); }
+  const streamUrl = (entry, sourceId, playSessionId = '') => {
+    const value = new URL(`${entry.server.url.replace(/\/$/, '')}/Videos/${entry.Id}/stream`);
+    value.searchParams.set('Static', 'true');
+    value.searchParams.set('MediaSourceId', sourceId || '');
+    value.searchParams.set('api_key', entry.token);
+    if (playSessionId) value.searchParams.set('PlaySessionId', playSessionId);
+    return value.href;
+  };
+  const url = new URL(streamUrl(item, source.Id, info.PlaySessionId));
+  const mediaDetails = mediaSource => {
+    const video=(mediaSource?.MediaStreams || []).find(stream => stream.Type === 'Video') || {};
+    return { container:String(mediaSource?.Container || ''), bitrate:Number(mediaSource?.Bitrate || video.BitRate || 0), width:Number(video.Width || 0), height:Number(video.Height || 0), codec:String(video.Codec || ''), profile:String(video.Profile || ''), range:String(video.VideoRangeType || video.VideoRange || ''), fps:Number(video.RealFrameRate || video.AverageFrameRate || 0) };
+  };
+  const resourceEntries = [item, ...(Array.isArray(resourceChoices) ? resourceChoices : [])].filter((entry, index, list) => entry?.Id && entry?.server?.url && list.findIndex(candidate => String(candidate?.Id) === String(entry.Id) && String(candidate?.server?.url) === String(entry.server.url) && String(candidate?.selectedMediaSourceId || '') === String(entry?.selectedMediaSourceId || '')) === index);
+  const resourceOptions = resourceEntries.map(entry => {
+    const sourceId = entry === item ? source.Id : entry.selectedMediaSourceId || entry.MediaSources?.[0]?.Id;
+    if (!sourceId) return null;
+    const mediaSource=entry===item ? source : (entry.MediaSources || []).find(candidate => String(candidate.Id)===String(sourceId)) || {};
+    return { url:streamUrl(entry, sourceId, entry === item ? info.PlaySessionId : ''), label:`${sourceVersion(entry)} · ${entry.server?.name || '媒体服务器'}`, serverName:String(entry.server?.name || '媒体服务器'), details:mediaDetails(mediaSource), serverUrl:entry.server.url, token:entry.token, itemId:entry.Id, mediaSourceId:sourceId, playSessionId:entry === item ? info.PlaySessionId || '' : '' };
+  }).filter(Boolean);
+  const episodeEntries = (live.detail?.episodeSources || [])
+    .sort((left, right) => Number(String(right.server?.id) === String(item.server?.id)) - Number(String(left.server?.id) === String(item.server?.id)) || Number(left.ParentIndexNumber || 0) - Number(right.ParentIndexNumber || 0) || Number(left.IndexNumber || 0) - Number(right.IndexNumber || 0))
+    .filter(entry => entry?.selectedMediaSourceId);
+  const episodeOptions = episodeEntries
+    .filter((entry, index, list) => list.findIndex(candidate => Number(candidate.ParentIndexNumber || 0) === Number(entry.ParentIndexNumber || 0) && Number(candidate.IndexNumber || 0) === Number(entry.IndexNumber || 0)) === index)
+    .map(entry => {
+      const chapterKey=yjMediaKey({tmdbid:entry.ProviderIds?.Tmdb || item.ProviderIds?.Tmdb || live.detail?.tmdbId || '',seriesid:entry.SeriesId || item.SeriesId || '',id:entry.Id,season:entry.ParentIndexNumber || 1,episode:entry.IndexNumber || 1,title:entry.SeriesName || item.SeriesName || ''});
+      return {
+      url:streamUrl(entry, entry.selectedMediaSourceId), label:`第 ${entry.ParentIndexNumber || 1} 季 · 第 ${entry.IndexNumber || 1} 集${cleanEpisodeName(entry) ? ` · ${cleanEpisodeName(entry)}` : ''}`,
+      season:Number(entry.ParentIndexNumber || 1), episode:Number(entry.IndexNumber || 1), episodeName:cleanEpisodeName(entry), seriesLogo:seriesTitleFor(entry) || '映迹',
+      chapterKey,chapterRule:yjChapterRules().find(rule=>rule.key===chapterKey) || null,
+      danmakuContext:{tmdbid:entry.ProviderIds?.Tmdb || item.ProviderIds?.Tmdb || live.detail?.tmdbId || '',imdbid:entry.ProviderIds?.Imdb || item.ProviderIds?.Imdb || '',tvdbid:entry.ProviderIds?.Tvdb || item.ProviderIds?.Tvdb || '',id:entry.ProviderIds?.Tmdb || item.ProviderIds?.Tmdb || live.detail?.tmdbId || '',seriesid:entry.SeriesId || item.SeriesId || '',season:entry.ParentIndexNumber || 1,episode:entry.IndexNumber || 1,title:seriesTitleFor(entry) || '映迹',name:seriesTitleFor(entry) || '映迹',url:streamUrl(entry,entry.selectedMediaSourceId),videourl:streamUrl(entry,entry.selectedMediaSourceId),chapterKey,preferenceKey:yjPlayerPreferenceKey({tmdbid:entry.ProviderIds?.Tmdb || item.ProviderIds?.Tmdb || live.detail?.tmdbId || '',seriesid:entry.SeriesId || item.SeriesId || '',id:entry.ProviderIds?.Tmdb || item.ProviderIds?.Tmdb || live.detail?.tmdbId || '',title:seriesTitleFor(entry) || '映迹'})},
+      serverUrl:entry.server.url, token:entry.token, itemId:entry.Id, mediaSourceId:entry.selectedMediaSourceId, playSessionId:'',
+      resourceOptions:episodeEntries
+        .filter(candidate => Number(candidate.ParentIndexNumber || 0) === Number(entry.ParentIndexNumber || 0) && Number(candidate.IndexNumber || 0) === Number(entry.IndexNumber || 0))
+        .map(candidate => { const mediaSource=(candidate.MediaSources || []).find(media => String(media.Id)===String(candidate.selectedMediaSourceId)) || {}; return { url:streamUrl(candidate,candidate.selectedMediaSourceId), label:`${sourceVersion(candidate)} · ${candidate.server?.name || '媒体服务器'}`, serverName:String(candidate.server?.name || '媒体服务器'), details:mediaDetails(mediaSource), serverUrl:candidate.server.url, token:candidate.token, itemId:candidate.Id, mediaSourceId:candidate.selectedMediaSourceId, playSessionId:'' }; })
+    }});
+  let danmaku = [];
+  const danmakuApis = yjDanmakuApis();
+  const detailContext = live.detail;
+  const seriesTitle = seriesTitleFor(item) || seriesTitleFor(detailContext?.item || {}, detailContext) || String(detailContext?.detail?.name || detailContext?.detail?.title || '').trim();
+  const values = {
+    tmdbid: item.ProviderIds?.Tmdb || item.tmdbId || detailContext?.tmdbId || '',
+    imdbid: item.ProviderIds?.Imdb || item.imdbId || detailContext?.imdbId || '',
+    tvdbid: item.ProviderIds?.Tvdb || item.tvdbId || detailContext?.tvdbId || '',
+    seriesid: item.SeriesId || detailContext?.seriesId || '',
+    id: item.ProviderIds?.Tmdb || item.tmdbId || detailContext?.tmdbId || '',
+    season: item.ParentIndexNumber || item.season || detailContext?.seasonNumber || '0',
+    episode: item.IndexNumber || item.episode || detailContext?.selectedEpisode || '0',
+    title: seriesTitle, name: seriesTitle, url: url.href, videourl: url.href
+  };
+  const playerPreferenceKey=yjPlayerPreferenceKey(values);
+  const playerPrefs=effectivePlayerSettings(playerPreferenceKey);
+  let danmakuSourceInfo=playerPrefs.danmakuEnabled && danmakuApis.length
+    ? danmakuApis.map(api=>({name:api.name,status:'等待播放器启动'})) : [];
+  if (playerPrefs.danmakuEnabled && danmakuApis.length) notify(`播放器已启动，后台获取弹幕 · ${seriesTitle || '当前剧集'} · 第 ${values.episode} 集`);
+  const chapterValues={ tmdbid:item.ProviderIds?.Tmdb || item.tmdbId || live.detail?.tmdbId || '', imdbid:item.ProviderIds?.Imdb || item.imdbId || live.detail?.imdbId || '', tvdbid:item.ProviderIds?.Tvdb || item.tvdbId || live.detail?.tvdbId || '', seriesid:item.SeriesId || '', id:item.Id, season:item.ParentIndexNumber || item.season || 0, episode:item.IndexNumber || item.episode || 0, title:item.SeriesName || item.Name || '' };
+  const chapterKey=yjMediaKey(chapterValues); let chapterRule=yjChapterRules().find(rule => rule.key===chapterKey) || null;
+  if (!chapterRule) {
+    const chapters=[...(Array.isArray(item.Chapters)?item.Chapters:[]),...(Array.isArray(source.Chapters)?source.Chapters:[])];
+    const stamp=entry=>Number(entry?.StartPositionTicks ?? entry?.startPositionTicks ?? entry?.StartTimeTicks ?? entry?.start_ms ?? entry?.startMs ?? entry?.StartTime ?? 0) / (entry?.StartPositionTicks || entry?.startPositionTicks || entry?.StartTimeTicks ? 10000000 : (entry?.start_ms || entry?.startMs ? 1000 : 1));
+    const chapterDuration=entry=>{ const value=Number(entry?.Duration ?? entry?.duration ?? entry?.duration_ms ?? entry?.durationMs ?? 0); if (!Number.isFinite(value)||value<=0) return 0; if (entry?.Duration!=null || entry?.duration!=null) return value>100000 ? value/10000000 : value>1000 ? value/1000 : value; return value>100000 ? value/1000 : value>1000 ? value/1000 : value; };
+    const intro=chapters.find(entry=>/intro|opening|片头/i.test(String(entry?.Name || entry?.Title || entry?.title || '')));
+    const outro=[...chapters].reverse().find(entry=>/outro|ending|credits|片尾/i.test(String(entry?.Name || entry?.Title || entry?.title || '')));
+    if (intro || outro) chapterRule={key:chapterKey,introEnd:intro ? stamp(intro)+chapterDuration(intro) : null,outroStart:outro ? stamp(outro) : null,source:'Emby',updatedAt:new Date().toISOString()};
   }
+  const currentEpisodeOption=episodeOptions.find(option=>option.chapterKey===chapterKey); if (currentEpisodeOption) currentEpisodeOption.chapterRule=chapterRule;
+  const logoItemId=item.SeriesId || item.Id;
+  const seriesLogoUrl=`${item.server.url.replace(/\/$/,'')}/Items/${encodeURIComponent(logoItemId)}/Images/Logo?maxWidth=420&quality=90&api_key=${encodeURIComponent(item.token)}`;
+  const tmdbLogoPath=live.detail?.detail?.images?.logos?.find(logo=>logo?.file_path)?.file_path || '';
+  const seriesLogoUrls=[seriesLogoUrl,tmdbLogoPath ? `https://image.tmdb.org/t/p/w500${tmdbLogoPath}` : ''].filter(Boolean);
+  const isEpisode = !!(item.SeriesName || item.ParentIndexNumber != null || item.IndexNumber != null);
   await window.yingjiDesktop.playMpv({
     url: url.href, title, token: item.token, serverUrl: item.server.url, userId: item.server.userId,
     itemId: item.Id, mediaSourceId: source.Id, playSessionId: info.PlaySessionId,
+    seriesLogo: seriesTitleFor(item) || '映迹', seriesLogoUrl, seriesLogoUrls, season: item.ParentIndexNumber || item.season || '', episode: item.IndexNumber || item.episode || '', episodeName: isEpisode ? cleanEpisodeName(item) : '', danmakuContext:{tmdbid:item.ProviderIds?.Tmdb || item.tmdbId || live.detail?.tmdbId || '',imdbid:item.ProviderIds?.Imdb || item.imdbId || live.detail?.imdbId || '',tvdbid:item.ProviderIds?.Tvdb || item.tvdbId || live.detail?.tvdbId || '',seriesid:item.SeriesId || live.detail?.seriesId || '',id:item.ProviderIds?.Tmdb || item.tmdbId || live.detail?.tmdbId || '',season:item.ParentIndexNumber || item.season || live.detail?.seasonNumber || 0,episode:item.IndexNumber || item.episode || live.detail?.selectedEpisode || 0,title:seriesTitleFor(item) || '映迹',name:seriesTitleFor(item) || '映迹',url:url.href,videourl:url.href,preferenceKey:playerPreferenceKey}, playerPreferenceKey, resourceLabel: sourceVersion(source), resourceOptions, episodeOptions,
     position: (item.UserData?.PlaybackPositionTicks || 0) / 10000000,
     bitrate: Number(source.Bitrate || 0),
     hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu,
     downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night,
-    subtitleEnabled: live.ui.toggles.subtitleEnabled, subtitleLanguage: live.ui.subtitleLanguage, subtitleScale: live.ui.subtitleScale,
-    danmakuEnabled: live.ui.toggles.danmakuEnabled, danmakuDensity: live.ui.danmakuDensity, danmaku
+    subtitleEnabled: live.ui.toggles.subtitleEnabled, subtitleLanguage: live.ui.subtitleLanguage, subtitleScale:playerPrefs.subtitleScale,
+    speed:playerPrefs.speed, audioPreference:playerPrefs.audioTrack, subtitlePreference:playerPrefs.subtitleTrack, audioDelay:playerPrefs.audioDelay, subtitleScale:playerPrefs.subtitleScale, subtitlePos:playerPrefs.subtitlePos, subtitleDelay:playerPrefs.subtitleDelay, subtitleBorder:playerPrefs.subtitleBorder, videoAspect:playerPrefs.videoAspect, videoZoom:playerPrefs.videoZoom, videoRotate:playerPrefs.videoRotate, loopFile:playerPrefs.loopFile,
+    danmakuEnabled: playerPrefs.danmakuEnabled, danmakuDensity: playerPrefs.danmakuDensity, danmakuMode:playerPrefs.danmakuMode, danmakuFontScale:playerPrefs.danmakuFontScale, danmakuOpacity:playerPrefs.danmakuOpacity, danmakuDuration:playerPrefs.danmakuDuration, danmakuMaxCount:playerPrefs.danmakuMaxCount, danmakuOutline:playerPrefs.danmakuOutline, danmakuSources:danmakuApis.length, danmakuSourceInfo, danmaku,
+    chapterKey, chapterRule, chapterAutoSkip:playerPrefs.chapterAutoSkip
   });
+  if ((playerPrefs.danmakuEnabled && danmakuApis.length) || !chapterRule) {
+    const chapterPromise=(async()=>{
+      if (chapterRule) return chapterRule;
+      for (const api of yjChapterApis().filter(entry=>entry.enabled)) {
+        if (!templateValuesAvailable(api.urlTemplate, chapterValues)) continue;
+        try { const raw=await request(expandDanmakuUrl(api.urlTemplate, chapterValues), { responseType:'json', headers:api.token?{Authorization:`Bearer ${api.token}`}:{}}); const normalized=normalizeChapterRule(raw,api.name); if (normalized.introEnd!==null || normalized.outroStart!==null) return { key:chapterKey,...normalized }; } catch (error) { if (!/\b404\b/.test(String(error?.message || ''))) notify(`${api.name} 获取失败：${error.message || '请检查数据源'}`); }
+      }
+      return null;
+    })();
+    const danmakuPromise=playerPrefs.danmakuEnabled && danmakuApis.length ? fetchDanmakuForContext(values) : Promise.resolve({data:[],sources:[]});
+    danmakuPromise.then(result=>chapterPromise.then(rule=>window.yingjiDesktop.updateMpv({type:'episode-data',danmaku:result.data,sources:result.sources,density:playerPrefs.danmakuDensity,mode:playerPrefs.danmakuMode,fontScale:playerPrefs.danmakuFontScale,opacity:playerPrefs.danmakuOpacity,duration:playerPrefs.danmakuDuration,maxCount:playerPrefs.danmakuMaxCount,outline:playerPrefs.danmakuOutline,chapterRule:rule,chapterKey}))).then(()=>{ if (playerPrefs.danmakuEnabled && danmakuApis.length) notify('弹幕加载完成'); }).catch(error=>notify(`后台加载失败：${error.message || '请打开面板查看详情'}`));
+  }
 }
+
+if (window.yingjiDesktop?.playerAction) window.yingjiDesktop.playerAction(action => {
+  if (!action) return;
+  if (action.type==='episode-change' && action.context) {
+    const apis=yjDanmakuApis();
+    const context=action.context, chapterKey=String(context.chapterKey || yjMediaKey(context));
+    const playerPrefs=effectivePlayerSettings(action.preferenceKey || context.preferenceKey || yjPlayerPreferenceKey(context));
+    const chapterSource=yjChapterRules().find(rule=>rule.key===chapterKey) || null;
+    const chapterPromise=(async()=>{
+      if (chapterSource) return chapterSource;
+      for (const api of yjChapterApis().filter(entry=>entry.enabled)) {
+        if (!templateValuesAvailable(api.urlTemplate,context)) continue;
+        try { const raw=await request(expandDanmakuUrl(api.urlTemplate,context),{responseType:'json',headers:api.token?{Authorization:`Bearer ${api.token}`}:{}}); const normalized=normalizeChapterRule(raw,api.name); if (normalized.introEnd!==null || normalized.outroStart!==null) return {key:chapterKey,...normalized}; } catch {}
+      }
+      return null;
+    })();
+    Promise.all([playerPrefs.danmakuEnabled ? fetchDanmakuForContext(context) : Promise.resolve({data:[],sources:[]}),chapterPromise]).then(([result,rule])=>{ const returned=result.data.length>0; notify(returned ? `新剧集弹幕已加载 ${result.data.length} 条` : '新剧集没有可用弹幕'); return window.yingjiDesktop.updateMpv({type:'episode-data',danmaku:result.data,sources:result.sources,density:playerPrefs.danmakuDensity,mode:playerPrefs.danmakuMode,fontScale:playerPrefs.danmakuFontScale,opacity:playerPrefs.danmakuOpacity,duration:playerPrefs.danmakuDuration,maxCount:playerPrefs.danmakuMaxCount,outline:playerPrefs.danmakuOutline,chapterRule:rule,chapterKey}); }).catch(()=>{});
+    return;
+  }
+  if (action.type==='media-preference' && action.preferenceKey && ['speed','audioTrack','subtitleTrack','audioDelay','subtitleScale','subtitlePos','subtitleDelay','subtitleBorder','videoAspect','videoZoom','videoRotate','loopFile','danmakuEnabled','danmakuMode','danmakuDensity','danmakuFontScale','danmakuOpacity','danmakuDuration','danmakuMaxCount','danmakuOutline','chapterAutoSkip'].includes(action.key)) {
+    savePlayerPreference(action.preferenceKey,{[action.key]:action.value});
+    const playerPrefs=effectivePlayerSettings(action.preferenceKey);
+    if (action.reload && action.context) {
+      fetchDanmakuForContext(action.context).then(result=>window.yingjiDesktop.updateMpv({type:'danmaku',danmaku:result.data,sources:result.sources,density:playerPrefs.danmakuDensity,mode:playerPrefs.danmakuMode,fontScale:playerPrefs.danmakuFontScale,opacity:playerPrefs.danmakuOpacity,duration:playerPrefs.danmakuDuration,maxCount:playerPrefs.danmakuMaxCount,outline:playerPrefs.danmakuOutline})).catch(()=>{});
+    }
+    return;
+  }
+  if (action.type==='preference' && action.key==='chapterAutoSkip') { live.ui.toggles.chapterAutoSkip=!!action.value; saveUi(); notify(`自动跳过片头片尾已${action.value?'开启':'关闭'}`); return; }
+  if (action.type==='preference' && ['danmakuMode','danmakuDensity'].includes(action.key) && (action.key==='danmakuMode' ? ['smart','top','bottom'].includes(action.value) : ['low','normal','high'].includes(action.value))) {
+    live.ui[action.key]=action.value; saveUi(); notify(`${action.key==='danmakuMode'?'弹幕显示模式':'弹幕密度'}已保存${action.reload?'并重新获取弹幕':'，下次播放生效'}`);
+    if (action.reload && action.context) fetchDanmakuForContext(action.context).then(result=>window.yingjiDesktop.updateMpv({type:'danmaku',danmaku:result.data,sources:result.sources,density:live.ui.danmakuDensity,mode:live.ui.danmakuMode,fontScale:live.ui.danmakuFontScale,opacity:live.ui.danmakuOpacity,duration:live.ui.danmakuDuration,maxCount:live.ui.danmakuMaxCount,outline:live.ui.danmakuOutline})).catch(()=>{});
+    return;
+  }
+  if (action.type!=='chapter-rule' || !action.key) return;
+  const rules=yjChapterRules(),index=rules.findIndex(rule => rule.key===action.key),current=index>=0?rules[index]:{key:action.key,source:'手动'};
+  const next={...current,source:'手动',updatedAt:new Date().toISOString()};
+  if (action.field==='introEnd') next.introEnd=Math.max(0,Number(action.time)||0);
+  if (action.field==='outroStart') next.outroStart=Math.max(0,Number(action.time)||0);
+  if (action.field==='clear') { if (index>=0) rules.splice(index,1); }
+  else if (index>=0) rules[index]=next; else rules.push(next);
+  providerConfig.chapterRules=rules; saveProviders();
+  notify(action.field==='clear'?'已删除本集片头片尾规则':`${action.field==='introEnd'?'片头结束':'片尾开始'}已保存为 ${Math.floor(Number(action.time)||0)} 秒`);
+});
 
 const runBusy = async (button, task) => {
   if (button.disabled) return;
@@ -914,7 +1178,7 @@ document.addEventListener('click', async event => {
     const matches = window.yjSortResourceList((live.detail.resources || []).filter(source => sourceQuality(source) === live.detail.selectedResolution), live.detail);
     const item = matches[live.detail.selectedResource] || matches[0];
     if (!item) return notify('当前没有可播放版本');
-    return runBusy(target, () => playEmby(item).catch(error => notify(`播放失败：${error.message}`)));
+    return runBusy(target, () => playEmby(item, matches).catch(error => notify(`播放失败：${error.message}`)));
   }
   if (target.dataset.continuePlay !== undefined) {
     const item = live.continueItems[Number(target.dataset.continuePlay)];
@@ -1084,9 +1348,9 @@ document.addEventListener('change', event => {
   if (!select) return;
   const key = select.dataset.setting;
   const value = select.value;
-  if (['hwdec', 'renderer', 'gpu', 'subtitleLanguage', 'subtitleScale', 'danmakuMode', 'danmakuDensity'].includes(key)) {
+  if (['hwdec', 'renderer', 'gpu', 'subtitleLanguage', 'subtitleScale', 'danmakuMode', 'danmakuDensity', 'danmakuFontScale', 'danmakuOpacity', 'danmakuDuration', 'danmakuMaxCount', 'danmakuOutline'].includes(key)) {
     live.ui[key] = value; saveUi();
-    const label = { hwdec:'硬解模式', renderer:'渲染器', gpu:'GPU', subtitleLanguage:'字幕语言', subtitleScale:'字幕大小', danmakuMode:'弹幕模式', danmakuDensity:'弹幕密度' }[key];
+    const label = { hwdec:'硬解模式', renderer:'渲染器', gpu:'GPU', subtitleLanguage:'字幕语言', subtitleScale:'字幕大小', danmakuMode:'弹幕模式', danmakuDensity:'弹幕密度', danmakuFontScale:'弹幕字号', danmakuOpacity:'弹幕不透明度', danmakuDuration:'弹幕停留时长', danmakuMaxCount:'弹幕上限', danmakuOutline:'弹幕描边' }[key];
     notify(`${label}已更新，下次播放生效`);
   }
 });

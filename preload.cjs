@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('yingjiDesktop', {
   openUrl: playback => ipcRenderer.invoke('mpv-open-url', playback),
   listAdapters: () => ipcRenderer.invoke('mpv-adapters'),
   mediaInfo: callback => ipcRenderer.on('mpv-media-info', (_event, info) => callback(info)),
+  playerAction: callback => ipcRenderer.on('mpv-player-action', (_event, action) => callback(action)),
+  updateMpv: update => ipcRenderer.invoke('mpv-player-update', update),
   setSecret: (key, value) => ipcRenderer.invoke('secret-set', key, value),
   getSecret: key => ipcRenderer.invoke('secret-get', key)
 });
