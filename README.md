@@ -1,37 +1,42 @@
-# 映迹
+# 映迹 Yingji
 
-Windows Emby 观影客户端，整合 TMDB、Trakt、多个 Emby 服务器与 mpv 播放内核。
+映迹是一款面向 Windows 的沉浸式私人影音客户端。它把 TMDB 中文影视资料、Emby / Jellyfin / WebDAV 媒体来源、Trakt 观看记录与 libmpv 播放器整合到统一的海报背景界面中。
 
-## 功能
+## 主要体验
 
-- TMDB 中文影视资料、海报与热门榜单
-- Trakt 设备授权、热门内容与追剧日历
-- 多 Emby 服务器登录、媒体库读取及同名资源聚合
-- mpv `gpu-next` / D3D11 / 自动硬件解码
-- HDR、Dolby Vision 元数据、ASS/SSA 字幕和多音轨支持
-- Emby 播放开始、进度与停止状态回传
-- Windows 数据保护加密 API 密钥及访问令牌
+- 以当前轮播海报贯穿首页、发现、追剧、片单、服务器与设置页面。
+- 首页支持海报轮播、观看进度和继续播放。
+- 搜索默认使用 TMDB，也可切换到已连接的媒体服务器。
+- 详情页提供季与剧集、播放进度、资源筛选、音轨字幕、演职人员、艺术图和相似推荐。
+- 资源可按服务器最优结果或全部资源版本浏览。
+- 播放状态可与已连接服务器及 Trakt 联动。
+- 追剧日历整合待看内容、Trakt 记录与剧集更新信息。
+- 播放器基于 libmpv，支持硬件解码、字幕、音轨、弹幕、章节和播放位置记忆。
 
-## 本地构建
+## 支持的媒体来源
 
-需要 Windows 10/11、Node.js 22+ 与 pnpm。
+- Emby
+- Jellyfin
+- WebDAV
+- TMDB 中文元数据
+- Trakt 观看记录与待看同步
 
-```powershell
-pnpm install --config.blockExoticSubdeps=false
-pnpm run fetch:mpv
-pnpm run dist:installer
-```
+## 下载与安装
 
-TMDB、Trakt 和 Emby 凭据均由用户在应用设置页填写，不应提交到仓库。
+请从 [GitHub Releases](https://github.com/TaoHua-cc/yingji/releases) 下载最新的 Windows x64 安装程序。
 
-## 分发
+安装包会部署映迹、Flutter Windows 运行组件和 libmpv 播放依赖。服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
 
-- `nsis`：完整安装版
-- `portable`：免安装便携版
-- `appx`：Microsoft Store 包；提交前必须把 `package.json` 中的 AppX Identity 和 Publisher 替换为 Partner Center 提供的准确值
+## 系统要求
 
-第三方组件信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本仓库当前未授予额外源代码许可证。
+- Windows 10 或 Windows 11（64 位）
+- 支持 D3D11 的显卡驱动
+- 访问 TMDB、Trakt 或个人媒体服务器所需的网络连接
 
-## 让用户免填 TMDB Key
+## 隐私与授权
 
-`metadata-worker` 提供一个最小代理。将 TMDB Read Access Token 保存为 Worker Secret，部署后把地址写入 `app/runtime-config.js`。最终用户无需接触或填写 TMDB Key，客户端也不会包含开发者 Token。
+映迹不会将媒体服务器凭据提交到本仓库。服务器访问令牌使用 Windows 数据保护机制存储。
+
+本仓库用于映迹产品发布与问题跟踪，不授予源代码开源许可。未经明确授权，不得复制、修改、再分发或将本项目代码用于派生产品。
+
+第三方组件信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
