@@ -132,6 +132,13 @@ providerConfig.emby.forEach(server => {
 const live = { rankings: null, library: [], active: null, heroIndex: 0, detail: null, watchlist: readLocalJson('yingji.live-watchlist', []), search: null, addingServer: false, returnToLibrary: false, sourceStats: {}, sourceIcons: {}, continueItems: [], calendarEvents: [], calendarPosters: {}, selectedSourceId: 'all',
   sourceKind: null, suppressedCalendar: readLocalJson('yingji.calendar-suppressed', []),
   ui: { ...defaultUi, ...storedUi, recentSearches: Array.isArray(storedUi.recentSearches) ? storedUi.recentSearches : defaultUi.recentSearches, toggles: { ...defaultUi.toggles, ...(storedUi.toggles || {}) } } };
+// Player console state: what is playing, the live mpv mirror, and the tab the
+// user left open.
+live.player = null;
+live.playerState = {};
+live.consoleTab = 'audio';
+live.gpuAdapters = null;
+live.consoleOntop = false;
 live.fileItems = [];
 if (!Array.isArray(live.watchlist)) live.watchlist = [];
 const prototypeMode = !window.yingjiDesktop;
@@ -1042,13 +1049,20 @@ async function playEmby(item, resourceChoices = []) {
     seriesLogo: seriesTitleFor(item) || '映迹', seriesLogoUrl, seriesLogoUrls, season: item.ParentIndexNumber || item.season || '', episode: item.IndexNumber || item.episode || '', episodeName: isEpisode ? cleanEpisodeName(item) : '', danmakuContext:{tmdbid:item.ProviderIds?.Tmdb || item.tmdbId || live.detail?.tmdbId || '',imdbid:item.ProviderIds?.Imdb || item.imdbId || live.detail?.imdbId || '',tvdbid:item.ProviderIds?.Tvdb || item.tvdbId || live.detail?.tvdbId || '',seriesid:item.SeriesId || live.detail?.seriesId || '',id:item.ProviderIds?.Tmdb || item.tmdbId || live.detail?.tmdbId || '',season:item.ParentIndexNumber || item.season || live.detail?.seasonNumber || 0,episode:item.IndexNumber || item.episode || live.detail?.selectedEpisode || 0,title:seriesTitleFor(item) || '映迹',name:seriesTitleFor(item) || '映迹',url:url.href,videourl:url.href,preferenceKey:playerPreferenceKey}, playerPreferenceKey, resourceLabel: sourceVersion(source), resourceOptions, episodeOptions,
     position: (item.UserData?.PlaybackPositionTicks || 0) / 10000000,
     bitrate: Number(source.Bitrate || 0),
-    hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu,
+    hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu, gpuAdapters:live.gpuAdapters || [], hardware:live.ui.toggles.hardware, hdr:live.ui.toggles.hdr,
     downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night,
     subtitleEnabled: live.ui.toggles.subtitleEnabled, subtitleLanguage: live.ui.subtitleLanguage, subtitleScale:playerPrefs.subtitleScale,
     speed:playerPrefs.speed, audioPreference:playerPrefs.audioTrack, subtitlePreference:playerPrefs.subtitleTrack, audioDelay:playerPrefs.audioDelay, subtitleScale:playerPrefs.subtitleScale, subtitlePos:playerPrefs.subtitlePos, subtitleDelay:playerPrefs.subtitleDelay, subtitleBorder:playerPrefs.subtitleBorder, videoAspect:playerPrefs.videoAspect, videoZoom:playerPrefs.videoZoom, videoRotate:playerPrefs.videoRotate, loopFile:playerPrefs.loopFile,
     danmakuEnabled: playerPrefs.danmakuEnabled, danmakuDensity: playerPrefs.danmakuDensity, danmakuMode:playerPrefs.danmakuMode, danmakuFontScale:playerPrefs.danmakuFontScale, danmakuOpacity:playerPrefs.danmakuOpacity, danmakuDuration:playerPrefs.danmakuDuration, danmakuMaxCount:playerPrefs.danmakuMaxCount, danmakuOutline:playerPrefs.danmakuOutline, danmakuSources:danmakuApis.length, danmakuSourceInfo, danmaku,
     chapterKey, chapterRule, chapterAutoSkip:playerPrefs.chapterAutoSkip
   });
+  // v2.0.130: the mpv window IS the player now. Its own OSC (yingji-osc.lua)
+  // draws the full V9 console, and main.cjs hides the Electron window for the
+  // duration of playback — so there is no renderer-side player route to enter.
+  // Stay on the current page and let mpv take over the screen.
+  live.player = yjPlayerContext({ item, source, title, chapterKey, chapterRule, danmakuContext:values, danmakuCount:danmaku?.length ?? null, resourceLabel:sourceVersion(source) });
+  live.playerState = {};
+  if (typeof render === 'function') render();
   if ((playerPrefs.danmakuEnabled && danmakuApis.length) || !chapterRule) {
     const chapterPromise=(async()=>{
       if (chapterRule) return chapterRule;
@@ -1088,6 +1102,12 @@ if (window.yingjiDesktop?.playerAction) window.yingjiDesktop.playerAction(action
       fetchDanmakuForContext(action.context).then(result=>window.yingjiDesktop.updateMpv({type:'danmaku',danmaku:result.data,sources:result.sources,density:playerPrefs.danmakuDensity,mode:playerPrefs.danmakuMode,fontScale:playerPrefs.danmakuFontScale,opacity:playerPrefs.danmakuOpacity,duration:playerPrefs.danmakuDuration,maxCount:playerPrefs.danmakuMaxCount,outline:playerPrefs.danmakuOutline})).catch(()=>{});
     }
     return;
+  }
+  if (action.type==='ui-preference') {
+    const toggleKeys=['hardware','hdr','downmix','vocal','night'];
+    const valueKeys=['hwdec','renderer','gpu'];
+    if (toggleKeys.includes(action.key)) { live.ui.toggles[action.key]=!!action.value; saveUi(); return; }
+    if (valueKeys.includes(action.key)) { live.ui[action.key]=String(action.value || ''); saveUi(); return; }
   }
   if (action.type==='preference' && action.key==='chapterAutoSkip') { live.ui.toggles.chapterAutoSkip=!!action.value; saveUi(); notify(`自动跳过片头片尾已${action.value?'开启':'关闭'}`); return; }
   if (action.type==='preference' && ['danmakuMode','danmakuDensity'].includes(action.key) && (action.key==='danmakuMode' ? ['smart','top','bottom'].includes(action.value) : ['low','normal','high'].includes(action.value))) {
@@ -1165,9 +1185,85 @@ document.addEventListener('pointermove', event => {
 document.addEventListener('pointerup', event => { if (yjShelfPress?.pointerId === event.pointerId) yjClearShelfPress(true); });
 document.addEventListener('pointercancel', event => { if (yjShelfPress?.pointerId === event.pointerId) yjClearShelfPress(false); });
 
+/* Console selects and sliders report on change, not on click. */
+const yjConsoleApplyField = node => {
+  if (typeof yjConsoleSetting !== 'function') return;
+  const key = node.dataset.consoleSelect || node.dataset.consoleRange;
+  if (!key) return;
+  yjConsoleSetting(key, node.value);
+  const label = node.closest('article')?.querySelector('small');
+  if (label && node.dataset.consoleRange) {
+    const text = { danmakuFontScale: v => `${v}%`, danmakuOpacity: v => `${v}%`, videoZoom: v => Number(v).toFixed(2), volume: v => `${v}%` }[key];
+    if (text) label.textContent = text(node.value);
+  }
+};
+document.addEventListener('change', event => {
+  const node = event.target.closest?.('[data-console-select]');
+  if (node) yjConsoleApplyField(node);
+});
+document.addEventListener('input', event => {
+  const node = event.target.closest?.('[data-console-range]');
+  if (!node) return;
+  const label = node.closest('article')?.querySelector('small');
+  const key = node.dataset.consoleRange;
+  if (label) {
+    if (key === 'danmakuFontScale' || key === 'danmakuOpacity') label.textContent = `${node.value}%`;
+    else if (key === 'videoZoom') label.textContent = Number(node.value).toFixed(2);
+  }
+});
+// Commit slider values when the drag ends instead of on every pixel.
+document.addEventListener('pointerup', event => {
+  const node = event.target.closest?.('[data-console-range]');
+  if (node) yjConsoleApplyField(node);
+});
+document.addEventListener('keydown', event => {
+  const bar = event.target.closest?.('[data-console-seek]');
+  if (!bar || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+  event.preventDefault();
+  const step = event.key === 'ArrowLeft' ? -5 : 5;
+  if (typeof yjConsoleSeekTo === 'function') yjConsoleSeekTo(Number(live.playerState?.timePos || 0) + step);
+});
+
+if (window.yingjiDesktop?.playbackState) window.yingjiDesktop.playbackState(state => {
+  live.playerState = state || {};
+  if (typeof yjConsoleLive === 'function') yjConsoleLive(live.playerState);
+});
+if (window.yingjiDesktop?.mediaInfo) window.yingjiDesktop.mediaInfo(info => {
+  if (!live.player) live.player = { title: '正在播放', meta: [] };
+  live.player.info = info?.ended ? null : (info || null);
+  if (info?.ended) { const head = document.querySelector('.p-rail-head p'); if (head) head.textContent = '播放已结束，可重新选择内容。'; }
+  // The diagnostics pane is a pure read of player.info, so it can refresh
+  // in place without disturbing an open tab elsewhere.
+  if (live.consoleTab === 'diag' && state.view === 'player') {
+    const pane = document.querySelector('[data-console-pane]');
+    if (pane && typeof yjConsolePane === 'function') pane.innerHTML = yjConsolePane('diag', live.player, live.playerState || {});
+  }
+});
+
 document.addEventListener('click', async event => {
-  const target = event.target.closest('[data-yj-back],[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-resource-sort],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance]');
+  const target = event.target.closest('[data-yj-back],[data-shelf-panel],[data-shelf-panel-close],[data-shelf-toggle],[data-shelf-filter],[data-load-ranking-more],[data-sync-discovery],[data-load-library],[data-detail-play],[data-continue-play],[data-emby-play],[data-url-play],[data-live-detail],[data-live-more],[data-open-shelf],[data-edit-server],[data-edit-file],[data-trakt-auth],[data-sync-calendar],[data-retry-search],[data-hero-prev],[data-hero-next],[data-hero-dot],[data-select-episode],[data-resolution],[data-select-resource],[data-resource-view],[data-resource-sort],[data-open-server-versions],[data-close-server-versions],[data-scroll-top],[data-scroll-episodes],[data-scroll-people],[data-scroll-extras],[data-live-watch],[data-live-unwatch],[data-calendar-remove],[data-toggle-library-server],[data-source-kind],[data-add-address],[data-remove-address],[data-address-protocol],[data-server-line],[data-close-trakt],[data-toggle],[data-calendar-filter],[data-calendar-day],[data-search-filter],[data-recent-search],[data-remove-recent],[data-clear-recent],[data-preference],button[data-appearance],[data-console-tab],[data-console-cmd],[data-console-toggle],[data-console-tool],[data-console-seg] button,[data-console-track],[data-console-chapter],[data-console-seek],[data-console-skip],[data-console-mark],[data-console-fullscreen] button');
   if (!target) return;
+  if (target.hasAttribute('data-console-tab')) { live.consoleTab = target.dataset.consoleTab; if (typeof render === 'function') render(); return; }
+  if (target.hasAttribute('data-console-cmd')) { if (typeof yjConsoleCommand === 'function') yjConsoleCommand(target.dataset.consoleCmd); return; }
+  if (target.hasAttribute('data-console-toggle')) { if (typeof yjConsoleToggle === 'function') yjConsoleToggle(target); return; }
+  if (target.hasAttribute('data-console-tool')) { if (typeof yjConsoleTool === 'function') yjConsoleTool(target.dataset.consoleTool); return; }
+  if (target.hasAttribute('data-console-mark')) { if (typeof yjConsoleMark === 'function') yjConsoleMark(target.dataset.consoleMark); return; }
+  if (target.hasAttribute('data-console-skip')) { if (typeof yjConsoleSeekTo === 'function') yjConsoleSeekTo(Number(target.dataset.consoleSkip) || 0); return; }
+  if (target.hasAttribute('data-console-chapter')) { if (typeof yjConsoleSeekTo === 'function') yjConsoleSeekTo(Number(target.dataset.consoleChapter) || 0); return; }
+  if (target.hasAttribute('data-console-track')) {
+    const type = target.dataset.consoleTrack, value = target.dataset.trackId;
+    yjConsoleSetting(type === 'audio' ? 'aid' : 'sid', value);
+    document.querySelectorAll(`[data-console-track="${type}"]`).forEach(node => node.classList.toggle('is-active', node === target));
+    return;
+  }
+  const consoleSeg = target.closest('[data-console-seg]');
+  if (consoleSeg) {
+    consoleSeg.querySelectorAll('button').forEach(node => node.classList.toggle('is-active', node === target));
+    yjConsoleSetting(consoleSeg.dataset.consoleSeg, target.dataset.value);
+    return;
+  }
+  if (target.closest('[data-console-fullscreen]')) { if (typeof yjConsoleCommand === 'function') yjConsoleCommand('fullscreen'); return; }
+  if (target.hasAttribute('data-console-seek')) { if (typeof yjConsoleSeek === 'function') yjConsoleSeek(event); return; }
   if (target.dataset.loadRankingMore !== undefined) return runBusy(target, () => loadMoreRanking(Number(target.dataset.loadRankingMore)));
   if (target.hasAttribute('data-yj-back')) { if (typeof yjBack === 'function') yjBack(); else { state.view = 'home'; if (typeof live !== 'undefined') live.detail = null; render(); } return; }
   if (target.hasAttribute('data-sync-discovery')) return runBusy(target, syncDiscovery);
@@ -1189,7 +1285,7 @@ document.addEventListener('click', async event => {
   if (target.dataset.embyPlay !== undefined) return runBusy(target, () => playEmby(live.library[Number(target.dataset.embyPlay)]).catch(error => notify(`播放失败：${error.message}`)));
   if (target.dataset.urlPlay !== undefined) {
     const item = live.fileItems[Number(target.dataset.urlPlay)];
-    return runBusy(target, () => window.yingjiDesktop.openUrl({ url: item.url, title: item.name, authorization: item.authorization, hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu, downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night }).catch(error => notify(`播放失败：${error.message}`)));
+    return runBusy(target, () => window.yingjiDesktop.openUrl({ url: item.url, title: item.name, authorization: item.authorization, hwdec: live.ui.hwdec, renderer: live.ui.renderer, gpu: live.ui.gpu, hardware:live.ui.toggles.hardware, hdr:live.ui.toggles.hdr, downmix: live.ui.toggles.downmix, vocal: live.ui.toggles.vocal, night: live.ui.toggles.night }).catch(error => notify(`播放失败：${error.message}`)));
   }
   if (target.dataset.liveDetail !== undefined) showLiveDetail(target.dataset.liveDetail, target.dataset.kind);
   if (target.dataset.liveMore !== undefined) return showLiveRanking(target.dataset.liveMore);
@@ -1367,6 +1463,12 @@ document.addEventListener('touchend', event => {
 }, { passive: true });
 
 /* ===== hero 局部更新（不重建整页，避免闪烁） ===== */
+// The previous version pinned .yj-no-anim on the wrapper forever, and
+// forward.css:567 already disables the copy animation inside yj-ui. Together
+// that turned every carousel step into a hard cut. Fade the outgoing slide
+// first, then swap — and restart the dwell timer so a manual click is not
+// immediately followed by an automatic advance.
+let yjHeroSwapToken = 0;
 function updateHero() {
   const items = live.rankings?.flatMap(group => group[1] || []) || [];
   const heroes = items.filter(item => item.backdrop_path).slice(0, 8);
@@ -1375,9 +1477,18 @@ function updateHero() {
   const feature = heroes[live.heroIndex] || items[0];
   const wrap = document.querySelector('.yj-hero-wrap');
   if (!wrap || !feature) return;
-  wrap.classList.add('yj-no-anim');
-  wrap.innerHTML = heroMarkup(feature, itemKind(feature), heroes, live.heroIndex);
-  yjApplyPosterTheme(feature);
+  const token = ++yjHeroSwapToken;
+  const swap = () => {
+    if (token !== yjHeroSwapToken) return;
+    wrap.innerHTML = heroMarkup(feature, itemKind(feature), heroes, live.heroIndex);
+    yjApplyPosterTheme(feature);
+    if (typeof yjStartHeroRotation === 'function') yjStartHeroRotation(heroes.length);
+  };
+  const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  const current = wrap.firstElementChild;
+  if (!current || reduceMotion) { swap(); return; }
+  current.classList.add('is-leaving');
+  setTimeout(swap, 180);
 }
 
 document.addEventListener('submit', async event => {
@@ -1479,7 +1590,23 @@ if (metadataEndpoint || (!prototypeMode && discoveryCacheMeta.version !== discov
 if (!prototypeMode) loadConnectedSourceData().catch(() => {});
 if (prototypeMode) {
   const prototypePage = location.hash.slice(1) || new URLSearchParams(location.search).get('page');
-  ({ home, search: searchPage, calendar, watchlist, library, downloads, settings: settingsV2 }[prototypePage] || home)();
+  if (prototypePage === 'player') {
+    live.player = {
+      title:'沙丘：第二部', crumbTitle:'沙丘：第二部', crumbSource:'Emby · 4K 媒体库', tint:'196,142,86', connected:true,
+      meta:['2024','电影','2 小时 46 分','TMDB 8.1','Emby · 线路 1'], chapterRule:{introEnd:52,outroStart:9100},
+      info:{video:{dw:3840,dh:1600,codec:'hevc',format:'yuv420p10',gamma:'smpte2084'},audio:{codec:'truehd',channels:'7.1',samplerate:48000},fps:23.976,bitrate:68400000}
+    };
+    live.playerState = {
+      timePos:4152,duration:9965,pause:false,volume:72,mute:false,speed:1,aid:1,sid:1,subDelay:0,subPos:95,subScale:1,audioDelay:-.12,
+      videoZoom:0,videoRotate:0,videoAspect:'auto',loopFile:false,subVisibility:true,hwdec:'D3D11VA',vo:'gpu-next',dropCount:0,
+      tracks:[
+        {id:1,type:'audio',lang:'英语',codec:'truehd','demux-channel-count':8,title:'默认 · 无损'},
+        {id:2,type:'audio',lang:'国语',codec:'dts-hd ma','demux-channel-count':6,title:'配音'},
+        {id:3,type:'audio',lang:'粤语',codec:'aac','demux-channel-count':2,title:'评论轨'}
+      ]
+    };
+    player();
+  } else ({ home, search: searchPage, calendar, watchlist, library, downloads, settings: settingsV2 }[prototypePage] || home)();
   document.addEventListener('click', event => {
     const segmented = event.target.closest('.segmented button');
     if (segmented) { segmented.parentElement.querySelectorAll('button').forEach(button => button.classList.toggle('on', button === segmented)); }

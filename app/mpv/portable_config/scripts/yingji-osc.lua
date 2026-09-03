@@ -10,7 +10,7 @@ local mp = require 'mp'
 local assdraw = require 'mp.assdraw'
 local utils = require 'mp.utils'
 
-local visible_until, panel_mode, panel_offset, panel_focus, pending_seek, panel_opened_at = 0, nil, 0, 1, nil, 0
+local visible_until, panel_mode, panel_offset, panel_focus, pending_seek, panel_opened_at = 0, 'audio', 0, 1, nil, 0
 local panel_nav_focus, panel_section_focus = false, 1
 local render_logged = false
 local mouse_x, mouse_y, overlay_signature = -1, -1, ''
@@ -42,6 +42,7 @@ local function load_state()
 end
 
 local state = load_state()
+local headless = mp.get_opt and mp.get_opt('yj-headless') == 'yes'
 local function now() return mp.get_time() end
 local function clamp(value, low, high) return math.max(low, math.min(high, value)) end
 local function esc(value) return tostring(value or ''):gsub('\\', '\\\\'):gsub('{', '\\{'):gsub('}', '\\}'):gsub('[\r\n]+', ' ') end
@@ -122,8 +123,9 @@ local function dimensions()
   return w,h
 end
 local function layout(w,h)
-  local edge=math.max(24,math.floor(w*.018)); local console_h=clamp(math.floor(h*.17),154,176); local console_y=h-edge-console_h
-  return { edge=edge, console_x=edge, console_y=console_y, console_w=w-edge*2, console_h=console_h, progress_y=console_y+26, meta_y=console_y+61, center_y=console_y+104, utility_y=console_y+139 }
+  local edge=math.max(24,math.floor(w*.018)); local rail_w=clamp(math.floor(w*.278),380,430); local main_w=w-rail_w
+  local console_h=clamp(math.floor(h*.17),154,176); local console_y=h-edge-console_h
+  return { edge=edge, rail_x=main_w, rail_w=rail_w, main_w=main_w, console_x=edge, console_y=console_y, console_w=main_w-edge*2, console_h=console_h, progress_y=console_y+26, meta_y=console_y+61, center_y=console_y+104, utility_y=console_y+139 }
 end
 
 local function line(ass,x,y,w,h,color) rect(ass,x,y,w,h,color or 'FFFFFF',0) end
@@ -183,9 +185,9 @@ end
 local function top_buttons(w,l)
   local x=w-l.edge-18; return {{name='close',x=x},{name='max',x=x-48},{name='min',x=x-96},{name='pin',x=x-144}}
 end
-local utility_names={'audio','episodes','settings','fullscreen'}
-local utility_labels={audio='音轨与字幕',episodes='选集',settings='更多设置',fullscreen='全屏'}
-local utility_widths={audio=44,episodes=44,settings=44,fullscreen=44}
+local utility_names={'subtitle','danmaku','settings','fullscreen'}
+local utility_labels={subtitle='字幕',danmaku='弹幕',settings='播放设置',fullscreen='全屏'}
+local utility_widths={subtitle=44,danmaku=44,settings=44,fullscreen=44}
 local PANEL_ROWS=6
 local function utility_buttons(w,l)
   local compact=w<1480; local right=l.console_x+l.console_w-24; local list={}
@@ -197,7 +199,7 @@ local function upper_controls(w,l)
   return {name='volume',x=right-142,y=l.console_y+55,w=142,h=34}
 end
 local function transport_buttons(w,l)
-  local center=w/2; return {{name='prev',x=center-116},{name='back',x=center-58},{name='pause',x=center},{name='forward',x=center+58},{name='next',x=center+116}}
+  local center=l.console_x+l.console_w/2; return {{name='prev',x=center-116},{name='back',x=center-58},{name='pause',x=center},{name='forward',x=center+58},{name='next',x=center+116}}
 end
 
 local function resources() return type(state.resourceOptions)=='table' and state.resourceOptions or {} end
@@ -236,10 +238,10 @@ local function apply_saved_track(kind,preference)
   end
 end
 local settings_sections={
-  {mode='resources',label='资源与画质',icon='resources'}, {mode='audio',label='声音',icon='audio'},
+  {mode='audio',label='声音',icon='audio'},
   {mode='subtitle',label='字幕',icon='subtitle'}, {mode='danmaku',label='弹幕',icon='danmaku'},
   {mode='playback',label='播放',icon='speed'}, {mode='picture',label='画面',icon='picture'},
-  {mode='chapters',label='章节与跳过',icon='chapters'}, {mode='info',label='播放信息',icon='info'}
+  {mode='chapters',label='章节',icon='chapters'}, {mode='info',label='诊断',icon='info'}
 }
 local function settings_section_index(mode)
   for index,item in ipairs(settings_sections) do if item.mode==mode then return index end end
@@ -254,16 +256,25 @@ local function cycle_property(property,values,preference)
   local index=1; for i,value in ipairs(values) do if math.abs(value-current)<.01 then index=i end end
   local next_value=values[index%#values+1]; mp.set_property_native(property,next_value); state[preference]=next_value; save_media_preference(preference,next_value)
 end
+local function save_ui_preference(key,value)
+  mp.set_property('user-data/yj-player-action',utils.format_json({type='ui-preference',key=key,value=value}))
+end
+local function audio_filters()
+  local filters={}
+  if state.vocal then filters[#filters+1]='lavfi=[highpass=f=80,equalizer=f=1000:t=q:w=1.5:g=6,equalizer=f=2800:t=q:w=1.5:g=4]' end
+  if state.night then filters[#filters+1]='lavfi=[dynaudnorm=f=200:g=15:p=0.85]' end
+  return table.concat(filters,',')
+end
 local function panel_rows(mode)
   local heading,rows
   if mode=='resources' then heading='资源版本'; rows={}; for i,item in ipairs(resources()) do local detail=item.details or {}; local info={}; if detail.height then info[#info+1]=(tonumber(detail.height)>=2000 and '4K' or tostring(detail.height)..'P') end; if detail.codec and detail.codec~='' then info[#info+1]=tostring(detail.codec):upper() end; if tonumber(detail.bitrate)>0 then info[#info+1]=string.format('%.1f Mbps',tonumber(detail.bitrate)/1000000) end; local active=item.url==mp.get_property('path',''); rows[#rows+1]={kind='resource',index=i,title=item.label or ('资源 '..i),detail=active and '正在播放' or table.concat(info,' · '),active=active} end
-  elseif mode=='audio' then heading='声音'; rows={}; for _,track in ipairs(tracks('audio')) do rows[#rows+1]={kind='audio',id=track.id,preference=track_signature(track),title=track.title or track.lang or ('音轨 '..track.id),detail=track_detail(track),active=track.selected} end; rows[#rows+1]={kind='audio-delay',icon='audio',title='音频延迟',detail=string.format('%+.1f 秒',tonumber(mp.get_property_native('audio-delay')) or 0)}
+  elseif mode=='audio' then heading='声音'; rows={}; for _,track in ipairs(tracks('audio')) do rows[#rows+1]={kind='audio',id=track.id,preference=track_signature(track),title=track.title or track.lang or ('音轨 '..track.id),detail=track_detail(track),active=track.selected} end; rows[#rows+1]={kind='downmix',icon='audio',title='立体声下混',detail=state.downmix and '已开启' or '关闭',active=state.downmix}; rows[#rows+1]={kind='vocal',icon='audio',title='人声增强',detail=state.vocal and '已开启' or '关闭',active=state.vocal}; rows[#rows+1]={kind='night',icon='audio',title='夜间模式',detail=state.night and '已开启' or '关闭',active=state.night}; rows[#rows+1]={kind='audio-delay',icon='audio',title='音频延迟',detail=string.format('%+.0f ms',(tonumber(mp.get_property_native('audio-delay')) or 0)*1000)}
   elseif mode=='subtitle' then heading='字幕'; rows={{kind='subtitle-off',title='关闭字幕',detail='',active=mp.get_property('sid','no')=='no'}}; for _,track in ipairs(tracks('sub')) do rows[#rows+1]={kind='subtitle',id=track.id,preference=track_signature(track),title=track.title or track.lang or ('字幕 '..track.id),detail=track_detail(track),active=track.selected} end; rows[#rows+1]={kind='subtitle-scale',icon='subtitle',title='字幕大小',detail=string.format('%.0f%%',(tonumber(mp.get_property_native('sub-scale')) or 1)*100)}; rows[#rows+1]={kind='subtitle-pos',icon='layout',title='垂直位置',detail=string.format('底部 %.0f%%',100-(tonumber(mp.get_property_native('sub-pos')) or 92))}; rows[#rows+1]={kind='subtitle-delay',icon='speed',title='字幕延迟',detail=string.format('%+.1f 秒',tonumber(mp.get_property_native('sub-delay')) or 0)}; rows[#rows+1]={kind='subtitle-border',icon='subtitle',title='文字描边',detail=string.format('%.1f px',tonumber(mp.get_property_native('sub-border-size')) or 1.5)}
   elseif mode=='speed' then heading='播放速度'; rows={}; for _,value in ipairs({.5,.75,1,1.25,1.5,1.75,2}) do local active=math.abs((mp.get_property_native('speed') or 1)-value)<.01; rows[#rows+1]={kind='speed',value=value,title=string.format('%.2g 倍',value),detail=active and '当前速度' or '',active=active} end
-  elseif mode=='chapters' then heading='片头 · 片尾'; local rule=state.chapterRule or {}; rows={{kind='chapter-set-intro',title='将当前时间设为片头结束',detail=rule.introEnd and fmt(rule.introEnd) or '未设置'},{kind='chapter-set-outro',title='将当前时间设为片尾开始',detail=rule.outroStart and fmt(rule.outroStart) or '未设置'},{kind='chapter-auto',title='自动跳过',detail=state.chapterAutoSkip and '已开启' or '已关闭'}}; if rule.source then rows[#rows+1]={kind='info',title='规则来源',detail=tostring(rule.source)} end; for i,item in ipairs(mp.get_property_native('chapter-list') or {}) do rows[#rows+1]={kind='chapter',index=i-1,title=item.title or ('媒体章节 '..i),detail=fmt(item.time)} end; rows[#rows+1]={kind='chapter-clear',title='删除本集规则',detail=''}
+  elseif mode=='chapters' then heading='片头 · 片尾'; local rule=state.chapterRule or {}; rows={{kind='chapter-set-intro',title='将当前时间设为片头结束',detail=rule.introEnd and fmt(rule.introEnd) or '未设置'},{kind='chapter-set-outro',title='将当前时间设为片尾开始',detail=rule.outroStart and fmt(rule.outroStart) or '未设置'},{kind='chapter-auto',title='自动跳过',detail=state.chapterAutoSkip and '已开启' or '已关闭',active=state.chapterAutoSkip}}; if rule.source then rows[#rows+1]={kind='info',title='规则来源',detail=tostring(rule.source)} end; for i,item in ipairs(mp.get_property_native('chapter-list') or {}) do rows[#rows+1]={kind='chapter',index=i-1,title=item.title or ('媒体章节 '..i),detail=fmt(item.time)} end; rows[#rows+1]={kind='chapter-clear',title='删除本集规则',detail=''}
   elseif mode=='danmaku' then heading='弹幕'; local track=danmaku_track(); local active=track and tostring(mp.get_property('secondary-sid','no'))==tostring(track.id); local mode_label=state.danmakuMode=='top' and '顶部优先' or state.danmakuMode=='bottom' and '底部优先' or '智能避让'; rows={{kind='info',icon='info',title='弹幕匹配集',detail='第 '..tostring(state.season or '?')..' 季 · 第 '..tostring(state.episode or '?')..' 集'},{kind='info',icon='count',title='当前状态',detail=(state.danmakuCount or 0)>0 and (tostring(state.danmakuCount)..' 条待播放') or '正在等待来源'},{kind='danmaku-toggle',icon='eye',title='显示弹幕',detail=active and '开启' or '关闭',active=active},{kind='danmaku-density',icon='density',title='显示密度',detail=state.danmakuDensity=='high' and '密集' or state.danmakuDensity=='low' and '稀疏' or '标准'},{kind='danmaku-mode',icon='layout',title='显示模式',detail=mode_label},{kind='danmaku-font',icon='info',title='字号',detail=tostring(state.danmakuFontScale or 100)..'%'},{kind='danmaku-opacity',icon='eye',title='不透明度',detail=tostring(state.danmakuOpacity or 86)..'%'},{kind='danmaku-duration',icon='speed',title='停留时间',detail=tostring(state.danmakuDuration or 5)..' 秒'},{kind='danmaku-count',icon='count',title='最大数量',detail=tostring(state.danmakuMaxCount or 1500)..' 条'},{kind='danmaku-outline',icon='subtitle',title='文字描边',detail=state.danmakuOutline=='strong' and '增强' or state.danmakuOutline=='none' and '关闭' or '柔和'},{kind='danmaku-reload',icon='refresh',title='重新获取弹幕',detail='重新查询所有来源'}}; for _,source in ipairs(state.danmakuSourceInfo or {}) do rows[#rows+1]={kind='info',icon='source',title=tostring(source.name or '弹幕 API'),detail=tostring(source.status or '')} end
-  elseif mode=='playback' then heading='播放'; rows={{kind='speed',value=.5,title='0.5 倍',detail='慢速',active=math.abs((mp.get_property_native('speed') or 1)-.5)<.01},{kind='speed',value=.75,title='0.75 倍',detail='慢速',active=math.abs((mp.get_property_native('speed') or 1)-.75)<.01},{kind='speed',value=1,title='1.0 倍',detail='标准',active=math.abs((mp.get_property_native('speed') or 1)-1)<.01},{kind='speed',value=1.25,title='1.25 倍',detail='快速',active=math.abs((mp.get_property_native('speed') or 1)-1.25)<.01},{kind='speed',value=1.5,title='1.5 倍',detail='快速',active=math.abs((mp.get_property_native('speed') or 1)-1.5)<.01},{kind='loop-file',icon='loop',title='单集循环',detail=mp.get_property('loop-file','no')=='inf' and '开启' or '关闭'},{kind='ab-loop',icon='loop',title='A-B 循环',detail='设置片段起止点'},{kind='capture',icon='capture',title='截取画面',detail='包含当前字幕'},{kind='ontop',icon='pin',title='窗口置顶',detail=mp.get_property_native('ontop',false) and '开启' or '关闭'}}
-  elseif mode=='picture' then heading='画面'; local aspect=mp.get_property('video-aspect-override','no'); rows={{kind='aspect',icon='picture',title='画面比例',detail=aspect=='no' and '原始比例' or aspect},{kind='zoom',icon='picture',title='缩放',detail=string.format('%.0f%%',(tonumber(mp.get_property_native('video-zoom')) or 0)*100)},{kind='rotate',icon='picture',title='旋转',detail=tostring(mp.get_property_native('video-rotate') or 0)..'°'},{kind='picture-reset',icon='refresh',title='恢复画面默认',detail='比例、缩放与旋转'},{kind='info',icon='info',title='硬件解码',detail=mp.get_property('hwdec-current','自动')},{kind='info',icon='info',title='视频输出',detail=mp.get_property('current-vo','--')}}
+  elseif mode=='playback' then heading='播放'; local looping=mp.get_property('loop-file','no')=='inf'; local ontop=mp.get_property_native('ontop',false); rows={{kind='speed',value=.5,title='0.5 倍',detail='慢速',active=math.abs((mp.get_property_native('speed') or 1)-.5)<.01},{kind='speed',value=.75,title='0.75 倍',detail='慢速',active=math.abs((mp.get_property_native('speed') or 1)-.75)<.01},{kind='speed',value=1,title='1.0 倍',detail='标准',active=math.abs((mp.get_property_native('speed') or 1)-1)<.01},{kind='speed',value=1.25,title='1.25 倍',detail='快速',active=math.abs((mp.get_property_native('speed') or 1)-1.25)<.01},{kind='speed',value=1.5,title='1.5 倍',detail='快速',active=math.abs((mp.get_property_native('speed') or 1)-1.5)<.01},{kind='loop-file',icon='loop',title='单集循环',detail=looping and '开启' or '关闭',active=looping},{kind='ab-loop',icon='loop',title='A-B 循环',detail='设置片段起止点'},{kind='capture',icon='capture',title='截取画面',detail='包含当前字幕'},{kind='ontop',icon='pin',title='窗口置顶',detail=ontop and '开启' or '关闭',active=ontop}}
+  elseif mode=='picture' then heading='画面'; local aspect=mp.get_property('video-aspect-override','no'); rows={{kind='aspect',icon='picture',title='画面比例',detail=aspect=='no' and '原始比例' or aspect},{kind='zoom',icon='picture',title='缩放',detail=string.format('%.0f%%',(tonumber(mp.get_property_native('video-zoom')) or 0)*100)},{kind='rotate',icon='picture',title='旋转',detail=tostring(mp.get_property_native('video-rotate') or 0)..'°'},{kind='picture-reset',icon='refresh',title='恢复画面默认',detail='比例、缩放与旋转'},{kind='hardware',icon='picture',title='硬件解码',detail=state.hardware and '已开启 · 下次播放生效' or '软解 · 下次播放生效',active=state.hardware},{kind='hwdec-mode',icon='picture',title='硬解模式',detail=tostring(state.hwdec or 'auto-safe')..' · 下次播放生效'},{kind='renderer',icon='picture',title='渲染器',detail=tostring(state.renderer or 'gpu-next')..' · 下次播放生效'},{kind='gpu',icon='picture',title='GPU 选择',detail=(state.gpu and state.gpu~='' and state.gpu or '自动')..' · 下次播放生效'},{kind='hdr',icon='picture',title='HDR 与 Dolby Vision',detail=state.hdr and '跟随显示器 · 下次播放生效' or '已关闭 · 下次播放生效',active=state.hdr},{kind='info',icon='info',title='实际硬解',detail=mp.get_property('hwdec-current','自动')},{kind='info',icon='info',title='视频输出',detail=mp.get_property('current-vo','--')}}
   elseif mode=='info' then heading='播放信息'; local video=mp.get_property_native('video-params') or {}; local audio=mp.get_property_native('audio-params') or {}; rows={{kind='info',icon='resources',title='播放路径',detail=state.resourceLabel or '当前资源'},{kind='info',icon='info',title='网络缓存',detail=rate(mp.get_property_native('cache-speed'))},{kind='info',icon='picture',title='视频',detail=tostring(video.pixelformat or mp.get_property('video-format','--')):upper()..' · '..tostring(video.w or '--')..'×'..tostring(video.h or '--')},{kind='info',icon='audio',title='音频',detail=tostring(audio.format or mp.get_property('audio-format','--')):upper()..' · '..tostring(audio['channel-count'] or '--')..' 声道'},{kind='info',icon='speed',title='帧率',detail=string.format('%.3f FPS',tonumber(mp.get_property_native('estimated-vf-fps')) or 0)},{kind='info',icon='info',title='丢帧',detail=tostring(mp.get_property_native('vo-drop-frame-count') or 0)}}
   else heading=''; rows={} end
   if #rows==0 then rows[1]={kind='info',title='暂无可用项目',detail=''} end
@@ -337,6 +348,9 @@ local function run_row(row)
   elseif row.kind=='subtitle-off' then mp.set_property('sid','no'); save_media_preference('subtitleTrack','off'); panel_mode=nil
   elseif row.kind=='speed' then mp.set_property_native('speed',row.value); save_media_preference('speed',row.value); panel_mode=nil
   elseif row.kind=='audio-delay' then cycle_property('audio-delay',{-1,-.5,0,.5,1},'audioDelay')
+  elseif row.kind=='downmix' then state.downmix=not state.downmix; mp.set_property('audio-channels',state.downmix and 'stereo' or 'auto'); save_ui_preference('downmix',state.downmix)
+  elseif row.kind=='vocal' then state.vocal=not state.vocal; mp.set_property('af',audio_filters()); save_ui_preference('vocal',state.vocal)
+  elseif row.kind=='night' then state.night=not state.night; mp.set_property('af',audio_filters()); save_ui_preference('night',state.night)
   elseif row.kind=='subtitle-scale' then cycle_property('sub-scale',{.85,1,1.15,1.3},'subtitleScale')
   elseif row.kind=='subtitle-pos' then cycle_property('sub-pos',{86,90,92,94},'subtitlePos')
   elseif row.kind=='subtitle-delay' then cycle_property('sub-delay',{-1,-.5,0,.5,1},'subtitleDelay')
@@ -360,6 +374,11 @@ local function run_row(row)
   elseif row.kind=='zoom' then cycle_property('video-zoom',{0,.15,.3},'videoZoom')
   elseif row.kind=='rotate' then cycle_property('video-rotate',{0,90,180,270},'videoRotate')
   elseif row.kind=='picture-reset' then mp.set_property('video-aspect-override','no'); mp.set_property_native('video-zoom',0); mp.set_property_native('video-rotate',0); state.videoAspect='auto'; state.videoZoom=0; state.videoRotate=0; save_media_preference('videoAspect','auto'); save_media_preference('videoZoom',0); save_media_preference('videoRotate',0)
+  elseif row.kind=='hardware' then state.hardware=not state.hardware; save_ui_preference('hardware',state.hardware)
+  elseif row.kind=='hdr' then state.hdr=not state.hdr; save_ui_preference('hdr',state.hdr)
+  elseif row.kind=='hwdec-mode' then local values={'auto-safe','d3d11va','d3d11va-copy','no'}; local index=1; for i,value in ipairs(values) do if value==state.hwdec then index=i end end; state.hwdec=values[index%#values+1]; save_ui_preference('hwdec',state.hwdec)
+  elseif row.kind=='renderer' then state.renderer=state.renderer=='gpu-next' and 'gpu' or 'gpu-next'; save_ui_preference('renderer',state.renderer)
+  elseif row.kind=='gpu' then local values={''}; for _,value in ipairs(state.gpuAdapters or {}) do values[#values+1]=value end; local index=1; for i,value in ipairs(values) do if value==state.gpu then index=i end end; state.gpu=values[index%#values+1]; save_ui_preference('gpu',state.gpu)
   elseif row.kind=='chapter-set-intro' or row.kind=='chapter-set-outro' then local field=row.kind=='chapter-set-intro' and 'introEnd' or 'outroStart'; local value=tonumber((mp.get_property_native('time-pos'))) or 0; state.chapterRule=state.chapterRule or {source='手动'}; state.chapterRule[field]=value; state.chapterRule.source='手动'; for _,episode in ipairs(episodes()) do if episode.chapterKey==state.chapterKey then episode.chapterRule=state.chapterRule end end; mp.set_property('user-data/yj-player-action',utils.format_json({type='chapter-rule',key=state.chapterKey,field=field,time=value}))
   elseif row.kind=='chapter-clear' then state.chapterRule=nil; for _,episode in ipairs(episodes()) do if episode.chapterKey==state.chapterKey then episode.chapterRule=nil end end; mp.set_property('user-data/yj-player-action',utils.format_json({type='chapter-rule',key=state.chapterKey,field='clear'})) end
   if not panel_mode and set_panel_key_bindings then set_panel_key_bindings(false) end
@@ -397,7 +416,7 @@ local function draw_console(ass,w,l)
   local volume=upper_controls(w,l)
   local volume_hover=hit(mouse_x,mouse_y,volume.x,volume.y,volume.x+volume.w,volume.y+volume.h); control_halo(ass,volume.x+12,volume.y+17,volume_hover,false,14); icon(ass,volume.x+12,volume.y+17,'volume','F7F8FC',.65); local value=clamp((tonumber((mp.get_property_native('volume'))) or 100)/100,0,1); rect(ass,volume.x+30,volume.y+16,volume.w-40,3,'8B939F',98); rect(ass,volume.x+30,volume.y+16,(volume.w-40)*value,3,'FFFFFF',0); circle(ass,volume.x+30+(volume.w-40)*value,volume.y+17.5,5,'FFFFFF',0); if volume_hover then tooltip(ass,volume.x+volume.w/2,volume.y,'音量') end
   for _,button in ipairs(utility_buttons(w,l)) do
-    local selected=(button.name=='episodes' and panel_mode=='episodes') or (button.name=='audio' and (panel_mode=='audio' or panel_mode=='subtitle')) or (button.name=='settings' and panel_mode and panel_mode~='episodes' and panel_mode~='audio' and panel_mode~='subtitle')
+    local selected=(button.name=='subtitle' and panel_mode=='subtitle') or (button.name=='danmaku' and panel_mode=='danmaku') or (button.name=='settings' and panel_mode and panel_mode~='episodes' and panel_mode~='subtitle' and panel_mode~='danmaku')
     local hovered=hit(mouse_x,mouse_y,button.x,button.y,button.x+button.w,button.y+button.h); local color=selected and 'FFFFFF' or (hovered and 'FFFFFF' or 'D8DEE7')
     control_halo(ass,button.x+button.w/2,button.y+18,hovered,selected,16); icon(ass,button.x+button.w/2,button.y+18,button.name,color,.66); if hovered then tooltip(ass,button.x+button.w/2,button.y,utility_labels[button.name]) end
   end
@@ -411,29 +430,33 @@ local function panel_motion()
   local t=clamp((now()-panel_opened_at)/.22,0,1)
   return 1-(1-t)*(1-t)*(1-t)
 end
-local kind_icons={info='info',audio='audio',subtitle='subtitle',resource='resources',speed='speed',chapter='chapters',['subtitle-off']='eye',['danmaku-toggle']='eye',['danmaku-density']='density',['danmaku-mode']='layout',['danmaku-font']='info',['danmaku-opacity']='eye',['danmaku-duration']='speed',['danmaku-count']='count',['danmaku-outline']='subtitle',['danmaku-reload']='refresh',['chapter-auto']='refresh',['chapter-set-intro']='chapters',['chapter-set-outro']='chapters',['chapter-clear']='close',['audio-delay']='audio',['subtitle-scale']='subtitle',['subtitle-pos']='layout',['subtitle-delay']='speed',['subtitle-border']='subtitle',['loop-file']='loop',['ab-loop']='loop',capture='capture',ontop='pin',aspect='picture',zoom='picture',rotate='picture',['picture-reset']='refresh'}
+local kind_icons={info='info',audio='audio',subtitle='subtitle',resource='resources',speed='speed',chapter='chapters',['subtitle-off']='eye',['danmaku-toggle']='eye',['danmaku-density']='density',['danmaku-mode']='layout',['danmaku-font']='info',['danmaku-opacity']='eye',['danmaku-duration']='speed',['danmaku-count']='count',['danmaku-outline']='subtitle',['danmaku-reload']='refresh',['chapter-auto']='refresh',['chapter-set-intro']='chapters',['chapter-set-outro']='chapters',['chapter-clear']='close',['audio-delay']='audio',downmix='audio',vocal='audio',night='audio',['subtitle-scale']='subtitle',['subtitle-pos']='layout',['subtitle-delay']='speed',['subtitle-border']='subtitle',['loop-file']='loop',['ab-loop']='loop',capture='capture',ontop='pin',aspect='picture',zoom='picture',rotate='picture',['picture-reset']='refresh',hardware='picture',['hwdec-mode']='picture',renderer='picture',gpu='picture',hdr='picture'}
 local function settings_panel_geometry(w,l)
-  local _,rows=panel_rows(panel_mode); local count=math.min(PANEL_ROWS,#rows); local width=clamp(math.floor(w*.48),720,900); local nav_w=226; local height=math.max(74+count*56,92+#settings_sections*46); local anchor=panel_anchor(w,l,(panel_mode=='audio' or panel_mode=='subtitle') and 'audio' or 'settings'); local x=clamp(anchor-width/2,l.edge,l.console_x+l.console_w-width); local y=math.max(20,l.console_y-height-18)
-  return {x=x,y=y+(1-panel_motion())*12,w=width,h=height,nav_w=nav_w,count=count,rows=rows}
+  local _,h=dimensions(); local _,rows=panel_rows(panel_mode); local body_y=154; local count=math.max(1,math.floor((h-body_y-22)/56))
+  return {x=l.rail_x,y=0,w=l.rail_w,h=h,body_y=body_y,count=math.min(count,#rows),rows=rows}
 end
 local function draw_list_panel(ass,w,l)
   clear_overlays()
-  local heading=select(1,panel_rows(panel_mode)); local box=settings_panel_geometry(w,l); panel_offset=clamp(panel_offset,0,math.max(0,#box.rows-PANEL_ROWS))
-  glass(ass,box.x,box.y,box.w,box.h,20); rect(ass,box.x+box.nav_w,box.y+1,1,box.h-2,'FFFFFF',224)
-  text(ass,box.x+24,box.y+35,18,7,'播放设置','FFFFFF',0,true)
+  local heading=select(1,panel_rows(panel_mode)); local box=settings_panel_geometry(w,l); panel_offset=clamp(panel_offset,0,math.max(0,#box.rows-box.count))
+  rect(ass,box.x,box.y,box.w,box.h,'08090D',10); rect(ass,box.x,box.y,1,box.h,'FFFFFF',220)
+  text(ass,box.x+22,30,17,7,'播放设置','FFFFFF',0,true); text(ass,box.x+22,51,11,7,'改动即时下发给 mpv，并记入播放偏好。','AAB2BE',0,false)
+  local tab_x=box.x+16; local tab_w=(box.w-32)/#settings_sections
   for index,item in ipairs(settings_sections) do
-    local ry=box.y+54+(index-1)*46; local selected=item.mode==panel_mode; local focused=panel_nav_focus and index==panel_section_focus; local hovered=hit(mouse_x,mouse_y,box.x+12,ry,box.x+box.nav_w-12,ry+40)
-    row_surface(ass,box.x+12,ry,box.nav_w-24,40,11,selected,focused,hovered); local color=(selected or focused) and 'FFFFFF' or 'D8DEE7'
-    icon(ass,box.x+34,ry+20,item.icon,color,.48); text(ass,box.x+56,ry+25,12,7,item.label,color,0,true)
-    if selected then text(ass,box.x+box.nav_w-24,ry+24,12,9,'›','211713',0,true) end
+    local tx=tab_x+(index-1)*tab_w; local selected=item.mode==panel_mode; local focused=panel_nav_focus and index==panel_section_focus; local hovered=hit(mouse_x,mouse_y,tx,73,tx+tab_w,109)
+    row_surface(ass,tx+2,76,tab_w-4,30,8,selected,focused,hovered); local color=(selected or focused) and 'FFFFFF' or 'B8C0CC'
+    text(ass,tx+tab_w/2,96,11,5,item.label,color,0,true)
   end
-  local detail_x=box.x+box.nav_w+20; icon(ass,detail_x+10,box.y+32,settings_sections[settings_section_index(panel_mode)].icon,'FFFFFF',.55); text(ass,detail_x+31,box.y+37,18,7,heading,'FFFFFF',0,true); text(ass,box.x+box.w-24,box.y+35,11,9,tostring(#box.rows)..' 项','B8C0CC',0,true); rect(ass,detail_x,box.y+53,box.w-box.nav_w-40,1,'FFFFFF',228)
+  rect(ass,box.x+20,120,box.w-40,1,'FFFFFF',232)
+  local detail_x=box.x+18; icon(ass,detail_x+10,139,settings_sections[settings_section_index(panel_mode)].icon,'FFFFFF',.5); text(ass,detail_x+30,144,16,7,heading,'FFFFFF',0,true); text(ass,box.x+box.w-22,143,11,9,tostring(#box.rows)..' 项','B8C0CC',0,true)
   for index=1,box.count do
-    local absolute=panel_offset+index; local row=box.rows[absolute]; local ry=box.y+64+(index-1)*56; local active=row.active==true; local focused=not panel_nav_focus and absolute==panel_focus; local hovered=hit(mouse_x,mouse_y,detail_x,ry,box.x+box.w-12,ry+48)
-    row_surface(ass,detail_x,ry,box.w-box.nav_w-32,48,14,active,focused,hovered); local row_color=(active or focused) and 'FFFFFF' or 'D8DEE7'; local detail_color=(active or focused) and 'E8EFF8' or 'AEB8C5'
-    icon(ass,detail_x+24,ry+24,row.icon or kind_icons[row.kind] or 'info',row_color,.56); local detail_right=active and box.x+box.w-60 or box.x+box.w-26
-    clipped_text(ass,detail_x+48,ry+22,13,7,row.title,row_color,0,true,detail_x+46,ry+6,box.x+box.w-164,ry+42); clipped_text(ass,detail_right,ry+22,11,9,row.detail or '',detail_color,0,false,box.x+box.w-158,ry+6,detail_right,ry+42)
-    if active then icon(ass,box.x+box.w-42,ry+24,'check','FFFFFF',.44) end
+    local absolute=panel_offset+index; local row=box.rows[absolute]; local ry=box.body_y+(index-1)*56; local active=row.active==true; local focused=not panel_nav_focus and absolute==panel_focus; local hovered=hit(mouse_x,mouse_y,detail_x,ry,box.x+box.w-14,ry+48)
+    row_surface(ass,detail_x,ry,box.w-36,48,14,active,focused,hovered); local row_color=(active or focused) and 'FFFFFF' or 'D8DEE7'; local detail_color=(active or focused) and 'E8EFF8' or 'AEB8C5'
+    icon(ass,detail_x+24,ry+24,row.icon or kind_icons[row.kind] or 'info',row_color,.56); local detail_right=active and box.x+box.w-58 or box.x+box.w-24
+    clipped_text(ass,detail_x+48,ry+22,13,7,row.title,row_color,0,true,detail_x+46,ry+6,box.x+box.w-170,ry+42); clipped_text(ass,detail_right,ry+22,10,9,row.detail or '',detail_color,0,false,box.x+box.w-164,ry+6,detail_right,ry+42)
+    local switches={downmix=true,vocal=true,night=true,['danmaku-toggle']=true,['chapter-auto']=true,['loop-file']=true,ontop=true,hardware=true,hdr=true}
+    if switches[row.kind] then
+      local sx,sy=box.x+box.w-58,ry+12; roundrect(ass,sx,sy,36,24,12,active and '6FBD76' or 'FFFFFF',active and 0 or 210); circle(ass,sx+(active and 24 or 12),sy+12,9,active and 'FFFFFF' or '262A33',0)
+    elseif active then icon(ass,box.x+box.w-42,ry+24,'check','FFFFFF',.44) end
   end
 end
 local function draw_episode_panel(ass,w,l)
@@ -457,7 +480,7 @@ function render()
   local w,h=dimensions(); if not w or w<=0 or not visible() then clear_overlays(); if logo_overlay_signature~='' then safe_overlay_command('overlay-remove',10); logo_overlay_signature='' end; mp.set_osd_ass(0,0,''); return end
   if not render_logged then mp.msg.info(string.format('[yingji_osc] render active (%dx%d)',w,h)); render_logged=true end
   pending_overlay_cards=nil; local ass=assdraw.ass_new(); local l=layout(w,h); draw_top(ass,w,l); draw_console(ass,w,l)
-  if panel_mode=='episodes' then draw_episode_panel(ass,w,l) elseif panel_mode then draw_list_panel(ass,w,l) else clear_overlays() end
+  if panel_mode=='episodes' then draw_episode_panel(ass,w,l) else draw_list_panel(ass,w,l) end
   mp.set_osd_ass(w,h,ass.text)
   sync_logo_overlay()
   if pending_overlay_cards then sync_episode_overlays(pending_overlay_cards) end
@@ -477,6 +500,11 @@ local function render_fallback(error_text)
   mp.set_osd_ass(w,h,ass.text)
 end
 function render()
+  if headless then
+    clear_overlays()
+    mp.set_osd_ass(0,0,'')
+    return
+  end
   local ok, err = pcall(render_impl)
   if not ok and not render_error_reported then
     render_error_reported = true
@@ -513,8 +541,8 @@ set_panel_key_bindings=function(enabled)
   mp.add_forced_key_binding('RIGHT','yingji-panel-focus-right',function() if panel_mode~='episodes' then panel_nav_focus=false; show(15); render() else move_panel_focus(1) end end)
 end
 local function toggle_panel(name)
-  if name=='settings' then name='resources' end
-  clear_overlays(); panel_mode=panel_mode==name and nil or name; panel_opened_at=now(); panel_nav_focus=false; panel_section_focus=settings_section_index(name); panel_focus=name=='episodes' and current_episode_index() or first_panel_row(name); panel_offset=name=='episodes' and math.max(1,panel_focus-2) or math.max(0,panel_focus-1); set_panel_key_bindings(panel_mode~=nil); show(panel_mode and 15 or 4.2); render()
+  if name=='settings' then name='audio' end
+  clear_overlays(); panel_mode=name; panel_opened_at=now(); panel_nav_focus=false; panel_section_focus=settings_section_index(name); panel_focus=name=='episodes' and current_episode_index() or first_panel_row(name); panel_offset=name=='episodes' and math.max(1,panel_focus-2) or math.max(0,panel_focus-1); set_panel_key_bindings(panel_mode=='episodes'); show(15); render()
 end
 local function set_volume_from_mouse(x, l)
   local volume=upper_controls(select(1,dimensions()),l)
@@ -530,9 +558,9 @@ local function click(event)
   if panel_mode=='episodes' then local cards=episode_cards(w,l); for _,card in ipairs(cards) do if hit(x,y,card.x,card.y,card.x+card.w,card.y+card.h) then load_item(card.item,true); return end end
   elseif panel_mode then
     local box=settings_panel_geometry(w,l)
-    if hit(x,y,box.x+12,box.y+54,box.x+box.nav_w-12,box.y+54+#settings_sections*46) then local index=clamp(math.floor((y-(box.y+54))/46)+1,1,#settings_sections); panel_mode=settings_sections[index].mode; panel_section_focus=index; panel_nav_focus=false; panel_focus=first_panel_row(panel_mode); panel_offset=0; show(15); render(); return end
-    local detail_x=box.x+box.nav_w+20
-    if hit(x,y,detail_x,box.y+64,box.x+box.w-12,box.y+64+box.count*56) then local index=math.floor((y-(box.y+64))/56)+1; local row=box.rows[panel_offset+index]; if row_actionable(row) then run_row(row); render() end; return end
+    if hit(x,y,box.x+16,73,box.x+box.w-16,109) then local index=clamp(math.floor((x-(box.x+16))/((box.w-32)/#settings_sections))+1,1,#settings_sections); panel_mode=settings_sections[index].mode; panel_section_focus=index; panel_nav_focus=false; panel_focus=first_panel_row(panel_mode); panel_offset=0; show(15); render(); return end
+    local detail_x=box.x+18
+    if hit(x,y,detail_x,box.body_y,box.x+box.w-14,box.body_y+box.count*56) then local index=math.floor((y-box.body_y)/56)+1; local row=box.rows[panel_offset+index]; if row_actionable(row) then run_row(row); render() end; return end
   end
   local duration=tonumber((mp.get_property_native('duration'))) or 0; local track_x=l.console_x+86; local track_w=l.console_w-172
   if hit(x,y,track_x,l.progress_y-15,track_x+track_w,l.progress_y+15) and duration>0 then progress_dragging=true; mp.commandv('seek',duration*clamp((x-track_x)/track_w,0,1),'absolute'); show(); return end
@@ -540,7 +568,7 @@ local function click(event)
   local volume=upper_controls(w,l)
   if hit(x,y,volume.x,volume.y,volume.x+volume.w,volume.y+volume.h) then volume_dragging=true; set_volume_from_mouse(x,l); show(); return end
   for _,button in ipairs(utility_buttons(w,l)) do if hit(x,y,button.x,button.y,button.x+button.w,button.y+button.h) then if button.name=='fullscreen' then mp.commandv('cycle','fullscreen'); show(); render() else toggle_panel(button.name) end; return end end
-  panel_mode=nil; panel_nav_focus=false; set_panel_key_bindings(false); clear_overlays(); show(); render()
+  panel_nav_focus=false; clear_overlays(); show(); render()
 end
 local function scroll_panel(delta)
   if not panel_mode then return end
@@ -558,12 +586,12 @@ mp.add_key_binding('UP','yingji-volume-up',function() if panel_mode then return 
 mp.add_key_binding('DOWN','yingji-volume-down',function() if panel_mode then return end; mp.set_property_native('volume',clamp((tonumber(mp.get_property_native('volume')) or 100)-5,0,100)); show(); render() end)
 mp.add_forced_key_binding('WHEEL_UP','yingji-panel-up',function() scroll_panel(-1) end)
 mp.add_forced_key_binding('WHEEL_DOWN','yingji-panel-down',function() scroll_panel(1) end)
-mp.add_key_binding('ESC','yingji-osc-close',function() if panel_mode then panel_mode=nil; panel_nav_focus=false; set_panel_key_bindings(false); clear_overlays(); render() else mp.commandv('quit') end end)
+mp.add_key_binding('ESC','yingji-osc-close',function() if panel_mode=='episodes' then panel_mode='audio'; panel_nav_focus=false; set_panel_key_bindings(false); clear_overlays(); render() else mp.commandv('quit') end end)
 mp.add_key_binding('SPACE','yingji-osc-pause',function() mp.commandv('cycle','pause'); show() end)
 mp.add_key_binding('LEFT','yingji-osc-back',function() mp.commandv('seek','-10','relative'); show() end)
 mp.add_key_binding('RIGHT','yingji-osc-forward',function() mp.commandv('seek','10','relative'); show() end)
 mp.register_script_message('yingji-test-panel',toggle_panel)
 mp.register_event('file-loaded',function() if pending_seek then local value=pending_seek; pending_seek=nil; mp.commandv('seek',value,'absolute+exact') end; apply_saved_track('audio',state.audioPreference); apply_saved_track('sub',state.subtitlePreference); local track=danmaku_track(); if track and state.danmakuEnabled then mp.set_property('secondary-sid',tostring(track.id)) end; show(4.5); render() end)
-mp.register_event('start-file',function() panel_mode=nil; panel_offset=0; panel_nav_focus=false; intro_skipped=false; outro_skipped=false; set_panel_key_bindings(false); clear_overlays(); show(4.5); render() end)
+mp.register_event('start-file',function() panel_mode='audio'; panel_offset=0; panel_nav_focus=false; intro_skipped=false; outro_skipped=false; set_panel_key_bindings(false); clear_overlays(); show(15); render() end)
 mp.register_event('shutdown',function() clear_overlays(); safe_overlay_command('overlay-remove',10) end)
 mp.add_periodic_timer(.15,render)

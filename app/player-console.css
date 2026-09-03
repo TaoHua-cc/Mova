@@ -1,0 +1,421 @@
+/* ══════════════════════════════════════════════════════════════════════════
+   Yingji — player console
+   The in-app surface shown while mpv owns playback. Everything here reuses
+   the tokens already defined in forward.css (:root / body.yj-ui) plus the
+   component language of .yj-setting-group, .switch and .yj-eyebrow.
+   No new colours are introduced.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Home hero rotation ───────────────────────────────────────────────────
+   forward.css:567 force-disables .yj-feature-copy animation inside yj-ui, and
+   updateHero() used to pin .yj-no-anim on the wrapper forever. Together that
+   made every carousel step a hard cut. Animate the section itself instead —
+   it is not covered by that override. */
+@keyframes yj-hero-rotate-in { from { opacity:0; transform:scale(1.014) } to { opacity:1; transform:none } }
+body.yj-ui #app.app .yj-home .yj-hero-wrap > .yj-tv-hero { animation:yj-hero-rotate-in .44s var(--ease) both; }
+body.yj-ui #app.app .yj-home .yj-hero-wrap > .yj-tv-hero.is-leaving { opacity:0; transition:opacity .18s ease; animation:none; }
+@media (prefers-reduced-motion:reduce) {
+  body.yj-ui #app.app .yj-home .yj-hero-wrap > .yj-tv-hero,
+  body.yj-ui #app.app .yj-home .yj-hero-wrap > .yj-tv-hero.is-leaving { animation:none !important; transition:none !important; opacity:1; }
+}
+
+/* ── Console skeleton ─────────────────────────────────────────────────── */
+.p-console{
+  display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:100vh;
+  padding-top:var(--yj-top);padding-left:var(--yj-side);
+  position:relative; /* anchor for .p-video absolute fill */
+  animation:yj-enter .32s var(--ease) both;
+}
+body.yj-ui #app.app>.p-console{
+  width:100%!important;min-height:100vh!important;margin:0!important;
+  padding:var(--yj-top) 0 0 var(--yj-side)!important;
+}
+
+/* ── Player-only application shell — copied from player-v9 ───────────── */
+.p-shell-titlebar{
+  position:fixed;z-index:190;top:0;right:0;left:0;display:flex;height:var(--yj-top);
+  align-items:center;padding:0 14px;border-bottom:1px solid transparent;
+  background:#08090d47;backdrop-filter:blur(28px) saturate(165%);-webkit-app-region:drag;
+}
+.p-shell-titlebar>b{font-size:12px;letter-spacing:.08em}
+.p-shell-titlebar>span{margin-left:16px;color:#7f808a;font-size:11px}
+.p-shell-titlebar .win{margin-left:auto;display:flex;gap:14px;color:#8b8d97;font-size:13px;-webkit-app-region:no-drag}
+.p-shell-titlebar .win span{display:grid;width:auto;height:auto;place-items:center}
+
+.p-shell-sidebar{
+  position:fixed;z-index:170;top:var(--yj-top);bottom:0;left:0;display:flex;width:var(--yj-side);
+  flex-direction:column;align-items:center;padding:1.2rem .7rem 1rem;gap:.42rem;
+  border-right:1px solid rgba(255,255,255,.14);
+  background:linear-gradient(180deg,rgba(15,18,27,.68),rgba(15,18,27,.4) 54%,rgba(6,8,13,.78));
+  box-shadow:inset -1px 0 rgba(255,255,255,.06),12px 0 38px rgba(0,0,0,.16);
+  backdrop-filter:blur(48px) saturate(160%);
+}
+.p-shell-brand{
+  display:grid;width:2.35rem;height:2.35rem;place-items:center;margin-bottom:.9rem;
+  border:1px solid #ffffff21;border-radius:12px;background:linear-gradient(145deg,#767280,#2f3039);
+  box-shadow:inset 0 1px #ffffff2b;font-weight:750;
+}
+.p-shell-sidebar nav{display:grid;gap:.42rem}
+.p-shell-nav{
+  display:grid;width:2.75rem;height:2.75rem;padding:0;place-items:center;border:0;border-radius:13px;
+  background:transparent;color:#90919c;transition:background .2s ease,color .2s ease;
+}
+.p-shell-nav:hover{background:#ffffff0b;color:#fff}
+.p-shell-nav.is-active{background:#ffffff29;box-shadow:inset 0 1px #ffffff33,0 6px 18px #00000052;color:#fff}
+.p-shell-nav svg{width:18px;height:18px}
+.p-shell-titlebar .win span:active,.p-shell-nav:active,.p-back:active,.p-icon-btn:active{transform:none}
+
+.p-shell-commandbar{
+  position:fixed;z-index:160;top:var(--yj-top);right:0;left:var(--yj-side);display:flex;height:var(--yj-command);
+  align-items:center;gap:12px;padding:0 clamp(18px,2.4vw,40px);
+  background:linear-gradient(#0b0c1080 60%,rgba(11,12,16,0));backdrop-filter:blur(18px) saturate(140%);
+  pointer-events:none;
+}
+.p-shell-commandbar>*{pointer-events:auto}
+.p-back{
+  display:flex;align-items:center;gap:6px;height:2.5rem;padding:0 .8rem;border:1px solid #ffffff10;
+  border-radius:.65rem;background:#ffffff07;color:var(--muted-2,#9698a3);font-size:13px;
+}
+.p-back:hover{background:#ffffff0f;color:var(--ink)}
+.p-back svg{width:16px;height:16px;transform:rotate(180deg)}
+.p-crumb{display:grid;min-width:0}
+.p-crumb b{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.p-crumb small{color:#7f808a;font-size:11px}
+.p-command-spacer{margin-left:auto}
+.p-icon-btn{
+  display:grid;width:2.5rem;height:2.5rem;padding:0;place-items:center;border:1px solid #ffffff0e;
+  border-radius:50%;background:#ffffff08;color:#aaa;
+}
+.p-icon-btn:hover{background:#ffffff14;color:#fff}
+
+/* ── Embedded video (mpv --wid) ──────────────────────────────────────────
+   mpv paints into the Electron window's client area and the window is
+   created with transparent:true, so the picture shows through wherever the
+   document is NOT opaque. That inverts the usual control: to reveal video
+   you remove paint, you don't add it.
+   Consequence: mpv fills the WHOLE window, not just one column — the v9
+   console is an overlay floating on the picture. */
+
+/* forward.css paints html/body with opaque --canvas / #08090d (body.yj-ui).
+   Anything opaque here completely hides the video, so the document surface
+   must go transparent while the console is mounted. Scoped with :has() so
+   every other route keeps its normal opaque background. !important beats the
+   light-theme variants in forward.css (html[data-appearance] body.yj-ui). */
+html:has(.p-console){background:transparent!important}
+body.yj-ui:has(.p-console){background:transparent!important}
+/* #app gets an opaque light fill under html[data-appearance="light"], which
+   would hide the picture just as effectively as the body fill does. */
+html:has(.p-console) .app{background:transparent!important}
+
+/* Global chrome (titlebar + sidebar) is forced transparent by
+   navigation-repair.css. Over moving video the nav icons stop being legible,
+   so give both a directional scrim only on the player route. */
+body.yj-ui:has(.p-console) .yj-titlebar{
+  background:linear-gradient(180deg,rgba(8,9,13,.80),rgba(8,9,13,.16))!important;
+  backdrop-filter:blur(20px) saturate(135%)!important;
+}
+body.yj-ui:has(.p-console) .yj-sidebar{
+  background:linear-gradient(90deg,rgba(8,9,13,.90) 0,rgba(8,9,13,.66) 74%,rgba(8,9,13,.30) 100%)!important;
+  backdrop-filter:blur(24px) saturate(140%)!important;
+}
+
+.p-video{
+  position:absolute;inset:0;z-index:0;
+  grid-column:1 / -1; /* spans the window — marks the mpv picture area */
+  background:transparent;pointer-events:none;
+}
+
+/* Stage reuses the --poster-rgb bloom already used by .yj-home / .detail-canvas */
+.p-stage{
+  position:relative;display:flex;flex-direction:column;justify-content:flex-end;
+  min-width:0;padding:calc(var(--yj-command) + 1.5rem) clamp(24px,3vw,48px) clamp(20px,2.4vh,34px);
+  z-index:1; /* above .p-video (mpv render target) */
+  /* No flat fill — a base colour here dims the picture with nothing behind it
+     to earn the contrast. Only the poster bloom stays, and it is a tint over
+     the video rather than a backdrop. */
+  background:
+    radial-gradient(70rem 34rem at 76% 0,rgba(var(--poster-rgb,120,140,180),.13),transparent 64%);
+  overflow:hidden;
+}
+/* Legibility scrims live here instead of a base fill: dark at the very top
+   (behind the floating back button) and heavy at the bottom (behind the
+   poster / transport block, which is bottom-anchored), fully open through
+   the middle so the picture reads. */
+.p-stage::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,
+    rgba(8,9,13,.58) 0,
+    rgba(8,9,13,.14) 12%,
+    transparent 26%,
+    transparent 48%,
+    rgba(8,9,13,.56) 72%,
+    rgba(8,9,13,.93) 100%);
+}
+.p-stage>*{position:relative;z-index:1}
+/* .yj-page-back is position:fixed in forward.css, but .p-stage>* above carries
+   the same specificity and loads later. Re-assert the floating placement. */
+.p-head{display:flex;gap:clamp(18px,2.2vw,30px);align-items:flex-end;margin-bottom:1.4rem}
+.p-poster{
+  width:clamp(116px,13vw,168px);aspect-ratio:2/3;flex:0 0 auto;border-radius:16px;
+  border:1px solid var(--line);box-shadow:0 22px 50px rgba(0,0,0,.5);
+  background:linear-gradient(150deg,#2b3242,#14171f 60%,#0d1015),#222 center/cover;
+  position:relative;overflow:hidden;
+}
+.p-poster::after{content:"";position:absolute;inset:0;background:radial-gradient(circle at 30% 22%,rgba(255,255,255,.14),transparent 58%)}
+.p-head-copy{min-width:0;padding-bottom:.2rem}
+.p-head h1{margin:.5rem 0 0;font-size:clamp(30px,3.4vw,50px);font-weight:680;line-height:.98;letter-spacing:-.05em}
+.p-stage-meta{display:flex;flex-wrap:wrap;gap:.45rem .7rem;margin:.7rem 0 0;padding:0;list-style:none;color:var(--muted-2,#9698a3);font-size:13px}
+.p-stage-meta li{display:flex;align-items:center;gap:.4rem}
+.p-stage-meta li+li::before{content:"";width:3px;height:3px;border-radius:50%;background:#5a5c66;margin-right:.25rem}
+
+/* Media chips reuse the .yj-media-chip shape that ui.js already injects.
+   Only the empty-state placeholder is added here. */
+.p-media-info{margin-bottom:1.15rem;min-height:2.7rem}
+.p-stage .p-media-info{justify-content:flex-start!important;margin:0 0 1.15rem!important}
+.p-media-info:empty::after{content:"正在读取媒体信息…";align-self:center;color:#858792;font-size:12px}
+
+/* Progress — inherits the legacy .timeline language: white played bar */
+.p-progress{padding:.55rem 0 .2rem}
+.p-progress-track{position:relative;height:4px;border-radius:99px;background:#ffffff22;cursor:pointer}
+.p-progress-track::before{content:"";position:absolute;inset:-9px 0}
+.p-progress-buffer{position:absolute;inset:0;border-radius:99px;background:rgba(255,255,255,.10);width:0}
+.p-progress-played{position:relative;height:100%;width:0;border-radius:99px;background:#fff;display:block}
+.p-progress-handle{
+  position:absolute;top:50%;left:100%;width:13px;height:13px;margin:-6.5px 0 0 -6.5px;
+  border-radius:50%;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.5);
+  transform:scale(0);transition:transform .16s var(--ease);
+}
+.p-progress:hover .p-progress-handle{transform:scale(1)}
+.p-progress-mark{position:absolute;top:-2px;width:2px;height:8px;border-radius:2px;background:#ffffff59}
+.p-times{display:flex;align-items:center;gap:.9rem;margin-top:.55rem;color:#9698a3;font-size:12px;font-variant-numeric:tabular-nums}
+.p-times b{color:var(--ink);font-weight:600}
+.p-skip-intro{
+  margin-left:auto;display:flex;align-items:center;gap:.35rem;height:1.9rem;padding:0 .7rem;
+  border:1px solid #ffffff14;border-radius:99px;background:#ffffff08;color:var(--ink);
+  font-size:12px;font-weight:600;
+}
+.p-skip-intro:hover{background:#ffffff14}
+
+/* Transport — same glass as .hud */
+.p-transport{
+  display:flex;align-items:center;gap:.5rem;margin-top:1rem;padding:.7rem .85rem;
+  border:1px solid rgba(255,255,255,.10);border-radius:16px;
+  background:var(--glass);backdrop-filter:blur(34px) saturate(155%);
+}
+.p-transport-btn{
+  display:grid;width:2.5rem;height:2.5rem;padding:0;place-items:center;
+  border:1px solid #ffffff0e;border-radius:50%;background:#ffffff08;color:#d7d8df;
+  transition:background .16s ease,color .16s ease,transform .16s ease;
+}
+.p-transport-btn:hover{background:#ffffff14;color:#fff}
+.p-transport-btn:active{transform:scale(.94)}
+.p-transport-btn:disabled{opacity:.35;cursor:not-allowed}
+.p-transport-btn.solid{width:2.85rem;height:2.85rem;background:#fff;color:#111;border-color:transparent}
+.p-transport-btn.solid:hover{background:#e9e9ee;color:#111}
+.p-transport-btn.solid svg{width:20px;height:20px;fill:currentColor;stroke:none}
+.p-transport-btn.solid.is-paused svg{fill:none;stroke:currentColor}
+.p-transport-div{width:1px;height:1.5rem;background:#ffffff14;margin:0 .25rem}
+.p-transport-spacer{margin-left:auto}
+.p-status-chip{
+  display:inline-flex;align-items:center;gap:.3rem;height:1.75rem;padding:0 .6rem;
+  border:1px solid var(--line);border-radius:99px;background:rgba(255,255,255,.05);
+  color:#9698a3;font-size:11px;font-weight:600;white-space:nowrap;
+}
+.p-status-chip svg{width:13px;height:13px}
+.p-status-chip.is-live{color:var(--success);border-color:rgba(142,228,156,.28);background:rgba(142,228,156,.10)}
+.p-vol{display:flex;align-items:center;gap:.5rem;padding:0 .35rem}
+.p-vol svg{width:17px;height:17px;color:#b8bac4}
+.p-volume-button{display:grid;width:18px;height:24px;padding:0;place-items:center;border:0;background:transparent;color:#b8bac4}
+.p-slider{
+  -webkit-appearance:none;appearance:none;height:4px;border-radius:99px;
+  background:#ffffff1f;outline:none;cursor:pointer;
+}
+.p-vol-slider{
+  -webkit-appearance:none;appearance:none;width:78px;height:4px;border-radius:99px;
+  background:#ffffff1f;outline:none;cursor:pointer;
+}
+.p-vol-slider::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 1px 5px rgba(0,0,0,.5)}
+.p-vol-slider::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff}
+.p-vol-slider:focus-visible{outline:2px solid #6ea8ff;outline-offset:4px}
+.p-slider::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 1px 5px rgba(0,0,0,.5)}
+.p-slider::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff}
+.p-slider:focus-visible{outline:2px solid #6ea8ff;outline-offset:4px}
+
+/* ── Right control rail ───────────────────────────────────────────────── */
+.p-rail{
+  display:flex;flex-direction:column;min-width:0;
+  border-left:1px solid rgba(255,255,255,.11);
+  /* In a transparent window backdrop-filter samples what is behind the
+     WINDOW (the desktop), not the mpv output underneath — so the panel
+     cannot lean on blur for contrast. Carry the weight in the fill and keep
+     the blur only as a softener. */
+  background:linear-gradient(180deg,rgba(11,12,16,.55),rgba(8,9,13,.85));
+  backdrop-filter:blur(38px) saturate(145%);
+  padding-top:var(--yj-command);
+  z-index:1; /* above .p-video (mpv render target) */
+}
+.p-rail-head{padding:1.1rem 1.25rem .85rem;border-bottom:1px solid #ffffff0d}
+.p-rail-head h2{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em}
+.p-rail-head p{margin:.25rem 0 0;color:#858792;font-size:12px}
+.p-rail-tabs{display:flex;gap:.3rem;overflow-x:auto;padding:.7rem 1.25rem;scrollbar-width:none}
+.p-rail-tabs::-webkit-scrollbar{display:none}
+.p-rail-tab{
+  flex:0 0 auto;min-height:2.1rem;padding:0 .72rem;border:0;border-radius:.5rem;
+  background:transparent;color:#9b9da8;font-size:.74rem;font-weight:680;
+  transition:background .16s ease,color .16s ease;
+}
+.p-rail-tab:hover{background:#ffffff0a;color:var(--ink)}
+.p-rail-tab.is-active{background:#ffffff13;color:#fff}
+.p-rail-body{flex:1;overflow-y:auto;padding:0 1.25rem 1.5rem;display:grid;align-content:start;gap:14px}
+
+/* Groups are surfaced by .yj-setting-group from forward.css; only the
+   internal grid differs (34px icon column instead of 42px). */
+.p-group > article{grid-template-columns:34px 1fr auto}
+.p-group .yj-ico{display:grid;width:34px;height:34px;place-items:center;border-radius:11px;background:#ffffff0a;color:#c3c5ce}
+.p-group .yj-ico svg{width:16px;height:16px}
+
+.p-select{
+  min-width:7.6rem;max-width:11rem;padding:.45rem .6rem;border-radius:.6rem;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);
+  color:inherit;font:inherit;font-size:.8rem;
+}
+.p-select:focus-visible{outline:2px solid #6ea8ff;outline-offset:1px}
+
+.p-seg{display:flex;gap:2px;padding:3px;border-radius:.6rem;background:rgba(255,255,255,.06)}
+.p-seg button{
+  min-height:1.8rem;padding:0 .6rem;border:0;border-radius:.45rem;background:transparent;
+  color:#9b9da8;font-size:.74rem;font-weight:650;
+}
+.p-seg button:hover{color:var(--ink)}
+.p-seg button.is-active{background:#ffffff13;color:#fff}
+
+.p-track-list{padding:0 8px 12px;display:grid;gap:2px}
+.p-track-row{
+  display:grid;width:100%;grid-template-columns:32px 1fr auto;gap:10px;align-items:center;
+  padding:8px 10px;border:0;border-radius:11px;background:transparent;color:#fff;text-align:left;
+}
+.p-track-row:hover{background:#ffffff0d}
+.p-track-row.is-active{background:#ffffff1a}
+.p-track-index{
+  display:grid;width:32px;height:32px;place-items:center;border-radius:10px;
+  background:#ffffff10;color:#dedee4;font-size:11px;font-weight:650;
+}
+.p-track-row.is-active .p-track-index{background:var(--focus,#79a8ff);color:#08101f}
+.p-track-copy{display:grid;min-width:0}
+.p-track-copy b{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.p-track-copy small{color:#797b86;font-size:10px}
+.p-track-row em{width:6px;height:6px;border-radius:50%;background:transparent}
+.p-track-row.is-active em{background:#78d689}
+
+.p-diag{display:grid;grid-template-columns:1fr auto;gap:0 12px;margin:0;padding:0 18px 16px;font-size:12px}
+.p-diag dt{color:#858792;padding:.32rem 0;border-top:1px solid #ffffff0d}
+.p-diag dd{margin:0;padding:.32rem 0;border-top:1px solid #ffffff0d;color:var(--ink);font-variant-numeric:tabular-nums;text-align:right;font-weight:600}
+.p-diag dd.is-ok{color:var(--success)}
+.p-diag dd.is-warn{color:#ffc46b}
+
+.p-chapter-list{padding:0 8px 12px;display:grid;gap:2px}
+.p-chapter-row{
+  display:grid;grid-template-columns:3.1rem 1fr auto;gap:.7rem;align-items:center;
+  width:100%;min-height:2.7rem;padding:.5rem .6rem;border:0;border-radius:.65rem;
+  background:transparent;color:inherit;text-align:left;
+}
+.p-chapter-row:hover{background:#ffffff0a}
+.p-chapter-row.is-current{background:#ffffff12}
+.p-chapter-row time{color:#858792;font-size:11px;font-variant-numeric:tabular-nums}
+.p-chapter-row span{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.p-chapter-row.is-current span{color:#fff;font-weight:600}
+.p-chapter-kind{font-style:normal;font-size:10px;color:#858792;padding:.1rem .4rem;border:1px solid var(--line);border-radius:99px}
+
+.p-note{
+  display:flex;gap:.5rem;padding:.7rem .85rem;border:1px solid rgba(255,255,255,.10);
+  border-radius:14px;background:rgba(255,255,255,.04);color:#9698a3;font-size:12px;line-height:1.5;
+}
+.p-note svg{width:15px;height:15px;flex:0 0 auto;margin-top:.1rem}
+.p-group-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 18px 16px}
+.p-group-actions button{
+  display:flex;align-items:center;justify-content:center;gap:.35rem;min-height:2.3rem;
+  border:1px solid var(--line);border-radius:.65rem;background:#ffffff12;color:#fff;font-size:12.5px;
+}
+.p-group-actions button:hover{background:#ffffff1c}
+.p-group-actions button svg{width:15px;height:15px}
+.p-group-actions-single{grid-template-columns:1fr}
+
+/* Compact player window keeps the video and essential transport only. */
+body.yj-player-pip .p-shell-titlebar,body.yj-player-pip .p-shell-sidebar,
+body.yj-player-pip .p-shell-commandbar,body.yj-player-pip .p-rail,
+body.yj-player-pip .p-head,body.yj-player-pip .p-media-info{display:none!important}
+body.yj-player-pip #app.app>.p-console{display:block!important;padding:0!important}
+body.yj-player-pip .p-stage{min-height:100vh;padding:14px;justify-content:flex-end}
+body.yj-player-pip .p-progress{padding-inline:4px}
+body.yj-player-pip .p-times span:not(:first-of-type),body.yj-player-pip .p-skip-intro,
+body.yj-player-pip .p-status-chip,body.yj-player-pip .p-transport-div,
+body.yj-player-pip .p-vol,body.yj-player-pip .p-transport-btn[data-console-tab]{display:none!important}
+body.yj-player-pip .p-transport{justify-content:center;margin-top:.45rem;padding:.38rem}
+body.yj-player-pip .p-transport-spacer{display:none}
+
+/* ── Light appearance (mirrors the body.light overrides in forward.css) ── */
+body.light .p-stage{background:#eef1f6}
+body.light .p-stage::after{background:linear-gradient(180deg,rgba(242,244,248,.20),rgba(242,244,248,.05) 34%,rgba(242,244,248,.78) 78%,#f2f4f8 100%)}
+body.light .p-rail{background:rgba(255,255,255,.82);border-left-color:rgba(28,35,48,.13)}
+body.light .p-head h1{color:#1d2430}
+body.light .p-stage-meta,body.light .p-times{color:#5b6170}
+body.light .p-times b{color:#1d2430}
+body.light .yj-media-chip{background:rgba(8,12,20,.05);border-color:rgba(8,12,20,.12)}
+body.light .yj-media-chip i{color:#1d2430}
+body.light .p-media-info:empty::after{color:#6b7280}
+body.light .p-progress-track{background:rgba(8,12,20,.14)}
+body.light .p-progress-buffer{background:rgba(8,12,20,.10)}
+body.light .p-progress-played{background:#2c6bff}
+body.light .p-progress-mark{background:rgba(8,12,20,.28)}
+body.light .p-transport{background:rgba(255,255,255,.72);border-color:rgba(28,35,48,.13)}
+body.light .p-transport-btn{background:rgba(8,12,20,.04);border-color:rgba(8,12,20,.10);color:#3a4152}
+body.light .p-transport-btn:hover{background:rgba(8,12,20,.09);color:#1d2430}
+body.light .p-transport-btn.solid{background:#1d2430;color:#fff}
+body.light .p-transport-btn.solid:hover{background:#2f3949;color:#fff}
+body.light .p-status-chip{background:rgba(8,12,20,.05);border-color:rgba(8,12,20,.14);color:#4d515c}
+body.light .p-status-chip.is-live{color:#128a46;border-color:rgba(18,138,70,.3);background:rgba(18,138,70,.10)}
+body.light .p-skip-intro{background:rgba(8,12,20,.05);border-color:rgba(8,12,20,.14);color:#1d2430}
+body.light .p-slider{background:rgba(8,12,20,.16)}
+body.light .p-slider::-webkit-slider-thumb{background:#2c6bff}
+body.light .p-slider::-moz-range-thumb{background:#2c6bff}
+body.light .p-rail-head{border-bottom-color:rgba(29,33,43,.08)}
+body.light .p-rail-head h2{color:#1d2430}
+body.light .p-rail-head p{color:#5b6170}
+body.light .p-rail-tab{color:#5b6170}
+body.light .p-rail-tab.is-active{background:#e3edfb;color:#183a66;box-shadow:inset 0 0 0 1px #c4d9f5}
+body.light .p-select{background:rgba(8,12,20,.06);border-color:rgba(8,12,20,.18);color:#1d2430}
+body.light .p-seg{background:rgba(8,12,20,.05)}
+body.light .p-seg button{color:#5b6170}
+body.light .p-seg button.is-active{background:#e3edfb;color:#183a66;box-shadow:inset 0 0 0 1px #c4d9f5}
+body.light .p-track-row{color:#1d2430}
+body.light .p-track-row:hover{background:rgba(8,12,20,.05)}
+body.light .p-track-row.is-active{background:#e3edfb}
+body.light .p-track-row.is-active .p-track-index{background:#2c6bff;color:#fff}
+body.light .p-track-index{background:rgba(8,12,20,.07);color:#3a4152}
+body.light .p-track-copy small{color:#6b7280}
+body.light .yj-setting-group{border-color:#d9e0eb;background:rgba(255,255,255,.88);color:#1d2430}
+body.light .yj-setting-group>header span,body.light .yj-setting-group small{color:#5b6170}
+body.light .yj-setting-group>article{border-top-color:rgba(29,33,43,.08)}
+body.light .p-group .yj-ico{background:rgba(8,12,20,.06);color:#4d515c}
+body.light .p-diag dt{color:#5b6170;border-top-color:rgba(29,33,43,.08)}
+body.light .p-diag dd{color:#1d2430;border-top-color:rgba(29,33,43,.08)}
+body.light .p-diag dd.is-warn{color:#8a5a00}
+body.light .p-chapter-row{color:#1d2430}
+body.light .p-chapter-row:hover{background:rgba(8,12,20,.05)}
+body.light .p-chapter-row.is-current{background:#e3edfb}
+body.light .p-chapter-row time{color:#6b7280}
+body.light .p-chapter-kind{border-color:rgba(29,33,43,.14);color:#5b6170}
+body.light .p-note{background:rgba(8,12,20,.04);border-color:rgba(29,33,43,.10);color:#5b6170}
+body.light .p-group-actions button{background:rgba(8,12,20,.05);border-color:rgba(29,33,43,.12);color:#1d2430}
+body.light .p-group-actions button:hover{background:rgba(8,12,20,.10)}
+
+/* ── Narrow layouts ───────────────────────────────────────────────────── */
+@media (max-width:1180px){
+  .p-console{grid-template-columns:1fr}
+  .p-rail{border-left:0;border-top:1px solid rgba(255,255,255,.11);padding-top:0}
+  .p-rail-body{max-height:none}
+  .p-video{grid-column:1 / -1} /* video fills width when rail is below */
+}
+@media (prefers-reduced-motion:reduce){
+  .p-console{animation:none}
+}

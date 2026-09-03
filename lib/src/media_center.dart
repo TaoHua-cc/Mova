@@ -2479,17 +2479,17 @@ Future<void> _openServerSearchDetail(
         // server holds.
         match =
             sameKind
-                    .where((item) => _titleKey(item.title) == key)
-                    .firstOrNull ??
-                sameKind
-                    .where(
-                      (item) =>
-                          _titleKey(item.title).contains(key) ||
-                          key.contains(_titleKey(item.title)),
-                    )
-                    .firstOrNull ??
-                sameKind.firstOrNull ??
-                rows.firstOrNull;
+                .where((item) => _titleKey(item.title) == key)
+                .firstOrNull ??
+            sameKind
+                .where(
+                  (item) =>
+                      _titleKey(item.title).contains(key) ||
+                      key.contains(_titleKey(item.title)),
+                )
+                .firstOrNull ??
+            sameKind.firstOrNull ??
+            rows.firstOrNull;
       } catch (_) {
         match = null; // TMDB unreachable; handled below.
       }
@@ -2507,11 +2507,7 @@ Future<void> _openServerSearchDetail(
           context,
           MaterialPageRoute(
             builder: (_) => MetadataDetailPage(
-              item: TmdbItem(
-                id: 0,
-                title: title,
-                kind: isSeries ? '剧集' : '电影',
-              ),
+              item: TmdbItem(id: 0, title: title, kind: isSeries ? '剧集' : '电影'),
               media: media,
             ),
           ),
@@ -6225,8 +6221,8 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
           MediaItem? media;
           try {
             final item = await client.itemById(session, serverItemId);
-            media = item.type == 'Episode' &&
-                    (item.seriesId?.isNotEmpty == true)
+            media =
+                item.type == 'Episode' && (item.seriesId?.isNotEmpty == true)
                 ? await client.itemById(session, item.seriesId!)
                 : item;
           } catch (_) {
@@ -6240,13 +6236,13 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
                 .toList(growable: false);
             media =
                 nonEpisodes
-                        .where((item) => item.id == serverItemId)
-                        .firstOrNull ??
-                    nonEpisodes
-                        .where((item) => item.title == seriesTitle)
-                        .firstOrNull ??
-                    nonEpisodes.firstOrNull ??
-                    rows.firstOrNull;
+                    .where((item) => item.id == serverItemId)
+                    .firstOrNull ??
+                nonEpisodes
+                    .where((item) => item.title == seriesTitle)
+                    .firstOrNull ??
+                nonEpisodes.firstOrNull ??
+                rows.firstOrNull;
           }
           if (media != null && context.mounted) {
             await _openServerSearchDetail(context, media);

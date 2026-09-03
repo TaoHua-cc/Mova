@@ -3,11 +3,19 @@ const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-let mpvProcess,mpvSocket;
+const { apiRequest } = require('./app/host/api-request.cjs');
+const { createSecretStore } = require('./app/host/secret-store.cjs');
+const { createMpvLauncher } = require('./app/host/mpv-process.cjs');
+let mpvProcess,mpvSocket,mainWindow,pipRestoreBounds,clipStart,mpvOwnHwnd=0,mpvTitleToken='',electronOwnerHwnd=0;
 // Danmaku matching can finish before mpv has opened its IPC pipe. Preserve the
 // newest update until that pipe is ready rather than dropping the first result.
 let pendingMpvUpdate = null;
+// Mirrors of the live player, kept at module scope so the console can read the
+// current state the moment it opens instead of waiting for the next change.
+let currentPlaybackState = null;
+let currentMediaInfo = null;
 const dynamicDanmakuFiles=new Set();
+const secretStore = createSecretStore({ app, safeStorage, fs, path });
 const mpvControls = [
   '--osd-font=Segoe UI Variable', '--osd-font-size=22', '--osd-bold=yes', '--osd-level=1',
   '--osd-color=#F7F8FC', '--osd-border-size=0', '--osd-shadow-offset=0',
@@ -20,31 +28,36 @@ const mpvPortableArgs = () => {
   const root = path.join(path.dirname(mpvExecutable()), 'portable_config');
   return ['--no-config', `--include=${path.join(root, 'mpv.conf')}`, `--script=${path.join(root, 'scripts', 'yingji-osc.lua')}`];
 };
-const launchMpv = async args => {
-  const mpv = mpvExecutable();
-  if (!fs.existsSync(mpv)) throw new Error('未找到 mpv 播放器内核');
-  const child = spawn(mpv, args, { cwd:path.dirname(mpv), windowsHide:false, stdio:['ignore', 'ignore', 'pipe'] });
-  let stderr = '';
-  child.stderr.on('data', chunk => { stderr = `${stderr}${chunk}`.slice(-2000); });
-  child.getLaunchError = () => stderr.trim();
-  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', error => reject(new Error(`播放器启动失败：${error.message}`))); });
-  await new Promise((resolve, reject) => {
-    const onExit = code => { clearTimeout(timer); reject(new Error(stderr.trim() || `mpv 启动后立即退出（代码 ${code ?? '未知'}）`)); };
-    const timer = setTimeout(() => { child.off('exit', onExit); resolve(); }, 350);
-    child.once('exit', onExit);
-  });
-  return child;
+
+const redactMpvLog = value => String(value || '')
+  .replace(/https?:\/\/\S+/gi, '<media-url>')
+  .replace(/(X-Emby-Token|Authorization):[^\r\n,]*/gi, '$1: <redacted>')
+  .replace(/(api_key|token)=[^&\s]+/gi, '$1=<redacted>');
+const appendMpvLog = line => {
+  try {
+    const file = path.join(app.getPath('userData'), 'mpv-last.log');
+    fs.appendFileSync(file, `[${new Date().toISOString()}] ${redactMpvLog(line)}\n`, 'utf8');
+  } catch {}
 };
+const launchMpv = createMpvLauncher({
+  resolveExecutable: mpvExecutable,
+  fs,
+  path,
+  spawn,
+  appendLog: line => appendMpvLog(redactMpvLog(line)),
+  isCurrent: child => child === null ? (mpvProcess = null, true) : mpvProcess === child
+});
 
 // Translate the renderer-side playback settings into mpv CLI flags.
 const mpvSettingArgs = playback => {
   const args = [];
   const renderer = playback.renderer || 'gpu-next';
-  const hwdec = playback.hwdec || 'auto-safe';
+  const hwdec = playback.hardware === false ? 'no' : (playback.hwdec || 'auto-safe');
   const gpu = playback.gpu || '';
   if (renderer) args.push(`--vo=${renderer}`);
   if (hwdec) args.push(`--hwdec=${hwdec}`);
   if (gpu) args.push(`--d3d11-adapter=${gpu}`);
+  if (playback.hdr === false) args.push('--target-colorspace-hint=no');
   if (playback.downmix) args.push('--audio-channels=stereo');
   if (playback.subtitleEnabled === false) args.push('--sub-visibility=no');
   else {
@@ -67,6 +80,55 @@ const mpvSettingArgs = playback => {
   return args;
 };
 
+// mpv renders in its OWN top-level window (--force-window=yes) and carries the
+// full V9 console itself: yingji-osc.lua draws the production OSC (transport,
+// volume, settings panels, episode picker) inside the mpv window, so there is
+// no Electron overlay anymore. The frameless mpv window is first glued to the
+// app window geometry via a tiny Win32 helper, then the app window hides for
+// the duration of playback and is shown again when mpv exits.
+const MPV_TITLE_MARK = 'YINGJI_MPV_';
+const mpvSync = { timer:null, pending:null };
+const mpvGluePsPath = () => app.isPackaged
+  ? path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'mpv', 'win32-glue.ps1')
+  : path.join(__dirname, 'app', 'mpv', 'win32-glue.ps1');
+const getElectronHwnd = win => {
+  if (!win || win.isDestroyed()) return 0;
+  try { return Number(win.getNativeWindowHandle().readBigUInt64LE()); } catch { return 0; }
+};
+const runMpvWin32 = (action, bounds) => new Promise(resolve => {
+  let ps;
+  try { ps = mpvGluePsPath(); } catch { return resolve(0); }
+  if (!ps || !ps.length || !fs.existsSync(ps)) return resolve(0);
+  const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps, '-Token', mpvTitleToken, '-Action', action];
+  if (bounds) args.push('-X', String(bounds.x), '-Y', String(bounds.y), '-W', String(bounds.width), '-H', String(bounds.height));
+  if (mpvOwnHwnd) args.push('-RawHwnd', String(mpvOwnHwnd));
+  if (electronOwnerHwnd) args.push('-OwnerHwnd', String(electronOwnerHwnd));
+  const child = spawn('powershell.exe', args, { windowsHide:true, stdio:['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', d => { out += d.toString(); });
+  child.once('close', () => { const m = out.trim().match(/\d+/); const hwnd = m ? parseInt(m[0], 10) : 0; if (hwnd) mpvOwnHwnd = hwnd; resolve(hwnd); });
+  child.once('error', () => resolve(0));
+});
+const syncMpvOwnWindow = win => {
+  if (!win || win.isDestroyed() || !mpvProcess || mpvProcess.killed || !mpvTitleToken) return;
+  electronOwnerHwnd = getElectronHwnd(win);
+  const bounds = win.getBounds();
+  mpvSync.pending = bounds;
+  if (mpvSync.timer) return;
+  mpvSync.timer = setTimeout(() => {
+    mpvSync.timer = null;
+    const job = mpvSync.pending;
+    mpvSync.pending = null;
+    if (!job) return;
+    runMpvWin32('move', job).catch(() => {});
+  }, 90);
+};
+const setMpvWindowVisible = visible => { if (mpvTitleToken) runMpvWin32(visible ? 'show' : 'hide', null).catch(() => {}); };
+const applyPlayerOnTop = (win, onTop) => {
+  if (win && !win.isDestroyed()) { try { win.setAlwaysOnTop(!!onTop, 'floating'); } catch {} }
+  if (mpvSocket && !mpvSocket.destroyed) { try { mpvSocket.write(JSON.stringify({ command:['set_property', 'ontop', !!onTop] }) + '\n'); } catch {} }
+};
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
@@ -74,7 +136,8 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 680,
     frame: false,
-    backgroundColor: '#080a0d',
+    transparent: true,
+    backgroundColor: '#00000000',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -82,6 +145,19 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true
     }
+  });
+  mainWindow = win;
+  const sync = () => syncMpvOwnWindow(win);
+  for (const event of ['move','resize','restore','maximize','unmaximize','enter-full-screen','leave-full-screen','show','focus']) win.on(event, sync);
+  win.on('minimize', () => { try { setMpvWindowVisible(false); } catch {} });
+  win.on('hide', () => { try { setMpvWindowVisible(false); } catch {} });
+  const sendFullscreen = () => { try { win.webContents.send('window-fullscreen-changed', win.isFullScreen()); } catch {} };
+  win.on('enter-full-screen', sendFullscreen);
+  win.on('leave-full-screen', sendFullscreen);
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null;
+    try { if (mpvProcess && !mpvProcess.killed) mpvProcess.kill(); } catch {}
+    mpvProcess = null;
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/(www\.)?(youtube\.com|trakt\.tv)\//.test(url)) shell.openExternal(url);
@@ -98,50 +174,45 @@ ipcMain.on('window-action', (event, action) => {
   if (action === 'maximize') win.isMaximized() ? win.unmaximize() : win.maximize();
   if (action === 'close') win.close();
 });
-
-ipcMain.handle('api-request', async (_event, request) => {
-  const url = new URL(request.url);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('仅支持 HTTP 或 HTTPS 地址');
-  const controller = new AbortController();
-  const timeoutMs = Math.min(60000, Math.max(5000, Number(request.timeoutMs) || 15000));
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const options = {
-      method: request.method || 'GET',
-      headers: { Accept: 'application/json, text/plain, application/xml, text/xml, */*', 'User-Agent': 'Yingji/2.0', ...(request.headers || {}) },
-      body: request.rawBody ?? (request.body ? JSON.stringify(request.body) : undefined),
-      signal: controller.signal
-    };
-    let response;
-    try { response = await fetch(url, options); }
-    catch (error) {
-      if (!electronNet?.fetch) throw error;
-      response = await electronNet.fetch(url, options);
-    }
-    const text = await response.text();
-    const data = request.responseType === 'text' ? text : text ? JSON.parse(text) : null;
-    if (request.acceptErrors) return { status: response.status, data };
-    if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 180)}`);
-    return data;
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
-    throw error;
-  } finally { clearTimeout(timer); }
+ipcMain.handle('window-fullscreen-set', (event, requested) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return false;
+  const next = typeof requested === 'boolean' ? requested : !win.isFullScreen();
+  win.setFullScreen(next);
+  if (mpvSocket && !mpvSocket.destroyed) { try { mpvSocket.write(JSON.stringify({ command:['set_property', 'fullscreen', next] }) + '\n'); } catch {} }
+  syncMpvOwnWindow(win);
+  return next;
+});
+ipcMain.handle('window-ontop-set', (event, requested) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return false;
+  const next = !!requested;
+  applyPlayerOnTop(win, next);
+  return next;
+});
+ipcMain.handle('window-pip-set', (event, requested) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return false;
+  const next = !!requested;
+  if (next) {
+    if (!pipRestoreBounds) pipRestoreBounds = win.getBounds();
+    const display = require('electron').screen.getDisplayMatching(win.getBounds()).workArea;
+    const width = Math.min(560, Math.max(420, Math.round(display.width * .27)));
+    const height = Math.round(width * 9 / 16);
+    win.setBounds({ x:display.x + display.width - width - 24, y:display.y + display.height - height - 24, width, height });
+    win.setAlwaysOnTop(true, 'floating');
+  } else {
+    if (pipRestoreBounds) win.setBounds(pipRestoreBounds);
+    pipRestoreBounds = null;
+    win.setAlwaysOnTop(true, 'floating'); // still playing: keep console above mpv
+  }
+  syncMpvOwnWindow(win);
+  return next;
 });
 
-function secretFile() { return path.join(app.getPath('userData'), 'secrets.json'); }
-function readSecrets() { try { return JSON.parse(fs.readFileSync(secretFile(), 'utf8')); } catch { return {}; } }
-ipcMain.handle('secret-set', (_event, key, value) => {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows 安全凭据加密当前不可用');
-  const data = readSecrets();
-  data[key] = safeStorage.encryptString(value).toString('base64');
-  fs.writeFileSync(secretFile(), JSON.stringify(data));
-  return true;
-});
-ipcMain.handle('secret-get', (_event, key) => {
-  const value = readSecrets()[key];
-  return value ? safeStorage.decryptString(Buffer.from(value, 'base64')) : '';
-});
+ipcMain.handle('api-request', (_event, request) => apiRequest(request, { electronNet }));
+ipcMain.handle('secret-set', (_event, key, value) => secretStore.set(key, value));
+ipcMain.handle('secret-get', (_event, key) => secretStore.get(key));
 
 const assTime = value => {
   const seconds = Math.max(0, Number(value) || 0), hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60);
@@ -268,8 +339,82 @@ ipcMain.handle('mpv-player-update',(_event,update)=>{
   return { queued:true };
 });
 
+// ── Runtime transport channel ──────────────────────────────────────────────
+// The renderer never touches the mpv socket directly. Every command and every
+// property write is matched against a whitelist here, so a bad UI state can
+// only ever be ignored — never turned into an arbitrary mpv instruction.
+const MPV_VERBS = new Set(['cycle','add','multiply','seek','osd','stop','quit','playlist-next','playlist-prev','frame-step','frame-back-step','sub-seek','show-text','keypress','loadfile']);
+const MPV_PROPERTIES = new Map([
+  ['pause','boolean'],['volume','number'],['mute','boolean'],['speed','number'],
+  ['time-pos','number'],['percent-pos','number'],['audio-delay','number'],
+  ['aid','track'],['sid','track'],['secondary-sid','track'],['sub-visibility','boolean'],
+  ['sub-delay','number'],['sub-pos','number'],['sub-scale','number'],
+  ['video-aspect','string'],['video-zoom','number'],['video-rotate','number'],
+  ['loop-file','boolean'],['fullscreen','boolean'],['ontop','boolean'],
+  ['af','string'],['audio-channels','string']
+]);
+const mpvCommandLine = payload => {
+  if (!payload || typeof payload !== 'object') return null;
+  if (Array.isArray(payload.command)) {
+    const verb = String(payload.command[0] || '');
+    if (!MPV_VERBS.has(verb)) return null;
+    // Only accept primitive arguments; never allow nested arrays or objects.
+    const args = payload.command.slice(1);
+    if (args.some(arg => arg !== null && ['object','function','symbol'].includes(typeof arg))) return null;
+    return `${JSON.stringify({ command: payload.command })}\n`;
+  }
+  if (payload.set && typeof payload.set.name === 'string') {
+    const kind = MPV_PROPERTIES.get(payload.set.name);
+    if (!kind) return null;
+    const value = payload.set.value;
+    if (kind === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) return null;
+    if (kind === 'boolean' && typeof value !== 'boolean') return null;
+    if (kind === 'string' && typeof value !== 'string') return null;
+    if (kind === 'track' && !['string','number','boolean'].includes(typeof value)) return null;
+    return `${JSON.stringify({ command: ['set_property', payload.set.name, value] })}\n`;
+  }
+  return null;
+};
+ipcMain.handle('mpv-command',(_event,payload)=>{
+  if (!mpvSocket || mpvSocket.destroyed) return { ok:false, reason:'no-player' };
+  const line = mpvCommandLine(payload);
+  if (!line) return { ok:false, reason:'blocked' };
+  try { mpvSocket.write(line); return { ok:true }; }
+  catch (error) { return { ok:false, reason:String(error?.message || 'write-failed') }; }
+});
+ipcMain.handle('mpv-state',()=>({ ok:!!(mpvSocket && !mpvSocket.destroyed), state:currentPlaybackState ? { ...currentPlaybackState } : null, info:currentMediaInfo ? { ...currentMediaInfo } : null }));
+ipcMain.handle('mpv-capture', (_event, kind) => {
+  if (!mpvSocket || mpvSocket.destroyed) return { ok:false, reason:'no-player' };
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+  if (kind === 'screenshot') {
+    const dir = path.join(app.getPath('pictures'), '映迹');
+    fs.mkdirSync(dir, { recursive:true });
+    const file = path.join(dir, `映迹截图-${stamp}.png`);
+    mpvSocket.write(`${JSON.stringify({ command:['screenshot-to-file',file,'subtitles'] })}\n`);
+    return { ok:true, phase:'saved', file };
+  }
+  if (kind === 'clip') {
+    const position = Number(currentPlaybackState?.timePos || 0);
+    if (!Number.isFinite(position)) return { ok:false, reason:'no-position' };
+    if (!Number.isFinite(clipStart)) {
+      clipStart = position;
+      mpvSocket.write(`${JSON.stringify({ command:['set_property','ab-loop-a',position] })}\n`);
+      return { ok:true, phase:'start', position };
+    }
+    const dir = path.join(app.getPath('videos'), '映迹');
+    fs.mkdirSync(dir, { recursive:true });
+    const file = path.join(dir, `映迹片段-${stamp}.mkv`);
+    mpvSocket.write(`${JSON.stringify({ command:['set_property','ab-loop-b',position] })}\n${JSON.stringify({ command:['ab-loop-dump-cache',file] })}\n`);
+    clipStart = null;
+    return { ok:true, phase:'saved', file };
+  }
+  return { ok:false, reason:'blocked' };
+});
+
 ipcMain.handle('mpv-play', async (event, playback) => {
   const sender = event.sender;
+  const owner = BrowserWindow.fromWebContents(sender);
+  clipStart = null;
   const mediaUrl = new URL(playback.url);
   const serverUrl = new URL(playback.serverUrl);
   if (!['http:', 'https:'].includes(mediaUrl.protocol) || mediaUrl.origin !== serverUrl.origin) throw new Error('播放器地址不属于当前 Emby 服务器');
@@ -334,32 +479,73 @@ ipcMain.handle('mpv-play', async (event, playback) => {
     playerPreferenceKey:String(playback.playerPreferenceKey || ''),
     audioPreference:playback.audioPreference || null,
     subtitlePreference:playback.subtitlePreference || null,
-    speed:Number(playback.speed || 1), audioDelay:Number(playback.audioDelay || 0), subtitleScale:Number(playback.subtitleScale || 1), subtitlePos:Number(playback.subtitlePos || 92), subtitleDelay:Number(playback.subtitleDelay || 0), subtitleBorder:Number(playback.subtitleBorder || 1.5), videoAspect:String(playback.videoAspect || 'auto'), videoZoom:Number(playback.videoZoom || 0), videoRotate:Number(playback.videoRotate || 0), loopFile:!!playback.loopFile,
+    speed:Number(playback.speed || 1), audioDelay:Number(playback.audioDelay || 0), subtitleScale:Number(playback.subtitleScale || 1), subtitlePos:Number(playback.subtitlePos || 92), subtitleDelay:Number(playback.subtitleDelay || 0), subtitleBorder:Number(playback.subtitleBorder || 1.5), videoAspect:String(playback.videoAspect || 'auto'), videoZoom:Number(playback.videoZoom || 0), videoRotate:Number(playback.videoRotate || 0), loopFile:!!playback.loopFile, downmix:!!playback.downmix, vocal:!!playback.vocal, night:!!playback.night, hardware:playback.hardware !== false, hdr:playback.hdr !== false, hwdec:String(playback.hwdec || 'auto-safe'), renderer:String(playback.renderer || 'gpu-next'), gpu:String(playback.gpu || ''), gpuAdapters:Array.isArray(playback.gpuAdapters) ? playback.gpuAdapters.map(String).slice(0,16) : [],
     danmakuContext: playback.danmakuContext || null,
     danmakuSourceInfo:danmakuSourceInfo.slice(0,12),
     chapterKey:String(playback.chapterKey || ''), chapterRule:playback.chapterRule || null, chapterAutoSkip:playback.chapterAutoSkip !== false
   }), 'utf8');
+  mpvTitleToken = `${MPV_TITLE_MARK}${process.pid}-${Date.now()}`;
+  mpvOwnHwnd = 0; // force the first Win32 sync to re-enumerate by the new title token
+  const ownerBounds = (owner && !owner.isDestroyed()) ? owner.getBounds() : { x:0, y:0, width:1280, height:720 };
   const args = [
     `--input-ipc-server=${pipe}`,
     ...mpvPortableArgs(),
     '--force-window=yes',
+    '--no-border',
+    `--title=${mpvTitleToken}`,
+    `--geometry=${ownerBounds.width}x${ownerBounds.height}+${ownerBounds.x}+${ownerBounds.y}`,
     ...mpvControls,
     ...mpvSettingArgs(playback),
     `--force-media-title=${String(playback.title || '映迹').replace(/[\r\n]/g, ' ')}`,
-    `--script-opts=yj-state-file=${playerStateFile}`,
+    `--script-opts=yj-state-file=${playerStateFile},yj-headless=no`,
     `--start=${Math.max(0, Number(playback.position || 0))}`,
     `--http-header-fields=X-Emby-Token: ${playback.token}`,
     ...(danmakuFile ? [`--sub-file=${danmakuFile}`] : []),
     mediaUrl.href
   ];
-  try { mpvProcess = await launchMpv(args); }
-  catch (error) {
-    // A stale hardware-decoder/adapter selection can make mpv exit before its
-    // IPC socket is ready. Retry once in a conservative software-decoder mode
-    // so a transient graphics choice does not look like a player crash.
-    const safeArgs=args.filter(argument=>!/^--(?:vo|hwdec|d3d11-adapter)=/i.test(argument)).concat(['--vo=gpu-next','--hwdec=no']);
-    try { mpvProcess = await launchMpv(safeArgs); }
-    catch { fs.rmSync(playerStateFile, { force:true }); for (const file of episodeThumbnailFiles) fs.rmSync(file, { force:true }); if (seriesLogoImage?.file) fs.rmSync(seriesLogoImage.file,{force:true}); throw error; }
+  const connect = (child, attempt = 0) => new Promise((resolve, reject) => {
+    if (!child || child.exitCode !== null || child.killed) {
+      reject(new Error(child?.getLaunchError?.() || 'mpv 在播放窗口就绪前退出'));
+      return;
+    }
+    const socket = net.connect(pipe);
+    const onError = error => {
+      socket.destroy();
+      if (attempt < 30 && child.exitCode === null && !child.killed) setTimeout(() => connect(child, attempt + 1).then(resolve, reject), 200);
+      else reject(new Error(child.getLaunchError?.() || error.message || '无法连接 mpv 控制通道'));
+    };
+    socket.once('error', onError);
+    socket.once('connect', () => { socket.removeListener('error', onError); resolve(socket); });
+  });
+  const cleanupPreparedPlayer = () => {
+    fs.rmSync(playerStateFile, { force:true });
+    if (danmakuFile) fs.rmSync(danmakuFile, { force:true });
+    for (const file of episodeThumbnailFiles) fs.rmSync(file, { force:true });
+    if (seriesLogoImage?.file) fs.rmSync(seriesLogoImage.file,{force:true});
+  };
+  let startupError = null;
+  try {
+    mpvProcess = await launchMpv(args, 'primary');
+    mpvSocket = await connect(mpvProcess);
+  } catch (error) {
+    startupError = error;
+    try { if (mpvProcess && !mpvProcess.killed) mpvProcess.kill(); } catch {}
+    mpvProcess = null; mpvSocket = null;
+    // Retry with software decoding. Keep the fallback flags before the media
+    // URL; mpv applies options positionally and flags appended after the URL
+    // do not repair the file that already failed to open.
+    const safeArgs = [...args.slice(0, -1).filter(argument => !/^--(?:vo|hwdec|d3d11-adapter)=/i.test(argument)), '--vo=gpu-next', '--hwdec=no', args.at(-1)];
+    try {
+      mpvProcess = await launchMpv(safeArgs, 'software-fallback');
+      mpvSocket = await connect(mpvProcess);
+    } catch (fallbackError) {
+      try { if (mpvProcess && !mpvProcess.killed) mpvProcess.kill(); } catch {}
+      mpvProcess = null; mpvSocket = null;
+      cleanupPreparedPlayer();
+      const detail = fallbackError?.message || startupError?.message || '未知错误';
+      appendMpvLog(`startup failed detail=${detail}`);
+      throw new Error(`播放器窗口启动失败：${redactMpvLog(detail)}`);
+    }
   }
   let playbackContext = { serverUrl:serverUrl.href, token:String(playback.token || ''), itemId:playback.itemId, mediaSourceId:playback.mediaSourceId, playSessionId:playback.playSessionId || '' };
   const report = async (suffix, position, paused) => {
@@ -373,16 +559,39 @@ ipcMain.handle('mpv-play', async (event, playback) => {
     } catch {}
   };
   const mediaInfo = { video: null, audio: null, fps: null, bitrate: null };
-  const sendMediaInfo = () => { try { sender.send('mpv-media-info', { ...mediaInfo }); } catch {} };
+  const sendMediaInfo = () => { currentMediaInfo = { ...mediaInfo }; try { sender.send('mpv-media-info', { ...mediaInfo }); } catch {} };
   let position = Number(playback.position || 0), paused = false, lastReport = -1;
-  const connect = attempt => new Promise((resolve, reject) => {
-    const socket = net.connect(pipe, () => resolve(socket));
-    socket.once('error', error => attempt < 30 ? setTimeout(() => connect(attempt + 1).then(resolve, reject), 200) : reject(error));
-  });
+  // Live transport + setting mirror for the in-app player console.
+  const playbackState = {
+    timePos:Number(playback.position || 0), duration:0, pause:false, volume:100, mute:false, speed:1,
+    aid:null, sid:null, subDelay:0, subPos:100, subScale:1, audioDelay:0, audioChannels:'auto',
+    videoZoom:0, videoRotate:0, videoAspect:'auto', loopFile:false, subVisibility:true,
+    hwdec:'', vo:'', dropCount:0, tracks:[], chapters:[]
+  };
+  currentPlaybackState = playbackState;
+  currentMediaInfo = { ...mediaInfo };
+  let stateLastSent = 0, stateTimer = null;
+  // time-pos fires roughly every frame; the console only needs ~2.5 Hz.
+  const sendPlaybackState = immediate => {
+    const flush = () => { stateTimer = null; stateLastSent = Date.now(); currentPlaybackState = { ...playbackState }; try { sender.send('mpv-playback-state', { ...playbackState }); } catch {} };
+    if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
+    if (immediate) { flush(); return; }
+    const wait = 400 - (Date.now() - stateLastSent);
+    if (wait <= 0) { flush(); return; }
+    stateTimer = setTimeout(flush, wait);
+  };
   report('', playback.position || 0, false).catch(() => {});
-  connect(0).then(socket => {
-    mpvSocket=socket;
-    socket.write('{"command":["observe_property",1,"time-pos"]}\n{"command":["observe_property",2,"pause"]}\n{"command":["observe_property",3,"video-params"]}\n{"command":["observe_property",4,"audio-params"]}\n{"command":["observe_property",5,"estimated-vf-fps"]}\n{"command":["observe_property",6,"bitrate"]}\n{"command":["observe_property",7,"user-data/yj-active"]}\n{"command":["observe_property",8,"user-data/yj-player-action"]}\n');
+  {
+    const socket = mpvSocket;
+    socket.on('error', error => appendMpvLog(`ipc error pid=${mpvProcess?.pid || 0} detail=${error.message}`));
+    const observed = [
+      'time-pos','pause','video-params','audio-params','estimated-vf-fps','bitrate',
+      'user-data/yj-active','user-data/yj-player-action','duration','volume','mute','speed',
+      'aid','sid','track-list','sub-delay','sub-pos','sub-scale','audio-delay','audio-channels',
+      'video-zoom','video-rotate','video-aspect','loop-file','sub-visibility',
+      'hwdec-current','current-vo','frame-drop-count','chapter-list'
+    ];
+    socket.write(observed.map((name, index) => JSON.stringify({ command: ['observe_property', index + 1, name] })).join('\n') + '\n');
     if (pendingMpvUpdate) {
       const update=pendingMpvUpdate; pendingMpvUpdate=null;
       deliverMpvUpdate(update);
@@ -394,21 +603,67 @@ ipcMain.handle('mpv-play', async (event, playback) => {
       for (const line of lines) try {
         const message = JSON.parse(line);
         if (message.event !== 'property-change') continue;
-        if (message.name === 'time-pos' && Number.isFinite(message.data)) position = message.data;
-        else if (message.name === 'pause') paused = message.data;
-        else if (message.name === 'video-params') { mediaInfo.video = message.data; sendMediaInfo(); }
-        else if (message.name === 'audio-params') { mediaInfo.audio = message.data; sendMediaInfo(); }
-        else if (message.name === 'estimated-vf-fps') { mediaInfo.fps = message.data; sendMediaInfo(); }
-        else if (message.name === 'bitrate') { mediaInfo.bitrate = message.data; sendMediaInfo(); }
-        else if (message.name === 'user-data/yj-active' && message.data) { try { const next = JSON.parse(message.data); if (next?.serverUrl && next?.itemId) playbackContext = { ...playbackContext, ...next }; } catch {} }
-        else if (message.name === 'user-data/yj-player-action' && message.data) { try { sender.send('mpv-player-action',JSON.parse(message.data)); } catch {} }
+        const data = message.data;
+        if (message.name === 'time-pos') { if (Number.isFinite(data)) { position = data; playbackState.timePos = data; } sendPlaybackState(false); }
+        else if (message.name === 'pause') { paused = !!data; playbackState.pause = !!data; sendPlaybackState(true); }
+        else if (message.name === 'duration') { playbackState.duration = Number.isFinite(data) ? data : 0; sendPlaybackState(true); }
+        else if (message.name === 'volume') { playbackState.volume = Number.isFinite(data) ? data : 100; sendPlaybackState(true); }
+        else if (message.name === 'mute') { playbackState.mute = !!data; sendPlaybackState(true); }
+        else if (message.name === 'speed') { playbackState.speed = Number.isFinite(data) ? data : 1; sendPlaybackState(true); }
+        else if (message.name === 'aid') { playbackState.aid = data; sendPlaybackState(true); }
+        else if (message.name === 'sid') { playbackState.sid = data; sendPlaybackState(true); }
+        else if (message.name === 'track-list') { playbackState.tracks = Array.isArray(data) ? data : []; sendPlaybackState(true); }
+        else if (message.name === 'sub-delay') { playbackState.subDelay = Number(data) || 0; sendPlaybackState(true); }
+        else if (message.name === 'sub-pos') { playbackState.subPos = Number(data) || 100; sendPlaybackState(true); }
+        else if (message.name === 'sub-scale') { playbackState.subScale = Number(data) || 1; sendPlaybackState(true); }
+        else if (message.name === 'audio-delay') { playbackState.audioDelay = Number(data) || 0; sendPlaybackState(true); }
+        else if (message.name === 'audio-channels') { playbackState.audioChannels = String(data || 'auto'); sendPlaybackState(true); }
+        else if (message.name === 'video-zoom') { playbackState.videoZoom = Number(data) || 0; sendPlaybackState(true); }
+        else if (message.name === 'video-rotate') { playbackState.videoRotate = Number(data) || 0; sendPlaybackState(true); }
+        else if (message.name === 'video-aspect') { playbackState.videoAspect = data === null ? 'auto' : String(data); sendPlaybackState(true); }
+        else if (message.name === 'loop-file') { playbackState.loopFile = data === 'inf' || data === true; sendPlaybackState(true); }
+        else if (message.name === 'sub-visibility') { playbackState.subVisibility = data !== false; sendPlaybackState(true); }
+        else if (message.name === 'hwdec-current') { playbackState.hwdec = String(data || ''); sendPlaybackState(true); }
+        else if (message.name === 'current-vo') { playbackState.vo = String(data || ''); sendPlaybackState(true); }
+        else if (message.name === 'frame-drop-count') { playbackState.dropCount = Number(data) || 0; sendPlaybackState(true); }
+        else if (message.name === 'chapter-list') { playbackState.chapters = Array.isArray(data) ? data : []; sendPlaybackState(true); }
+        else if (message.name === 'video-params') { mediaInfo.video = data; sendMediaInfo(); }
+        else if (message.name === 'audio-params') { mediaInfo.audio = data; sendMediaInfo(); }
+        else if (message.name === 'estimated-vf-fps') { mediaInfo.fps = data; sendMediaInfo(); }
+        else if (message.name === 'bitrate') { mediaInfo.bitrate = data; sendMediaInfo(); }
+        else if (message.name === 'user-data/yj-active' && data) { try { const next = JSON.parse(data); if (next?.serverUrl && next?.itemId) playbackContext = { ...playbackContext, ...next }; } catch {} }
+        else if (message.name === 'user-data/yj-player-action' && data) { try { sender.send('mpv-player-action',JSON.parse(data)); } catch {} }
         const second = Math.floor(position);
         if (second > 0 && second % 10 === 0 && second !== lastReport) { lastReport = second; report('/Progress', position, paused); }
       } catch {}
     });
-  }).catch(() => {});
+  }
+  // The mpv window now owns the whole player UI (its OSC draws the V9-style
+  // console). Hide the Electron app window so mpv's window is the only thing
+  // on screen — the player becomes a dedicated mpv window, not an overlay.
+  try { if (owner && !owner.isDestroyed()) owner.hide(); } catch {}
+  syncMpvOwnWindow(owner);
+  [120, 400, 1000, 2500].forEach(delay => setTimeout(() => { try { if (mpvProcess && !mpvProcess.killed) syncMpvOwnWindow(owner); } catch {} }, delay));
   const launchedProcess=mpvProcess;
-  launchedProcess.once('exit', () => { report('/Stopped', position, paused); if (danmakuFile) fs.rmSync(danmakuFile, { force:true }); for (const file of dynamicDanmakuFiles) fs.rmSync(file,{force:true}); dynamicDanmakuFiles.clear(); for (const file of episodeThumbnailFiles) fs.rmSync(file, { force:true }); if (seriesLogoImage?.file) fs.rmSync(seriesLogoImage.file,{force:true}); fs.rmSync(playerStateFile, { force:true }); sender.send('mpv-media-info', { ended: true }); if (mpvProcess===launchedProcess) { mpvSocket=null; pendingMpvUpdate=null; mpvProcess = null; } });
+  launchedProcess.once('exit', () => {
+    report('/Stopped', position, paused);
+    if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
+    currentPlaybackState = null; currentMediaInfo = null;
+    if (danmakuFile) fs.rmSync(danmakuFile, { force:true });
+    for (const file of dynamicDanmakuFiles) fs.rmSync(file,{force:true}); dynamicDanmakuFiles.clear();
+    for (const file of episodeThumbnailFiles) fs.rmSync(file, { force:true });
+    if (seriesLogoImage?.file) fs.rmSync(seriesLogoImage.file,{force:true});
+    fs.rmSync(playerStateFile, { force:true });
+    sender.send('mpv-media-info', { ended: true });
+    // Restore the app window: while playing we hide() it so the mpv window owns
+    // the whole player UI; bring it back (and drop the old pin) when playback
+    // ends, including when the user closes the mpv window itself.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      try { mainWindow.setAlwaysOnTop(false); } catch {}
+      try { mainWindow.show(); } catch {}
+    }
+    if (mpvProcess===launchedProcess) { mpvSocket=null; pendingMpvUpdate=null; mpvProcess = null; }
+  });
   return true;
 });
 
@@ -431,9 +686,12 @@ ipcMain.handle('mpv-adapters', async () => {
   return new Promise(resolve => {
     const child = spawn(mpv, ['--vo=gpu-next', '--d3d11-adapter=help'], { cwd: path.dirname(mpv), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
+    // A hung probe would orphan yet another mpv, so cap the wait.
+    const probeTimer = setTimeout(() => { try { child.kill(); } catch {} }, 10000);
     child.stdout.on('data', chunk => { out += chunk.toString(); });
     child.stderr.on('data', chunk => { out += chunk.toString(); });
     child.once('close', () => {
+      clearTimeout(probeTimer);
       const adapters = [];
       for (const raw of out.split('\n')) {
         const line = raw.trim();
@@ -445,9 +703,30 @@ ipcMain.handle('mpv-adapters', async () => {
       }
       resolve(adapters);
     });
-    child.once('error', () => resolve([]));
+    child.once('error', () => { clearTimeout(probeTimer); resolve([]); });
   });
 });
+
+// mpv is spawned as a detached child, so it outlives Electron unless we kill it.
+// Quitting used to orphan the player: the leftover processes sit there as
+// "mpv smtc" windows with 0 CPU time, keep app/mpv/mpv.exe locked, and later
+// stall electron-builder during packaging (it hangs in the packaging step).
+const cleanupMpv = () => {
+  const proc = mpvProcess;
+  mpvProcess = null;
+  if (proc && !proc.killed) { try { proc.kill(); } catch {} }
+  if (mpvSocket && !mpvSocket.destroyed) { try { mpvSocket.destroy(); } catch {} }
+  mpvSocket = null;
+  clipStart = null;
+  mpvOwnHwnd = 0;
+  mpvTitleToken = '';
+  electronOwnerHwnd = 0;
+  if (mainWindow && !mainWindow.isDestroyed()) { try { mainWindow.setAlwaysOnTop(false); } catch {} }
+  for (const file of dynamicDanmakuFiles) { try { fs.rmSync(file, { force: true }); } catch {} }
+  dynamicDanmakuFiles.clear();
+};
+app.on('before-quit', cleanupMpv);
+app.on('will-quit', cleanupMpv);
 
 app.whenReady().then(() => {
   createWindow();

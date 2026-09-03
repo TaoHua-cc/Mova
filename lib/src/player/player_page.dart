@@ -168,17 +168,20 @@ class _PlayerPageState extends State<PlayerPage> {
   WatchStateStore? _watchStore;
   bool _settingsOpen = false;
   bool _exitStarted = false;
+
   /// The Emby item whose playback session has been announced to the server
   /// (PlaybackStart). Progress reports keep flowing for this item until it
   /// changes or playback ends; switching media first closes the old session
   /// (PlaybackStopped) so the server stamps a truthful LastPlayedDate on it.
   String? _reportedSessionItemId;
+
   /// PlaySessionId minted per announced item. Emby 400s `Sessions/Playing`
   /// and `Sessions/Playing/Progress` bodies without it ("Value cannot be
   /// null. (Parameter 'key')"), so start/progress/stop of one session must
   /// reuse the same id. The entry lives until the session is closed (or the
   /// start failed), keyed by serverItemId.
   final Map<String, String> _sessionPlayIds = {};
+
   /// MediaSourceId of the source actually streamed, captured from the playback
   /// URL when the session starts. Not mandatory (the server falls back to the
   /// item's default source) but sent for parity with official clients.
@@ -965,7 +968,10 @@ class _PlayerPageState extends State<PlayerPage> {
   /// without them every resume row stays undated and the server's
   /// "continue watching" order degrades to an arbitrary one. Each session
   /// carries a stable PlaySessionId; the server 400s reports that omit it.
-  Future<void> _syncProgress({bool syncTrakt = false, bool ending = false}) async {
+  Future<void> _syncProgress({
+    bool syncTrakt = false,
+    bool ending = false,
+  }) async {
     // Capture the episode and position up-front: the async hops below (source
     // lookup, HTTP) can race an in-page episode switch, and the stop for the
     // *old* item must never target the *new* one.
@@ -1012,7 +1018,8 @@ class _PlayerPageState extends State<PlayerPage> {
                   // progress ping, and every report needs the session id. The
                   // marker is claimed before the network hops so two
                   // overlapping calls cannot both announce the same item.
-                  final needsStart = _reportedSessionItemId != itemId ||
+                  final needsStart =
+                      _reportedSessionItemId != itemId ||
                       !_sessionPlayIds.containsKey(itemId);
                   if (needsStart) {
                     final previous = _reportedSessionItemId;
@@ -1031,8 +1038,9 @@ class _PlayerPageState extends State<PlayerPage> {
                           position: position,
                           duration: duration,
                           playSessionId: _sessionPlayIds.remove(previous),
-                          mediaSourceId:
-                              _sessionMediaSourceIds.remove(previous),
+                          mediaSourceId: _sessionMediaSourceIds.remove(
+                            previous,
+                          ),
                         );
                       } catch (_) {
                         // The previous item may belong to another source.

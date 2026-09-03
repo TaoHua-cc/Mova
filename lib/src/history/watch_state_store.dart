@@ -94,12 +94,9 @@ class WatchStateStore {
   /// Records without a timestamp (written by very old builds) stay at the end
   /// in their stored order instead of arbitrarily jumping above dated ones.
   List<WatchState> load() {
-    final rows =
-        (_prefs.getStringList(key) ?? const [])
-            .map(
-              (v) => WatchState.fromJson(jsonDecode(v) as Map<String, dynamic>),
-            )
-            .toList();
+    final rows = (_prefs.getStringList(key) ?? const [])
+        .map((v) => WatchState.fromJson(jsonDecode(v) as Map<String, dynamic>))
+        .toList();
     return sortWatchStatesByRecency(rows);
   }
 

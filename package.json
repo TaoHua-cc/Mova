@@ -1,15 +1,16 @@
 {
   "name": "yingji",
-  "version": "2.0.121",
-  "description": "映迹 Windows 观影客户端",
+  "version": "3.0.0",
+  "description": "映迹 Flutter Windows 私人媒体客户端（内置 libmpv）",
   "main": "main.cjs",
   "author": "Yingji",
   "license": "UNLICENSED",
   "scripts": {
-    "start": "electron .",
-    "fetch:mpv": "powershell -ExecutionPolicy Bypass -File scripts/fetch-mpv.ps1",
-    "dist:installer": "electron-builder --win nsis",
-    "dist:store": "electron-builder --win appx"
+    "start": "flutter run -d windows",
+    "build:windows": "flutter build windows --release",
+    "package:installer": "powershell -ExecutionPolicy Bypass -File scripts/build-installer.ps1",
+    "test": "flutter test",
+    "analyze": "flutter analyze"
   },
   "devDependencies": {
     "electron": "39.2.7",

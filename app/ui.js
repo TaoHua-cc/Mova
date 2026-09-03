@@ -13,10 +13,17 @@ const yjArt = (item, type = 'backdrop', size = 'w780') => {
   return path ? `https://image.tmdb.org/t/p/${size}${path}` : '';
 };
 const yjContinueImages = (item, width = 640) => {
-  const base = item?.server?.url, token = item?.token;
+  const base = item?.server?.url?.replace(/\/+$/, ''), token = item?.token;
   if (!base || !token) return [];
-  const ids = [item.Id].filter(Boolean);
-  return ids.map(id => `${base}/Items/${id}/Images/Primary?maxWidth=${width}&quality=88&api_key=${encodeURIComponent(token)}`);
+  const imageUrl = (id, kind) => `${base}/Items/${encodeURIComponent(id)}/Images/${kind}?maxWidth=${width}&quality=88&api_key=${encodeURIComponent(token)}`;
+  const candidates = [];
+  const add = (id, kind) => { if (id && !candidates.includes(`${id}:${kind}`)) candidates.push(`${id}:${kind}`); };
+  // Episodes commonly have no Primary image of their own. Try the episode's
+  // still/thumb first, then inherit artwork from its series/parent item.
+  add(item.Id, 'Primary'); add(item.Id, 'Thumb'); add(item.Id, 'Backdrop');
+  add(item.SeriesId, 'Backdrop'); add(item.SeriesId, 'Primary');
+  add(item.ParentId, 'Backdrop'); add(item.ParentId, 'Primary');
+  return candidates.slice(0, 7).map(value => { const [id, kind] = value.split(':'); return imageUrl(id, kind); });
 };
 const yjWarmContinueArt = () => document.querySelectorAll('[data-continue-art]').forEach(node => {
   const urls = (node.dataset.continueArt || '').split('|').filter(Boolean); let index = 0;
@@ -306,9 +313,6 @@ const yjMpvStyle = () => {
     .yj-media-chip i { font-style:normal; font-size:.92rem; font-weight:650; }
     .yj-media-chip.yj-media-empty, .yj-media-chip.yj-media-ended { opacity:.6; font-size:.82rem; }
     body.light .yj-media-chip { background:rgba(8,12,20,.05); border-color:rgba(8,12,20,.12); }
-    /* Home page without hero banner */
-    body.yj-ui .app .yj-home.yj-no-hero { padding-top: clamp(2rem, 4vh, 3.5rem); }
-    body.yj-ui .app .yj-home.yj-no-hero::before { display:none !important; }
   `;
   document.head.appendChild(style);
 };
@@ -334,6 +338,10 @@ const yjHdrLabel = v => {
 const yjRenderMediaInfo = info => {
   const host = document.querySelector('[data-mpv-info]');
   if (!host) return;
+  // The console opens before any media info arrives, so info is null on the
+  // first paint. Without this the `.video` read below throws and everything
+  // after the call (mpv state snapshot, GPU adapters) silently never runs.
+  if (!info) info = {};
   if (info?.ended) { host.innerHTML = '<span class="yj-media-chip yj-media-ended">播放已结束</span>'; return; }
   const v = info.video || {}, a = info.audio || {};
   const chips = [];
@@ -615,10 +623,462 @@ const yjLoadDetailSeason = async seasonNumber => {
   } catch (error) { data.seasonLoading = false; renderLiveDetail(); notify(`加载第 ${seasonNumber} 季失败：${error.message || '请检查网络'}`); }
 };
 
-showPlayerHandoff = function yjPlayerHandoff(title) {
-  app.innerHTML = yjShell(`<main class="yj-page yj-handoff"><span class="yj-handoff-icon">${ico('play')}</span><span class="yj-eyebrow">NOW PLAYING IN MPV</span><h1>${esc(title)}</h1><p>mpv 已接管高品质播放。关闭播放器后可以返回资料库继续选择内容。</p><div class="yj-media-info" data-mpv-info aria-live="polite"><span class="yj-media-chip yj-media-empty">等待播放器媒体信息…</span></div><button class="primary" data-go="library">返回资料库</button></main>`, 'library', { title: '正在播放' });
+/* ══════════════════════════════════════════════════════════════════════════
+   Player console
+   mpv owns the video window; this page is the app-side surface for it. It
+   mirrors live mpv state and writes back through the whitelisted command
+   channel in main.cjs. Controls that only exist as launch flags are labelled
+   as taking effect on the next playback instead of pretending to be live.
+   ══════════════════════════════════════════════════════════════════════════ */
+const yjClock = seconds => {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+};
+
+// Same 24×24 stroke language as ico() in index.html, for transport glyphs the
+// shared icon set has no entry for (skip track, seek nudge, fullscreen).
+const yjSvg = d => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${d}"/></svg>`;
+const yjMpvCommand = async (payload, label) => {
+  if (!window.yingjiDesktop?.mpvCommand) return false;
+  try {
+    const result = await window.yingjiDesktop.mpvCommand(payload);
+    if (result?.ok) return true;
+    if (label) notify(result?.reason === 'no-player' ? '播放器已关闭' : `${label}未生效`);
+    return false;
+  } catch { if (label) notify(`${label}未生效`); return false; }
+};
+// Settings that are baked into mpv's command line. Changing them here only
+// affects the next launch — say so rather than leaving a dead control.
+const yjRelaunchNote = () => `<div class="p-note">${ico('history')}<span>硬解模式、渲染器与 GPU 属于启动参数，改动会在<strong>下次播放</strong>生效。</span></div>`;
+const yjConsoleSwitch = (key, label, on = null) => {
+  const active = on === null ? !!live.ui.toggles[key] : !!on;
+  return `<button class="switch ${active ? '' : 'off'}" role="switch" aria-checked="${active}" data-console-toggle="${esc(key)}" aria-label="${esc(label)}"></button>`;
+};
+const yjConsoleSeg = (key, options, current) => `<div class="p-seg" data-console-seg="${esc(key)}">${options.map(([value, text]) => `<button class="${String(current) === String(value) ? 'is-active' : ''}" data-value="${esc(value)}">${esc(text)}</button>`).join('')}</div>`;
+const yjConsoleSelect = (key, options, current, ariaLabel) => `<select class="p-select" data-console-select="${esc(key)}" aria-label="${esc(ariaLabel)}">${options.map(([value, text]) => `<option value="${esc(value)}" ${String(current ?? '') === String(value) ? 'selected' : ''}>${esc(text)}</option>`).join('')}</select>`;
+
+const yjConsoleTracks = (tracks, type, activeId) => {
+  const rows = (tracks || []).filter(track => track?.type === type);
+  if (!rows.length) return `<div class="p-track-list"><button class="p-track-row" disabled><i class="p-track-index">—</i><span class="p-track-copy"><b>暂无可切换${type === 'audio' ? '音轨' : '字幕'}</b><small>等待 mpv 报告轨道列表</small></span></button></div>`;
+  const off = `<button class="p-track-row ${activeId === false || activeId === 'no' ? 'is-active' : ''}" data-console-track="${type}" data-track-id="no"><i class="p-track-index">—</i><span class="p-track-copy"><b>关闭</b></span><em></em></button>`;
+  return `<div class="p-track-list">${rows.map(track => { const id = track.id; const lang = track.lang ? `${track.lang} · ` : ''; const title = track.title || track['demux-title'] || track.externalFilename || ''; const codec = track.codec ? String(track.codec).toUpperCase() : ''; const channels = track['demux-channels'] ? `${track['demux-channels']}` : ''; return `<button class="p-track-row ${String(activeId) === String(id) ? 'is-active' : ''}" data-console-track="${type}" data-track-id="${esc(id)}"><i class="p-track-index">${esc(id)}</i><span class="p-track-copy"><b>${esc(lang + (title || (type === 'audio' ? '音轨' : '字幕')))}</b><small>${esc([codec, channels ? `${channels} 声道` : ''].filter(Boolean).join(' · '))}</small></span><em></em></button>`; }).join('')}${type === 'sub' ? off : ''}</div>`;
+};
+
+const yjConsolePane = (tab, player, state) => {
+  const t = live.ui.toggles || {};
+  if (tab === 'audio') return `
+    <section class="yj-setting-group p-group"><header><h2>音轨</h2><span>${(state.tracks || []).filter(track => track?.type === 'audio').length || '—'} 条</span></header>${yjConsoleTracks(state.tracks, 'audio', state.aid)}</section>
+    <section class="yj-setting-group p-group"><header><h2>音频处理</h2></header>
+      <article><span class="yj-ico">${ico('smart')}</span><span><b>立体声下混</b><small>多声道转为 2.0，适配耳机与音箱</small></span>${yjConsoleSwitch('downmix')}</article>
+      <article><span class="yj-ico">${ico('audio')}</span><span><b>人声增强</b><small>highpass 80Hz + 1k/2.8k 提升</small></span>${yjConsoleSwitch('vocal')}</article>
+      <article><span class="yj-ico">${ico('moon')}</span><span><b>夜间模式</b><small>压缩动态范围，压低爆炸声</small></span>${yjConsoleSwitch('night')}</article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>同步</h2></header>
+      <article><span class="yj-ico">${ico('history')}</span><span><b>音频延迟</b><small>正值表示声音延后</small></span>${yjConsoleSelect('audioDelay', [['0', '0 ms'], ['0.05', '+50 ms'], ['-0.12', '-120 ms'], ['-0.25', '-250 ms'], ['-0.5', '-500 ms']], String(Number(state.audioDelay || 0).toFixed(2)), '音频延迟')}</article>
+      <article><span class="yj-ico">${yjSvg('M4 7h9M17 7h3M4 12h3M11 12h9M4 17h6M14 17h6')}</span><span><b>声道布局</b><small>由 mpv 依设备能力选择</small></span>${yjConsoleSelect('audioChannels', [['auto', '自动'], ['stereo', '立体声'], ['5.1', '5.1'], ['7.1', '7.1']], state.audioChannels || 'auto', '声道布局')}</article>
+    </section>`;
+  if (tab === 'subtitle') return `
+    <section class="yj-setting-group p-group"><header><h2>字幕轨</h2><span>${(state.tracks || []).filter(track => track?.type === 'sub').length || '—'} 条</span></header>${yjConsoleTracks(state.tracks, 'sub', state.sid)}</section>
+    <section class="yj-setting-group p-group"><header><h2>外观</h2></header>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>字幕字号</b><small>相对画面高度</small></span>${yjConsoleSelect('subScale', [['0.8', '小'], ['1', '标准'], ['1.2', '大'], ['1.5', '特大']], String(Number(state.subScale || 1).toFixed(1)), '字幕字号')}</article>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>字幕位置</b><small>距底部百分比</small></span>${yjConsoleSelect('subPos', [['95', '顶部'], ['92', '底部 5%'], ['85', '底部 12%'], ['78', '底部 20%']], String(Math.round(Number(state.subPos || 92))), '字幕位置')}</article>
+      <article><span class="yj-ico">${ico('history')}</span><span><b>字幕延迟</b><small>与画面对齐</small></span>${yjConsoleSelect('subDelay', [['0', '0 ms'], ['0.25', '+250 ms'], ['-0.25', '-250 ms'], ['-0.5', '-500 ms'], ['-1', '-1 秒']], String(Number(state.subDelay || 0).toFixed(2)), '字幕延迟')}</article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>首选语言</b><small>自动匹配简体中文优先</small></span>${yjConsoleSelect('subtitleLanguage', [['auto', '自动'], ['chi', '简体中文'], ['zho', '繁體中文'], ['eng', 'English']], live.ui.subtitleLanguage || 'auto', '字幕首选语言')}</article>
+    </section>`;
+  if (tab === 'danmaku') return `
+    <section class="yj-setting-group p-group"><header><h2>弹幕</h2><span>${player.danmakuCount != null ? `${player.danmakuCount} 条` : '—'}</span></header>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>显示弹幕</b><small>弹幕渲染在独立浮层</small></span>${yjConsoleSwitch('danmakuEnabled')}</article>
+      <article><span class="yj-ico">${ico('smart')}</span><span><b>防挡模式</b><small>智能避让人物与字幕区</small></span>${yjConsoleSeg('danmakuMode', [['smart', '智能'], ['top', '顶部'], ['bottom', '底部'], ['off', '关闭']], live.ui.danmakuMode)}</article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>同屏密度</b><small>越高越密集</small></span>${yjConsoleSeg('danmakuDensity', [['low', '稀疏'], ['normal', '标准'], ['high', '密集']], live.ui.danmakuDensity)}</article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>外观细节</h2></header>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>字号</b><small>${live.ui.danmakuFontScale || 100}%</small></span><input class="p-slider" style="width:96px" type="range" min="60" max="180" step="10" value="${esc(live.ui.danmakuFontScale || 100)}" data-console-range="danmakuFontScale" aria-label="弹幕字号"></article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>不透明度</b><small>${live.ui.danmakuOpacity || 86}%</small></span><input class="p-slider" style="width:96px" type="range" min="20" max="100" step="2" value="${esc(live.ui.danmakuOpacity || 86)}" data-console-range="danmakuOpacity" aria-label="弹幕不透明度"></article>
+      <article><span class="yj-ico">${ico('history')}</span><span><b>停留时长</b><small>滚动一条耗时</small></span>${yjConsoleSelect('danmakuDuration', [['4', '4 秒'], ['5', '5 秒'], ['7', '7 秒'], ['9', '9 秒']], live.ui.danmakuDuration, '弹幕停留时长')}</article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>同屏上限</b><small>超出后丢弃新弹幕</small></span>${yjConsoleSelect('danmakuMaxCount', [['800', '800 条'], ['1500', '1500 条'], ['3000', '3000 条'], ['0', '不限']], live.ui.danmakuMaxCount, '弹幕同屏上限')}</article>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>描边</b><small>硬描边在亮画面更清晰</small></span>${yjConsoleSeg('danmakuOutline', [['soft', '柔和'], ['hard', '硬边'], ['none', '关闭']], live.ui.danmakuOutline)}</article>
+    </section>
+    <div class="p-note">${ico('history')}<span>弹幕参数随下一次播放或切集生效；密度与模式改动会重新拉取弹幕。</span></div>`;
+  if (tab === 'picture') return `
+    <section class="yj-setting-group p-group"><header><h2>取景</h2></header>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>画面比例</b><small>原始比例来自片源</small></span>${yjConsoleSelect('videoAspect', [['auto', '原始'], ['16:9', '16:9'], ['4:3', '4:3'], ['2.35:1', '2.35:1']], state.videoAspect === 'auto' || !state.videoAspect ? 'auto' : state.videoAspect, '画面比例')}</article>
+      <article><span class="yj-ico">${ico('search')}</span><span><b>缩放</b><small>${Number(state.videoZoom || 0).toFixed(2)}</small></span><input class="p-slider" style="width:96px" type="range" min="-1" max="1" step="0.05" value="${esc(Number(state.videoZoom || 0))}" data-console-range="videoZoom" aria-label="画面缩放"></article>
+      <article><span class="yj-ico">${ico('refresh')}</span><span><b>旋转</b><small>修正竖拍素材</small></span>${yjConsoleSelect('videoRotate', [['0', '0°'], ['90', '90°'], ['180', '180°'], ['270', '270°']], String(Math.round(Number(state.videoRotate || 0))), '画面旋转')}</article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>解码与渲染</h2><span>mpv</span></header>
+      <article><span class="yj-ico">${ico('smart')}</span><span><b>硬件解码</b><small>D3D11 与 gpu-next</small></span>${yjConsoleSwitch('hardware')}</article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>硬解模式</b><small>自动安全优先兼容性</small></span>${yjConsoleSelect('hwdec', [['auto-safe', '自动安全'], ['d3d11va', 'D3D11VA'], ['d3d11va-copy', 'D3D11VA Copy'], ['no', '软解 (CPU)']], live.ui.hwdec, '硬解模式')}</article>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>渲染器</b><small>gpu-next 支持 HDR 与色调映射</small></span>${yjConsoleSelect('renderer', [['gpu-next', 'gpu-next'], ['gpu', 'gpu']], live.ui.renderer, '渲染器')}</article>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>GPU 选择</b><small>指定 D3D11 适配器</small></span><select class="p-select" data-console-select="gpu" aria-label="GPU 选择"><option value="">自动（系统默认）</option>${(live.gpuAdapters || []).map(name => `<option value="${esc(name)}" ${live.ui.gpu === name ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></article>
+      <article><span class="yj-ico">${ico('sun')}</span><span><b>HDR 与 Dolby Vision</b><small>跟随显示器能力输出</small></span>${yjConsoleSwitch('hdr')}</article>
+    </section>
+    ${yjRelaunchNote()}`;
+  if (tab === 'playback') return `
+    <section class="yj-setting-group p-group"><header><h2>速度</h2></header>
+      <article><span class="yj-ico">${ico('chip')}</span><span><b>播放速度</b><small>保持音调不变</small></span>${yjConsoleSelect('speed', [['0.5', '0.5×'], ['0.75', '0.75×'], ['1', '1.0×'], ['1.25', '1.25×'], ['1.5', '1.5×'], ['2', '2.0×']], String(Number(state.speed || 1)), '播放速度')}</article>
+      <article><span class="yj-ico">${ico('refresh')}</span><span><b>单文件循环</b><small>AB 循环请在 mpv 窗口内操作</small></span>${yjConsoleSwitch('loopFile', state.loopFile)}</article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>窗口</h2></header>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>窗口置顶</b><small>播放器始终在最前</small></span>${yjConsoleSwitch('windowOntop')}</article>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>画中画</b><small>缩为小窗继续观看</small></span>${yjConsoleSwitch('windowPip', live.consolePip)}</article>
+      <article><span class="yj-ico">${ico('display')}</span><span><b>全屏</b><small>独占显示器输出</small></span><div class="p-seg" data-console-fullscreen><button>${live.consoleFullscreen ? '退出全屏' : '进入全屏'}</button></div></article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>工具</h2></header>
+      <div class="p-group-actions"><button data-console-tool="screenshot">${ico('display')}截图</button><button data-console-tool="clip">${ico('plus')}截取片段</button></div>
+    </section>`;
+  if (tab === 'chapter') {
+    const rule = player.chapterRule || null;
+    const intro = rule?.introEnd != null ? yjClock(rule.introEnd) : null;
+    const outro = rule?.outroStart != null ? yjClock(rule.outroStart) : null;
+    const chapters = Array.isArray(state.chapters) && state.chapters.length
+      ? state.chapters.map((chapter, index) => ({ time:Number(chapter.time || 0), title:chapter.title || `章节 ${index + 1}`, kind:/片头|intro|opening/i.test(chapter.title || '') ? '片头' : /片尾|outro|ending|credits/i.test(chapter.title || '') ? '片尾' : '正片' }))
+      : [{time:0,title:'开场',kind:'正片'}, ...(rule?.introEnd != null ? [{time:Number(rule.introEnd),title:'片头结束',kind:'片头'}] : []), ...(rule?.outroStart != null ? [{time:Number(rule.outroStart),title:'片尾开始',kind:'片尾'}] : [])];
+    const currentIndex = chapters.reduce((found, chapter, index) => chapter.time <= Number(state.timePos || 0) ? index : found, 0);
+    return `
+    <section class="yj-setting-group p-group"><header><h2>自动跳过</h2><span>${rule?.source ? esc(rule.source) : '未识别'}</span></header>
+      <article><span class="yj-ico">${ico('play')}</span><span><b>跳过片头</b><small>${intro ? `已识别片头，结束于 ${intro}` : '本集未识别到片头标记'}</small></span>${yjConsoleSwitch('chapterAutoSkip')}</article>
+      <article><span class="yj-ico">${ico('play')}</span><span><b>跳过片尾</b><small>${outro ? `已识别片尾，开始于 ${outro}` : '本集未识别到片尾标记'}</small></span>${yjConsoleSwitch('chapterAutoSkip')}</article>
+      <article><span class="yj-ico">${ico('history')}</span><span><b>章节来源</b><small>优先使用 Emby 内嵌章节</small></span>${yjConsoleSelect('chapterSource', [['server', '服务器章节'], ['local', '本地解析'], ['off', '关闭']], live.ui.chapterSource || 'server', '章节来源')}</article>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>章节</h2><span>${chapters.length} 个</span></header>
+      <div class="p-chapter-list">${chapters.map((chapter,index) => `<button class="p-chapter-row ${index === currentIndex ? 'is-current' : ''}" data-console-chapter="${esc(chapter.time)}"><time>${yjClock(chapter.time)}</time><span>${esc(chapter.title)}</span><em class="p-chapter-kind">${esc(chapter.kind)}</em></button>`).join('')}</div>
+    </section>`;
+  }
+  const v = player.info?.video || {}, a = player.info?.audio || {};
+  return `
+    <section class="yj-setting-group p-group"><header><h2>媒体信息</h2><span>实时</span></header>
+      <dl class="p-diag">
+        <dt>视频编码</dt><dd>${esc(String(v.codec || '—').toUpperCase())}</dd>
+        <dt>分辨率</dt><dd>${esc(v.dw && v.dh ? `${v.dw}×${v.dh}` : '—')}</dd>
+        <dt>位深 / 色度</dt><dd>${esc([yjPixelDepth(v.format), v.format].filter(Boolean).join(' · '))}</dd>
+        <dt>帧率</dt><dd>${esc(player.info?.fps ? `${Number(player.info.fps).toFixed(3).replace(/\.?0+$/, '')} fps` : '—')}</dd>
+        <dt>动态范围</dt><dd>${esc(yjHdrLabel(v) || 'SDR')}</dd>
+        <dt>码率</dt><dd>${esc(player.info?.bitrate ? `${(player.info.bitrate / 1000).toFixed(0)} kbps` : '—')}</dd>
+        <dt>音频编码</dt><dd>${esc(String(a.codec || '—').toUpperCase())}</dd>
+        <dt>声道 / 采样</dt><dd>${esc([a.channels, a.samplerate ? `${(a.samplerate / 1000).toFixed(1)} kHz` : ''].filter(Boolean).join(' · ') || '—')}</dd>
+      </dl>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>解码状态</h2></header>
+      <dl class="p-diag">
+        <dt>实际硬解</dt><dd class="${state.hwdec && state.hwdec !== 'no' ? 'is-ok' : ''}">${esc(state.hwdec || '—')}</dd>
+        <dt>渲染器</dt><dd>${esc(state.vo || '—')}</dd>
+        <dt>GPU 适配器</dt><dd>${esc(live.ui.gpu || '自动（系统默认）')}</dd>
+        <dt>丢帧</dt><dd class="${state.dropCount ? 'is-warn' : 'is-ok'}">${esc(state.dropCount || 0)}</dd>
+        <dt>播放速度</dt><dd>${esc(Number(state.speed || 1))}×</dd>
+        <dt>音量</dt><dd>${esc(Math.round(Number(state.volume ?? 100)))}%</dd>
+      </dl>
+    </section>
+    <section class="yj-setting-group p-group"><header><h2>日志</h2></header>
+      <div class="p-group-actions p-group-actions-single"><button data-console-tool="copy-diagnostics">复制诊断信息</button></div>
+    </section>`;
+};
+
+const yjConsoleMarkup = (tab, player, state) => {
+  const meta = (player.meta || []).filter(Boolean);
+  const total = Number(state.duration || 0);
+  const played = Number(state.timePos || 0);
+  const percent = total > 0 ? Math.min(100, Math.max(0, played / total * 100)) : 0;
+  const rule = player.chapterRule || null;
+  const introMark = rule?.introEnd != null && total > 0 ? `<span class="p-progress-mark" style="left:${Math.min(100, rule.introEnd / total * 100).toFixed(2)}%" title="片头结束 ${yjClock(rule.introEnd)}"></span>` : '';
+  const outroMark = rule?.outroStart != null && total > 0 ? `<span class="p-progress-mark" style="left:${Math.min(100, rule.outroStart / total * 100).toFixed(2)}%" title="片尾开始 ${yjClock(rule.outroStart)}"></span>` : '';
+  // Embedded layout: mpv renders into the Electron window via --wid.
+  // .p-video is transparent — mpv draws to the window behind it.
+  return `<main class="p-console p-page">
+    <div class="p-video" data-mpv-video aria-hidden="true"></div>
+    <section class="p-stage" ${player.tint ? `style="--poster-rgb:${esc(player.tint)}"` : ''}>
+      <div class="p-head">
+        <span class="p-poster" ${player.poster ? `style="background-image:url('${esc(player.poster)}')"` : ''}></span>
+        <div class="p-head-copy">
+          <span class="yj-eyebrow">NOW PLAYING · MPV</span>
+          <h1>${esc(player.title || '正在播放')}</h1>
+          <ul class="p-stage-meta">${meta.map(entry => `<li>${esc(entry)}</li>`).join('')}</ul>
+        </div>
+      </div>
+      <div class="yj-media-info p-media-info" data-mpv-info aria-live="polite"><span class="yj-media-chip yj-media-empty">正在读取媒体信息…</span></div>
+      <div class="p-progress">
+        <div class="p-progress-track" data-console-seek role="slider" aria-label="播放进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(0)}" tabindex="0">
+          <div class="p-progress-buffer"></div>
+          <div class="p-progress-played" style="width:${percent.toFixed(2)}%"><i class="p-progress-handle"></i></div>
+          ${introMark}${outroMark}
+        </div>
+        <div class="p-times">
+          <b data-console-time>${yjClock(played)}</b>
+          <span data-console-duration>/ ${total ? yjClock(total) : '--:--'}</span>
+          <span data-console-remain>${total ? `剩余 ${yjClock(total - played)}` : ''}</span>
+          ${rule?.introEnd != null ? `<button class="p-skip-intro" data-console-skip="${esc(rule.introEnd)}">跳过片头 ${yjClock(rule.introEnd)}</button>` : ''}
+        </div>
+      </div>
+      <div class="p-transport">
+        <button class="p-transport-btn" data-console-cmd="playlist-prev" title="上一集" aria-label="上一集">${yjSvg('M18 6v12L9 12zM6 6v12')}</button>
+        <button class="p-transport-btn" data-console-cmd="seek-back" title="后退 10 秒" aria-label="后退 10 秒">${yjSvg('M20 6v5h-5M19 11a8 8 0 1 0 1 5')}</button>
+        <button class="p-transport-btn solid ${state.pause ? 'is-paused' : ''}" data-console-cmd="pause" title="${state.pause ? '播放' : '暂停'}" aria-label="${state.pause ? '播放' : '暂停'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="${state.pause ? 'M9 7l8 5-8 5z' : 'M9 7v10m6-10v10'}"/></svg></button>
+        <button class="p-transport-btn" data-console-cmd="seek-forward" title="前进 10 秒" aria-label="前进 10 秒">${yjSvg('M4 6v5h5M5 11a8 8 0 1 1 1 5')}</button>
+        <button class="p-transport-btn" data-console-cmd="playlist-next" title="下一集" aria-label="下一集">${yjSvg('M6 6v12l9-6zM18 6v12')}</button>
+        <div class="p-transport-div"></div>
+        <div class="p-vol">
+          <button class="p-volume-button" data-console-cmd="mute" title="静音" aria-label="静音">${ico('audio')}</button>
+          <input class="p-vol-slider" type="range" min="0" max="100" value="${Math.round(Number(state.volume ?? 100))}" data-console-range="volume" aria-label="音量">
+        </div>
+        <div class="p-transport-spacer"></div>
+        <span class="p-status-chip is-live">${ico('check')}直连</span>
+        <span class="p-status-chip">${esc(state.hwdec || live.ui.hwdec || '—')}</span>
+        <span class="p-status-chip">${esc(state.vo || live.ui.renderer || '—')}</span>
+        <div class="p-transport-div"></div>
+        <button class="p-transport-btn" data-console-tab="subtitle" title="字幕" aria-label="字幕">${yjSvg('M3 5h18v14H3zM7 14h4M13 14h4')}</button>
+        <button class="p-transport-btn" data-console-tab="danmaku" title="弹幕" aria-label="弹幕">${yjSvg('M4 7h9M17 7h3M4 12h3M11 12h9M4 17h6M14 17h6')}</button>
+        <button class="p-transport-btn" data-console-tab="playback" title="播放设置" aria-label="播放设置">${ico('more')}</button>
+        <button class="p-transport-btn" data-console-cmd="fullscreen" title="全屏" aria-label="全屏">${yjSvg('M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5')}</button>
+      </div>
+    </section>
+    <aside class="p-rail">
+      <div class="p-rail-head"><h2>播放设置</h2><p>${player.connected ? '改动即时下发给 mpv，并记入播放偏好。' : '播放器已关闭，重新播放后可继续调整。'}</p></div>
+      <nav class="p-rail-tabs" aria-label="播放设置分类">
+        ${[['audio', '声音'], ['subtitle', '字幕'], ['danmaku', '弹幕'], ['picture', '画面'], ['playback', '播放'], ['chapter', '章节'], ['diag', '诊断']].map(([key, label]) => `<button class="p-rail-tab ${tab === key ? 'is-active' : ''}" data-console-tab="${key}" aria-pressed="${tab === key}">${label}</button>`).join('')}
+      </nav>
+      <div class="p-rail-body" data-console-pane>${yjConsolePane(tab, player, state)}</div>
+    </aside>
+  </main>`;
+};
+
+const yjPlayerShell = (content, player) => {
+  const nav = yjNav.map(([route, icon, label]) => `<button class="p-shell-nav ${route === 'library' ? 'is-active' : ''}" data-go="${route}" aria-label="${label}" title="${label}">${ico(icon)}</button>`).join('');
+  return `<header class="p-shell-titlebar" aria-label="窗口控制"><b>映迹</b><span>正在播放</span><div class="win"><span>—</span><span>□</span><span>×</span></div></header>
+    <aside class="p-shell-sidebar"><div class="p-shell-brand">映</div><nav aria-label="主导航">${nav}</nav></aside>
+    <div class="p-shell-commandbar">
+      <button class="p-back" data-yj-back>${ico('chevron')} 返回</button>
+      <div class="p-crumb"><b>${esc(player.crumbTitle || player.title || '正在播放')}</b><small>${esc(player.crumbSource || 'mpv · 当前播放')}</small></div>
+      <div class="p-command-spacer"></div>
+      <button class="p-icon-btn" data-live-watch="${esc(player.itemId || '')}" title="加入待看" aria-label="加入待看">${ico('watch')}</button>
+      <button class="p-icon-btn" data-console-tab="playback" title="更多" aria-label="更多">${ico('more')}</button>
+    </div>${content}`;
+};
+
+// Patch only the nodes that change every tick. Re-rendering the rail here
+// would fight the user's cursor and drop the open select menus.
+const yjConsoleLive = state => {
+  const track = document.querySelector('[data-console-seek]');
+  if (!track) return;
+  const total = Number(state.duration || 0), played = Number(state.timePos || 0);
+  const percent = total > 0 ? Math.min(100, Math.max(0, played / total * 100)) : 0;
+  const bar = track.querySelector('.p-progress-played');
+  if (bar) bar.style.width = `${percent.toFixed(2)}%`;
+  track.setAttribute('aria-valuenow', percent.toFixed(0));
+  const time = document.querySelector('[data-console-time]');
+  if (time) time.textContent = yjClock(played);
+  const duration = document.querySelector('[data-console-duration]');
+  if (duration) duration.textContent = `/ ${total ? yjClock(total) : '--:--'}`;
+  const remain = document.querySelector('[data-console-remain]');
+  if (remain) remain.textContent = total ? `剩余 ${yjClock(total - played)}` : '';
+  const play = document.querySelector('[data-console-cmd="pause"]');
+  if (play) {
+    play.classList.toggle('is-paused', !!state.pause);
+    play.title = play.ariaLabel = state.pause ? '播放' : '暂停';
+    const path = play.querySelector('path');
+    if (path) path.setAttribute('d', state.pause ? 'M9 7l8 5-8 5z' : 'M9 7v10m6-10v10');
+  }
+};
+
+const yjConsolePlayer = () => ({ ...(live.player || { title: '正在播放', meta: [] }) });
+
+// Build the console view model from the Emby item that just started playing.
+const yjPlayerContext = ({ item, source, title, chapterKey, chapterRule, danmakuContext, danmakuCount, resourceLabel } = {}) => {
+  const server = item?.server || {};
+  const itemId = item?.SeriesId || item?.Id || '';
+  const poster = item?.poster_path
+    ? `https://image.tmdb.org/t/p/w500${item.poster_path}`
+    : (server.url && item?.token && itemId
+      ? `${String(server.url).replace(/\/$/, '')}/Items/${encodeURIComponent(itemId)}/Images/Primary?maxWidth=420&quality=90&api_key=${encodeURIComponent(item.token)}`
+      : '');
+  const season = item?.ParentIndexNumber ?? item?.season;
+  const episode = item?.IndexNumber ?? item?.episode;
+  const meta = [
+    item?.ProductionYear || '',
+    item?.Type === 'Movie' ? '电影' : '剧集',
+    season != null && episode != null ? `第 ${season} 季 · 第 ${episode} 集` : '',
+    server.name || '',
+    resourceLabel ? `版本 · ${resourceLabel}` : ''
+  ];
+  let tint = '';
+  try { if (item?.id) tint = localStorage.getItem(`yingji.poster-color-${item.id}`) || ''; } catch {}
+  return {
+    title: (typeof seriesTitleFor === 'function' ? seriesTitleFor(item) : '') || title || '正在播放',
+    crumbTitle: (typeof seriesTitleFor === 'function' ? seriesTitleFor(item) : '') || title || '正在播放',
+    crumbSource: [server.name || 'Emby', resourceLabel || '当前版本'].filter(Boolean).join(' · '),
+    itemId: item?.Id || '',
+    poster, tint, meta,
+    chapterKey: chapterKey || '', chapterRule: chapterRule || null,
+    danmakuContext: danmakuContext || null, danmakuCount: danmakuCount ?? null,
+    connected: true, info: null
+  };
+};
+
+const yjPlayerConsole = () => {
+  const tab = ['audio', 'subtitle', 'danmaku', 'picture', 'playback', 'chapter', 'diag'].includes(live.consoleTab) ? live.consoleTab : 'audio';
+  const player = yjConsolePlayer();
+  const state = live.playerState || {};
+  app.innerHTML = yjPlayerShell(yjConsoleMarkup(tab, player, state), player);
   yjMpvStyle();
-  if (!prototypeMode && window.yingjiDesktop?.mediaInfo) window.yingjiDesktop.mediaInfo(info => yjRenderMediaInfo(info));
+  yjRenderMediaInfo(player.info || null);
+  if (!prototypeMode) {
+    // Pull the authoritative snapshot so a console opened mid-playback is not
+    // blank until the next property change arrives.
+    window.yingjiDesktop?.mpvState?.().then(snapshot => {
+      if (!snapshot) return;
+      if (snapshot.state) { live.playerState = snapshot.state; yjConsoleLive(snapshot.state); }
+      if (snapshot.info) { const merged = { ...(live.player || {}), info: snapshot.info }; live.player = merged; yjRenderMediaInfo(snapshot.info); }
+      const rail = document.querySelector('.p-rail-head p');
+      if (rail && snapshot.ok === false) rail.textContent = '播放器已关闭，重新播放后可继续调整。';
+    }).catch(() => {});
+    if (!live.gpuAdapters && window.yingjiDesktop?.listAdapters) {
+      window.yingjiDesktop.listAdapters().then(list => { live.gpuAdapters = list || []; }).catch(() => { live.gpuAdapters = []; });
+    }
+  }
+};
+// `player` is declared in the index.html bootstrap (let home,detail,player,…)
+// and is the route render() dispatches to for state.view === 'player'.
+player = yjPlayerConsole;
+
+/* ── Console interaction ─────────────────────────────────────────────────── */
+// Mirrors mpvSettingArgs() in main.cjs so a runtime edit produces the same
+// filter chain a fresh launch would.
+const yjConsoleAudioFilters = () => {
+  const filters = [];
+  if (live.ui.toggles?.vocal) filters.push('lavfi=[highpass=f=80,equalizer=f=1000:t=q:w=1.5:g=6,equalizer=f=2800:t=q:w=1.5:g=4]');
+  if (live.ui.toggles?.night) filters.push('lavfi=[dynaudnorm=f=200:g=15:p=0.85]');
+  return filters.join(',');
+};
+const YJ_CONSOLE_COMMANDS = {
+  pause: { command: ['cycle', 'pause'] },
+  'seek-back': { command: ['seek', -10, 'relative'] },
+  'seek-forward': { command: ['seek', 10, 'relative'] },
+  'playlist-prev': { command: ['playlist-prev'] },
+  'playlist-next': { command: ['playlist-next'] },
+  mute: { command: ['cycle', 'mute'] }
+  // `fullscreen` is deliberately absent: it is window state, not playback
+  // state. mpv is embedded with --wid and owns no window, so `cycle
+  // fullscreen` sent to mpv does nothing. Handled in yjConsoleCommand below.
+};
+const yjSyncFullscreenLabel = () => {
+  const button = document.querySelector('[data-console-fullscreen] button');
+  if (button) button.textContent = live.consoleFullscreen ? '退出全屏' : '进入全屏';
+};
+const yjConsoleCommand = async key => {
+  if (key === 'fullscreen') {
+    const api = window.yingjiDesktop;
+    if (!api?.setWindowFullScreen) return;
+    live.consoleFullscreen = !!(await api.setWindowFullScreen());
+    yjSyncFullscreenLabel();
+    return;
+  }
+  const payload = YJ_CONSOLE_COMMANDS[key];
+  if (!payload) return;
+  yjMpvCommand(payload, '该操作');
+};
+// Registered once at module scope so Esc / F11 (which leave fullscreen without
+// going through the button) still update the label.
+window.yingjiDesktop?.onWindowFullScreen?.(on => {
+  live.consoleFullscreen = !!on;
+  yjSyncFullscreenLabel();
+});
+const yjConsoleToggle = async button => {
+  const key = button.dataset.consoleToggle;
+  if (!key) return;
+  live.ui.toggles = live.ui.toggles || {};
+  if (key === 'downmix' || key === 'vocal' || key === 'night') {
+    live.ui.toggles[key] = !live.ui.toggles[key];
+    const ok = key === 'downmix'
+      ? await yjMpvCommand({ set: { name: 'audio-channels', value: live.ui.toggles.downmix ? 'stereo' : 'auto' } }, '立体声下混')
+      : await yjMpvCommand({ set: { name: 'af', value: yjConsoleAudioFilters() } }, key === 'vocal' ? '人声增强' : '夜间模式');
+    if (!ok) live.ui.toggles[key] = !live.ui.toggles[key];
+  } else if (key === 'loopFile') {
+    const next = !live.playerState?.loopFile;
+    if (!await yjMpvCommand({ set: { name: 'loop-file', value: next } }, '单文件循环')) return;
+    live.playerState = { ...(live.playerState || {}), loopFile: next };
+  } else if (key === 'windowOntop') {
+    // Window state, same as fullscreen — mpv has no window to keep on top.
+    const next = !live.consoleOntop;
+    const api = window.yingjiDesktop;
+    if (!api?.setWindowOnTop) return;
+    await api.setWindowOnTop(next);
+    live.consoleOntop = next;
+  } else if (key === 'windowPip') {
+    const next = !live.consolePip;
+    const api = window.yingjiDesktop;
+    if (!api?.setWindowPictureInPicture) return;
+    live.consolePip = !!(await api.setWindowPictureInPicture(next));
+    document.body.classList.toggle('yj-player-pip', live.consolePip);
+  } else {
+    live.ui.toggles[key] = !live.ui.toggles[key];
+  }
+  saveUi();
+  const checked = key === 'loopFile' ? live.playerState?.loopFile : key === 'windowOntop' ? live.consoleOntop : key === 'windowPip' ? live.consolePip : live.ui.toggles[key];
+  button.classList.toggle('off', !checked);
+  button.setAttribute('aria-checked', String(!!checked));
+};
+const yjConsoleSetting = async (key, value) => {
+  if (['hwdec', 'renderer', 'gpu'].includes(key)) { live.ui[key] = value; saveUi(); notify('已保存，下次播放生效'); return; }
+  if (key === 'subtitleLanguage') { live.ui.subtitleLanguage = value; saveUi(); notify('字幕首选语言已保存，下次播放生效'); return; }
+  if (key === 'chapterSource') { live.ui.chapterSource = value; saveUi(); notify('章节来源已保存'); return; }
+  if (key.startsWith('danmaku')) { live.ui[key] = value; saveUi(); notify('弹幕设置已保存，下次播放或切集生效'); return; }
+  if (key === 'chapterAutoSkip') { live.ui.toggles.chapterAutoSkip = value === true || value === 'true'; saveUi(); notify(`自动跳过片头片尾已${live.ui.toggles.chapterAutoSkip ? '开启' : '关闭'}`); return; }
+  const write = {
+    audioDelay: () => yjMpvCommand({ set: { name: 'audio-delay', value: Number(value) || 0 } }, '音频延迟'),
+    audioChannels: () => yjMpvCommand({ set: { name: 'audio-channels', value: String(value || 'auto') } }, '声道布局'),
+    subDelay: () => yjMpvCommand({ set: { name: 'sub-delay', value: Number(value) || 0 } }, '字幕延迟'),
+    subPos: () => yjMpvCommand({ set: { name: 'sub-pos', value: Number(value) || 92 } }, '字幕位置'),
+    subScale: () => yjMpvCommand({ set: { name: 'sub-scale', value: Number(value) || 1 } }, '字幕字号'),
+    videoAspect: () => yjMpvCommand({ set: { name: 'video-aspect', value: value === 'auto' ? '-1' : String(value) } }, '画面比例'),
+    videoZoom: () => yjMpvCommand({ set: { name: 'video-zoom', value: Number(value) || 0 } }, '画面缩放'),
+    videoRotate: () => yjMpvCommand({ set: { name: 'video-rotate', value: Number(value) || 0 } }, '画面旋转'),
+    speed: () => yjMpvCommand({ set: { name: 'speed', value: Number(value) || 1 } }, '播放速度'),
+    volume: () => yjMpvCommand({ set: { name: 'volume', value: Number(value) || 0 } }, '音量'),
+    aid: () => yjMpvCommand({ set: { name: 'aid', value: value === 'no' ? 'no' : Number(value) } }, '音轨切换'),
+    sid: () => yjMpvCommand({ set: { name: 'sid', value: value === 'no' ? 'no' : Number(value) } }, '字幕切换')
+  }[key];
+  if (!write) return;
+  const ok = await write();
+  if (ok) live.playerState = { ...(live.playerState || {}), [key === 'aid' ? 'aid' : key === 'sid' ? 'sid' : key]: value };
+};
+const yjConsoleTool = async kind => {
+  if (kind === 'copy-diagnostics') {
+    const player = live.player || {}, state = live.playerState || {}, info = player.info || {};
+    const text = JSON.stringify({ title:player.title || '', video:info.video || null, audio:info.audio || null, fps:info.fps || null, bitrate:info.bitrate || null, playback:state }, null, 2);
+    try { await navigator.clipboard.writeText(text); notify('诊断信息已复制'); } catch { notify('复制失败，请检查剪贴板权限'); }
+    return;
+  }
+  const result = await window.yingjiDesktop?.captureMpv?.(kind);
+  if (!result?.ok) return notify('播放器尚未准备好');
+  if (kind === 'clip' && result.phase === 'start') return notify(`片段起点已设为 ${yjClock(result.position)}，再次点击保存`);
+  notify(kind === 'screenshot' ? '截图已保存到“图片/映迹”' : '片段已保存到“视频/映迹”');
+};
+const yjConsoleSeek = event => {
+  const track = event.currentTarget;
+  const total = Number(live.playerState?.duration || 0);
+  if (!total) return notify('还没有可用的总时长');
+  const rect = track.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(rect.width, 1)));
+  yjMpvCommand({ set: { name: 'time-pos', value: Number((ratio * total).toFixed(2)) } }, '跳转');
+};
+const yjConsoleSeekTo = seconds => yjMpvCommand({ set: { name: 'time-pos', value: Math.max(0, Number(seconds) || 0) } }, '跳转');
+const yjConsoleMark = field => {
+  const context = live.player?.danmakuContext || live.player?.context;
+  if (!context) return notify('当前内容缺少章节标识，无法保存标记');
+  const seconds = Number(live.playerState?.timePos || 0);
+  const rules = yjChapterRules();
+  const key = String(live.player?.chapterKey || yjMediaKey(context));
+  const index = rules.findIndex(rule => rule.key === key);
+  const current = index >= 0 ? rules[index] : { key, source: '手动' };
+  const next = { ...current, source: '手动', updatedAt: new Date().toISOString() };
+  if (field === 'introEnd') next.introEnd = Math.max(0, Math.round(seconds));
+  else if (field === 'outroStart') next.outroStart = Math.max(0, Math.round(seconds));
+  else return;
+  if (index >= 0) rules[index] = next; else rules.push(next);
+  providerConfig.chapterRules = rules;
+  saveProviders();
+  if (live.player) live.player.chapterRule = next;
+  notify(`${field === 'introEnd' ? '片头结束' : '片尾开始'}已标记为 ${yjClock(seconds)}`);
+  if (typeof render === 'function' && state.view === 'player') render();
 };
 
 syncTraktCalendar = async function yjSyncCalendar() {
@@ -784,7 +1244,13 @@ document.addEventListener('contextmenu', event => {
   const source = yjSources().find(item => String(item.id) === String(card.dataset.serverCard));
   if (!source) return;
   const lines = source.kind === 'WebDAV' ? '' : (source.addresses || [source.url]).map((address,index) => `<button data-context-line="${index}"><span>线路 ${index + 1}</span><small>${esc(new URL(address).host)}</small>${index === source.activeAddress ? '<em>当前</em>' : ''}</button>`).join('');
-  document.body.insertAdjacentHTML('beforeend', `<menu class="yj-server-menu" data-server-menu data-server-id="${esc(source.id)}" style="--menu-x:${event.clientX}px;--menu-y:${event.clientY}px"><button data-context-edit>${ico('settings')} 编辑此服务器</button><button data-context-refresh>${ico('refresh')} 重新连接并刷新</button><button data-context-icon>${ico('library')} 修改图标</button><button data-context-aggregate>${ico('library')} ${source.aggregate === false ? '加入详情页聚合' : '退出详情页聚合'}</button>${lines}</menu>`);
+  document.body.insertAdjacentHTML('beforeend', `<menu class="yj-server-menu" data-server-menu data-server-id="${esc(source.id)}"><button data-context-edit>${ico('settings')} 编辑此服务器</button><button data-context-refresh>${ico('refresh')} 重新连接并刷新</button><button data-context-icon>${ico('library')} 修改图标</button><button data-context-aggregate>${ico('library')} ${source.aggregate === false ? '加入详情页聚合' : '退出详情页聚合'}</button>${lines}</menu>`);
+  const menu = document.body.querySelector('[data-server-menu]');
+  if (menu) {
+    const margin = 12, rect = menu.getBoundingClientRect();
+    menu.style.setProperty('--menu-x', `${Math.round(Math.max(margin, Math.min(event.clientX, window.innerWidth - rect.width - margin)))}px`);
+    menu.style.setProperty('--menu-y', `${Math.round(Math.max(margin, Math.min(event.clientY, window.innerHeight - rect.height - margin)))}px`);
+  }
 });
 document.addEventListener('click', event => {
   const menu = event.target.closest('[data-server-menu]');
