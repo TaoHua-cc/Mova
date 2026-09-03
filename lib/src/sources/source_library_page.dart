@@ -1,0 +1,239 @@
+import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+
+import '../brand.dart';
+import '../metadata/metadata_detail_page.dart';
+import '../metadata/tmdb_client.dart';
+import 'emby_client.dart';
+import 'media_source.dart';
+import 'source_store.dart';
+
+class EmbyLibraryPage extends StatefulWidget {
+  const EmbyLibraryPage({super.key, required this.source});
+  final MediaSource source;
+
+  @override
+  State<EmbyLibraryPage> createState() => _EmbyLibraryPageState();
+}
+
+class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
+  String? _parentId;
+  String _title = '完整媒体库';
+  late Future<List<MediaItem>> _items;
+
+  @override
+  void initState() {
+    super.initState();
+    _items = _load();
+  }
+
+  Future<List<MediaItem>> _load() async {
+    final store = await SourceStore.create();
+    final token = store.tokenFor(widget.source);
+    if (token == null || token.isEmpty) throw Exception('未找到服务器登录令牌');
+    final client = EmbyClient();
+    try {
+      return await client.browse(
+        EmbySession(source: widget.source, token: token),
+        parentId: _parentId,
+      );
+    } finally {
+      client.dispose();
+    }
+  }
+
+  void _open(MediaItem item) {
+    if (item.isContainer) {
+      setState(() {
+        _parentId = item.id;
+        _title = item.title;
+        _items = _load();
+      });
+      return;
+    }
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MetadataDetailPage(
+          item: TmdbItem(
+            id: int.tryParse(item.providerIds['Tmdb'] ?? '') ?? 0,
+            title: item.title,
+            kind: item.type == 'Series' ? '剧集' : '电影',
+            overview: item.overview,
+            year: item.year,
+          ),
+          media: item,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: YingjiColors.canvas,
+    appBar: PreferredSize(
+      preferredSize: const Size.fromHeight(76),
+      child: YingjiPageChrome(
+        onBack: () => Navigator.pop(context),
+        title: _title,
+        actions: [
+          IconButton(
+            tooltip: '刷新',
+            onPressed: () => setState(() => _items = _load()),
+            icon: const Icon(YingjiIcons.refresh),
+          ),
+        ],
+      ),
+    ),
+    body: FutureBuilder<List<MediaItem>>(
+      future: _items,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: _SourceFailure(
+                message: snapshot.error
+                    .toString()
+                    .replaceFirst('Exception: ', ''),
+                onRetry: () => setState(() => _items = _load()),
+              ),
+            ),
+          );
+        }
+        final items = snapshot.data ?? const <MediaItem>[];
+        if (items.isEmpty) return const Center(child: Text('此目录没有内容'));
+        return GridView.builder(
+          padding: const EdgeInsets.fromLTRB(42, 18, 42, 48),
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 220,
+            mainAxisExtent: 310,
+            crossAxisSpacing: 18,
+            mainAxisSpacing: 22,
+          ),
+          itemCount: items.length,
+          itemBuilder: (_, index) => _SourceMediaCard(
+            item: items[index],
+            onOpen: () => _open(items[index]),
+          ),
+        );
+      },
+    ),
+  );
+}
+
+class _SourceMediaCard extends StatelessWidget {
+  const _SourceMediaCard({required this.item, this.onOpen});
+  final MediaItem item;
+  final VoidCallback? onOpen;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 164,
+    child: InkWell(
+      borderRadius: BorderRadius.circular(15),
+      onTap:
+          onOpen ??
+          (() => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => MetadataDetailPage(
+                item: TmdbItem(
+                  id: 0,
+                  title: item.title,
+                  kind: '视频',
+                  overview: item.overview,
+                  year: item.year,
+                ),
+                media: item,
+              ),
+            ),
+          )),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            height: 230,
+            width: 164,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(color: YingjiColors.line),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x66000000),
+                    blurRadius: 20,
+                    offset: Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: item.imageUrl == null
+                    ? const ColoredBox(
+                        color: YingjiColors.elevated,
+                        child: Center(
+                          child: Icon(
+                            YingjiIcons.play_rectangle_fill,
+                            color: YingjiColors.focus,
+                            size: 34,
+                          ),
+                        ),
+                      )
+                    : CachedNetworkImage(
+                        imageUrl: item.imageUrl.toString(),
+                        fit: BoxFit.cover,
+                        errorWidget: (_, _, _) =>
+                            const ColoredBox(color: YingjiColors.elevated),
+                      ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            item.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            '${item.year ?? '—'} · ${item.type}',
+            style: const TextStyle(color: YingjiColors.muted, fontSize: 12),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _SourceFailure extends StatelessWidget {
+  const _SourceFailure({required this.message, this.onRetry});
+  final String message;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(22),
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(),
+      borderRadius: BorderRadius.circular(18),
+      border: Border.all(color: YingjiGlass.line()),
+    ),
+    child: Row(
+      children: [
+        const Icon(
+          YingjiIcons.exclamationmark_triangle,
+          color: Color(0xFFFFA1A9),
+        ),
+        const SizedBox(width: 12),
+        Expanded(child: Text(message)),
+        if (onRetry != null)
+          TextButton(onPressed: onRetry, child: const Text('重试')),
+      ],
+    ),
+  );
+}

@@ -13,3 +13,26 @@ _*.py
 _layout_probe*
 app/mpv/portable_config/cache/
 dist-new*/
+
+# --- Flutter build outputs & tool state ---
+/build/
+/.dart_tool/
+/.flutter-plugins
+/.flutter-plugins-dependencies
+/.flutter_tool_state
+/.idea/
+*.iml
+/.workbuddy/
+/windows/flutter/ephemeral/
+
+# --- Installer & package build artifacts ---
+/dist-installer/
+/dist-repack-*/
+/dist-yingji-*/
+*.zip
+
+# --- Local debug / probe scratch ---
+/settings-preview.html
+/verify-asar.cjs
+/verify-console.cjs
+/v9-console-handoff/
