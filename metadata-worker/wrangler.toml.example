@@ -1,9 +1,0 @@
-name = "yingji-metadata"
-main = "src/worker.js"
-compatibility_date = "2026-08-24"
-
-# Deploy:
-# 1. Copy this file to wrangler.toml
-# 2. npx wrangler secret put TMDB_TOKEN
-# 3. npx wrangler deploy
-# 4. Put the deployed URL in app/runtime-config.js
