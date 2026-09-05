@@ -114,4 +114,28 @@ void main() {
     expect(identity.id, 'server-1');
     client.dispose();
   });
+
+  test(
+    'legacy icon records remain eligible for automatic server discovery',
+    () {
+      final legacy = MediaSource.fromJson({
+        'id': 'source-1',
+        'name': 'Server',
+        'kind': 'emby',
+        'endpoint': 'https://media.example/',
+        'iconUrl': 'https://icons.example/unrelated.png',
+      });
+      final selected = MediaSource(
+        id: legacy.id,
+        name: legacy.name,
+        kind: legacy.kind,
+        endpoint: legacy.endpoint,
+        iconUrl: 'https://icons.example/chosen.png',
+        customIcon: true,
+      );
+
+      expect(legacy.customIcon, isFalse);
+      expect(MediaSource.fromJson(selected.toJson()).customIcon, isTrue);
+    },
+  );
 }

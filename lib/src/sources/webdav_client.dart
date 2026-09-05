@@ -28,6 +28,7 @@ class WebDavClient {
                 .where((value) => value != endpoint)
                 .toList(growable: false),
             iconUrl: source.iconUrl,
+            customIcon: source.customIcon,
           ),
           auth: auth,
         );

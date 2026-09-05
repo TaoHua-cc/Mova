@@ -10,6 +10,7 @@ class MediaSource {
     this.serverId,
     this.alternateEndpoints = const [],
     this.iconUrl,
+    this.customIcon = false,
   });
   final String id;
   final String name;
@@ -19,6 +20,11 @@ class MediaSource {
   final String? serverId;
   final List<Uri> alternateEndpoints;
   final String? iconUrl;
+
+  /// Whether [iconUrl] was explicitly selected by the user from an icon pack.
+  /// Older saved sources default to false so their icon can be refreshed from
+  /// the connected server instead of being mistaken for an automatic result.
+  final bool customIcon;
 
   List<Uri> get endpoints => [
     endpoint,
@@ -42,6 +48,7 @@ class MediaSource {
         .map((value) => value.toString())
         .toList(),
     'iconUrl': iconUrl,
+    'customIcon': customIcon,
   };
 
   factory MediaSource.fromJson(Map<String, dynamic> json) => MediaSource(
@@ -60,5 +67,6 @@ class MediaSource {
             .whereType<Uri>()
             .toList(growable: false),
     iconUrl: json['iconUrl'] as String?,
+    customIcon: json['customIcon'] == true,
   );
 }

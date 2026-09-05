@@ -55,6 +55,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
             .where((value) => value != identity.endpoint)
             .toList(growable: false),
         iconUrl: source.iconUrl,
+        customIcon: source.customIcon,
       );
       await store.upsert(source, token);
       return await client.browse(

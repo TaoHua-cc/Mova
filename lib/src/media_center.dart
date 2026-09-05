@@ -2923,6 +2923,7 @@ class _SourceHubState extends State<_SourceHub> {
                       .where((value) => value != identity.endpoint)
                       .toList(growable: false),
                   iconUrl: source.iconUrl,
+                  customIcon: source.customIcon,
                 );
                 await store.upsert(current, token);
               }
@@ -2982,15 +2983,26 @@ class _SourceHubState extends State<_SourceHub> {
     MediaSource source,
     String? token,
   ) async {
-    if (source.iconUrl?.isNotEmpty == true ||
-        source.kind == SourceKind.webdav) {
+    if (source.customIcon || source.kind == SourceKind.webdav) {
       return source;
     }
+    // Legacy records did not distinguish a selected icon-pack image from a
+    // detected server icon. Clear those values before probing so a stale,
+    // unrelated image cannot keep masking the connected server's identity.
+    final baseline = MediaSource(
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      endpoint: source.endpoint,
+      userId: source.userId,
+      serverId: source.serverId,
+      alternateEndpoints: source.alternateEndpoints,
+    );
     final candidates = [
       source.endpoint.resolve('web/assets/img/icon-transparent.png'),
       source.endpoint.resolve('web/assets/img/icon.png'),
-      source.endpoint.resolve('web/favicon.ico'),
-      source.endpoint.resolve('favicon.ico'),
+      source.endpoint.resolve('web/assets/img/icon-square.png'),
+      source.endpoint.resolve('web/assets/img/icon-round.png'),
     ];
     final http = HttpClient()..connectionTimeout = const Duration(seconds: 3);
     try {
@@ -3018,6 +3030,7 @@ class _SourceHubState extends State<_SourceHub> {
               serverId: source.serverId,
               alternateEndpoints: source.alternateEndpoints,
               iconUrl: candidate.toString(),
+              customIcon: false,
             );
             if (token != null && token.isNotEmpty) {
               await store.upsert(updated, token);
@@ -3031,7 +3044,10 @@ class _SourceHubState extends State<_SourceHub> {
     } finally {
       http.close(force: true);
     }
-    return source;
+    if (source.iconUrl != null && token != null && token.isNotEmpty) {
+      await store.upsert(baseline, token);
+    }
+    return baseline;
   }
 
   Future<void> _remove(MediaSource source) async {
@@ -3100,6 +3116,7 @@ class _SourceHubState extends State<_SourceHub> {
         serverId: source.serverId,
         alternateEndpoints: source.alternateEndpoints,
         iconUrl: icon.isEmpty ? null : icon,
+        customIcon: icon.isNotEmpty,
       ),
       token,
     );
@@ -3123,6 +3140,7 @@ class _SourceHubState extends State<_SourceHub> {
             .where((value) => value != endpoint)
             .toList(growable: false),
         iconUrl: source.iconUrl,
+        customIcon: source.customIcon,
       ),
       token,
     );
@@ -3175,6 +3193,7 @@ class _SourceHubState extends State<_SourceHub> {
               ...identity.discoveredEndpoints,
             }.where((value) => value != identity.endpoint).toList(),
             iconUrl: source.iconUrl,
+            customIcon: source.customIcon,
           );
           await client.checkConnection(
             EmbySession(source: tested, token: token),
@@ -3474,6 +3493,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
           endpoint: endpoint,
           alternateEndpoints: alternates,
           iconUrl: _iconUrl.text.trim().isEmpty ? null : _iconUrl.text.trim(),
+          customIcon: existing?.customIcon ?? false,
         );
         final token = keepCredentials
             ? store.tokenFor(existing)
@@ -3552,6 +3572,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
             userId: existing.userId,
             serverId: identity.id,
             iconUrl: _iconUrl.text.trim().isEmpty ? null : _iconUrl.text.trim(),
+            customIcon: existing.customIcon,
           ),
           token,
         );
@@ -3627,6 +3648,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
               iconUrl: _iconUrl.text.trim().isEmpty
                   ? null
                   : _iconUrl.text.trim(),
+              customIcon: existing?.customIcon ?? false,
             ),
             session.token,
           );
@@ -8272,16 +8294,19 @@ class _ServerMark extends StatelessWidget {
       child: customIcon != null && customIcon.hasScheme
           ? ClipRRect(
               borderRadius: BorderRadius.circular(size * .29),
-              child: Image.network(
-                customIcon.toString(),
-                headers:
-                    customIcon.host == source.endpoint.host &&
-                        token != null &&
-                        token!.isNotEmpty
-                    ? {'X-Emby-Token': token!}
-                    : null,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
+              child: Padding(
+                padding: EdgeInsets.all(size * .08),
+                child: Image.network(
+                  customIcon.toString(),
+                  headers:
+                      customIcon.host == source.endpoint.host &&
+                          token != null &&
+                          token!.isNotEmpty
+                      ? {'X-Emby-Token': token!}
+                      : null,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
+                ),
               ),
             )
           : _defaultMark(webdav, colors),

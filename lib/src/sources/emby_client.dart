@@ -173,6 +173,7 @@ class EmbyClient {
                 .where((value) => value != endpoint)
                 .toList(growable: false),
             iconUrl: session.source.iconUrl,
+            customIcon: session.source.customIcon,
           ),
         );
       } catch (error) {
