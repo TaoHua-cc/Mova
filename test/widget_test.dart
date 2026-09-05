@@ -113,15 +113,27 @@ void main() {
     expect(find.text('发现页栏目编排'), findsOneWidget);
     expect(find.text('数据来源'), findsWidgets);
     await tester.tap(find.byType(Switch).first);
+    await tester.pumpAndSettle();
+    expect(find.text('显示的列表'), findsOneWidget);
+    expect(find.text('隐藏的列表'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('显示的列表')).dy,
+      lessThan(tester.getTopLeft(find.text('隐藏的列表')).dy),
+    );
     await tester.tap(find.text('TMDB · 今日热门电视剧').first);
     await tester.pumpAndSettle();
-    expect(find.text('Trakt 电影榜单'), findsOneWidget);
-    expect(find.text('Trakt · 趋势电影'), findsOneWidget);
     expect(find.text('TMDB · 科幻电影'), findsOneWidget);
     await tester.ensureVisible(find.text('TMDB · 科幻电影'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('TMDB · 科幻电影'));
     await tester.pumpAndSettle();
+    await tester.tap(find.text('固定列表').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自定义筛选').last);
+    await tester.pumpAndSettle();
+    expect(find.text('影视'), findsWidgets);
+    expect(find.text('类型'), findsWidgets);
+    expect(find.text('热度类别'), findsWidgets);
     await tester.tap(find.byTooltip('关闭').last);
     await tester.pump(const Duration(milliseconds: 400));
 
@@ -133,7 +145,7 @@ void main() {
     );
     expect(
       prefs.getString('yingji.discover.section-sources'),
-      contains('科幻电影'),
+      contains('custom|tmdb|movie|all|popularity.desc'),
     );
     await tester.pumpWidget(const SizedBox.shrink());
   });

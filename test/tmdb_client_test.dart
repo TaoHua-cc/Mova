@@ -44,4 +44,23 @@ void main() {
       client.dispose();
     },
   );
+
+  test('discover forwards custom category and ranking filters', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    SharedPreferences.setMockInitialValues({});
+    Uri? requested;
+    final client = TmdbClient(
+      client: MockClient((request) async {
+        requested = request.url;
+        return http.Response(jsonEncode({'results': <Object>[]}), 200);
+      }),
+    );
+
+    await client.discover('tv', genre: 16, sortBy: 'vote_average.desc');
+
+    expect(requested?.path, endsWith('/discover/tv'));
+    expect(requested?.queryParameters['with_genres'], '16');
+    expect(requested?.queryParameters['sort_by'], 'vote_average.desc');
+    client.dispose();
+  });
 }

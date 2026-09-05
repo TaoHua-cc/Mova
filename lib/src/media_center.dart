@@ -1495,6 +1495,30 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       'trakt.shows.played',
     ],
   };
+  static const _providerLabels = <String, String>{
+    'tmdb': 'TMDB',
+    'trakt': 'Trakt',
+  };
+  static const _mediaLabels = <String, String>{'movie': '电影', 'tv': '剧集'};
+  static const _genreLabels = <String, String>{
+    'all': '全部类型',
+    'action': '动作',
+    'comedy': '喜剧',
+    'scifi': '科幻',
+    'mystery': '悬疑',
+    'animation': '动画',
+    'documentary': '纪录片',
+  };
+  static const _heatLabels = <String, String>{
+    'popularity.desc': '当前热门',
+    'vote_average.desc': '高分口碑',
+    'date.desc': '最近更新',
+  };
+  static const _traktHeatLabels = <String, String>{
+    'trending': '实时趋势',
+    'popular': '长期热门',
+    'anticipated': '最受期待',
+  };
   final Map<String, int> _cardStyles = {};
   final Map<String, String> _sectionSources = {};
   final Set<String> _hiddenSections = {};
@@ -1548,7 +1572,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
             final section = '${entry.key}';
             final source = '${entry.value}';
             if (_defaultSections.contains(section) &&
-                _sourceLabels.containsKey(source)) {
+                (_sourceLabels.containsKey(source) ||
+                    _DiscoverFeedSelection.tryParse(source) != null)) {
               _sectionSources[section] = source;
             }
           }
@@ -1570,6 +1595,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ...known.where((section) => !saved.contains(section)),
       ];
     }
+    _groupSectionsByVisibility();
   }
 
   Future<void> _persistLayout() async {
@@ -1580,9 +1606,26 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     await prefs.setStringList(_hiddenKey, _hiddenSections.toList());
   }
 
+  void _groupSectionsByVisibility() {
+    _sections = [
+      ..._sections.where((section) => !_hiddenSections.contains(section)),
+      ..._sections.where(_hiddenSections.contains),
+    ];
+  }
+
+  String _sourceLabel(String source) {
+    final custom = _DiscoverFeedSelection.tryParse(source);
+    if (custom == null) return _sourceLabels[source] ?? source;
+    return '${_providerLabels[custom.provider]} · '
+        '${_mediaLabels[custom.mediaType]} · '
+        '${custom.provider == 'tmdb' ? '${_genreLabels[custom.genre]} · ' : ''}'
+        '${custom.provider == 'trakt' ? _traktHeatLabels[custom.heat] : _heatLabels[custom.heat]}';
+  }
+
   Future<void> _showCardSettings() async {
     final previews = await _items;
     if (!mounted) return;
+    _groupSectionsByVisibility();
     var changed = false;
     await showDialog<void>(
       context: context,
@@ -1620,7 +1663,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '拖动调整顺序；每个栏目可独立选择数据、显示状态和卡片样式。',
+                    '显示栏目按页面顺序排列，隐藏栏目统一收纳在下方。数据配置按来源、列表与筛选条件逐步选择。',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   const SizedBox(height: 16),
@@ -1633,6 +1676,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                         updateDialog(() {
                           final section = _sections.removeAt(oldIndex);
                           _sections.insert(newIndex, section);
+                          _groupSectionsByVisibility();
                         });
                         changed = true;
                       },
@@ -1640,82 +1684,115 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                         final section = _sections[index];
                         final visible = !_hiddenSections.contains(section);
                         final source = _sectionSources[section] ?? section;
+                        final firstVisible =
+                            visible &&
+                            _sections
+                                    .where(
+                                      (item) => !_hiddenSections.contains(item),
+                                    )
+                                    .firstOrNull ==
+                                section;
+                        final firstHidden =
+                            !visible &&
+                            _sections
+                                    .where(_hiddenSections.contains)
+                                    .firstOrNull ==
+                                section;
                         return Padding(
                           key: ValueKey('discover-setting-$section'),
                           padding: const EdgeInsets.only(bottom: 14),
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: YingjiGlass.surface(strength: .72),
-                              borderRadius: BorderRadius.circular(15),
-                              border: Border.all(color: YingjiGlass.line()),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(14),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    children: [
-                                      ReorderableDragStartListener(
-                                        index: index,
-                                        child: const Padding(
-                                          padding: EdgeInsets.all(6),
-                                          child: Icon(
-                                            YingjiIcons.line_horizontal_3,
-                                            size: 18,
-                                            color: YingjiColors.muted,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          section,
-                                          style: const TextStyle(
-                                            fontWeight: FontWeight.w800,
-                                          ),
-                                        ),
-                                      ),
-                                      Text(
-                                        visible ? '显示' : '隐藏',
-                                        style: const TextStyle(
-                                          color: YingjiColors.muted,
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w700,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Switch(
-                                        value: visible,
-                                        onChanged: (value) {
-                                          updateDialog(() {
-                                            if (value) {
-                                              _hiddenSections.remove(section);
-                                            } else {
-                                              _hiddenSections.add(section);
-                                            }
-                                          });
-                                          changed = true;
-                                        },
-                                      ),
-                                    ],
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (firstVisible || firstHidden) ...[
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    2,
+                                    2,
+                                    2,
+                                    10,
                                   ),
-                                  const SizedBox(height: 10),
-                                  Row(
+                                  child: Text(
+                                    firstVisible ? '显示的列表' : '隐藏的列表',
+                                    style: const TextStyle(
+                                      color: YingjiColors.muted,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                              DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: YingjiGlass.surface(strength: .72),
+                                  borderRadius: BorderRadius.circular(15),
+                                  border: Border.all(color: YingjiGlass.line()),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(14),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
-                                      const Text(
-                                        '数据来源',
-                                        style: TextStyle(
-                                          color: YingjiColors.muted,
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w700,
-                                        ),
+                                      Row(
+                                        children: [
+                                          ReorderableDragStartListener(
+                                            index: index,
+                                            child: const Padding(
+                                              padding: EdgeInsets.all(6),
+                                              child: Icon(
+                                                YingjiIcons.line_horizontal_3,
+                                                size: 18,
+                                                color: YingjiColors.muted,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              section,
+                                              style: const TextStyle(
+                                                fontWeight: FontWeight.w800,
+                                              ),
+                                            ),
+                                          ),
+                                          Text(
+                                            visible ? '显示' : '隐藏',
+                                            style: const TextStyle(
+                                              color: YingjiColors.muted,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Switch(
+                                            value: visible,
+                                            onChanged: (value) {
+                                              updateDialog(() {
+                                                if (value) {
+                                                  _hiddenSections.remove(
+                                                    section,
+                                                  );
+                                                } else {
+                                                  _hiddenSections.add(section);
+                                                }
+                                                _groupSectionsByVisibility();
+                                              });
+                                              changed = true;
+                                            },
+                                          ),
+                                        ],
                                       ),
-                                      const Spacer(),
-                                      _DiscoverSourceMenu(
+                                      const SizedBox(height: 10),
+                                      _DiscoverSourceEditor(
                                         value: source,
                                         labels: _sourceLabels,
                                         groups: _sourceGroups,
+                                        providerLabels: _providerLabels,
+                                        mediaLabels: _mediaLabels,
+                                        genreLabels: _genreLabels,
+                                        heatLabels: _heatLabels,
+                                        traktHeatLabels: _traktHeatLabels,
                                         onChanged: (value) {
                                           updateDialog(() {
                                             _sectionSources[section] = value;
@@ -1723,41 +1800,47 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                           changed = true;
                                         },
                                       ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Row(
-                                    children: [
-                                      for (var style = 0; style < 3; style++)
-                                        Expanded(
-                                          child: Padding(
-                                            padding: EdgeInsets.only(
-                                              right: style == 2 ? 0 : 8,
-                                            ),
-                                            child: _DiscoveryStylePreview(
-                                              label: _styleNames[style],
-                                              style: style,
-                                              selected:
-                                                  (_cardStyles[section] ??
-                                                      index % 3) ==
-                                                  style,
-                                              items:
-                                                  previews[section] ?? const [],
-                                              onTap: () {
-                                                updateDialog(
-                                                  () => _cardStyles[section] =
+                                      const SizedBox(height: 12),
+                                      Row(
+                                        children: [
+                                          for (
+                                            var style = 0;
+                                            style < 3;
+                                            style++
+                                          )
+                                            Expanded(
+                                              child: Padding(
+                                                padding: EdgeInsets.only(
+                                                  right: style == 2 ? 0 : 8,
+                                                ),
+                                                child: _DiscoveryStylePreview(
+                                                  label: _styleNames[style],
+                                                  style: style,
+                                                  selected:
+                                                      (_cardStyles[section] ??
+                                                          index % 3) ==
                                                       style,
-                                                );
-                                                changed = true;
-                                              },
+                                                  items:
+                                                      previews[section] ??
+                                                      const [],
+                                                  onTap: () {
+                                                    updateDialog(
+                                                      () =>
+                                                          _cardStyles[section] =
+                                                              style,
+                                                    );
+                                                    changed = true;
+                                                  },
+                                                ),
+                                              ),
                                             ),
-                                          ),
-                                        ),
+                                        ],
+                                      ),
                                     ],
                                   ),
-                                ],
+                                ),
                               ),
-                            ),
+                            ],
                           ),
                         );
                       },
@@ -1841,8 +1924,46 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     '按分类' => _tmdb.discover('movie', page: page, genre: 28),
     '按平台' => _tmdb.discover('tv', page: page, provider: '8|337|350'),
     final source when source.startsWith('trakt.') => _loadTrakt(source, page),
+    final source when source.startsWith('custom|') => _loadCustomSection(
+      source,
+      page,
+    ),
     _ => _tmdb.trendingToday('movie', page: page),
   };
+
+  Future<List<TmdbItem>> _loadCustomSection(String source, int page) {
+    final selection = _DiscoverFeedSelection.tryParse(source);
+    if (selection == null) return _tmdb.trendingToday('movie', page: page);
+    if (selection.provider == 'trakt') {
+      return _loadTrakt(
+        'trakt.${selection.mediaType == 'tv' ? 'shows' : 'movies'}.${selection.heat}',
+        page,
+      );
+    }
+    final genre = switch ((selection.mediaType, selection.genre)) {
+      (_, 'all') => null,
+      ('movie', 'action') => 28,
+      ('tv', 'action') => 10759,
+      (_, 'comedy') => 35,
+      (_, 'scifi') => 10765,
+      ('movie', 'mystery') => 9648,
+      ('tv', 'mystery') => 9648,
+      (_, 'animation') => 16,
+      (_, 'documentary') => 99,
+      _ => null,
+    };
+    final sortBy = selection.heat == 'date.desc'
+        ? selection.mediaType == 'tv'
+              ? 'first_air_date.desc'
+              : 'primary_release_date.desc'
+        : selection.heat;
+    return _tmdb.discover(
+      selection.mediaType,
+      page: page,
+      genre: genre,
+      sortBy: sortBy,
+    );
+  }
 
   Future<List<TmdbItem>> _loadTrakt(String source, int page) async {
     final parts = source.split('.');
@@ -1953,9 +2074,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
               final section = visibleSections[index - 1];
               final block = _DiscoverBlock(
                 title: section,
-                sourceLabel:
-                    _sourceLabels[_sectionSources[section] ?? section] ??
-                    'TMDB · $section',
+                sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
                 items: sections[section] ?? const [],
                 variant: _cardStyles[section] ?? _sections.indexOf(section) % 3,
                 loadPage: (page) => _loadSectionFor(section, page),
@@ -1977,109 +2096,246 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       );
 }
 
-class _DiscoverSourceMenu extends StatelessWidget {
-  const _DiscoverSourceMenu({
+class _DiscoverFeedSelection {
+  const _DiscoverFeedSelection({
+    required this.provider,
+    required this.mediaType,
+    required this.genre,
+    required this.heat,
+  });
+
+  final String provider;
+  final String mediaType;
+  final String genre;
+  final String heat;
+
+  String get encoded => 'custom|$provider|$mediaType|$genre|$heat';
+
+  static _DiscoverFeedSelection? tryParse(String value) {
+    final parts = value.split('|');
+    if (parts.length != 5 || parts.first != 'custom') return null;
+    const providers = {'tmdb', 'trakt'};
+    const mediaTypes = {'movie', 'tv'};
+    const genres = {
+      'all',
+      'action',
+      'comedy',
+      'scifi',
+      'mystery',
+      'animation',
+      'documentary',
+    };
+    const tmdbHeat = {'popularity.desc', 'vote_average.desc', 'date.desc'};
+    const traktHeat = {'trending', 'popular', 'anticipated'};
+    if (!providers.contains(parts[1]) ||
+        !mediaTypes.contains(parts[2]) ||
+        !genres.contains(parts[3]) ||
+        !(parts[1] == 'trakt' ? traktHeat : tmdbHeat).contains(parts[4])) {
+      return null;
+    }
+    return _DiscoverFeedSelection(
+      provider: parts[1],
+      mediaType: parts[2],
+      genre: parts[3],
+      heat: parts[4],
+    );
+  }
+}
+
+class _DiscoverSourceEditor extends StatelessWidget {
+  const _DiscoverSourceEditor({
     required this.value,
     required this.labels,
     required this.groups,
+    required this.providerLabels,
+    required this.mediaLabels,
+    required this.genreLabels,
+    required this.heatLabels,
+    required this.traktHeatLabels,
     required this.onChanged,
   });
   final String value;
   final Map<String, String> labels;
   final Map<String, List<String>> groups;
+  final Map<String, String> providerLabels;
+  final Map<String, String> mediaLabels;
+  final Map<String, String> genreLabels;
+  final Map<String, String> heatLabels;
+  final Map<String, String> traktHeatLabels;
   final ValueChanged<String> onChanged;
 
   @override
-  Widget build(BuildContext context) => YingjiGlassMenu(
-    entries: [
-      for (final group in groups.entries) ...[
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
-          child: Row(
-            children: [
-              Icon(
-                group.key.startsWith('Trakt')
-                    ? YingjiIcons.refresh
-                    : group.key.contains('流媒体')
-                    ? YingjiIcons.play_rectangle
-                    : YingjiIcons.rectangle_stack,
-                size: 14,
-                color: YingjiColors.muted,
-              ),
-              const SizedBox(width: 7),
-              Expanded(
-                child: Text(
-                  group.key,
-                  style: const TextStyle(
-                    color: YingjiColors.muted,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ),
-              if (group.key.startsWith('Trakt'))
-                const Tooltip(
-                  message: '需要在设置中配置 Trakt Client ID',
-                  child: Icon(YingjiIcons.info_circle, size: 13),
-                ),
-            ],
-          ),
-        ),
-        for (final source in group.value)
-          MenuItemButton(
-            onPressed: () => onChanged(source),
-            trailingIcon: source == value
-                ? const Icon(YingjiIcons.checkmark_circle_fill, size: 16)
-                : null,
-            child: Text(
-              labels[source] ?? source,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontWeight: source == value ? FontWeight.w800 : FontWeight.w600,
-              ),
+  Widget build(BuildContext context) {
+    final custom = _DiscoverFeedSelection.tryParse(value);
+    final provider =
+        custom?.provider ?? (value.startsWith('trakt.') ? 'trakt' : 'tmdb');
+    final mode = custom == null ? 'fixed' : 'custom';
+    final fixedSources = groups.entries
+        .where(
+          (entry) => provider == 'trakt'
+              ? entry.key.startsWith('Trakt')
+              : entry.key.startsWith('TMDB'),
+        )
+        .expand((entry) => entry.value)
+        .toList(growable: false);
+    final fixedValue = fixedSources.contains(value)
+        ? value
+        : fixedSources.first;
+    final selection =
+        custom ??
+        _DiscoverFeedSelection(
+          provider: provider,
+          mediaType: 'movie',
+          genre: 'all',
+          heat: 'popularity.desc',
+        );
+
+    void updateCustom({
+      String? nextProvider,
+      String? mediaType,
+      String? genre,
+      String? heat,
+    }) {
+      onChanged(
+        _DiscoverFeedSelection(
+          provider: nextProvider ?? selection.provider,
+          mediaType: mediaType ?? selection.mediaType,
+          genre: genre ?? selection.genre,
+          heat: heat ?? selection.heat,
+        ).encoded,
+      );
+    }
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: YingjiGlass.surface(strength: .46),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: YingjiGlass.line(strength: .8)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '数据来源',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
             ),
-          ),
-      ],
-    ],
-    child: Semantics(
-      button: true,
-      label: '选择数据来源，当前${labels[value] ?? value}',
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: YingjiGlass.surface(strength: .9),
-          borderRadius: BorderRadius.circular(13),
-          border: Border.all(color: YingjiGlass.line()),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 230),
-                child: Text(
-                  labels[value] ?? value,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 14,
+              runSpacing: 14,
+              children: [
+                SizedBox(
+                  width: 190,
+                  child: YingjiGlassChoiceField<String>(
+                    label: '来源',
+                    value: provider,
+                    items: providerLabels.keys.toList(growable: false),
+                    labelBuilder: (item) => providerLabels[item] ?? item,
+                    onChanged: (item) {
+                      if (mode == 'custom') {
+                        updateCustom(
+                          nextProvider: item,
+                          genre: 'all',
+                          heat: item == 'trakt'
+                              ? 'trending'
+                              : 'popularity.desc',
+                        );
+                      } else {
+                        final first = groups.entries
+                            .where(
+                              (entry) => item == 'trakt'
+                                  ? entry.key.startsWith('Trakt')
+                                  : entry.key.startsWith('TMDB'),
+                            )
+                            .expand((entry) => entry.value)
+                            .first;
+                        onChanged(first);
+                      }
+                    },
                   ),
                 ),
+                SizedBox(
+                  width: 190,
+                  child: YingjiGlassChoiceField<String>(
+                    label: '列表',
+                    value: mode,
+                    items: const ['fixed', 'custom'],
+                    labelBuilder: (item) => item == 'fixed' ? '固定列表' : '自定义筛选',
+                    onChanged: (item) {
+                      if (item == 'custom') {
+                        updateCustom(
+                          nextProvider: provider,
+                          heat: provider == 'trakt'
+                              ? 'trending'
+                              : 'popularity.desc',
+                        );
+                      } else {
+                        onChanged(fixedValue);
+                      }
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            if (mode == 'fixed')
+              YingjiGlassChoiceField<String>(
+                label: '选择固定列表',
+                value: fixedValue,
+                items: fixedSources,
+                labelBuilder: (item) => labels[item] ?? item,
+                onChanged: onChanged,
+              )
+            else
+              Wrap(
+                spacing: 14,
+                runSpacing: 14,
+                children: [
+                  SizedBox(
+                    width: 150,
+                    child: YingjiGlassChoiceField<String>(
+                      label: '影视',
+                      value: selection.mediaType,
+                      items: mediaLabels.keys.toList(growable: false),
+                      labelBuilder: (item) => mediaLabels[item] ?? item,
+                      onChanged: (item) => updateCustom(mediaType: item),
+                    ),
+                  ),
+                  if (provider == 'tmdb')
+                    SizedBox(
+                      width: 150,
+                      child: YingjiGlassChoiceField<String>(
+                        label: '类型',
+                        value: selection.genre,
+                        items: genreLabels.keys.toList(growable: false),
+                        labelBuilder: (item) => genreLabels[item] ?? item,
+                        onChanged: (item) => updateCustom(genre: item),
+                      ),
+                    ),
+                  SizedBox(
+                    width: 150,
+                    child: YingjiGlassChoiceField<String>(
+                      label: '热度类别',
+                      value: selection.heat,
+                      items:
+                          (provider == 'trakt' ? traktHeatLabels : heatLabels)
+                              .keys
+                              .toList(growable: false),
+                      labelBuilder: (item) => provider == 'trakt'
+                          ? traktHeatLabels[item] ?? item
+                          : heatLabels[item] ?? item,
+                      onChanged: (item) => updateCustom(heat: item),
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 7),
-              const Icon(
-                YingjiIcons.chevron_down,
-                size: 15,
-                color: Colors.white70,
-              ),
-            ],
-          ),
+          ],
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _DiscoverBlock extends StatefulWidget {

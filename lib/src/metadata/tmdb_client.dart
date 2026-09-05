@@ -314,11 +314,12 @@ class TmdbClient {
     String? originCountry,
     int? genre,
     String? provider,
+    String sortBy = 'popularity.desc',
     String apiKey = '',
   }) => _list('/discover/$type', apiKey, {
     'language': 'zh-CN',
     'page': '$page',
-    'sort_by': 'popularity.desc',
+    'sort_by': sortBy,
     'include_adult': 'false',
     'with_origin_country': ?originCountry,
     'with_genres': ?(genre == null ? null : '$genre'),
