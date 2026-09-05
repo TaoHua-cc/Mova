@@ -3369,7 +3369,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
   String _scheme = 'https';
   final _name = TextEditingController();
   final _url = TextEditingController();
-  final _alternateUrls = TextEditingController();
+  final _alternateUrlControllers = <TextEditingController>[];
   final _iconUrl = TextEditingController();
   final _username = TextEditingController();
   final _password = TextEditingController();
@@ -3384,15 +3384,20 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
       _scheme = existing.endpoint.scheme == 'http' ? 'http' : 'https';
       _name.text = existing.name;
       _url.text = existing.endpoint.toString();
-      _alternateUrls.text = existing.alternateEndpoints
-          .map((value) => value.toString())
-          .join('\n');
+      _alternateUrlControllers.addAll(
+        existing.alternateEndpoints.map(
+          (value) => TextEditingController(text: value.toString()),
+        ),
+      );
       _iconUrl.text = existing.iconUrl ?? '';
     }
   }
 
   List<Uri> _parsedEndpoints() {
-    final raw = '${_url.text}\n${_alternateUrls.text}';
+    final raw = [
+      _url.text,
+      ..._alternateUrlControllers.map((row) => row.text),
+    ].join('\n');
     final matches = RegExp(r'https?://[^\s,;]+', caseSensitive: false)
         .allMatches(raw)
         .map((match) => Uri.tryParse(match.group(0)!))
@@ -3428,7 +3433,9 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
   void dispose() {
     _name.dispose();
     _url.dispose();
-    _alternateUrls.dispose();
+    for (final controller in _alternateUrlControllers) {
+      controller.dispose();
+    }
     _iconUrl.dispose();
     _username.dispose();
     _password.dispose();
@@ -3761,17 +3768,54 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _alternateUrls,
-                  keyboardType: TextInputType.url,
-                  decoration: const InputDecoration(
-                    labelText: '补充线路（可选）',
-                    hintText:
-                        'http://192.168.1.8:8096/  https://mirror.example.com/',
-                    helperText: '空格、换行或逗号分隔均会自动拆分；验证后也会加入服务器发布的线路。',
-                    prefixIcon: Icon(YingjiIcons.link),
+                for (
+                  var index = 0;
+                  index < _alternateUrlControllers.length;
+                  index++
+                ) ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _alternateUrlControllers[index],
+                          keyboardType: TextInputType.url,
+                          decoration: InputDecoration(
+                            labelText: '线路 ${index + 2}',
+                            hintText: 'https://mirror.example.com/',
+                            prefixIcon: const Icon(YingjiIcons.link),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      YingjiMotionIconButton(
+                        icon: YingjiIcons.trash,
+                        tooltip: '删除线路 ${index + 2}',
+                        size: 38,
+                        onPressed: () => setState(() {
+                          _alternateUrlControllers.removeAt(index).dispose();
+                        }),
+                      ),
+                    ],
                   ),
+                ],
+                const SizedBox(height: 10),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: YingjiMotionIconButton(
+                    icon: YingjiIcons.plus,
+                    tooltip: '添加线路',
+                    size: 38,
+                    onPressed: () => setState(
+                      () =>
+                          _alternateUrlControllers.add(TextEditingController()),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '每个输入框保存一条线路；验证后也会加入服务器发布的线路。',
+                  style: TextStyle(color: YingjiColors.muted, fontSize: 11),
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -4745,7 +4789,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final _danmakuKey = GlobalKey();
   final _maintenanceKey = GlobalKey();
   final _aboutKey = GlobalKey();
-  int _activeSetting = 0;
+  final _activeSetting = ValueNotifier<int>(0);
   bool _hardware = true, _hdr = true, _downmix = false, _night = false;
   bool _preferChineseSubtitle = true;
   String _subtitleLanguage = 'zh';
@@ -5145,15 +5189,13 @@ class _SettingsPageState extends State<SettingsPage> {
           .offset;
       if (offset <= position) active = index;
     }
-    if (active != _activeSetting && mounted) {
-      setState(() => _activeSetting = active);
-    }
+    if (active != _activeSetting.value) _activeSetting.value = active;
   }
 
   Future<void> _jumpToSetting(int index, GlobalKey key) async {
     final targetContext = key.currentContext;
     if (targetContext == null) return;
-    setState(() => _activeSetting = index);
+    _activeSetting.value = index;
     _jumpingToSetting = true;
     await Scrollable.ensureVisible(
       targetContext,
@@ -5167,6 +5209,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void dispose() {
     _settingsScroll.dispose();
+    _activeSetting.dispose();
     _tmdbApiKey.dispose();
     _traktClientId.dispose();
     _traktClientSecret.dispose();
@@ -5226,40 +5269,43 @@ class _SettingsPageState extends State<SettingsPage> {
                   width: 220,
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(18, 40, 18, 24),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        for (var i = 0; i < labels.length; i++)
-                          Padding(
-                            padding: const EdgeInsets.only(bottom: 6),
-                            child: TextButton(
-                              onPressed: () => _jumpToSetting(i, keys[i]),
-                              style: TextButton.styleFrom(
-                                alignment: Alignment.centerLeft,
-                                foregroundColor: _activeSetting == i
-                                    ? const Color(0xFF111216)
-                                    : const Color(0xFFB8BDC8),
-                                backgroundColor: _activeSetting == i
-                                    ? const Color(0xFFF1F1F2)
-                                    : Colors.transparent,
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 14,
-                                  vertical: 12,
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: _activeSetting,
+                      builder: (context, active, _) => Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var i = 0; i < labels.length; i++)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 6),
+                              child: TextButton(
+                                onPressed: () => _jumpToSetting(i, keys[i]),
+                                style: TextButton.styleFrom(
+                                  alignment: Alignment.centerLeft,
+                                  foregroundColor: active == i
+                                      ? const Color(0xFF111216)
+                                      : const Color(0xFFB8BDC8),
+                                  backgroundColor: active == i
+                                      ? const Color(0xFFF1F1F2)
+                                      : Colors.transparent,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
                                 ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
+                                child: Row(
+                                  children: [
+                                    Icon(labels[i].$2, size: 18),
+                                    const SizedBox(width: 11),
+                                    Text(labels[i].$1),
+                                  ],
                                 ),
-                              ),
-                              child: Row(
-                                children: [
-                                  Icon(labels[i].$2, size: 18),
-                                  const SizedBox(width: 11),
-                                  Text(labels[i].$1),
-                                ],
                               ),
                             ),
-                          ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -5365,31 +5411,6 @@ class _SettingsPageState extends State<SettingsPage> {
                                   },
                                 ),
                                 const SizedBox(height: 12),
-                                Row(
-                                  children: [
-                                    for (final option
-                                        in const <(String, String)>[
-                                          ('play', '播放'),
-                                          ('spark', '光芒'),
-                                          ('letter', '字标'),
-                                        ]) ...[
-                                      _AppearanceIconChoice(
-                                        style: option.$1,
-                                        label: option.$2,
-                                        selected: _appearanceIcon == option.$1,
-                                        onTap: () {
-                                          setState(
-                                            () => _appearanceIcon = option.$1,
-                                          );
-                                          _applyAppearance();
-                                          _save();
-                                        },
-                                      ),
-                                      const SizedBox(width: 10),
-                                    ],
-                                  ],
-                                ),
-                                const SizedBox(height: 14),
                                 YingjiGlassDropdownField<String>(
                                   initialValue: _homeCarouselEffect,
                                   decoration: const InputDecoration(
@@ -7466,53 +7487,6 @@ class _FrostSurfaceState extends State<_FrostSurface> {
   );
 }
 
-class _AppearanceIconChoice extends StatelessWidget {
-  const _AppearanceIconChoice({
-    required this.style,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-  final String style;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => Tooltip(
-    message: '切换为$label图标',
-    child: InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(14),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        width: 70,
-        padding: const EdgeInsets.symmetric(vertical: 10),
-        decoration: BoxDecoration(
-          color: selected
-              ? YingjiGlass.surface(strength: 1.25)
-              : YingjiGlass.chrome(strength: .72),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: YingjiGlass.line(strength: selected ? 1.5 : .75),
-          ),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            YingjiMark(size: 32, style: style),
-            const SizedBox(height: 7),
-            Text(
-              label,
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-            ),
-          ],
-        ),
-      ),
-    ),
-  );
-}
-
 class _CircleAction extends StatelessWidget {
   const _CircleAction({
     required this.icon,
@@ -7929,6 +7903,8 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
   final _query = TextEditingController();
   List<_IconPackEntry> _icons = const [];
   List<String> _packs = const [];
+  Map<String, String> _packInfo = const {};
+  String? _selectedPack;
   bool _loading = false;
   String? _message;
 
@@ -7942,10 +7918,21 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
   Future<void> _loadPacks() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
-    setState(
-      () =>
-          _packs = prefs.getStringList('yingji.server.icon-packs') ?? const [],
-    );
+    final packs = prefs.getStringList('yingji.server.icon-packs') ?? const [];
+    final rawInfo = prefs.getString('yingji.server.icon-pack-info');
+    final decoded = rawInfo == null ? null : jsonDecode(rawInfo);
+    final info = decoded is Map
+        ? decoded.map((key, value) => MapEntry('$key', '$value'))
+        : <String, String>{};
+    final selected =
+        prefs.getString('yingji.server.icon-pack-selected') ??
+        (packs.isEmpty ? null : packs.last);
+    setState(() {
+      _packs = packs;
+      _packInfo = info;
+      _selectedPack = selected;
+    });
+    if (selected != null) unawaited(_selectPack(selected));
   }
 
   Future<List<_IconPackEntry>> _readPack(String value) async {
@@ -8010,10 +7997,18 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
       final icons = await _readPack(value);
       final prefs = await SharedPreferences.getInstance();
       final packs = {..._packs, value}.toList(growable: false);
+      final info = <String, String>{
+        ..._packInfo,
+        value: '${Uri.parse(value).host} · ${icons.length} 个图标',
+      };
       await prefs.setStringList('yingji.server.icon-packs', packs);
+      await prefs.setString('yingji.server.icon-pack-selected', value);
+      await prefs.setString('yingji.server.icon-pack-info', jsonEncode(info));
       if (mounted) {
         setState(() {
           _packs = packs;
+          _packInfo = info;
+          _selectedPack = value;
           _icons = icons;
           _message = '已加载 ${icons.length} 个图标';
         });
@@ -8038,9 +8033,12 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
     });
     try {
       final icons = await _readPack(value);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('yingji.server.icon-pack-selected', value);
       if (mounted) {
         setState(() {
           _icons = icons;
+          _selectedPack = value;
           _message = '已加载 ${icons.length} 个图标';
         });
       }
@@ -8141,13 +8139,14 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
                   runSpacing: 8,
                   children: [
                     for (final pack in _packs)
-                      ActionChip(
+                      ChoiceChip(
                         label: Text(
                           Uri.tryParse(pack)?.host.isNotEmpty == true
                               ? Uri.parse(pack).host
                               : pack,
                         ),
-                        onPressed: () {
+                        selected: _selectedPack == pack,
+                        onSelected: (_) {
                           unawaited(_selectPack(pack));
                         },
                       ),
@@ -8159,7 +8158,10 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
                 children: [
                   Expanded(
                     child: Text(
-                      _message ?? '可添加多条 JSON 图标包链接；已保存 ${_packs.length} 个图标包。',
+                      _message ??
+                          (_selectedPack == null
+                              ? '可添加多条 JSON 图标包链接。'
+                              : (_packInfo[_selectedPack!] ?? '已选中图标包。')),
                       style: const TextStyle(
                         color: YingjiColors.muted,
                         fontSize: 12,
