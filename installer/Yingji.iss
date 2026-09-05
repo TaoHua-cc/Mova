@@ -1,5 +1,5 @@
 #define AppName "映迹"
-#define AppVersion "3.1.57"
+#define AppVersion "3.1.58"
 #define AppPublisher "Yingji"
 #define AppExeName "yingji.exe"
 

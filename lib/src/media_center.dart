@@ -2997,8 +2997,16 @@ class _SourceHubState extends State<_SourceHub> {
       for (final candidate in candidates) {
         try {
           final request = await http.getUrl(candidate);
+          if (token != null && token.isNotEmpty) {
+            request.headers.set('X-Emby-Token', token);
+          }
           final response = await request.close();
-          final image = response.headers.contentType?.primaryType == 'image';
+          final image =
+              response.headers.contentType?.primaryType == 'image' ||
+              RegExp(
+                r'\.(?:png|jpe?g|webp|gif|ico)$',
+                caseSensitive: false,
+              ).hasMatch(candidate.path);
           await response.drain<void>();
           if (response.statusCode < 300 && image) {
             final updated = MediaSource(
@@ -3070,6 +3078,33 @@ class _SourceHubState extends State<_SourceHub> {
       await _load();
       unawaited(_refresh(manual: true));
     }
+  }
+
+  Future<void> _pickIcon(MediaSource source) async {
+    final store = _store ?? await SourceStore.create();
+    final token = store.tokenFor(source);
+    if (token == null || token.isEmpty) return;
+    if (!mounted) return;
+    final icon = await showDialog<String>(
+      context: context,
+      builder: (_) => _ServerIconDialog(source: source, token: token),
+    );
+    if (icon == null) return;
+    await store.upsert(
+      MediaSource(
+        id: source.id,
+        name: source.name,
+        kind: source.kind,
+        endpoint: source.endpoint,
+        userId: source.userId,
+        serverId: source.serverId,
+        alternateEndpoints: source.alternateEndpoints,
+        iconUrl: icon.isEmpty ? null : icon,
+      ),
+      token,
+    );
+    await _load();
+    if (icon.isEmpty) unawaited(_refresh(manual: true));
   }
 
   Future<void> _switchEndpoint(MediaSource source, Uri endpoint) async {
@@ -3274,6 +3309,8 @@ class _SourceHubState extends State<_SourceHub> {
               child: _SourceCard(
                 source: source,
                 stats: _stats[source.id],
+                iconToken: _store?.tokenFor(source),
+                onPickIcon: () => _pickIcon(source),
                 offline: _offline.contains(source.id),
                 onRemove: () => _remove(source),
                 onEdit: () => _edit(source),
@@ -3329,6 +3366,7 @@ class _AddSourceDialog extends StatefulWidget {
 
 class _AddSourceDialogState extends State<_AddSourceDialog> {
   SourceKind _kind = SourceKind.emby;
+  String _scheme = 'https';
   final _name = TextEditingController();
   final _url = TextEditingController();
   final _alternateUrls = TextEditingController();
@@ -3343,6 +3381,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
     final existing = widget.existing;
     if (existing != null) {
       _kind = existing.kind;
+      _scheme = existing.endpoint.scheme == 'http' ? 'http' : 'https';
       _name.text = existing.name;
       _url.text = existing.endpoint.toString();
       _alternateUrls.text = existing.alternateEndpoints
@@ -3350,6 +3389,39 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
           .join('\n');
       _iconUrl.text = existing.iconUrl ?? '';
     }
+  }
+
+  List<Uri> _parsedEndpoints() {
+    final raw = '${_url.text}\n${_alternateUrls.text}';
+    final matches = RegExp(r'https?://[^\s,;]+', caseSensitive: false)
+        .allMatches(raw)
+        .map((match) => Uri.tryParse(match.group(0)!))
+        .whereType<Uri>();
+    final values = <Uri>[];
+    for (final value in matches) {
+      if (value.host.isEmpty || !['http', 'https'].contains(value.scheme)) {
+        continue;
+      }
+      final normalized = value.toString().endsWith('/')
+          ? value
+          : value.replace(path: '${value.path}/');
+      if (!values.contains(normalized)) values.add(normalized);
+    }
+    if (values.isEmpty && _url.text.trim().isNotEmpty) {
+      final value = Uri.tryParse('$_scheme://${_url.text.trim()}');
+      if (value != null && value.host.isNotEmpty) values.add(value);
+    }
+    return values;
+  }
+
+  void _selectScheme(String scheme) {
+    final value = Uri.tryParse(_url.text.trim());
+    setState(() {
+      _scheme = scheme;
+      if (value != null && value.host.isNotEmpty) {
+        _url.text = value.replace(scheme: scheme).toString();
+      }
+    });
   }
 
   @override
@@ -3364,25 +3436,17 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
   }
 
   Future<void> _submit() async {
-    final raw = _url.text.trim();
-    final endpoint = Uri.tryParse(raw);
-    if (raw.isEmpty ||
-        endpoint == null ||
-        !['http', 'https'].contains(endpoint.scheme) ||
-        endpoint.host.isEmpty) {
+    final candidates = _parsedEndpoints();
+    if (candidates.isEmpty) {
       setState(() => _error = '请输入完整的 http:// 或 https:// 服务器地址');
       return;
     }
-    final alternates = _alternateUrls.text
-        .split(RegExp(r'\r?\n'))
-        .map((value) => Uri.tryParse(value.trim()))
-        .whereType<Uri>()
-        .where(
-          (value) =>
-              ['http', 'https'].contains(value.scheme) &&
-              value.host.isNotEmpty &&
-              value != endpoint,
-        )
+    final endpoint = candidates.firstWhere(
+      (value) => value.scheme == _scheme,
+      orElse: () => candidates.first,
+    );
+    final alternates = candidates
+        .where((value) => value != endpoint)
         .toList(growable: false);
     setState(() {
       _saving = true;
@@ -3584,167 +3648,195 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
       child: GlassPanel(
         radius: 22,
         padding: const EdgeInsets.all(28),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          widget.existing == null ? '连接媒体服务器' : '修改媒体服务器',
-                          style: TextStyle(
-                            fontSize: 26,
-                            fontWeight: FontWeight.w900,
-                            letterSpacing: -.5,
-                          ),
-                        ),
-                        SizedBox(height: 6),
-                        Text(
-                          widget.existing == null
-                              ? '验证成功后自动读取服务器名称、媒体统计与播放能力。'
-                              : '留空用户名和密码可保留现有凭据；修改后可在卡片上测速。',
-                          style: TextStyle(color: YingjiColors.muted),
-                        ),
-                      ],
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: _saving ? null : () => Navigator.pop(context),
-                    icon: const Icon(YingjiIcons.xmark),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              const Text(
-                '来源类型',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  for (final kind in SourceKind.values) ...[
+        child: ScrollConfiguration(
+          behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    if (widget.existing != null) ...[
+                      _ServerMark(source: widget.existing!, size: 42),
+                      const SizedBox(width: 12),
+                    ],
                     Expanded(
-                      child: _SourceKindChoice(
-                        kind: kind,
-                        selected: _kind == kind,
-                        onTap: _saving
-                            ? null
-                            : () => setState(() => _kind = kind),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.existing == null ? '连接媒体服务器' : '修改媒体服务器',
+                            style: TextStyle(
+                              fontSize: 26,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: -.5,
+                            ),
+                          ),
+                          SizedBox(height: 6),
+                          Text(
+                            widget.existing == null
+                                ? '验证成功后自动读取服务器名称、媒体统计与播放能力。'
+                                : '留空用户名和密码可保留现有凭据；修改后可在卡片上测速。',
+                            style: TextStyle(color: YingjiColors.muted),
+                          ),
+                        ],
                       ),
                     ),
-                    if (kind != SourceKind.values.last)
-                      const SizedBox(width: 10),
+                    IconButton(
+                      onPressed: _saving ? null : () => Navigator.pop(context),
+                      icon: const Icon(YingjiIcons.xmark),
+                    ),
                   ],
-                ],
-              ),
-              const SizedBox(height: 24),
-              TextField(
-                controller: _name,
-                decoration: const InputDecoration(
-                  labelText: '显示名称',
-                  hintText: '例如：客厅 Emby',
-                  prefixIcon: Icon(YingjiIcons.rectangle_stack),
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _url,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: '服务器地址',
-                  hintText: 'https://server.example.com/',
-                  prefixIcon: Icon(YingjiIcons.link),
+                const SizedBox(height: 24),
+                const Text(
+                  '来源类型',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _alternateUrls,
-                keyboardType: TextInputType.url,
-                minLines: 1,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  labelText: '备用线路（每行一个，可选）',
-                  hintText: 'https://mirror.example.com/',
-                  helperText: '右键服务器卡片可快速切换已保存线路。',
-                  prefixIcon: Icon(YingjiIcons.link),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    for (final kind in SourceKind.values) ...[
+                      Expanded(
+                        child: _SourceKindChoice(
+                          kind: kind,
+                          selected: _kind == kind,
+                          onTap: _saving
+                              ? null
+                              : () => setState(() => _kind = kind),
+                        ),
+                      ),
+                      if (kind != SourceKind.values.last)
+                        const SizedBox(width: 10),
+                    ],
+                  ],
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _iconUrl,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: '服务器图标地址（可选）',
-                  hintText: 'https://…/icon.png',
-                  helperText: '留空时尝试使用服务器公开图标；不可用则使用默认标记。',
-                  prefixIcon: Icon(YingjiIcons.rectangle_stack),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _username,
-                decoration: InputDecoration(
-                  labelText: _kind == SourceKind.webdav ? '用户名（可选）' : '用户名',
-                  prefixIcon: const Icon(YingjiIcons.person),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _password,
-                obscureText: true,
-                onSubmitted: (_) => _submit(),
-                decoration: InputDecoration(
-                  labelText: _kind == SourceKind.webdav ? '密码（可选）' : '密码',
-                  prefixIcon: const Icon(YingjiIcons.lock),
-                ),
-              ),
-              if (_error != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 14),
-                  child: Text(
-                    _error!,
-                    style: const TextStyle(color: YingjiColors.danger),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: _name,
+                  decoration: const InputDecoration(
+                    labelText: '显示名称',
+                    hintText: '例如：客厅 Emby',
+                    prefixIcon: Icon(YingjiIcons.rectangle_stack),
                   ),
                 ),
-              const SizedBox(height: 24),
-              Row(
-                children: [
-                  const Expanded(
+                const SizedBox(height: 12),
+                const Text(
+                  '连接信息',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _url,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: '服务器线路',
+                    hintText: 'https://server.example.com/（可直接粘贴多条）',
+                    prefixIcon: Icon(YingjiIcons.link),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    for (final scheme in const ['https', 'http']) ...[
+                      ChoiceChip(
+                        label: Text(scheme.toUpperCase()),
+                        selected: _scheme == scheme,
+                        onSelected: _saving
+                            ? null
+                            : (_) => _selectScheme(scheme),
+                      ),
+                      if (scheme == 'https') const SizedBox(width: 8),
+                    ],
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        '优先使用选中协议；其他粘贴的地址会自动保存为可切换线路。',
+                        style: TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _alternateUrls,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: '补充线路（可选）',
+                    hintText:
+                        'http://192.168.1.8:8096/  https://mirror.example.com/',
+                    helperText: '空格、换行或逗号分隔均会自动拆分；验证后也会加入服务器发布的线路。',
+                    prefixIcon: Icon(YingjiIcons.link),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _username,
+                  decoration: InputDecoration(
+                    labelText: _kind == SourceKind.webdav ? '用户名（可选）' : '用户名',
+                    prefixIcon: const Icon(YingjiIcons.person),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _password,
+                  obscureText: true,
+                  onSubmitted: (_) => _submit(),
+                  decoration: InputDecoration(
+                    labelText: _kind == SourceKind.webdav ? '密码（可选）' : '密码',
+                    prefixIcon: const Icon(YingjiIcons.lock),
+                  ),
+                ),
+                if (_error != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 14),
                     child: Text(
-                      '凭据仅用于连接所填服务器，并保存在本机。',
-                      style: TextStyle(color: YingjiColors.muted, fontSize: 11),
+                      _error!,
+                      style: const TextStyle(color: YingjiColors.danger),
                     ),
                   ),
-                  TextButton(
-                    onPressed: _saving ? null : () => Navigator.pop(context),
-                    child: const Text('取消'),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton.icon(
-                    onPressed: _saving ? null : _submit,
-                    icon: _saving
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(YingjiIcons.checkmark_shield, size: 17),
-                    label: Text(
-                      _saving
-                          ? '正在验证'
-                          : widget.existing == null
-                          ? '验证并添加'
-                          : '保存修改',
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        '凭据仅用于连接所填服务器，并保存在本机。',
+                        style: TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 11,
+                        ),
+                      ),
                     ),
-                  ),
-                ],
-              ),
-            ],
+                    TextButton(
+                      onPressed: _saving ? null : () => Navigator.pop(context),
+                      child: const Text('取消'),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.icon(
+                      onPressed: _saving ? null : _submit,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(YingjiIcons.checkmark_shield, size: 17),
+                      label: Text(
+                        _saving
+                            ? '正在验证'
+                            : widget.existing == null
+                            ? '验证并添加'
+                            : '保存修改',
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -4680,6 +4772,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final _traktToken = TextEditingController();
   final _danmakuName = TextEditingController();
   final _danmakuUrl = TextEditingController();
+  final _danmakuApiNameControllers = <TextEditingController>[];
   final _danmakuApiControllers = <TextEditingController>[];
   final _danmakuToken = TextEditingController();
   String? _savedMessage;
@@ -4689,9 +4782,11 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _danmakuMessage;
   bool _traktAuthorizing = false;
   String? _traktMessage;
+  bool _jumpingToSetting = false;
   @override
   void initState() {
     super.initState();
+    _settingsScroll.addListener(_syncActiveSetting);
     _load();
   }
 
@@ -4760,6 +4855,11 @@ class _SettingsPageState extends State<SettingsPage> {
         for (final controller in _danmakuApiControllers) {
           controller.dispose();
         }
+        for (final controller in _danmakuApiNameControllers) {
+          controller.dispose();
+        }
+        final savedApiNames =
+            prefs.getStringList('yingji.danmaku.api-names') ?? const [];
         _danmakuApiControllers
           ..clear()
           ..addAll(
@@ -4770,13 +4870,25 @@ class _SettingsPageState extends State<SettingsPage> {
         if (_danmakuApiControllers.isEmpty) {
           _danmakuApiControllers.add(TextEditingController());
         }
+        _danmakuApiNameControllers
+          ..clear()
+          ..addAll(
+            List.generate(
+              _danmakuApiControllers.length,
+              (index) => TextEditingController(
+                text: index < savedApiNames.length
+                    ? savedApiNames[index]
+                    : '弹幕 ${index + 1}',
+              ),
+            ),
+          );
         _danmakuToken.text = prefs.getString('yingji.danmaku.token') ?? '';
       });
       _applyAppearance();
     }
   }
 
-  Future<void> _save() async {
+  Future<void> _save({bool feedback = false}) async {
     final danmakuApis = _danmakuApiControllers
         .map((controller) => controller.text.trim())
         .where((value) => value.isNotEmpty)
@@ -4841,8 +4953,17 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('yingji.danmaku.name', _danmakuName.text.trim());
     await prefs.setString('yingji.danmaku.url', danmakuApis.firstOrNull ?? '');
     await prefs.setStringList('yingji.danmaku.apis', danmakuApis);
+    await prefs.setStringList(
+      'yingji.danmaku.api-names',
+      List.generate(
+        danmakuApis.length,
+        (index) => index < _danmakuApiNameControllers.length
+            ? _danmakuApiNameControllers[index].text.trim()
+            : '',
+      ),
+    );
     await prefs.setString('yingji.danmaku.token', _danmakuToken.text.trim());
-    if (mounted) setState(() => _savedMessage = '已保存');
+    if (feedback && mounted) setState(() => _savedMessage = '已保存');
   }
 
   void _applyAppearance() {
@@ -4860,11 +4981,13 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  Future<void> _testDanmaku() async {
+  Future<void> _testDanmaku([String? target]) async {
     if (_danmakuTesting) return;
-    final endpoint = _danmakuApiControllers
-        .map((controller) => controller.text.trim())
-        .firstWhere((value) => value.isNotEmpty, orElse: () => '');
+    final endpoint =
+        target ??
+        _danmakuApiControllers
+            .map((controller) => controller.text.trim())
+            .firstWhere((value) => value.isNotEmpty, orElse: () => '');
     if (endpoint.isEmpty) {
       setState(() => _danmakuMessage = '请先填写弹幕 API 地址');
       return;
@@ -4999,19 +5122,46 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  List<GlobalKey> get _settingKeys => [
+    _homeKey,
+    _appearanceKey,
+    _playerKey,
+    _behaviorKey,
+    _networkKey,
+    _danmakuKey,
+    _maintenanceKey,
+    _aboutKey,
+  ];
+
+  void _syncActiveSetting() {
+    if (_jumpingToSetting || !_settingsScroll.hasClients) return;
+    final position = _settingsScroll.offset + 28;
+    var active = 0;
+    for (var index = 0; index < _settingKeys.length; index++) {
+      final target = _settingKeys[index].currentContext?.findRenderObject();
+      if (target == null || !target.attached) continue;
+      final offset = RenderAbstractViewport.of(target)
+          .getOffsetToReveal(target, 0)
+          .offset;
+      if (offset <= position) active = index;
+    }
+    if (active != _activeSetting && mounted) {
+      setState(() => _activeSetting = active);
+    }
+  }
+
   Future<void> _jumpToSetting(int index, GlobalKey key) async {
     final targetContext = key.currentContext;
-    if (targetContext == null || !_settingsScroll.hasClients) return;
-    final target = targetContext.findRenderObject();
-    if (target == null || !target.attached) return;
-    final viewport = RenderAbstractViewport.of(target);
-    final offset = viewport.getOffsetToReveal(target, 0).offset - 20;
+    if (targetContext == null) return;
     setState(() => _activeSetting = index);
-    await _settingsScroll.animateTo(
-      offset.clamp(0, _settingsScroll.position.maxScrollExtent),
+    _jumpingToSetting = true;
+    await Scrollable.ensureVisible(
+      targetContext,
+      alignment: 0,
       duration: const Duration(milliseconds: 300),
       curve: Curves.easeOutCubic,
     );
+    _jumpingToSetting = false;
   }
 
   @override
@@ -5023,6 +5173,9 @@ class _SettingsPageState extends State<SettingsPage> {
     _traktToken.dispose();
     _danmakuName.dispose();
     _danmakuUrl.dispose();
+    for (final controller in _danmakuApiNameControllers) {
+      controller.dispose();
+    }
     for (final controller in _danmakuApiControllers) {
       controller.dispose();
     }
@@ -5112,935 +5265,967 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
                 const VerticalDivider(width: 1, color: Color(0x22FFFFFF)),
                 Expanded(
-                  child: SingleChildScrollView(
-                    controller: _settingsScroll,
-                    padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text(
-                          '设置',
-                          style: TextStyle(
-                            fontSize: 48,
-                            height: 1,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: -1.2,
+                  child: ScrollConfiguration(
+                    behavior: ScrollConfiguration.of(context)
+                        .copyWith(scrollbars: false),
+                    child: SingleChildScrollView(
+                      controller: _settingsScroll,
+                      padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Text(
+                            '设置',
+                            style: TextStyle(
+                              fontSize: 48,
+                              height: 1,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -1.2,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 28),
-                        _FrostSurface(
-                          key: _homeKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '首页',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
+                          const SizedBox(height: 28),
+                          _FrostSurface(
+                            key: _homeKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '首页',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '控制首页海报轮播、浮动导航和继续观看内容。保存后返回首页即可生效。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              _ToggleRow(
-                                title: '显示继续观看',
-                                detail: '在首页海报下方显示本机播放进度',
-                                value: _homeContinueWatching,
-                                onChanged: (value) {
-                                  setState(() => _homeContinueWatching = value);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '显示首页图标',
-                                detail: '在左侧浮动导航中保留首页按钮',
-                                value: _homeShowIcon,
-                                onChanged: (value) {
-                                  setState(() => _homeShowIcon = value);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '自动轮播海报',
-                                detail: '关闭后保留当前海报，可用轮播点手动切换',
-                                value: _homeAutoCarousel,
-                                onChanged: (value) {
-                                  setState(() => _homeAutoCarousel = value);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '显示轮播点',
-                                detail: '在海报右下方显示当前轮播进度',
-                                value: _homeShowCarouselDots,
-                                onChanged: (value) {
-                                  setState(() => _homeShowCarouselDots = value);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 8),
-                              YingjiGlassChoiceField<String>(
-                                label: '首页轮播来源',
-                                helper: '决定海报轮播使用哪组真实 TMDB 数据',
-                                value: _homeCarouselSource,
-                                items: const [
-                                  'trending',
-                                  'popular-movies',
-                                  'popular-shows',
-                                  'top-rated',
-                                ],
-                                labelBuilder: (value) => switch (value) {
-                                  'trending' => 'TMDB · 本周趋势',
-                                  'popular-movies' => 'TMDB · 热门电影',
-                                  'popular-shows' => 'TMDB · 热门剧集',
-                                  _ => 'TMDB · 高分电影',
-                                },
-                                onChanged: (value) {
-                                  setState(() => _homeCarouselSource = value);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  for (final option in const <(String, String)>[
-                                    ('play', '播放'),
-                                    ('spark', '光芒'),
-                                    ('letter', '字标'),
-                                  ]) ...[
-                                    _AppearanceIconChoice(
-                                      style: option.$1,
-                                      label: option.$2,
-                                      selected: _appearanceIcon == option.$1,
-                                      onTap: () {
-                                        setState(
-                                          () => _appearanceIcon = option.$1,
-                                        );
-                                        _applyAppearance();
-                                        _save();
-                                      },
-                                    ),
-                                    const SizedBox(width: 10),
-                                  ],
-                                ],
-                              ),
-                              const SizedBox(height: 14),
-                              YingjiGlassDropdownField<String>(
-                                initialValue: _homeCarouselEffect,
-                                decoration: const InputDecoration(
-                                  labelText: '海报轮播效果',
-                                  helperText: '切换海报时使用的过渡动画',
-                                ),
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'blur-dissolve',
-                                    child: Text('模糊溶解（推荐）'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'slide-fade',
-                                    child: Text('上浮渐变'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'fade',
-                                    child: Text('淡入式'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'zoom-fade',
-                                    child: Text('缩放淡入'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'slide-horizontal',
-                                    child: Text('横向滑入'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'instant',
-                                    child: Text('即时切换'),
-                                  ),
-                                ],
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setState(() => _homeCarouselEffect = value);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 14),
-                              Text('海报停留时间  ${_homeCarouselSeconds.round()} 秒'),
-                              Slider(
-                                value: _homeCarouselSeconds,
-                                min: 3,
-                                max: 15,
-                                divisions: 12,
-                                label: '${_homeCarouselSeconds.round()} 秒',
-                                onChanged: (value) => setState(
-                                  () => _homeCarouselSeconds = value,
-                                ),
-                                onChangeEnd: (_) => _save(),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _appearanceKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '外观',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '调整整体明暗、圆润图标与全局玻璃材质；改动会即时应用到每个悬浮卡片。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              const SizedBox(height: 8),
-                              YingjiGlassDropdownField<String>(
-                                initialValue: _appearanceTheme,
-                                decoration: const InputDecoration(
-                                  labelText: '颜色模式',
-                                  helperText: '系统模式会跟随 Windows 的浅色/深色设置',
-                                ),
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'dark',
-                                    child: Text('深色模式'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'light',
-                                    child: Text('浅色模式'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'system',
-                                    child: Text('跟随系统'),
-                                  ),
-                                ],
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setState(() => _appearanceTheme = value);
-                                  _applyAppearance();
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 14),
-                              YingjiGlassDropdownField<String>(
-                                initialValue: _appearanceFont,
-                                decoration: const InputDecoration(
-                                  labelText: '全局字体',
-                                  helperText: '字体会即时应用到标题、正文、榜单与播放器控件',
-                                ),
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'round',
-                                    child: Text('映迹圆润无衬线（内置）'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'wenkai',
-                                    child: Text('映迹温润文楷（内置）'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'dengxian',
-                                    child: Text('方圆 UI · 等线（Windows）'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'yahei',
-                                    child: Text('微软雅黑 UI（Windows）'),
-                                  ),
-                                ],
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setState(() => _appearanceFont = value);
-                                  _applyAppearance();
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 14),
-                              Text(
-                                '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              const Text(
-                                '左端完全透明，右端完全玻璃化；所有图标与卡片同步使用。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              Slider(
-                                value: _appearanceGlassOpacity,
-                                min: 0,
-                                max: 1,
-                                divisions: 20,
-                                label:
-                                    '${(_appearanceGlassOpacity * 100).round()}%',
-                                onChanged: (value) {
-                                  setState(
-                                    () => _appearanceGlassOpacity = value,
-                                  );
-                                  _applyAppearance();
-                                },
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '背景模糊  ${_appearanceGlassBlur.round()} px',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              const Text(
-                                '左端完全无模糊，右端为完整毛玻璃；可单独与透明度组合。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              Slider(
-                                value: _appearanceGlassBlur,
-                                min: 0,
-                                max: 40,
-                                divisions: 15,
-                                label: '${_appearanceGlassBlur.round()} px',
-                                onChanged: (value) {
-                                  setState(() => _appearanceGlassBlur = value);
-                                  _applyAppearance();
-                                },
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              const Text(
-                                '左端更明亮通透，右端更深邃；不会改变海报背景本身。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              Slider(
-                                value: _appearanceCardDepth,
-                                min: 0,
-                                max: 1,
-                                divisions: 20,
-                                label:
-                                    '${(_appearanceCardDepth * 100).round()}%',
-                                onChanged: (value) {
-                                  setState(() => _appearanceCardDepth = value);
-                                  _applyAppearance();
-                                },
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              const SizedBox(height: 14),
-                              YingjiGlassDropdownField<String>(
-                                initialValue: _appearanceIcon,
-                                decoration: const InputDecoration(
-                                  labelText: '应用图标',
-                                  helperText: '同时应用于窗口左上角和浮动导航 Logo',
-                                ),
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: 'play',
-                                    child: Text('映迹播放标记'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'spark',
-                                    child: Text('映迹光芒标记'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: 'letter',
-                                    child: Text('映迹字标'),
-                                  ),
-                                ],
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setState(() => _appearanceIcon = value);
-                                  _applyAppearance();
-                                  _save();
-                                },
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _playerKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '播放器',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '内置 libmpv；这些偏好会在播放时下发给内核。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              _ToggleRow(
-                                title: '硬件解码',
-                                detail: '优先 D3D11VA',
-                                value: _hardware,
-                                onChanged: (v) {
-                                  setState(() => _hardware = v);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: 'HDR 输出',
-                                detail: '匹配 Windows HDR 状态',
-                                value: _hdr,
-                                onChanged: (v) {
-                                  setState(() => _hdr = v);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '立体声下混',
-                                detail: '多声道输出转换为立体声',
-                                value: _downmix,
-                                onChanged: (v) {
-                                  setState(() => _downmix = v);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '夜间模式',
-                                detail: '压缩动态范围',
-                                value: _night,
-                                onChanged: (v) {
-                                  setState(() => _night = v);
-                                  _save();
-                                },
-                              ),
-                              _ToggleRow(
-                                title: '人声增强',
-                                detail: '提升对白清晰度',
-                                value: _voiceEnhance,
-                                onChanged: (v) {
-                                  setState(() => _voiceEnhance = v);
-                                  _save();
-                                },
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _behaviorKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '播放行为与默认值',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '这些值会作为每次打开播放器时的初始状态，也可在播放控制台临时调整。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              _ToggleRow(
-                                title: '继续播放提示',
-                                detail: '打开已观看媒体时显示上次进度',
-                                value: _resumePrompt,
-                                onChanged: (v) {
-                                  setState(() => _resumePrompt = v);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 6),
-                              YingjiGlassDropdownField<String>(
-                                initialValue: _aspect,
-                                decoration: const InputDecoration(
-                                  labelText: '默认画面比例',
-                                ),
-                                items: const ['自动', '16:9', '4:3', '21:9']
-                                    .map(
-                                      (value) => DropdownMenuItem(
-                                        value: value,
-                                        child: Text(value),
-                                      ),
-                                    )
-                                    .toList(),
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setState(() => _aspect = value);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 14),
-                              Text(
-                                '默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x',
-                              ),
-                              Slider(
-                                value: _defaultSpeed,
-                                min: .5,
-                                max: 2,
-                                divisions: 30,
-                                label: '${_defaultSpeed.toStringAsFixed(2)}x',
-                                onChanged: (value) =>
-                                    setState(() => _defaultSpeed = value),
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              Text('预读缓存  ${_cacheSeconds.round()} 秒'),
-                              Slider(
-                                value: _cacheSeconds,
-                                min: 5,
-                                max: 120,
-                                divisions: 23,
-                                label: '${_cacheSeconds.round()} 秒',
-                                onChanged: (value) =>
-                                    setState(() => _cacheSeconds = value),
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              Text(
-                                '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
-                              ),
-                              Slider(
-                                value: _audioDelay,
-                                min: -3,
-                                max: 3,
-                                divisions: 120,
-                                label: '${(_audioDelay * 1000).round()} ms',
-                                onChanged: (value) =>
-                                    setState(() => _audioDelay = value),
-                                onChangeEnd: (_) => _save(),
-                              ),
-                              Text(
-                                '默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
-                              ),
-                              Slider(
-                                value: _subtitleDelay,
-                                min: -3,
-                                max: 3,
-                                divisions: 120,
-                                label: '${(_subtitleDelay * 1000).round()} ms',
-                                onChanged: (value) =>
-                                    setState(() => _subtitleDelay = value),
-                                onChangeEnd: (_) => _save(),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _networkKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '网络与同步',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                'TMDB 默认通过映迹托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              const SizedBox(height: 14),
-                              TextField(
-                                controller: _tmdbApiKey,
-                                obscureText: true,
-                                decoration: const InputDecoration(
-                                  labelText: 'TMDB API Key（可选）',
-                                  hintText: '留空使用映迹托管网关',
-                                ),
-                              ),
-                              const SizedBox(height: 14),
-                              Row(
-                                children: [
-                                  FilledButton.tonalIcon(
-                                    onPressed: _tmdbTesting ? null : _testTmdb,
-                                    icon: _tmdbTesting
-                                        ? const SizedBox(
-                                            width: 16,
-                                            height: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            YingjiIcons.wifi,
-                                            size: 16,
-                                          ),
-                                    label: const Text('测试 TMDB 网络'),
-                                  ),
-                                  if (_tmdbMessage != null) ...[
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Text(
-                                        _tmdbMessage!,
-                                        style: const TextStyle(
-                                          color: Color(0xFFABB1BE),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                              const SizedBox(height: 14),
-                              TextField(
-                                controller: _traktClientId,
-                                decoration: const InputDecoration(
-                                  labelText: 'Trakt Client ID',
-                                ),
-                              ),
-                              const SizedBox(height: 10),
-                              TextField(
-                                controller: _traktToken,
-                                obscureText: true,
-                                decoration: const InputDecoration(
-                                  labelText: 'Trakt Access Token',
-                                ),
-                              ),
-                              const SizedBox(height: 10),
-                              TextField(
-                                controller: _traktClientSecret,
-                                obscureText: true,
-                                decoration: const InputDecoration(
-                                  labelText: 'Trakt Client Secret（设备授权需要）',
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  FilledButton.tonal(
-                                    onPressed: _traktAuthorizing
-                                        ? null
-                                        : _authorizeTrakt,
-                                    child: Text(
-                                      _traktAuthorizing
-                                          ? '等待授权…'
-                                          : '浏览器授权 Trakt',
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  FilledButton(
-                                    onPressed: _save,
-                                    child: Text(_savedMessage ?? '保存设置'),
-                                  ),
-                                ],
-                              ),
-                              if (_traktMessage != null) ...[
                                 const SizedBox(height: 8),
-                                Text(
-                                  _traktMessage!,
-                                  style: const TextStyle(
-                                    color: Color(0xFFABB1BE),
-                                  ),
+                                const Text(
+                                  '控制首页海报轮播、浮动导航和继续观看内容。保存后返回首页即可生效。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
                                 ),
-                              ],
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _danmakuKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const SizedBox(height: 24),
-                              SwitchListTile.adaptive(
-                                contentPadding: EdgeInsets.zero,
-                                secondary: const Icon(
-                                  YingjiIcons.captions_bubble,
+                                _ToggleRow(
+                                  title: '显示继续观看',
+                                  detail: '在首页海报下方显示本机播放进度',
+                                  value: _homeContinueWatching,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _homeContinueWatching = value,
+                                    );
+                                    _save();
+                                  },
                                 ),
-                                title: const Text('启用字幕语言优先'),
-                                subtitle: const Text(
-                                  '按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。',
+                                _ToggleRow(
+                                  title: '显示首页图标',
+                                  detail: '在左侧浮动导航中保留首页按钮',
+                                  value: _homeShowIcon,
+                                  onChanged: (value) {
+                                    setState(() => _homeShowIcon = value);
+                                    _save();
+                                  },
                                 ),
-                                value: _preferChineseSubtitle,
-                                onChanged: (value) {
-                                  setState(
-                                    () => _preferChineseSubtitle = value,
-                                  );
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 24),
-                              YingjiGlassChoiceField<String>(
-                                label: '首选字幕语言',
-                                value: _subtitleLanguage,
-                                items: subtitleLanguages.keys.toList(),
-                                labelBuilder: (v) => subtitleLanguages[v] ?? v,
-                                onChanged: (v) {
-                                  setState(() => _subtitleLanguage = v);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 24),
-                              const Text(
-                                '弹幕服务',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
+                                _ToggleRow(
+                                  title: '自动轮播海报',
+                                  detail: '关闭后保留当前海报，可用轮播点手动切换',
+                                  value: _homeAutoCarousel,
+                                  onChanged: (value) {
+                                    setState(() => _homeAutoCarousel = value);
+                                    _save();
+                                  },
                                 ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '支持 TaoHua danmu_api 部署根地址，应用会自动匹配剧集并读取弹幕；也兼容带占位符的通用 API。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              _ToggleRow(
-                                title: '启用弹幕',
-                                detail: _danmakuEnabled
-                                    ? '播放时读取下方 API'
-                                    : '当前关闭',
-                                value: _danmakuEnabled,
-                                onChanged: (value) {
-                                  setState(() => _danmakuEnabled = value);
-                                  _save();
-                                },
-                              ),
-                              const SizedBox(height: 6),
-                              TextField(
-                                controller: _danmakuName,
-                                decoration: const InputDecoration(
-                                  labelText: '服务名称（可选）',
-                                  hintText: '例如：我的弹幕服务',
+                                _ToggleRow(
+                                  title: '显示轮播点',
+                                  detail: '在海报右下方显示当前轮播进度',
+                                  value: _homeShowCarouselDots,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _homeShowCarouselDots = value,
+                                    );
+                                    _save();
+                                  },
                                 ),
-                              ),
-                              const SizedBox(height: 10),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '弹幕 API',
-                                style: TextStyle(fontWeight: FontWeight.w800),
-                              ),
-                              const SizedBox(height: 4),
-                              const Text(
-                                '每个地址独立保存。播放时并行测速，使用最先返回实际弹幕的服务。',
-                                style: TextStyle(
-                                  color: Color(0xFFABB1BE),
-                                  fontSize: 12,
+                                const SizedBox(height: 8),
+                                YingjiGlassChoiceField<String>(
+                                  label: '首页轮播来源',
+                                  helper: '决定海报轮播使用哪组真实 TMDB 数据',
+                                  value: _homeCarouselSource,
+                                  items: const [
+                                    'trending',
+                                    'popular-movies',
+                                    'popular-shows',
+                                    'top-rated',
+                                  ],
+                                  labelBuilder: (value) => switch (value) {
+                                    'trending' => 'TMDB · 本周趋势',
+                                    'popular-movies' => 'TMDB · 热门电影',
+                                    'popular-shows' => 'TMDB · 热门剧集',
+                                    _ => 'TMDB · 高分电影',
+                                  },
+                                  onChanged: (value) {
+                                    setState(() => _homeCarouselSource = value);
+                                    _save();
+                                  },
                                 ),
-                              ),
-                              const SizedBox(height: 8),
-                              for (
-                                var index = 0;
-                                index < _danmakuApiControllers.length;
-                                index++
-                              ) ...[
+                                const SizedBox(height: 12),
                                 Row(
                                   children: [
-                                    Expanded(
-                                      child: TextField(
-                                        controller:
-                                            _danmakuApiControllers[index],
-                                        keyboardType: TextInputType.url,
-                                        decoration: InputDecoration(
-                                          labelText: 'API ${index + 1}',
-                                          hintText: 'https://example.com/api',
-                                          prefixIcon: const Icon(
-                                            YingjiIcons.link,
+                                    for (final option
+                                        in const <(String, String)>[
+                                          ('play', '播放'),
+                                          ('spark', '光芒'),
+                                          ('letter', '字标'),
+                                        ]) ...[
+                                      _AppearanceIconChoice(
+                                        style: option.$1,
+                                        label: option.$2,
+                                        selected: _appearanceIcon == option.$1,
+                                        onTap: () {
+                                          setState(
+                                            () => _appearanceIcon = option.$1,
+                                          );
+                                          _applyAppearance();
+                                          _save();
+                                        },
+                                      ),
+                                      const SizedBox(width: 10),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 14),
+                                YingjiGlassDropdownField<String>(
+                                  initialValue: _homeCarouselEffect,
+                                  decoration: const InputDecoration(
+                                    labelText: '海报轮播效果',
+                                    helperText: '切换海报时使用的过渡动画',
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: 'blur-dissolve',
+                                      child: Text('模糊溶解（推荐）'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'slide-fade',
+                                      child: Text('上浮渐变'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'fade',
+                                      child: Text('淡入式'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'zoom-fade',
+                                      child: Text('缩放淡入'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'slide-horizontal',
+                                      child: Text('横向滑入'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'instant',
+                                      child: Text('即时切换'),
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value == null) return;
+                                    setState(() => _homeCarouselEffect = value);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 14),
+                                Text(
+                                  '海报停留时间  ${_homeCarouselSeconds.round()} 秒',
+                                ),
+                                Slider(
+                                  value: _homeCarouselSeconds,
+                                  min: 3,
+                                  max: 15,
+                                  divisions: 12,
+                                  label: '${_homeCarouselSeconds.round()} 秒',
+                                  onChanged: (value) => setState(
+                                    () => _homeCarouselSeconds = value,
+                                  ),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _appearanceKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '外观',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '调整整体明暗、圆润图标与全局玻璃材质；改动会即时应用到每个悬浮卡片。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                const SizedBox(height: 8),
+                                YingjiGlassDropdownField<String>(
+                                  initialValue: _appearanceTheme,
+                                  decoration: const InputDecoration(
+                                    labelText: '颜色模式',
+                                    helperText: '系统模式会跟随 Windows 的浅色/深色设置',
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: 'dark',
+                                      child: Text('深色模式'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'light',
+                                      child: Text('浅色模式'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'system',
+                                      child: Text('跟随系统'),
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value == null) return;
+                                    setState(() => _appearanceTheme = value);
+                                    _applyAppearance();
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 14),
+                                YingjiGlassDropdownField<String>(
+                                  initialValue: _appearanceFont,
+                                  decoration: const InputDecoration(
+                                    labelText: '全局字体',
+                                    helperText: '字体会即时应用到标题、正文、榜单与播放器控件',
+                                  ),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: 'round',
+                                      child: Text('映迹圆润无衬线（内置）'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'wenkai',
+                                      child: Text('映迹温润文楷（内置）'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'dengxian',
+                                      child: Text('方圆 UI · 等线（Windows）'),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'yahei',
+                                      child: Text('微软雅黑 UI（Windows）'),
+                                    ),
+                                  ],
+                                  onChanged: (value) {
+                                    if (value == null) return;
+                                    setState(() => _appearanceFont = value);
+                                    _applyAppearance();
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 14),
+                                Text(
+                                  '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                const Text(
+                                  '左端完全透明，右端完全玻璃化；所有图标与卡片同步使用。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                Slider(
+                                  value: _appearanceGlassOpacity,
+                                  min: 0,
+                                  max: 1,
+                                  divisions: 20,
+                                  label:
+                                      '${(_appearanceGlassOpacity * 100).round()}%',
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _appearanceGlassOpacity = value,
+                                    );
+                                    _applyAppearance();
+                                  },
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '背景模糊  ${_appearanceGlassBlur.round()} px',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                const Text(
+                                  '左端完全无模糊，右端为完整毛玻璃；可单独与透明度组合。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                Slider(
+                                  value: _appearanceGlassBlur,
+                                  min: 0,
+                                  max: 40,
+                                  divisions: 15,
+                                  label: '${_appearanceGlassBlur.round()} px',
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _appearanceGlassBlur = value,
+                                    );
+                                    _applyAppearance();
+                                  },
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                const Text(
+                                  '左端更明亮通透，右端更深邃；不会改变海报背景本身。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                Slider(
+                                  value: _appearanceCardDepth,
+                                  min: 0,
+                                  max: 1,
+                                  divisions: 20,
+                                  label:
+                                      '${(_appearanceCardDepth * 100).round()}%',
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _appearanceCardDepth = value,
+                                    );
+                                    _applyAppearance();
+                                  },
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _playerKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '播放器',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '内置 libmpv；这些偏好会在播放时下发给内核。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                _ToggleRow(
+                                  title: '硬件解码',
+                                  detail: '优先 D3D11VA',
+                                  value: _hardware,
+                                  onChanged: (v) {
+                                    setState(() => _hardware = v);
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: 'HDR 输出',
+                                  detail: '匹配 Windows HDR 状态',
+                                  value: _hdr,
+                                  onChanged: (v) {
+                                    setState(() => _hdr = v);
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: '立体声下混',
+                                  detail: '多声道输出转换为立体声',
+                                  value: _downmix,
+                                  onChanged: (v) {
+                                    setState(() => _downmix = v);
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: '夜间模式',
+                                  detail: '压缩动态范围',
+                                  value: _night,
+                                  onChanged: (v) {
+                                    setState(() => _night = v);
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: '人声增强',
+                                  detail: '提升对白清晰度',
+                                  value: _voiceEnhance,
+                                  onChanged: (v) {
+                                    setState(() => _voiceEnhance = v);
+                                    _save();
+                                  },
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _behaviorKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '播放行为与默认值',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '这些值会作为每次打开播放器时的初始状态，也可在播放控制台临时调整。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                _ToggleRow(
+                                  title: '继续播放提示',
+                                  detail: '打开已观看媒体时显示上次进度',
+                                  value: _resumePrompt,
+                                  onChanged: (v) {
+                                    setState(() => _resumePrompt = v);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 6),
+                                YingjiGlassDropdownField<String>(
+                                  initialValue: _aspect,
+                                  decoration: const InputDecoration(
+                                    labelText: '默认画面比例',
+                                  ),
+                                  items: const ['自动', '16:9', '4:3', '21:9']
+                                      .map(
+                                        (value) => DropdownMenuItem(
+                                          value: value,
+                                          child: Text(value),
+                                        ),
+                                      )
+                                      .toList(),
+                                  onChanged: (value) {
+                                    if (value == null) return;
+                                    setState(() => _aspect = value);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 14),
+                                Text(
+                                  '默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x',
+                                ),
+                                Slider(
+                                  value: _defaultSpeed,
+                                  min: .5,
+                                  max: 2,
+                                  divisions: 30,
+                                  label: '${_defaultSpeed.toStringAsFixed(2)}x',
+                                  onChanged: (value) =>
+                                      setState(() => _defaultSpeed = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                Text('预读缓存  ${_cacheSeconds.round()} 秒'),
+                                Slider(
+                                  value: _cacheSeconds,
+                                  min: 5,
+                                  max: 120,
+                                  divisions: 23,
+                                  label: '${_cacheSeconds.round()} 秒',
+                                  onChanged: (value) =>
+                                      setState(() => _cacheSeconds = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                Text(
+                                  '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
+                                ),
+                                Slider(
+                                  value: _audioDelay,
+                                  min: -3,
+                                  max: 3,
+                                  divisions: 120,
+                                  label: '${(_audioDelay * 1000).round()} ms',
+                                  onChanged: (value) =>
+                                      setState(() => _audioDelay = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                Text(
+                                  '默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
+                                ),
+                                Slider(
+                                  value: _subtitleDelay,
+                                  min: -3,
+                                  max: 3,
+                                  divisions: 120,
+                                  label:
+                                      '${(_subtitleDelay * 1000).round()} ms',
+                                  onChanged: (value) =>
+                                      setState(() => _subtitleDelay = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _networkKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '网络与同步',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'TMDB 默认通过映迹托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                const SizedBox(height: 14),
+                                TextField(
+                                  controller: _tmdbApiKey,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'TMDB API Key（可选）',
+                                    hintText: '留空使用映迹托管网关',
+                                  ),
+                                ),
+                                const SizedBox(height: 14),
+                                Row(
+                                  children: [
+                                    FilledButton.tonalIcon(
+                                      onPressed: _tmdbTesting
+                                          ? null
+                                          : _testTmdb,
+                                      icon: _tmdbTesting
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              YingjiIcons.wifi,
+                                              size: 16,
+                                            ),
+                                      label: const Text('测试 TMDB 网络'),
+                                    ),
+                                    if (_tmdbMessage != null) ...[
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Text(
+                                          _tmdbMessage!,
+                                          style: const TextStyle(
+                                            color: Color(0xFFABB1BE),
                                           ),
                                         ),
-                                      ),
-                                    ),
-                                    if (_danmakuApiControllers.length > 1) ...[
-                                      const SizedBox(width: 8),
-                                      YingjiMotionIconButton(
-                                        icon: YingjiIcons.trash,
-                                        tooltip: '移除 API ${index + 1}',
-                                        size: 38,
-                                        onPressed: () => setState(() {
-                                          _danmakuApiControllers
-                                              .removeAt(index)
-                                              .dispose();
-                                        }),
                                       ),
                                     ],
                                   ],
                                 ),
-                                const SizedBox(height: 8),
-                              ],
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: YingjiMotionIconButton(
-                                  icon: YingjiIcons.plus,
-                                  tooltip: '添加弹幕 API',
-                                  size: 38,
-                                  onPressed: () => setState(
-                                    () => _danmakuApiControllers.add(
-                                      TextEditingController(),
+                                const SizedBox(height: 14),
+                                TextField(
+                                  controller: _traktClientId,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Trakt Client ID',
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                TextField(
+                                  controller: _traktToken,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Trakt Access Token',
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                TextField(
+                                  controller: _traktClientSecret,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Trakt Client Secret（设备授权需要）',
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.end,
+                                  children: [
+                                    FilledButton.tonal(
+                                      onPressed: _traktAuthorizing
+                                          ? null
+                                          : _authorizeTrakt,
+                                      child: Text(
+                                        _traktAuthorizing
+                                            ? '等待授权…'
+                                            : '浏览器授权 Trakt',
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    FilledButton(
+                                      onPressed: _save,
+                                      child: Text(_savedMessage ?? '保存设置'),
+                                    ),
+                                  ],
+                                ),
+                                if (_traktMessage != null) ...[
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    _traktMessage!,
+                                    style: const TextStyle(
+                                      color: Color(0xFFABB1BE),
                                     ),
                                   ),
-                                ),
-                              ),
-                              const SizedBox(height: 10),
-                              TextField(
-                                controller: _danmakuToken,
-                                obscureText: true,
-                                decoration: const InputDecoration(
-                                  labelText: 'API Token（可选）',
-                                  hintText: '以 Bearer Token 方式发送',
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: [
-                                  FilledButton.tonalIcon(
-                                    onPressed: _danmakuTesting
-                                        ? null
-                                        : _testDanmaku,
-                                    icon: _danmakuTesting
-                                        ? const SizedBox(
-                                            width: 16,
-                                            height: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            YingjiIcons.checkmark_seal,
-                                            size: 16,
-                                          ),
-                                    label: const Text('测试弹幕 API'),
+                                ],
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _danmakuKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 24),
+                                SwitchListTile.adaptive(
+                                  contentPadding: EdgeInsets.zero,
+                                  secondary: const Icon(
+                                    YingjiIcons.captions_bubble,
                                   ),
-                                  if (_danmakuMessage != null) ...[
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Text(
-                                        _danmakuMessage!,
-                                        style: const TextStyle(
-                                          color: Color(0xFFABB1BE),
+                                  title: const Text('启用字幕语言优先'),
+                                  subtitle: const Text(
+                                    '按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。',
+                                  ),
+                                  value: _preferChineseSubtitle,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _preferChineseSubtitle = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 24),
+                                YingjiGlassChoiceField<String>(
+                                  label: '首选字幕语言',
+                                  value: _subtitleLanguage,
+                                  items: subtitleLanguages.keys.toList(),
+                                  labelBuilder: (v) =>
+                                      subtitleLanguages[v] ?? v,
+                                  onChanged: (v) {
+                                    setState(() => _subtitleLanguage = v);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 24),
+                                const Text(
+                                  '弹幕服务',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '支持 TaoHua danmu_api 部署根地址，应用会自动匹配剧集并读取弹幕；也兼容带占位符的通用 API。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                _ToggleRow(
+                                  title: '启用弹幕',
+                                  detail: _danmakuEnabled
+                                      ? '播放时读取下方 API'
+                                      : '当前关闭',
+                                  value: _danmakuEnabled,
+                                  onChanged: (value) {
+                                    setState(() => _danmakuEnabled = value);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 6),
+                                TextField(
+                                  controller: _danmakuName,
+                                  decoration: const InputDecoration(
+                                    labelText: '服务名称（可选）',
+                                    hintText: '例如：我的弹幕服务',
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '弹幕 API',
+                                  style: TextStyle(fontWeight: FontWeight.w800),
+                                ),
+                                const SizedBox(height: 4),
+                                const Text(
+                                  '每个地址独立保存。播放时并行测速，使用最先返回实际弹幕的服务。',
+                                  style: TextStyle(
+                                    color: Color(0xFFABB1BE),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                for (
+                                  var index = 0;
+                                  index < _danmakuApiControllers.length;
+                                  index++
+                                ) ...[
+                                  Row(
+                                    children: [
+                                      SizedBox(
+                                        width: 118,
+                                        child: TextField(
+                                          controller:
+                                              _danmakuApiNameControllers[index],
+                                          decoration: InputDecoration(
+                                            labelText: '名称',
+                                            hintText: '弹幕 ${index + 1}',
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _maintenanceKey,
-                          borderRadius: 22,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                '维护与数据',
-                                style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              const Text(
-                                '清理仅影响本机缓存和观看记录，不会修改 Emby、Jellyfin 或 WebDAV 上的媒体。',
-                                style: TextStyle(color: Color(0xFFABB1BE)),
-                              ),
-                              const SizedBox(height: 14),
-                              Wrap(
-                                spacing: 10,
-                                runSpacing: 10,
-                                children: [
-                                  FilledButton.tonalIcon(
-                                    onPressed: _clearTmdbCache,
-                                    icon: const Icon(
-                                      YingjiIcons.trash,
-                                      size: 16,
-                                    ),
-                                    label: const Text('清理 TMDB 缓存'),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: TextField(
+                                          controller:
+                                              _danmakuApiControllers[index],
+                                          keyboardType: TextInputType.url,
+                                          decoration: InputDecoration(
+                                            labelText: 'API ${index + 1}',
+                                            hintText: 'https://example.com/api',
+                                            prefixIcon: const Icon(
+                                              YingjiIcons.link,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      YingjiMotionIconButton(
+                                        icon: YingjiIcons.checkmark_seal,
+                                        tooltip:
+                                            '测试 ${_danmakuApiNameControllers[index].text.trim().isEmpty ? '弹幕 API ${index + 1}' : _danmakuApiNameControllers[index].text.trim()}',
+                                        size: 38,
+                                        onPressed: _danmakuTesting
+                                            ? () {}
+                                            : () {
+                                                unawaited(
+                                                  _testDanmaku(
+                                                    _danmakuApiControllers[index]
+                                                        .text
+                                                        .trim(),
+                                                  ),
+                                                );
+                                              },
+                                      ),
+                                      if (_danmakuApiControllers.length >
+                                          1) ...[
+                                        const SizedBox(width: 8),
+                                        YingjiMotionIconButton(
+                                          icon: YingjiIcons.trash,
+                                          tooltip: '移除 API ${index + 1}',
+                                          size: 38,
+                                          onPressed: () => setState(() {
+                                            _danmakuApiControllers
+                                                .removeAt(index)
+                                                .dispose();
+                                            _danmakuApiNameControllers
+                                                .removeAt(index)
+                                                .dispose();
+                                          }),
+                                        ),
+                                      ],
+                                    ],
                                   ),
-                                  FilledButton.tonalIcon(
-                                    onPressed: _clearWatchHistory,
-                                    icon: const Icon(
-                                      YingjiIcons.clock,
-                                      size: 16,
-                                    ),
-                                    label: const Text('清空观看记录'),
-                                  ),
+                                  const SizedBox(height: 8),
                                 ],
-                              ),
-                              const SizedBox(height: 14),
-                              Text(
-                                _savedMessage ?? '本机缓存与观看记录',
-                                style: const TextStyle(
-                                  color: Color(0xFFABB1BE),
-                                  fontSize: 12,
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: YingjiMotionIconButton(
+                                    icon: YingjiIcons.plus,
+                                    tooltip: '添加弹幕 API',
+                                    size: 38,
+                                    onPressed: () => setState(() {
+                                      _danmakuApiControllers.add(
+                                        TextEditingController(),
+                                      );
+                                      _danmakuApiNameControllers.add(
+                                        TextEditingController(
+                                          text:
+                                              '弹幕 ${_danmakuApiControllers.length}',
+                                        ),
+                                      );
+                                    }),
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        _FrostSurface(
-                          key: _aboutKey,
-                          borderRadius: 22,
-                          child: Row(
-                            children: [
-                              const YingjiMark(size: 72),
-                              const SizedBox(width: 22),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                const SizedBox(height: 10),
+                                TextField(
+                                  controller: _danmakuToken,
+                                  obscureText: true,
+                                  decoration: const InputDecoration(
+                                    labelText: 'API Token（可选）',
+                                    hintText: '以 Bearer Token 方式发送',
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
                                   children: [
-                                    const Text(
-                                      '映迹',
-                                      style: TextStyle(
-                                        fontSize: 30,
-                                        fontWeight: FontWeight.w800,
-                                      ),
+                                    FilledButton.tonalIcon(
+                                      onPressed: _danmakuTesting
+                                          ? null
+                                          : _testDanmaku,
+                                      icon: _danmakuTesting
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              YingjiIcons.checkmark_seal,
+                                              size: 16,
+                                            ),
+                                      label: const Text('测试弹幕 API'),
                                     ),
-                                    const SizedBox(height: 6),
-                                    const Text(
-                                      '私人媒体中心',
-                                      style: TextStyle(
-                                        color: YingjiColors.muted,
+                                    if (_danmakuMessage != null) ...[
+                                      const SizedBox(width: 12),
+                                      Expanded(
+                                        child: Text(
+                                          _danmakuMessage!,
+                                          style: const TextStyle(
+                                            color: Color(0xFFABB1BE),
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                    const SizedBox(height: 12),
-                                    const Text(
-                                      '版本 3.1.56 · Windows · Flutter + libmpv',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: YingjiColors.muted,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    const Text('连接你的媒体，延续每一次观看。'),
+                                    ],
                                   ],
                                 ),
-                              ),
-                              YingjiMotionIconButton(
-                                icon: YingjiIcons.info_circle,
-                                tooltip: '关于与许可',
-                                onPressed: () => showAboutDialog(
-                                  context: context,
-                                  applicationName: '映迹',
-                                  applicationIcon: const YingjiMark(size: 56),
-                                  applicationVersion: '3.1.56',
-                                  applicationLegalese: '私人媒体中心 · 内置 libmpv',
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
-                      ],
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _maintenanceKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '维护与数据',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '清理仅影响本机缓存和观看记录，不会修改 Emby、Jellyfin 或 WebDAV 上的媒体。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                const SizedBox(height: 14),
+                                Wrap(
+                                  spacing: 10,
+                                  runSpacing: 10,
+                                  children: [
+                                    FilledButton.tonalIcon(
+                                      onPressed: _clearTmdbCache,
+                                      icon: const Icon(
+                                        YingjiIcons.trash,
+                                        size: 16,
+                                      ),
+                                      label: const Text('清理 TMDB 缓存'),
+                                    ),
+                                    FilledButton.tonalIcon(
+                                      onPressed: _clearWatchHistory,
+                                      icon: const Icon(
+                                        YingjiIcons.clock,
+                                        size: 16,
+                                      ),
+                                      label: const Text('清空观看记录'),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 14),
+                                Text(
+                                  _savedMessage ?? '本机缓存与观看记录',
+                                  style: const TextStyle(
+                                    color: Color(0xFFABB1BE),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _aboutKey,
+                            borderRadius: 22,
+                            child: Row(
+                              children: [
+                                const YingjiMark(size: 72),
+                                const SizedBox(width: 22),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        '映迹',
+                                        style: TextStyle(
+                                          fontSize: 30,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 6),
+                                      const Text(
+                                        '私人媒体中心',
+                                        style: TextStyle(
+                                          color: YingjiColors.muted,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                      const Text(
+                                        '版本 3.1.56 · Windows · Flutter + libmpv',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: YingjiColors.muted,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      const Text('连接你的媒体，延续每一次观看。'),
+                                    ],
+                                  ),
+                                ),
+                                YingjiMotionIconButton(
+                                  icon: YingjiIcons.info_circle,
+                                  tooltip: '关于与许可',
+                                  onPressed: () => showAboutDialog(
+                                    context: context,
+                                    applicationName: '映迹',
+                                    applicationIcon: const YingjiMark(size: 56),
+                                    applicationVersion: '3.1.56',
+                                    applicationLegalese: '私人媒体中心 · 内置 libmpv',
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -7465,6 +7650,8 @@ class _SourceCard extends StatefulWidget {
   const _SourceCard({
     required this.source,
     required this.stats,
+    required this.iconToken,
+    required this.onPickIcon,
     required this.offline,
     required this.onRemove,
     required this.onEdit,
@@ -7478,6 +7665,8 @@ class _SourceCard extends StatefulWidget {
   /// Locally cached library statistics supplied by the parent hub — the card
   /// itself never performs a network request on mount.
   final _CachedSourceStats? stats;
+  final String? iconToken;
+  final VoidCallback onPickIcon;
   final bool offline;
   final VoidCallback onRemove;
   final VoidCallback onEdit;
@@ -7572,12 +7761,6 @@ class _SourceCardState extends State<_SourceCard> {
   Widget build(BuildContext context) => YingjiGlassMenu(
     secondaryOnly: true,
     entries: [
-      MenuItemButton(
-        onPressed: widget.onEdit,
-        leadingIcon: const Icon(YingjiIcons.rectangle_stack, size: 16),
-        child: const Text('更换图标与线路'),
-      ),
-      const Divider(height: 12),
       for (final endpoint in widget.source.endpoints)
         MenuItemButton(
           onPressed: () {
@@ -7617,7 +7800,15 @@ class _SourceCardState extends State<_SourceCard> {
             return Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _ServerMark(source: widget.source, size: 54),
+                InkWell(
+                  onTap: widget.onPickIcon,
+                  borderRadius: BorderRadius.circular(16),
+                  child: _ServerMark(
+                    source: widget.source,
+                    token: widget.iconToken,
+                    size: 54,
+                  ),
+                ),
                 const SizedBox(width: 13),
                 Expanded(
                   child: Column(
@@ -7718,9 +7909,334 @@ class _SourceCardState extends State<_SourceCard> {
   );
 }
 
-class _ServerMark extends StatelessWidget {
-  const _ServerMark({required this.source, this.size = 42});
+class _IconPackEntry {
+  const _IconPackEntry({required this.name, required this.url});
+  final String name;
+  final String url;
+}
+
+class _ServerIconDialog extends StatefulWidget {
+  const _ServerIconDialog({required this.source, required this.token});
   final MediaSource source;
+  final String token;
+
+  @override
+  State<_ServerIconDialog> createState() => _ServerIconDialogState();
+}
+
+class _ServerIconDialogState extends State<_ServerIconDialog> {
+  final _packUrl = TextEditingController();
+  final _query = TextEditingController();
+  List<_IconPackEntry> _icons = const [];
+  List<String> _packs = const [];
+  bool _loading = false;
+  String? _message;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPacks();
+    _query.addListener(() => setState(() {}));
+  }
+
+  Future<void> _loadPacks() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(
+      () =>
+          _packs = prefs.getStringList('yingji.server.icon-packs') ?? const [],
+    );
+  }
+
+  Future<List<_IconPackEntry>> _readPack(String value) async {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null || !['http', 'https'].contains(uri.scheme)) {
+      throw Exception('图标包链接无效');
+    }
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client.getUrl(uri);
+      final response = await request.close().timeout(
+        const Duration(seconds: 12),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('图标包读取失败（HTTP ${response.statusCode}）');
+      }
+      final raw = await utf8.decoder.bind(response).join();
+      final data = jsonDecode(raw);
+      final List<dynamic> rows;
+      if (data is List) {
+        rows = data;
+      } else if (data is Map<String, dynamic>) {
+        rows = data['icons'] is List
+            ? List<dynamic>.from(data['icons'] as List)
+            : List<dynamic>.from(data.entries);
+      } else {
+        rows = const [];
+      }
+      final result = <_IconPackEntry>[];
+      for (final row in rows) {
+        String? name;
+        String? url;
+        if (row is MapEntry) {
+          name = '${row.key}';
+          url = '${row.value}';
+        } else if (row is Map) {
+          name = '${row['name'] ?? row['title'] ?? row['slug'] ?? '未命名图标'}';
+          final candidate =
+              row['url'] ?? row['icon'] ?? row['logo'] ?? row['src'];
+          if (candidate != null) url = '$candidate';
+        }
+        final iconUri = Uri.tryParse(url ?? '');
+        if (name != null && iconUri != null && iconUri.hasScheme) {
+          result.add(_IconPackEntry(name: name, url: iconUri.toString()));
+        }
+      }
+      if (result.isEmpty) throw Exception('图标包中没有可用图标');
+      return result;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _addPack() async {
+    if (_loading) return;
+    setState(() {
+      _loading = true;
+      _message = null;
+    });
+    try {
+      final value = _packUrl.text.trim();
+      final icons = await _readPack(value);
+      final prefs = await SharedPreferences.getInstance();
+      final packs = {..._packs, value}.toList(growable: false);
+      await prefs.setStringList('yingji.server.icon-packs', packs);
+      if (mounted) {
+        setState(() {
+          _packs = packs;
+          _icons = icons;
+          _message = '已加载 ${icons.length} 个图标';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _message = error.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _selectPack(String value) async {
+    if (_loading) return;
+    setState(() {
+      _loading = true;
+      _packUrl.text = value;
+      _message = null;
+    });
+    try {
+      final icons = await _readPack(value);
+      if (mounted) {
+        setState(() {
+          _icons = icons;
+          _message = '已加载 ${icons.length} 个图标';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _message = error.toString().replaceFirst('Exception: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _packUrl.dispose();
+    _query.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filter = _query.text.trim().toLowerCase();
+    final icons = _icons
+        .where(
+          (icon) => filter.isEmpty || icon.name.toLowerCase().contains(filter),
+        )
+        .toList(growable: false);
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 760, maxHeight: 680),
+        child: GlassPanel(
+          radius: 22,
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  _ServerMark(
+                    source: widget.source,
+                    token: widget.token,
+                    size: 48,
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      '服务器图标',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                  YingjiMotionIconButton(
+                    icon: YingjiIcons.xmark,
+                    tooltip: '关闭',
+                    size: 38,
+                    onPressed: () {
+                      Navigator.pop(context);
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _packUrl,
+                      keyboardType: TextInputType.url,
+                      decoration: const InputDecoration(
+                        labelText: '图标包 JSON 链接',
+                        hintText: 'https://example.com/icons.json',
+                        prefixIcon: Icon(YingjiIcons.link),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  YingjiMotionIconButton(
+                    icon: YingjiIcons.plus,
+                    tooltip: '获取图标包',
+                    size: 42,
+                    onPressed: _loading
+                        ? () {}
+                        : () {
+                            unawaited(_addPack());
+                          },
+                  ),
+                ],
+              ),
+              if (_packs.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final pack in _packs)
+                      ActionChip(
+                        label: Text(
+                          Uri.tryParse(pack)?.host.isNotEmpty == true
+                              ? Uri.parse(pack).host
+                              : pack,
+                        ),
+                        onPressed: () {
+                          unawaited(_selectPack(pack));
+                        },
+                      ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _message ?? '可添加多条 JSON 图标包链接；已保存 ${_packs.length} 个图标包。',
+                      style: const TextStyle(
+                        color: YingjiColors.muted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, ''),
+                    child: const Text('使用自动图标'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _query,
+                decoration: const InputDecoration(
+                  labelText: '搜索图标',
+                  prefixIcon: Icon(YingjiIcons.search),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: _loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : icons.isEmpty
+                    ? const Center(child: Text('添加图标包后，可在这里搜索并替换服务器图标。'))
+                    : GridView.builder(
+                        gridDelegate:
+                            const SliverGridDelegateWithMaxCrossAxisExtent(
+                              maxCrossAxisExtent: 118,
+                              mainAxisSpacing: 10,
+                              crossAxisSpacing: 10,
+                              childAspectRatio: .88,
+                            ),
+                        itemCount: icons.length,
+                        itemBuilder: (context, index) {
+                          final icon = icons[index];
+                          return InkWell(
+                            onTap: () => Navigator.pop(context, icon.url),
+                            borderRadius: BorderRadius.circular(14),
+                            child: _FrostSurface(
+                              borderRadius: 14,
+                              padding: const EdgeInsets.all(9),
+                              child: Column(
+                                children: [
+                                  Expanded(
+                                    child: Image.network(
+                                      icon.url,
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    icon.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 11),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ServerMark extends StatelessWidget {
+  const _ServerMark({required this.source, this.token, this.size = 42});
+  final MediaSource source;
+  final String? token;
   final double size;
 
   @override
@@ -7756,6 +8272,12 @@ class _ServerMark extends StatelessWidget {
               borderRadius: BorderRadius.circular(size * .29),
               child: Image.network(
                 customIcon.toString(),
+                headers:
+                    customIcon.host == source.endpoint.host &&
+                        token != null &&
+                        token!.isNotEmpty
+                    ? {'X-Emby-Token': token!}
+                    : null,
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
               ),

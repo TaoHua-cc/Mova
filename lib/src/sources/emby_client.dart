@@ -574,6 +574,7 @@ class EmbyClient {
                     'IncludeItemTypes': type,
                     'Recursive': 'true',
                     'Limit': '0',
+                    'EnableTotalRecordCount': 'true',
                     'Fields': 'Id',
                     'api_key': session.token,
                   },
@@ -591,11 +592,13 @@ class EmbyClient {
       return (data['TotalRecordCount'] as num?)?.toInt() ?? 0;
     }
 
-    final counts = await Future.wait([
-      count('Movie'),
-      count('Series'),
-      count('Episode'),
-    ]);
+    // Some reverse proxies throttle simultaneous `/Items` requests. Keep this
+    // small probe sequential so all three totals are populated reliably.
+    final counts = [
+      await count('Movie'),
+      await count('Series'),
+      await count('Episode'),
+    ];
     stopwatch.stop();
     return EmbyLibraryStats(
       movieCount: counts[0],
@@ -648,10 +651,19 @@ class EmbyClient {
   /// Performs a small authenticated request so the source page can distinguish
   /// a bad endpoint/token from an empty library.
   Future<void> checkConnection(EmbySession session) async {
+    final userId = session.source.userId;
+    if (userId == null || userId.isEmpty) {
+      throw Exception('媒体服务器登录信息缺少用户 ID');
+    }
     final response = await _client
         .get(
-          session.source.endpoint.resolve('System/Info/Public'),
-          headers: const {'Accept': 'application/json'},
+          session.source.endpoint
+              .resolve('Users/$userId')
+              .replace(queryParameters: {'api_key': session.token}),
+          headers: {
+            'Accept': 'application/json',
+            'X-Emby-Token': session.token,
+          },
         )
         .timeout(const Duration(seconds: 15));
     if (response.statusCode < 200 || response.statusCode >= 300) {
