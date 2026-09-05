@@ -2899,44 +2899,59 @@ class _SourceHubState extends State<_SourceHub> {
               EmbySession(source: source, token: token),
             )).source;
             // 1) Verify reachability and refresh the server identity.
-            final identity = await client.serverIdentity(current);
-            final endpoints = <Uri>{
-              ...source.endpoints,
-              ...identity.discoveredEndpoints,
-            };
-            if (identity.name != source.name ||
-                identity.id != (source.serverId ?? source.id) ||
-                identity.endpoint != source.endpoint ||
-                endpoints.length != source.endpoints.length) {
-              current = MediaSource(
-                id: source.id,
-                name: identity.name,
-                kind: source.kind,
-                endpoint: identity.endpoint,
-                userId: source.userId,
-                serverId: identity.id,
-                alternateEndpoints: endpoints
-                    .where((value) => value != identity.endpoint)
-                    .toList(growable: false),
-                iconUrl: source.iconUrl,
+            try {
+              final identity = await client.serverIdentity(
+                current,
+                token: token,
               );
-              await store.upsert(current, token);
+              final endpoints = <Uri>{
+                ...source.endpoints,
+                ...identity.discoveredEndpoints,
+              };
+              if (identity.name != source.name ||
+                  identity.id != (source.serverId ?? source.id) ||
+                  identity.endpoint != source.endpoint ||
+                  endpoints.length != source.endpoints.length) {
+                current = MediaSource(
+                  id: source.id,
+                  name: identity.name,
+                  kind: source.kind,
+                  endpoint: identity.endpoint,
+                  userId: source.userId,
+                  serverId: identity.id,
+                  alternateEndpoints: endpoints
+                      .where((value) => value != identity.endpoint)
+                      .toList(growable: false),
+                  iconUrl: source.iconUrl,
+                );
+                await store.upsert(current, token);
+              }
+            } catch (_) {
+              // An authenticated media session can work when info is private.
             }
             // 2) Refresh the cached library statistics.
-            final library = await client.libraryStats(
-              EmbySession(source: current, token: token),
-            );
-            final cached = _CachedSourceStats(
-              movieCount: library.movieCount,
-              seriesCount: library.seriesCount,
-              episodeCount: library.episodeCount,
-              latencyMs: library.latency.inMilliseconds,
-              checkedAt: now,
-            );
-            stats[current.id] = cached;
-            await store.saveStats(current.id, jsonEncode(cached.toJson()));
+            try {
+              final library = await client.libraryStats(
+                EmbySession(source: current, token: token),
+              );
+              final cached = _CachedSourceStats(
+                movieCount: library.movieCount,
+                seriesCount: library.seriesCount,
+                episodeCount: library.episodeCount,
+                latencyMs: library.latency.inMilliseconds,
+                checkedAt: now,
+              );
+              stats[current.id] = cached;
+              await store.saveStats(current.id, jsonEncode(cached.toJson()));
+            } catch (_) {
+              // Statistics permissions do not determine connection status.
+            }
             // 3) Discover a server icon once, when none is stored yet.
-            updated[index] = await _discoverServerIcon(store, current, token);
+            try {
+              updated[index] = await _discoverServerIcon(store, current, token);
+            } catch (_) {
+              updated[index] = current;
+            }
           } catch (_) {
             offline.add(source.id);
           } finally {
@@ -3109,7 +3124,10 @@ class _SourceHubState extends State<_SourceHub> {
           final resolved = await client.resolveSession(
             EmbySession(source: source, token: token),
           );
-          final identity = await client.serverIdentity(resolved.source);
+          final identity = await client.serverIdentity(
+            resolved.source,
+            token: token,
+          );
           final tested = MediaSource(
             id: source.id,
             name: identity.name,
@@ -3420,6 +3438,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
               userId: existing.userId,
               serverId: existing.serverId,
             ),
+            token: token,
           );
           final available = <Uri>{
             endpoint,
@@ -3498,6 +3517,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
               userId: session.source.userId,
               serverId: session.source.serverId,
             ),
+            token: session.token,
           );
           final allEndpoints = <Uri>{
             endpoint,

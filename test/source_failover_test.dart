@@ -86,4 +86,32 @@ void main() {
     );
     client.dispose();
   });
+
+  test('server identity uses the saved login before public info', () async {
+    final client = EmbyClient(
+      client: MockClient((request) async {
+        expect(request.url.path, '/System/Info');
+        expect(request.headers['X-Emby-Token'], 'token');
+        return http.Response(
+          jsonEncode({'ServerName': 'Private server', 'Id': 'server-1'}),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    final identity = await client.serverIdentity(
+      MediaSource(
+        id: 'source-1',
+        name: 'Old name',
+        kind: SourceKind.emby,
+        endpoint: Uri.parse('https://online.example/'),
+      ),
+      token: 'token',
+    );
+
+    expect(identity.name, 'Private server');
+    expect(identity.id, 'server-1');
+    client.dispose();
+  });
 }

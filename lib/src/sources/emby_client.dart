@@ -187,43 +187,57 @@ class EmbyClient {
   Future<
     ({String name, String id, Uri endpoint, List<Uri> discoveredEndpoints})
   >
-  serverIdentity(MediaSource source) async {
+  serverIdentity(MediaSource source, {String? token}) async {
     Object? lastError;
     for (final endpoint in source.endpoints) {
-      try {
-        final base = _base(endpoint);
-        final response = await _client
-            .get(
-              base.resolve('System/Info/Public'),
-              headers: const {'Accept': 'application/json'},
-            )
-            .timeout(const Duration(seconds: 10));
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          lastError = Exception(_message(response.statusCode, '服务器信息读取失败'));
-          continue;
-        }
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final name = '${data['ServerName'] ?? data['Name'] ?? source.name}'
-            .trim();
-        final id = '${data['Id'] ?? source.serverId ?? source.id}'.trim();
-        final discovered = <Uri>[];
-        for (final value in [data['LocalAddress'], data['WanAddress']]) {
-          final candidate = Uri.tryParse('${value ?? ''}'.trim());
-          if (candidate != null &&
-              ['http', 'https'].contains(candidate.scheme) &&
-              candidate.host.isNotEmpty) {
-            final normalized = _base(candidate);
-            if (!discovered.contains(normalized)) discovered.add(normalized);
+      final base = _base(endpoint);
+      for (final path in [
+        if (token != null && token.isNotEmpty) 'System/Info',
+        'System/Info/Public',
+      ]) {
+        try {
+          final response = await _client
+              .get(
+                base
+                    .resolve(path)
+                    .replace(
+                      queryParameters: token == null || token.isEmpty
+                          ? null
+                          : {'api_key': token},
+                    ),
+                headers: {
+                  'Accept': 'application/json',
+                  if (token != null && token.isNotEmpty) 'X-Emby-Token': token,
+                },
+              )
+              .timeout(const Duration(seconds: 10));
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            lastError = Exception(_message(response.statusCode, '服务器信息读取失败'));
+            continue;
           }
+          final data = jsonDecode(response.body) as Map<String, dynamic>;
+          final name = '${data['ServerName'] ?? data['Name'] ?? source.name}'
+              .trim();
+          final id = '${data['Id'] ?? source.serverId ?? source.id}'.trim();
+          final discovered = <Uri>[];
+          for (final value in [data['LocalAddress'], data['WanAddress']]) {
+            final candidate = Uri.tryParse('${value ?? ''}'.trim());
+            if (candidate != null &&
+                ['http', 'https'].contains(candidate.scheme) &&
+                candidate.host.isNotEmpty) {
+              final normalized = _base(candidate);
+              if (!discovered.contains(normalized)) discovered.add(normalized);
+            }
+          }
+          return (
+            name: name.isEmpty ? source.name : name,
+            id: id.isEmpty ? source.id : id,
+            endpoint: base,
+            discoveredEndpoints: discovered,
+          );
+        } catch (error) {
+          lastError = error;
         }
-        return (
-          name: name.isEmpty ? source.name : name,
-          id: id.isEmpty ? source.id : id,
-          endpoint: base,
-          discoveredEndpoints: discovered,
-        );
-      } catch (error) {
-        lastError = error;
       }
     }
     throw Exception(
