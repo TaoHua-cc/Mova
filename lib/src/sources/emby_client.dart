@@ -134,22 +134,103 @@ class EmbyClient {
   EmbyClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
 
-  Future<({String name, String id})> serverIdentity(MediaSource source) async {
-    final response = await _client
-        .get(
-          _base(source.endpoint).resolve('System/Info/Public'),
-          headers: const {'Accept': 'application/json'},
-        )
-        .timeout(const Duration(seconds: 10));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(_message(response.statusCode, '服务器信息读取失败'));
+  /// Selects the first line that accepts this saved login, not merely the
+  /// first reverse proxy that answers a public health request.
+  Future<EmbySession> resolveSession(EmbySession session) async {
+    final userId = session.source.userId;
+    if (userId == null || userId.isEmpty) {
+      throw Exception('媒体服务器登录信息缺少用户 ID');
     }
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final name = '${data['ServerName'] ?? data['Name'] ?? source.name}'.trim();
-    final id = '${data['Id'] ?? source.serverId ?? source.id}'.trim();
-    return (
-      name: name.isEmpty ? source.name : name,
-      id: id.isEmpty ? source.id : id,
+    Object? lastError;
+    for (final endpoint in session.source.endpoints) {
+      try {
+        final base = _base(endpoint);
+        final response = await _client
+            .get(
+              base
+                  .resolve('Users/$userId')
+                  .replace(queryParameters: {'api_key': session.token}),
+              headers: {
+                'Accept': 'application/json',
+                'X-Emby-Token': session.token,
+              },
+            )
+            .timeout(const Duration(seconds: 10));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          lastError = Exception(_message(response.statusCode, '服务器登录验证失败'));
+          continue;
+        }
+        return EmbySession(
+          token: session.token,
+          source: MediaSource(
+            id: session.source.id,
+            name: session.source.name,
+            kind: session.source.kind,
+            endpoint: base,
+            userId: userId,
+            serverId: session.source.serverId,
+            alternateEndpoints: session.source.endpoints
+                .where((value) => value != endpoint)
+                .toList(growable: false),
+            iconUrl: session.source.iconUrl,
+          ),
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw Exception(
+      lastError?.toString().replaceFirst('Exception: ', '') ?? '所有服务器线路均无法验证登录',
+    );
+  }
+
+  Future<
+    ({String name, String id, Uri endpoint, List<Uri> discoveredEndpoints})
+  >
+  serverIdentity(MediaSource source) async {
+    Object? lastError;
+    for (final endpoint in source.endpoints) {
+      try {
+        final base = _base(endpoint);
+        final response = await _client
+            .get(
+              base.resolve('System/Info/Public'),
+              headers: const {'Accept': 'application/json'},
+            )
+            .timeout(const Duration(seconds: 10));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          lastError = Exception(_message(response.statusCode, '服务器信息读取失败'));
+          continue;
+        }
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final name = '${data['ServerName'] ?? data['Name'] ?? source.name}'
+            .trim();
+        final id = '${data['Id'] ?? source.serverId ?? source.id}'.trim();
+        final discovered = <Uri>[];
+        for (final value in [data['LocalAddress'], data['WanAddress']]) {
+          final candidate = Uri.tryParse('${value ?? ''}'.trim());
+          if (candidate != null &&
+              ['http', 'https'].contains(candidate.scheme) &&
+              candidate.host.isNotEmpty) {
+            final normalized = _base(candidate);
+            if (!discovered.contains(normalized)) discovered.add(normalized);
+          }
+        }
+        return (
+          name: name.isEmpty ? source.name : name,
+          id: id.isEmpty ? source.id : id,
+          endpoint: base,
+          discoveredEndpoints: discovered,
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw Exception(
+      lastError?.toString().replaceFirst('Exception: ', '').trim().isNotEmpty ==
+              true
+          ? lastError.toString().replaceFirst('Exception: ', '')
+          : '所有服务器线路均无法连接',
     );
   }
 

@@ -29,12 +29,36 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
 
   Future<List<MediaItem>> _load() async {
     final store = await SourceStore.create();
-    final token = store.tokenFor(widget.source);
+    final saved = store.load().where((row) => row.id == widget.source.id);
+    var source = saved.isEmpty ? widget.source : saved.first;
+    final token = store.tokenFor(source);
     if (token == null || token.isEmpty) throw Exception('未找到服务器登录令牌');
     final client = EmbyClient();
     try {
+      final resolved = await client.resolveSession(
+        EmbySession(source: source, token: token),
+      );
+      source = resolved.source;
+      final identity = await client.serverIdentity(source);
+      final endpoints = <Uri>{
+        ...source.endpoints,
+        ...identity.discoveredEndpoints,
+      };
+      source = MediaSource(
+        id: source.id,
+        name: identity.name,
+        kind: source.kind,
+        endpoint: identity.endpoint,
+        userId: source.userId,
+        serverId: identity.id,
+        alternateEndpoints: endpoints
+            .where((value) => value != identity.endpoint)
+            .toList(growable: false),
+        iconUrl: source.iconUrl,
+      );
+      await store.upsert(source, token);
       return await client.browse(
-        EmbySession(source: widget.source, token: token),
+        EmbySession(source: source, token: token),
         parentId: _parentId,
       );
     } finally {
@@ -96,9 +120,10 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
             child: Padding(
               padding: const EdgeInsets.all(24),
               child: _SourceFailure(
-                message: snapshot.error
-                    .toString()
-                    .replaceFirst('Exception: ', ''),
+                message: snapshot.error.toString().replaceFirst(
+                  'Exception: ',
+                  '',
+                ),
                 onRetry: () => setState(() => _items = _load()),
               ),
             ),
@@ -106,19 +131,123 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
         }
         final items = snapshot.data ?? const <MediaItem>[];
         if (items.isEmpty) return const Center(child: Text('此目录没有内容'));
-        return GridView.builder(
-          padding: const EdgeInsets.fromLTRB(42, 18, 42, 48),
-          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: 220,
-            mainAxisExtent: 310,
-            crossAxisSpacing: 18,
-            mainAxisSpacing: 22,
-          ),
-          itemCount: items.length,
-          itemBuilder: (_, index) => _SourceMediaCard(
-            item: items[index],
-            onOpen: () => _open(items[index]),
-          ),
+        final folders = items
+            .where(
+              (item) =>
+                  item.isContainer &&
+                  item.type != 'Series' &&
+                  item.type != 'Season',
+            )
+            .toList();
+        final shows = items.where((item) => item.type == 'Series').toList();
+        final seasons = items.where((item) => item.type == 'Season').toList();
+        final movies = items
+            .where((item) => !item.isContainer && item.type == 'Movie')
+            .toList();
+        final other = items
+            .where(
+              (item) =>
+                  item.type != 'Series' &&
+                  item.type != 'Movie' &&
+                  item.type != 'Season' &&
+                  !folders.contains(item),
+            )
+            .toList();
+        final groups = <(String, String, List<MediaItem>)>[
+          ('媒体库', '按服务器目录进入分类内容', folders),
+          ('剧集', '${shows.length} 部剧集', shows),
+          ('季', '${seasons.length} 季', seasons),
+          ('电影', '${movies.length} 部电影', movies),
+          ('其他内容', '${other.length} 项', other),
+        ].where((group) => group.$3.isNotEmpty).toList();
+        return CustomScrollView(
+          slivers: [
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(42, 18, 42, 10),
+              sliver: SliverToBoxAdapter(
+                child: GlassPanel(
+                  radius: 16,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 14,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(YingjiIcons.server, size: 22),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              widget.source.name,
+                              style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              '${widget.source.kindLabel} · ${groups.length} 个内容分组 · ${items.length} 项',
+                              style: const TextStyle(
+                                color: YingjiColors.muted,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            for (final group in groups) ...[
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(42, 24, 42, 12),
+                sliver: SliverToBoxAdapter(
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          group.$1,
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        group.$2,
+                        style: const TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(42, 0, 42, 26),
+                sliver: SliverGrid(
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 220,
+                    mainAxisExtent: 310,
+                    crossAxisSpacing: 18,
+                    mainAxisSpacing: 22,
+                  ),
+                  delegate: SliverChildBuilderDelegate(
+                    (_, index) => _SourceMediaCard(
+                      item: group.$3[index],
+                      onOpen: () => _open(group.$3[index]),
+                    ),
+                    childCount: group.$3.length,
+                  ),
+                ),
+              ),
+            ],
+          ],
         );
       },
     ),

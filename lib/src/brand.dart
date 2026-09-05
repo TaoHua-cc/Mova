@@ -203,6 +203,7 @@ abstract final class YingjiIcons {
   static const gauge = Iconsax.speedometer;
   static const wifi = Iconsax.wifi;
   static const captions_bubble = Iconsax.subtitle;
+  static const danmaku = Iconsax.message_text;
   static const bookmark = Iconsax.bookmark;
   static const clock = Iconsax.clock;
   static const person = Iconsax.user;
@@ -331,21 +332,11 @@ class YingjiGlassChoiceButton<T> extends StatelessWidget {
   final IconData icon;
 
   @override
-  Widget build(BuildContext context) => PopupMenuButton<T>(
-    tooltip: labelBuilder(value),
-    color: YingjiGlass.chrome(strength: 1.2),
-    elevation: 16,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(16),
-      side: BorderSide(color: YingjiGlass.line()),
-    ),
-    offset: const Offset(0, 42),
-    onSelected: onChanged,
-    itemBuilder: (context) => items
+  Widget build(BuildContext context) => YingjiGlassMenu(
+    entries: items
         .map(
-          (item) => PopupMenuItem<T>(
-            value: item,
-            height: 42,
+          (item) => MenuItemButton(
+            onPressed: () => onChanged(item),
             child: Row(
               children: [
                 Expanded(
@@ -386,6 +377,130 @@ class YingjiGlassChoiceButton<T> extends StatelessWidget {
         ),
       ),
     ),
+  );
+}
+
+/// One clipped backdrop for the whole menu, including scrolling menus.
+/// MenuAnchor retains native keyboard traversal, Escape and edge placement.
+class YingjiGlassMenu extends StatelessWidget {
+  const YingjiGlassMenu({
+    super.key,
+    required this.entries,
+    required this.child,
+    this.secondaryOnly = false,
+    this.onOpen,
+    this.onClose,
+  });
+  final List<Widget> entries;
+  final Widget child;
+  final bool secondaryOnly;
+  final VoidCallback? onOpen;
+  final VoidCallback? onClose;
+
+  @override
+  Widget build(BuildContext context) => MenuAnchor(
+    onOpen: onOpen,
+    onClose: onClose,
+    style: const MenuStyle(
+      backgroundColor: WidgetStatePropertyAll(Colors.transparent),
+      surfaceTintColor: WidgetStatePropertyAll(Colors.transparent),
+      elevation: WidgetStatePropertyAll(0),
+      padding: WidgetStatePropertyAll(EdgeInsets.zero),
+    ),
+    menuChildren: [
+      ListenableBuilder(
+        listenable: yingjiAppearance,
+        builder: (context, _) => GlassPanel(
+          padding: const EdgeInsets.all(6),
+          radius: 16,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minWidth: 200,
+              maxWidth: 360,
+              maxHeight: MediaQuery.sizeOf(context).height * .65,
+            ),
+            child: SingleChildScrollView(
+              primary: false,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: entries,
+              ),
+            ),
+          ),
+        ),
+      ),
+    ],
+    builder: (context, controller, _) => InkWell(
+      borderRadius: BorderRadius.circular(13),
+      onSecondaryTapUp: secondaryOnly
+          ? (details) => controller.open(position: details.localPosition)
+          : null,
+      onTap: secondaryOnly
+          ? null
+          : () => controller.isOpen ? controller.close() : controller.open(),
+      child: child,
+    ),
+  );
+}
+
+/// Adapter for legacy form selectors; all options use the shared glass menu.
+class YingjiGlassDropdownField<T> extends StatelessWidget {
+  const YingjiGlassDropdownField({
+    super.key,
+    required this.initialValue,
+    required this.decoration,
+    required this.items,
+    required this.onChanged,
+  });
+  final T initialValue;
+  final InputDecoration decoration;
+  final List<DropdownMenuItem<T>> items;
+  final ValueChanged<T?> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(
+        decoration.labelText ?? '',
+        style: const TextStyle(fontWeight: FontWeight.w700),
+      ),
+      if (decoration.helperText != null)
+        Text(
+          decoration.helperText!,
+          style: const TextStyle(fontSize: 12, color: YingjiColors.muted),
+        ),
+      const SizedBox(height: 9),
+      YingjiGlassMenu(
+        entries: [
+          for (final item in items)
+            MenuItemButton(
+              onPressed: item.enabled ? () => onChanged(item.value) : null,
+              trailingIcon: item.value == initialValue
+                  ? const Icon(YingjiIcons.checkmark_circle_fill, size: 16)
+                  : null,
+              child: item.child,
+            ),
+        ],
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              items
+                  .firstWhere(
+                    (item) => item.value == initialValue,
+                    orElse: () => items.first,
+                  )
+                  .child,
+              const SizedBox(width: 12),
+              const Icon(YingjiIcons.chevron_down, size: 16),
+            ],
+          ),
+        ),
+      ),
+    ],
   );
 }
 
@@ -551,8 +666,8 @@ class GlassPanel extends StatelessWidget {
     borderRadius: BorderRadius.circular(radius),
     child: BackdropFilter(
       filter: ImageFilter.blur(
-        sigmaX: YingjiGlass.blur + 4,
-        sigmaY: YingjiGlass.blur + 4,
+        sigmaX: YingjiGlass.blur,
+        sigmaY: YingjiGlass.blur,
       ),
       child: DecoratedBox(
         decoration: BoxDecoration(
@@ -718,7 +833,14 @@ class YingjiPageChrome extends StatelessWidget {
 /// physics as the rest of Yingji instead of mixing native caption glyphs with
 /// application controls.
 class YingjiWindowControls extends StatefulWidget {
-  const YingjiWindowControls({super.key});
+  const YingjiWindowControls({
+    super.key,
+    this.onClose,
+    this.fullscreen = false,
+  });
+
+  final VoidCallback? onClose;
+  final bool fullscreen;
 
   @override
   State<YingjiWindowControls> createState() => _YingjiWindowControlsState();
@@ -728,6 +850,12 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
   bool _maximized = false;
 
   Future<void> _toggleMaximize() async {
+    if (widget.fullscreen) {
+      final active = await windowManager.isFullScreen();
+      await windowManager.setFullScreen(!active);
+      if (mounted) setState(() => _maximized = !active);
+      return;
+    }
     final maximized = await windowManager.isMaximized();
     if (maximized) {
       await windowManager.unmaximize();
@@ -750,7 +878,9 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
       const SizedBox(width: 7),
       YingjiMotionIconButton(
         icon: _maximized ? YingjiIcons.rectangle_stack : YingjiIcons.square,
-        tooltip: _maximized ? '还原' : '最大化',
+        tooltip: widget.fullscreen
+            ? (_maximized ? '退出全屏' : '全屏')
+            : (_maximized ? '还原' : '最大化'),
         size: 38,
         onPressed: _toggleMaximize,
       ),
@@ -759,7 +889,7 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
         icon: YingjiIcons.xmark,
         tooltip: '关闭',
         size: 38,
-        onPressed: windowManager.close,
+        onPressed: widget.onClose ?? windowManager.close,
       ),
     ],
   );

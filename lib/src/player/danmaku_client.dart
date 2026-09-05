@@ -32,6 +32,8 @@ class DanmakuClient {
   DanmakuClient({http.Client? client})
     : _client = client ?? createNetworkHttpClient();
   final http.Client _client;
+  Uri? commentEndpoint;
+  String? matchedEpisode;
 
   Future<List<DanmakuComment>> fetch({
     required String template,
@@ -152,6 +154,12 @@ class DanmakuClient {
       throw Exception('未找到与“$fileName”匹配的弹幕');
     }
     final episodeId = '${(matches.first as Map)['episodeId'] ?? ''}'.trim();
+    final matched = matches.first as Map;
+    matchedEpisode = [
+      matched['animeTitle'],
+      matched['episodeTitle'],
+      if (episodeId.isNotEmpty) 'ID $episodeId',
+    ].where((value) => value != null && '$value'.trim().isNotEmpty).join(' · ');
     if (episodeId.isEmpty) throw Exception('弹幕匹配结果缺少 episodeId');
     final uri = Uri.parse(
       '$baseUrl/api/v2/comment/${Uri.encodeComponent(episodeId)}?format=json',
@@ -160,6 +168,7 @@ class DanmakuClient {
   }
 
   Future<dynamic> _getJson(Uri uri, Map<String, String> headers) async {
+    commentEndpoint = uri;
     final response = await _client
         .get(uri, headers: headers)
         .timeout(const Duration(seconds: 15));

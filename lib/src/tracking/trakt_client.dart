@@ -10,6 +10,9 @@ class TraktEvent {
     this.posterUrl,
     this.platform,
     this.timeKnown = true,
+    this.tmdbId,
+    this.seasonNumber,
+    this.episodeNumber,
   });
   final String title;
   final String episode;
@@ -19,6 +22,9 @@ class TraktEvent {
   /// Trakt supplies the show's broadcast network when it is known.
   final String? platform;
   final bool timeKnown;
+  final int? tmdbId;
+  final int? seasonNumber;
+  final int? episodeNumber;
 
   Map<String, dynamic> toJson() => {
     'title': title,
@@ -27,6 +33,9 @@ class TraktEvent {
     'posterUrl': posterUrl?.toString(),
     'platform': platform,
     'timeKnown': timeKnown,
+    'tmdbId': tmdbId,
+    'seasonNumber': seasonNumber,
+    'episodeNumber': episodeNumber,
   };
 
   factory TraktEvent.fromJson(Map<String, dynamic> value) => TraktEvent(
@@ -38,6 +47,9 @@ class TraktEvent {
         : Uri.tryParse('${value['posterUrl']}'),
     platform: value['platform'] as String?,
     timeKnown: value['timeKnown'] != false,
+    tmdbId: (value['tmdbId'] as num?)?.toInt(),
+    seasonNumber: (value['seasonNumber'] as num?)?.toInt(),
+    episodeNumber: (value['episodeNumber'] as num?)?.toInt(),
   );
 }
 
@@ -124,7 +136,7 @@ class TraktClient {
     final response = await _client
         .get(
           Uri.parse(
-            'https://api.trakt.tv/calendars/my/shows/$day/14?extended=full',
+            'https://api.trakt.tv/calendars/my/shows/$day/31?extended=full',
           ),
           headers: {
             'Authorization': 'Bearer ${accessToken.trim()}',
@@ -141,6 +153,9 @@ class TraktClient {
     final data = jsonDecode(response.body) as List<dynamic>;
     return data
         .whereType<Map<String, dynamic>>()
+        .where(
+          (item) => DateTime.tryParse('${item['first_aired'] ?? ''}') != null,
+        )
         .map((item) {
           final show = item['show'] as Map<String, dynamic>? ?? const {};
           final episode = item['episode'] as Map<String, dynamic>? ?? const {};
@@ -149,6 +164,11 @@ class TraktClient {
               ? image['full'] as String?
               : null;
           return TraktEvent(
+            tmdbId: ((show['ids'] as Map?)?['tmdb'] as num?)?.toInt(),
+            seasonNumber: (episode['season'] as num?)?.toInt(),
+            episodeNumber: (episode['number'] as num?)?.toInt(),
+            timeKnown: RegExp(r'(Z|[+-]\d{2}:\d{2})$')
+                .hasMatch('${item['first_aired']}'),
             title: '${show['title'] ?? '未命名剧集'}',
             episode:
                 '第 ${episode['season'] ?? 0} 季 · 第 ${episode['number'] ?? 0} 集 · ${episode['title'] ?? ''}',

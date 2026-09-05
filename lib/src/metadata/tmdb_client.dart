@@ -167,16 +167,67 @@ class TmdbUpcomingEpisode {
     required this.airDate,
     this.network,
     this.stillPath,
+    this.timeKnown = false,
+    this.source = 'TMDB',
   });
   final int seasonNumber;
   final int episodeNumber;
   final String title;
   final DateTime airDate;
+  final bool timeKnown;
+  final String source;
   final String? network;
   final String? stillPath;
   Uri? get stillUrl => stillPath == null
       ? null
       : Uri.parse('https://image.tmdb.org/t/p/w780$stillPath');
+}
+
+List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
+  dynamic episodes,
+  Map show,
+  DateTime now, {
+  DateTime? until,
+}) {
+  if (episodes is! List) return const [];
+  final candidates = <TmdbUpcomingEpisode>[];
+  for (final row in episodes.whereType<Map>()) {
+    final stamp = '${row['airstamp'] ?? ''}';
+    final known =
+        '${row['airtime'] ?? ''}'.isNotEmpty &&
+        RegExp(r'(Z|[+-]\d{2}:\d{2})$').hasMatch(stamp);
+    final date = DateTime.tryParse(known ? stamp : '${row['airdate'] ?? ''}');
+    final season = row['season'];
+    final number = row['number'];
+    if (date == null || season is! num || number is! num || number <= 0) {
+      continue;
+    }
+    final cutoff = known ? now : DateTime(now.year, now.month, now.day);
+    if (date.isBefore(cutoff)) continue;
+    if (until != null && date.isAfter(until)) continue;
+    final channel = show['webChannel'] ?? show['network'];
+    candidates.add(
+      TmdbUpcomingEpisode(
+        seasonNumber: season.toInt(),
+        episodeNumber: number.toInt(),
+        title: '${row['name'] ?? ''}',
+        airDate: date,
+        timeKnown: known,
+        network: channel is Map ? channel['name'] as String? : null,
+        source: 'TVmaze',
+      ),
+    );
+  }
+  candidates.sort((a, b) => a.airDate.compareTo(b.airDate));
+  return candidates;
+}
+
+TmdbUpcomingEpisode? upcomingFromTvmaze(
+  dynamic episodes,
+  Map show,
+  DateTime now,
+) {
+  return upcomingListFromTvmaze(episodes, show, now).firstOrNull;
 }
 
 class TmdbExtras {
@@ -435,37 +486,176 @@ class TmdbClient {
         .toList(growable: false);
   }
 
-  /// Cached TMDB lookup used by the tracking calendar for locally added shows.
-  /// The underlying request is cache-first and refreshes in the background.
-  Future<TmdbUpcomingEpisode?> upcomingEpisode(
+  /// Returns every published future episode inside [horizon]. Exact instants
+  /// supplied by TVmaze win; TMDB season data fills gaps without inventing a
+  /// broadcast hour when only a calendar date has been announced.
+  Future<List<TmdbUpcomingEpisode>> upcomingEpisodes(
     TmdbItem item, {
     String apiKey = '',
+    Duration horizon = const Duration(days: 90),
   }) async {
-    if (item.kind != '剧集' || item.id <= 0) return null;
-    final data = await _get('/tv/${item.id}', apiKey, {'language': 'zh-CN'});
-    final row = data['next_episode_to_air'] as Map<String, dynamic>?;
-    final date = DateTime.tryParse('${row?['air_date'] ?? ''}');
-    if (row == null || date == null) return null;
+    if (item.kind != '剧集' || item.id <= 0) return const [];
+    final now = DateTime.now();
+    final until = now.add(horizon);
+    final data = await _get('/tv/${item.id}', apiKey, {
+      'language': 'zh-CN',
+      'append_to_response': 'external_ids',
+    }, preferFresh: true);
+    final exact = <TmdbUpcomingEpisode>[];
+    try {
+      final ids = data['external_ids'] as Map<String, dynamic>? ?? const {};
+      final imdb = '${ids['imdb_id'] ?? ''}';
+      final tvdb = ids['tvdb_id'];
+      if (RegExp(r'^tt\d+$').hasMatch(imdb) || tvdb is num) {
+        final show = await _scheduleJson(
+          Uri.https('api.tvmaze.com', '/lookup/shows', {
+            if (RegExp(r'^tt\d+$').hasMatch(imdb))
+              'imdb': imdb
+            else
+              'thetvdb': '$tvdb',
+          }),
+        );
+        if (show is Map && show['id'] is num) {
+          final episodes = await _scheduleJson(
+            Uri.https('api.tvmaze.com', '/shows/${show['id']}/episodes'),
+          );
+          exact.addAll(
+            upcomingListFromTvmaze(episodes, show, now, until: until),
+          );
+        }
+      }
+    } catch (_) {
+      /* Retain TMDB's date if the time source is unavailable. */
+    }
     final networks = data['networks'] as List<dynamic>? ?? const [];
     final network = networks
         .whereType<Map<String, dynamic>>()
         .map((entry) => '${entry['name'] ?? ''}')
         .firstWhere((name) => name.isNotEmpty, orElse: () => '');
-    return TmdbUpcomingEpisode(
-      seasonNumber: (row['season_number'] as num?)?.toInt() ?? 0,
-      episodeNumber: (row['episode_number'] as num?)?.toInt() ?? 0,
-      title: '${row['name'] ?? ''}',
-      airDate: date,
-      network: network.isEmpty ? null : network,
-      stillPath: row['still_path'] as String?,
-    );
+    final nextRow = data['next_episode_to_air'] as Map<String, dynamic>?;
+    final firstSeason = (nextRow?['season_number'] as num?)?.toInt();
+    final seasonRows = (data['seasons'] as List<dynamic>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .where((row) {
+          final number = (row['season_number'] as num?)?.toInt() ?? 0;
+          if (number <= 0 || (firstSeason != null && number < firstSeason)) {
+            return false;
+          }
+          final date = DateTime.tryParse('${row['air_date'] ?? ''}');
+          return date == null || !date.isAfter(until);
+        })
+        .take(3)
+        .toList(growable: false);
+    final dated = <TmdbUpcomingEpisode>[];
+    for (final season in seasonRows) {
+      final number = (season['season_number'] as num?)?.toInt() ?? 0;
+      try {
+        final episodes = await seasonEpisodes(item.id, number, apiKey: apiKey);
+        for (final episode in episodes) {
+          final date = episode.airDate;
+          if (date == null) continue;
+          final today = DateTime(now.year, now.month, now.day);
+          if (date.isBefore(today) || date.isAfter(until)) continue;
+          dated.add(
+            TmdbUpcomingEpisode(
+              seasonNumber: episode.seasonNumber,
+              episodeNumber: episode.episodeNumber,
+              title: episode.name,
+              airDate: date,
+              network: network.isEmpty ? null : network,
+              stillPath: episode.stillPath,
+            ),
+          );
+        }
+      } catch (_) {
+        // Keep other seasons and the independently fetched exact schedule.
+      }
+    }
+    if (dated.isEmpty && nextRow != null) {
+      final date = DateTime.tryParse('${nextRow['air_date'] ?? ''}');
+      final today = DateTime(now.year, now.month, now.day);
+      if (date != null && !date.isBefore(today) && !date.isAfter(until)) {
+        dated.add(
+          TmdbUpcomingEpisode(
+            seasonNumber: (nextRow['season_number'] as num?)?.toInt() ?? 0,
+            episodeNumber: (nextRow['episode_number'] as num?)?.toInt() ?? 0,
+            title: '${nextRow['name'] ?? ''}',
+            airDate: date,
+            network: network.isEmpty ? null : network,
+            stillPath: nextRow['still_path'] as String?,
+          ),
+        );
+      }
+    }
+    final merged = <String, TmdbUpcomingEpisode>{};
+    for (final episode in [...dated, ...exact]) {
+      final key = '${episode.seasonNumber}:${episode.episodeNumber}';
+      final previous = merged[key];
+      if (previous == null || episode.timeKnown) {
+        merged[key] = TmdbUpcomingEpisode(
+          seasonNumber: episode.seasonNumber,
+          episodeNumber: episode.episodeNumber,
+          title: episode.title.isEmpty ? previous?.title ?? '' : episode.title,
+          airDate: episode.airDate,
+          timeKnown: episode.timeKnown,
+          source: episode.source,
+          network: episode.network ?? previous?.network,
+          stillPath: episode.stillPath ?? previous?.stillPath,
+        );
+      }
+    }
+    final result = merged.values.toList()
+      ..sort((a, b) => a.airDate.compareTo(b.airDate));
+    return result;
+  }
+
+  /// Compatibility helper for detail surfaces that only need the next item.
+  Future<TmdbUpcomingEpisode?> upcomingEpisode(
+    TmdbItem item, {
+    String apiKey = '',
+  }) async {
+    return (await upcomingEpisodes(item, apiKey: apiKey)).firstOrNull;
+  }
+
+  Future<dynamic> _scheduleJson(Uri uri) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key =
+        'yingji.schedule.${base64UrlEncode(utf8.encode(uri.toString()))}';
+    final raw = prefs.getString(key);
+    Map<String, dynamic>? cached;
+    try {
+      if (raw != null) cached = jsonDecode(raw) as Map<String, dynamic>;
+      final saved = DateTime.tryParse('${cached?['savedAt']}');
+      if (saved != null &&
+          DateTime.now().difference(saved) < const Duration(hours: 1)) {
+        return cached!['data'];
+      }
+    } catch (_) {
+      cached = null;
+    }
+    try {
+      final response = await _client
+          .get(uri, headers: const {'User-Agent': 'Yingji/3 schedule-client'})
+          .timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) throw Exception('Schedule unavailable');
+      final data = jsonDecode(response.body);
+      await prefs.setString(
+        key,
+        jsonEncode({'savedAt': DateTime.now().toIso8601String(), 'data': data}),
+      );
+      return data;
+    } catch (_) {
+      if (cached != null) return cached['data'];
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> _get(
     String path,
     String apiKey,
-    Map<String, String> query,
-  ) async {
+    Map<String, String> query, {
+    bool preferFresh = false,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
     final effectiveApiKey = apiKey.trim().isNotEmpty
         ? apiKey.trim()
@@ -484,7 +674,7 @@ class TmdbClient {
           'api_key': effectiveApiKey,
         }),
     ];
-    for (final uri in uris) {
+    for (final uri in preferFresh ? <Uri>[] : uris) {
       final cached = prefs.getString(_cacheKey(uri));
       if (cached == null || cached.isEmpty) continue;
       try {

@@ -1,5 +1,13 @@
 # Third-party notices
 
+## Metadata services
+
+Rating platform logos identify their respective rating sources and remain the property of their respective owners. Image provenance: https://github.com/Druidblack/jellyfin_ratings/tree/main/logo . No endorsement is implied; public distribution remains subject to the applicable owners' permissions.
+
+- TMDB: https://www.themoviedb.org/ — This product uses the TMDB API but is not endorsed or certified by TMDB.
+- MDBList: https://mdblist.com/ — Aggregated ratings retain their original source and scale. Availability varies by title. Public distribution and caching remain subject to provider permissions.
+- TVmaze: https://www.tvmaze.com/ — Broadcast metadata from the TVmaze API (https://www.tvmaze.com/api), licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/). Episode timestamps are converted to the user's local timezone; original date-only precision is retained. The license applies to TVmaze data, including redistributed adaptations.
+
 映迹包含 Electron 与 mpv 运行时。
 
 mpv Windows x64 build: shinchiro/mpv-winbuild-cmake release `20260814`, asset `mpv-x86_64-20260814-git-7b8915bc1d.7z`.

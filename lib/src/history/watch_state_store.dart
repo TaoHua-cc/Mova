@@ -22,6 +22,7 @@ class WatchState {
     this.seasonNumber,
     this.episodeNumber,
     this.updatedAt,
+    this.isPlayed = false,
   });
   final String mediaId;
   final String title;
@@ -35,6 +36,9 @@ class WatchState {
   final int? seasonNumber;
   final int? episodeNumber;
   final DateTime? updatedAt;
+  final bool isPlayed;
+  bool get isCompleted =>
+      isPlayed || (duration > Duration.zero && progress >= .92);
   double get progress => duration.inMilliseconds == 0
       ? 0
       : (position.inMilliseconds / duration.inMilliseconds).clamp(0, 1);
@@ -51,6 +55,7 @@ class WatchState {
     'seasonNumber': seasonNumber,
     'episodeNumber': episodeNumber,
     'updatedAt': updatedAt?.toIso8601String(),
+    'isPlayed': isPlayed,
   };
   factory WatchState.fromJson(Map<String, dynamic> value) => WatchState(
     mediaId: '${value['mediaId']}',
@@ -65,6 +70,7 @@ class WatchState {
     seasonNumber: (value['seasonNumber'] as num?)?.toInt(),
     episodeNumber: (value['episodeNumber'] as num?)?.toInt(),
     updatedAt: DateTime.tryParse('${value['updatedAt'] ?? ''}'),
+    isPlayed: value['isPlayed'] == true,
   );
 
   WatchState withUpdatedAt(DateTime? value) => WatchState(
@@ -80,6 +86,7 @@ class WatchState {
     seasonNumber: seasonNumber,
     episodeNumber: episodeNumber,
     updatedAt: value,
+    isPlayed: isPlayed,
   );
 }
 
@@ -177,4 +184,44 @@ List<WatchState> sortWatchStatesByRecency(Iterable<WatchState> source) {
   }
   dated.sort((a, b) => b.updatedAt!.compareTo(a.updatedAt!));
   return [...dated, ...undated];
+}
+
+/// A display projection only: episode history stays intact for resume/rewatch.
+List<WatchState> continueWatchingRows(Iterable<WatchState> history) {
+  final seen = <String>{};
+  final seenItems = <String>{};
+  final result = <WatchState>[];
+  for (final row in sortWatchStatesByRecency(history)) {
+    final episodic = row.episodeNumber != null || row.seasonNumber != null;
+    final name = row.title.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
+    final aliases = <String>[
+      if (row.tmdbId != null && row.tmdbId! > 0)
+        '${episodic ? 'tv' : 'movie'}:${row.tmdbId}',
+      if (episodic && name.isNotEmpty) 'series:$name',
+      if (!episodic) 'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
+      if (episodic && name.isEmpty)
+        'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
+    ];
+    // Resolve the latest state per episode before grouping resumable shows.
+    // Marking one episode watched must not hide another episode's progress.
+    final itemAliases = <String>[
+      'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
+      if (episodic && row.episodeNumber != null)
+        for (final alias in aliases)
+          '$alias:season:${row.seasonNumber}:episode:${row.episodeNumber}',
+      if (!episodic) ...aliases,
+    ];
+    final alreadySeen = itemAliases.any(seenItems.contains);
+    seenItems.addAll(itemAliases);
+    if (alreadySeen || row.isCompleted || row.position <= Duration.zero) {
+      continue;
+    }
+    if (aliases.any(seen.contains)) {
+      seen.addAll(aliases);
+      continue;
+    }
+    seen.addAll(aliases);
+    result.add(row);
+  }
+  return result;
 }

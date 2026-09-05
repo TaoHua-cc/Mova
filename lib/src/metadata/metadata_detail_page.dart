@@ -21,6 +21,8 @@ import '../history/watchlist_store.dart';
 import '../history/watch_state_store.dart';
 import '../tracking/trakt_client.dart';
 import 'tmdb_client.dart';
+import 'ratings.dart';
+import 'next_episode.dart';
 
 String _episodeKey(int? season, int? episode) =>
     '${season ?? 0}:${episode ?? 0}';
@@ -193,8 +195,13 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         } else {
           if (token == null || token.isEmpty) continue;
           final client = EmbyClient();
-          final session = EmbySession(source: source, token: token);
           try {
+            final session = await client.resolveSession(
+              EmbySession(source: source, token: token),
+            );
+            if (session.source.endpoint != source.endpoint) {
+              await store.upsert(session.source, token);
+            }
             var found = await client.findByTmdbId(session, widget.item.id);
             // Some Emby libraries omit ProviderIds even though their series
             // title is searchable. Search the server before falling back to
@@ -1418,10 +1425,15 @@ class _DetailHeroCopy extends StatelessWidget {
           if (item.year != null) _DetailMetaChip('${item.year}'),
           _DetailMetaChip(item.kind),
           for (final genre in item.genres) _DetailMetaChip(genre),
-          _DetailRatingRow(item: item),
         ],
       ),
       const SizedBox(height: 22),
+      _DetailRatingRow(item: item),
+      if (item.kind == '剧集') ...[
+        const SizedBox(height: 10),
+        NextEpisodeLabel(item: item),
+      ],
+      const SizedBox(height: 16),
       Row(
         children: [
           _DetailAction(
@@ -1505,39 +1517,9 @@ class _DetailMetaChip extends StatelessWidget {
 class _DetailRatingRow extends StatelessWidget {
   const _DetailRatingRow({required this.item});
   final TmdbItem item;
-
   @override
-  Widget build(BuildContext context) {
-    final scores = <({String label, double value})>[
-      if (item.rating > 0) (label: 'TMDB', value: item.rating),
-      ..._find('IMDb', const ['imdb', 'imdb_rating']),
-      ..._find('豆瓣', const ['douban', '豆瓣']),
-      ..._find('RT', const ['rt', 'rotten_tomatoes', 'rottentomatoes']),
-      ..._find('MC', const ['mc', 'metacritic']),
-    ];
-    if (scores.isEmpty) return const SizedBox.shrink();
-    return Wrap(
-      spacing: 6,
-      children: [
-        for (final score in scores)
-          _DetailMetaChip('${score.label} ${score.value.toStringAsFixed(1)}'),
-      ],
-    );
-  }
-
-  List<({String label, double value})> _find(
-    String label,
-    List<String> aliases,
-  ) {
-    for (final alias in aliases) {
-      final value = item.ratings.entries
-          .where((entry) => entry.key.toLowerCase() == alias.toLowerCase())
-          .map((entry) => entry.value)
-          .firstWhere((score) => score > 0, orElse: () => 0);
-      if (value > 0) return [(label: label, value: value)];
-    }
-    return const [];
-  }
+  Widget build(BuildContext context) =>
+      MediaRatingRow(item: item, expanded: true);
 }
 
 class _DetailAction extends StatelessWidget {
@@ -4133,19 +4115,8 @@ class _RecommendationDetailCard extends StatelessWidget {
                         fontSize: 11,
                       ),
                     ),
-                    if (item.rating > 0) ...[
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          const Icon(YingjiIcons.sparkles, size: 14),
-                          const SizedBox(width: 5),
-                          Text(
-                            'TMDB ${item.rating.toStringAsFixed(1)}',
-                            style: const TextStyle(fontWeight: FontWeight.w800),
-                          ),
-                        ],
-                      ),
-                    ],
+                    const SizedBox(height: 8),
+                    MediaRatingRow(item: item),
                     const SizedBox(height: 10),
                     Expanded(
                       child: Text(

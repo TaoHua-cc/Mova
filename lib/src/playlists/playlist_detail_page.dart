@@ -4,6 +4,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import '../brand.dart';
 import '../metadata/metadata_detail_page.dart';
 import '../metadata/tmdb_client.dart';
+import '../metadata/ratings.dart';
 import 'playlist_store.dart';
 
 class PlaylistDetailPage extends StatefulWidget {
@@ -152,8 +153,9 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                                                   ),
                                                 ),
                                                 const SizedBox(height: 5),
+                                                MediaRatingRow(item: item),
                                                 Text(
-                                                  '${item.year ?? '年份未知'} · ${item.kind} · TMDB ${item.rating.toStringAsFixed(1)}',
+                                                  '${item.year ?? '年份未知'} · ${item.kind}',
                                                   style: const TextStyle(
                                                     color: YingjiColors.muted,
                                                     fontSize: 12,

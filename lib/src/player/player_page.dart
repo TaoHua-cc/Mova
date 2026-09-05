@@ -12,6 +12,7 @@ import 'package:window_manager/window_manager.dart';
 import '../brand.dart';
 import '../history/watch_state_store.dart';
 import 'danmaku_client.dart';
+import 'subtitle_preference.dart';
 import 'segment_client.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
@@ -168,6 +169,7 @@ class _PlayerPageState extends State<PlayerPage> {
   WatchStateStore? _watchStore;
   bool _settingsOpen = false;
   bool _exitStarted = false;
+  bool _switchingEpisode = false;
 
   /// The Emby item whose playback session has been announced to the server
   /// (PlaybackStart). Progress reports keep flowing for this item until it
@@ -195,6 +197,14 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _danmakuEnabled = false;
   String _danmakuName = '';
   String _danmakuUrl = '';
+  String _activeDanmakuApi = '';
+  String _matchedDanmakuEpisode = '';
+  int _danmakuRequest = 0;
+  bool _preferChineseSubtitle = true;
+  String _subtitleLanguage = 'zh';
+  bool _quickMenuOpen = false;
+  bool _subtitleChosen = false;
+  StreamSubscription<Tracks>? _subtitleSubscription;
   List<String> _danmakuApis = const [];
   double _danmakuOpacity = .82;
   double _danmakuArea = .65;
@@ -265,8 +275,20 @@ class _PlayerPageState extends State<PlayerPage> {
     );
     _focusNode = FocusNode(debugLabel: '映迹播放器快捷键');
     _controller = VideoController(_player);
+    _subtitleSubscription = _player.stream.tracks.listen((tracks) {
+      if (!_preferChineseSubtitle ||
+          _subtitleChosen ||
+          _activeEpisode.initialSubtitleTrack != null)
+        return;
+      final track = preferredSubtitle(tracks.subtitle, _subtitleLanguage);
+      if (track != null) {
+        _subtitleChosen = true;
+        unawaited(_player.setSubtitleTrack(track));
+      }
+    });
     _initializePlayer();
     _progressTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (_switchingEpisode) return;
       unawaited(_syncProgress());
       unawaited(_saveWatchState());
     });
@@ -278,7 +300,7 @@ class _PlayerPageState extends State<PlayerPage> {
       if (mounted && value.isNotEmpty) setState(() => _error = value);
     });
     _playingSubscription = _player.stream.playing.listen((playing) {
-      if (!mounted) return;
+      if (!mounted || _switchingEpisode) return;
       if (playing) {
         // Playback actually started (or resumed): announce the session to the
         // server right away instead of waiting for the 30s progress timer, so
@@ -317,8 +339,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   void _scheduleControlsHide() {
     _controlsTimer?.cancel();
-    if (_settingsOpen || !_player.state.playing) return;
-    _controlsTimer = Timer(const Duration(seconds: 4), () {
+    if (_settingsOpen || _quickMenuOpen || !_player.state.playing) return;
+    _controlsTimer = Timer(const Duration(milliseconds: 1800), () {
       if (mounted && !_settingsOpen && _player.state.playing) {
         setState(() => _showControls = false);
       }
@@ -388,6 +410,12 @@ class _PlayerPageState extends State<PlayerPage> {
     _speed = prefs.getDouble('yingji.player.speed') ?? 1;
     _audioDelay = prefs.getDouble('yingji.player.audio-delay') ?? 0;
     _subtitleDelay = prefs.getDouble('yingji.player.subtitle-delay') ?? 0;
+    _preferChineseSubtitle =
+        prefs.getBool('yingji.player.subtitle-priority-enabled') ??
+        prefs.getBool('yingji.player.prefer-chinese-subtitle') ??
+        true;
+    _subtitleLanguage =
+        prefs.getString('yingji.player.subtitle-language') ?? 'zh';
     _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
     _aspect = prefs.getString('yingji.player.aspect') ?? '自动';
     _volume = (prefs.getDouble('yingji.player.volume') ?? 100).clamp(0, 100);
@@ -420,6 +448,10 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _openCurrentMedia() async {
     final episode = _activeEpisode;
+    _subtitleChosen = false;
+    _skipDismissed.clear();
+    _skipKind = null;
+    _skipTicks = 0;
     await _player.open(Media(episode.url, httpHeaders: episode.headers));
     if (episode.initialAudioTrack != null) {
       await _setMpvProperty('aid', '${episode.initialAudioTrack! + 1}');
@@ -525,27 +557,91 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _switchEpisode(int index) async {
-    if (index < 0 ||
+    if (_switchingEpisode ||
+        index < 0 ||
         index >= widget.episodes.length ||
         index == _activeEpisodeIndex) {
       return;
     }
-    await _saveWatchState();
-    setState(() {
-      _activeEpisodeIndex = index;
-      _resourceOverride = null;
-      _error = null;
-      _danmakuComments = const [];
-      _danmakuError = null;
-    });
-    await _loadSegmentPreferences(await SharedPreferences.getInstance());
-    await _openCurrentMedia();
-    unawaited(_loadSegmentData());
-    if (_danmakuEnabled && _danmakuApis.isNotEmpty) {
-      final prefs = await SharedPreferences.getInstance();
-      unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
+    _switchingEpisode = true;
+    try {
+      await _player.pause();
+      await _saveWatchState();
+      final target = widget.episodes[index];
+      final resume = await _episodeResumePosition(target);
+      if (!mounted || _exitStarted) return;
+      setState(() {
+        _activeEpisodeIndex = index;
+        _resourceOverride = target.withInitialPosition(resume);
+        _error = null;
+        _danmakuComments = const [];
+        _danmakuError = null;
+      });
+      await _loadSegmentPreferences(await SharedPreferences.getInstance());
+      await _openCurrentMedia();
+      unawaited(_loadSegmentData());
+      if (_danmakuEnabled && _danmakuApis.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
+      }
+      _revealControls(keepVisible: true);
+    } finally {
+      _switchingEpisode = false;
     }
-    _revealControls(keepVisible: true);
+  }
+
+  Future<Duration> _episodeResumePosition(PlayerEpisode episode) async {
+    final store = _watchStore ?? await WatchStateStore.create();
+    final local = store
+        .load()
+        .where(
+          (row) =>
+              row.mediaId == episode.url ||
+              (episode.sourceId != null &&
+                  episode.serverItemId != null &&
+                  row.sourceId == episode.sourceId &&
+                  row.serverItemId == episode.serverItemId) ||
+              (episode.tmdbId != null &&
+                  episode.tmdbId! > 0 &&
+                  episode.seasonNumber != null &&
+                  episode.episodeNumber != null &&
+                  row.tmdbId == episode.tmdbId &&
+                  row.seasonNumber == episode.seasonNumber &&
+                  row.episodeNumber == episode.episodeNumber),
+        )
+        .firstOrNull;
+    var position = local?.position ?? episode.initialPosition;
+    if (episode.sourceId == null || episode.serverItemId == null)
+      return position;
+    final client = EmbyClient();
+    try {
+      final sources = await SourceStore.create();
+      final source = sources
+          .load()
+          .where((s) => s.id == episode.sourceId)
+          .firstOrNull;
+      if (source == null || source.kind == SourceKind.webdav) return position;
+      final token = sources.tokenFor(source);
+      if (token == null || token.isEmpty) return position;
+      final remote = await client
+          .itemById(
+            EmbySession(source: source, token: token),
+            episode.serverItemId!,
+          )
+          .timeout(const Duration(seconds: 3));
+      if (remote.playbackPosition != null &&
+          (local == null ||
+              (remote.lastPlayedAt != null &&
+                  (local.updatedAt == null ||
+                      remote.lastPlayedAt!.isAfter(local.updatedAt!))))) {
+        position = remote.playbackPosition!;
+      }
+    } catch (_) {
+      // Offline switching still resumes the latest saved local position.
+    } finally {
+      client.dispose();
+    }
+    return position;
   }
 
   String get _segmentKey {
@@ -652,28 +748,116 @@ class _PlayerPageState extends State<PlayerPage> {
     });
   }
 
-  Future<void> _applySegmentSkip() async {
-    if (!_autoSkipSegments || _segmentActionPending || !_player.state.playing) {
-      return;
-    }
+  String? _skipKind;
+  int _skipTicks = 0;
+  final Set<String> _skipDismissed = {};
+
+  String? get _currentSkipKind {
     final position = _player.state.position;
-    final introEnd = _introEnd;
-    if (introEnd != null && position > Duration.zero && position < introEnd) {
-      _segmentActionPending = true;
-      await _player.seek(introEnd);
-      _segmentActionPending = false;
-      return;
+    if (_introEnd != null &&
+        position > Duration.zero &&
+        position < _introEnd!) {
+      final starts = _segments.where(
+        (s) => s.type == PlaybackSegmentType.intro,
+      );
+      if (starts.isEmpty || position >= starts.first.start) return 'intro';
     }
-    final outroStart = _outroStart;
-    if (outroStart != null &&
-        position >= outroStart &&
-        widget.episodes.isNotEmpty &&
-        _activeEpisodeIndex < widget.episodes.length - 1) {
-      _segmentActionPending = true;
-      await _switchEpisode(_activeEpisodeIndex + 1);
+    if (_outroStart != null &&
+        position >= _outroStart! &&
+        _player.state.duration > position)
+      return 'outro';
+    return null;
+  }
+
+  Future<void> _applySegmentSkip() async {
+    if (!mounted || _switchingEpisode || _segmentActionPending) return;
+    final kind = _currentSkipKind;
+    if (kind != _skipKind) {
+      setState(() {
+        _skipKind = kind;
+        _skipTicks = 0;
+      });
+    }
+    if (kind == null ||
+        _skipDismissed.contains(kind) ||
+        !_autoSkipSegments ||
+        !_player.state.playing ||
+        _player.state.buffering)
+      return;
+    setState(() => _skipTicks++);
+    if (_skipTicks >= 10) await _performSegmentSkip();
+  }
+
+  Future<void> _performSegmentSkip() async {
+    final kind = _currentSkipKind;
+    if (kind == null || _segmentActionPending) return;
+    _segmentActionPending = true;
+    _skipDismissed.add(kind);
+    try {
+      if (kind == 'intro') {
+        await _player.seek(_introEnd!);
+      } else if (widget.episodes.isNotEmpty &&
+          _activeEpisodeIndex < widget.episodes.length - 1) {
+        await _switchEpisode(_activeEpisodeIndex + 1);
+      } else {
+        await _player.seek(_player.state.duration);
+      }
+    } finally {
       _segmentActionPending = false;
+      if (mounted) setState(() => _skipKind = null);
     }
   }
+
+  Widget _segmentPrompt() => Positioned(
+    right: 28,
+    bottom: _showControls ? 170 : 32,
+    child: GlassPanel(
+      radius: 16,
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            _skipKind == 'intro'
+                ? '片头 · 跳转至 ${_time(_introEnd!)}'
+                : '片尾 · ${_activeEpisodeIndex < widget.episodes.length - 1 ? '播放下一集' : '跳转至结尾'}',
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          if (_autoSkipSegments) ...[
+            const SizedBox(height: 6),
+            Text(
+              '${((10 - _skipTicks) / 2).ceil().clamp(0, 5)} 秒后自动跳过',
+              style: const TextStyle(fontSize: 12, color: YingjiColors.muted),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: 224,
+              child: LinearProgressIndicator(
+                value: (_skipTicks / 10).clamp(0, 1),
+              ),
+            ),
+          ],
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextButton.icon(
+                onPressed: _performSegmentSkip,
+                icon: const Icon(YingjiIcons.chevron_right, size: 16),
+                label: const Text('立即跳过'),
+              ),
+              TextButton(
+                onPressed: () => setState(() {
+                  if (_skipKind != null) _skipDismissed.add(_skipKind!);
+                }),
+                child: const Text('本次不跳过'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
 
   Future<void> _switchResource(PlayerResourceOption resource) async {
     if (resource.url == _activeEpisode.url) return;
@@ -694,33 +878,43 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _loadDanmaku(String token) async {
+    final request = ++_danmakuRequest;
+    _activeDanmakuApi = '';
     _danmakuClient?.dispose();
     final clients = <DanmakuClient>[];
+    final clientsByApi = <String, DanmakuClient>{};
     try {
       final apis = _danmakuApis.isEmpty ? [_danmakuUrl] : _danmakuApis;
       final futures = apis
           .map((api) {
             final client = DanmakuClient();
+            clientsByApi[api] = client;
             clients.add(client);
-            return client.fetch(
-              template: api,
-              title: _activeEpisode.title,
-              season: _activeEpisode.seasonNumber,
-              episode: _activeEpisode.episodeNumber,
-              mediaUrl: _activeEpisode.url,
-              token: token,
-            );
+            return client
+                .fetch(
+                  template: api,
+                  title: _activeEpisode.title,
+                  season: _activeEpisode.seasonNumber,
+                  episode: _activeEpisode.episodeNumber,
+                  mediaUrl: _activeEpisode.url,
+                  token: token,
+                )
+                .then((comments) => (api, comments));
           })
           .toList(growable: false);
       final comments = await _firstDanmakuResult(futures);
-      if (mounted) {
+      if (mounted && request == _danmakuRequest) {
         setState(() {
-          _danmakuComments = comments;
+          final source = clientsByApi[comments.$1];
+          _activeDanmakuApi =
+              source?.commentEndpoint?.toString() ?? comments.$1;
+          _matchedDanmakuEpisode = source?.matchedEpisode ?? '接口未提供匹配名称';
+          _danmakuComments = comments.$2;
           _danmakuError = null;
         });
       }
     } catch (error) {
-      if (mounted) {
+      if (mounted && request == _danmakuRequest) {
         setState(
           () =>
               _danmakuError = error.toString().replaceFirst('Exception: ', ''),
@@ -731,10 +925,17 @@ class _PlayerPageState extends State<PlayerPage> {
     }
   }
 
-  Future<List<DanmakuComment>> _firstDanmakuResult(
-    List<Future<List<DanmakuComment>>> futures,
+  String get _displayDanmakuApi {
+    final uri = Uri.tryParse(_activeDanmakuApi);
+    if (uri == null) return '地址格式无效';
+    return uri.replace(userInfo: '', query: '', fragment: '').toString();
+  }
+
+  Future<(String, List<DanmakuComment>)> _firstDanmakuResult(
+    List<Future<(String, List<DanmakuComment>)>> futures,
   ) async {
-    final completer = Completer<List<DanmakuComment>>();
+    if (futures.isEmpty) return ('', const <DanmakuComment>[]);
+    final completer = Completer<(String, List<DanmakuComment>)>();
     var remaining = futures.length;
     Object? lastError;
     var sawEmptyResult = false;
@@ -744,12 +945,12 @@ class _PlayerPageState extends State<PlayerPage> {
             remaining--;
             // A fast but empty endpoint must not hide a slower endpoint that
             // actually has comments for this episode.
-            if (value.isNotEmpty && !completer.isCompleted) {
+            if (value.$2.isNotEmpty && !completer.isCompleted) {
               completer.complete(value);
             } else {
               sawEmptyResult = true;
               if (remaining == 0 && !completer.isCompleted) {
-                completer.complete(const []);
+                completer.complete(('', const <DanmakuComment>[]));
               }
             }
           })
@@ -758,7 +959,7 @@ class _PlayerPageState extends State<PlayerPage> {
             remaining--;
             if (remaining == 0 && !completer.isCompleted) {
               if (sawEmptyResult) {
-                completer.complete(const []);
+                completer.complete(('', const <DanmakuComment>[]));
               } else {
                 completer.completeError(lastError!);
               }
@@ -902,6 +1103,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    _subtitleSubscription?.cancel();
+    _danmakuRequest++;
     unawaited(_syncProgress(syncTrakt: true, ending: true));
     unawaited(_saveWatchState());
     _progressTimer?.cancel();
@@ -1146,7 +1349,7 @@ class _PlayerPageState extends State<PlayerPage> {
           onHover: (_) => _revealControls(),
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onTap: () => _revealControls(),
+            onTap: _togglePlayback,
             child: Stack(
               fit: StackFit.expand,
               children: [
@@ -1172,7 +1375,7 @@ class _PlayerPageState extends State<PlayerPage> {
                       area: _danmakuArea,
                       density: _danmakuDensity,
                       fontSize: _danmakuFontSize,
-                      speed: _danmakuSpeed * _speed,
+                      speed: _danmakuSpeed,
                       showScroll: _danmakuScroll,
                       showTop: _danmakuTop,
                       showBottom: _danmakuBottom,
@@ -1227,6 +1430,10 @@ class _PlayerPageState extends State<PlayerPage> {
                     child: _overlay(context),
                   ),
                 ),
+                if (_skipKind != null &&
+                    !_skipDismissed.contains(_skipKind) &&
+                    !_settingsOpen)
+                  _segmentPrompt(),
                 if (_settingsOpen) _consolePanel(context),
                 // Keep a dedicated caption strip above the custom overlay so
                 // controls cannot swallow window-drag gestures. It avoids
@@ -1322,7 +1529,10 @@ class _PlayerPageState extends State<PlayerPage> {
                   ok: !_player.state.buffering,
                 ),
                 const SizedBox(width: 12),
-                const YingjiWindowControls(),
+                YingjiWindowControls(
+                  fullscreen: true,
+                  onClose: () => _exitPlayer(context),
+                ),
               ],
             ),
           ),
@@ -1439,7 +1649,7 @@ class _PlayerPageState extends State<PlayerPage> {
                                     _player.playOrPause();
                                   },
                                   selected: playing.data == true,
-                                  size: 46,
+                                  size: 40,
                                   icon: playing.data == true
                                       ? YingjiIcons.pause_fill
                                       : YingjiIcons.play_fill,
@@ -1477,7 +1687,7 @@ class _PlayerPageState extends State<PlayerPage> {
                           ),
                         ),
                         const SizedBox(width: 14),
-                        Expanded(
+                        Flexible(
                           child: GlassPanel(
                             radius: 28,
                             padding: const EdgeInsets.symmetric(
@@ -1485,6 +1695,7 @@ class _PlayerPageState extends State<PlayerPage> {
                               vertical: 8,
                             ),
                             child: Row(
+                              mainAxisSize: MainAxisSize.min,
                               mainAxisAlignment: MainAxisAlignment.end,
                               children: [
                                 YingjiMotionIconButton(
@@ -1498,6 +1709,7 @@ class _PlayerPageState extends State<PlayerPage> {
                                 ),
                                 SizedBox(
                                   width: 116,
+                                  height: 40,
                                   child: Slider(
                                     value: _volume,
                                     min: 0,
@@ -1593,9 +1805,6 @@ class _PlayerPageState extends State<PlayerPage> {
           _consoleGroup('音轨', [
             '音频轨道  ${_player.state.tracks.audio.length} 条',
             '音量  ${_volume.round()}%',
-            '立体声下混  ${_downmix ? '已开启' : '关闭'}',
-            '人声增强  ${_voiceEnhance ? '已开启' : '关闭'}',
-            '夜间模式  ${_night ? '已开启' : '关闭'}',
           ]),
           _trackSelector(audio: true),
           _consoleGroup('同步', ['音频延迟  ${(_audioDelay * 1000).round()} ms']),
@@ -1604,7 +1813,7 @@ class _PlayerPageState extends State<PlayerPage> {
         return [
           _consoleGroup('字幕', [
             '字幕轨道  ${_player.state.tracks.subtitle.length} 条',
-            '首选语言  自动',
+            '首选语言  ${_preferChineseSubtitle ? (subtitleLanguages[_subtitleLanguage] ?? '中文') : '跟随媒体默认'}',
             '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
           ]),
           _trackSelector(audio: false),
@@ -1613,8 +1822,10 @@ class _PlayerPageState extends State<PlayerPage> {
         return [
           _consoleGroup('弹幕', [
             '服务  ${_danmakuEnabled ? (_danmakuName.isEmpty ? '已启用' : _danmakuName) : '未启用'}',
-            'API 地址  ${_danmakuUrl.isEmpty ? '未设置' : '已设置'}',
-            _danmakuEnabled && _danmakuUrl.isNotEmpty
+            'API 地址  ${_activeDanmakuApi.isEmpty ? '尚无成功返回的来源' : _displayDanmakuApi}',
+            if (_activeDanmakuApi.isNotEmpty) '匹配结果  $_matchedDanmakuEpisode',
+            '请求剧集  ${_activeEpisode.title} · 第 ${_activeEpisode.seasonNumber ?? 1} 季 · 第 ${_activeEpisode.episodeNumber ?? 1} 集 · ${_activeEpisode.episodeTitle ?? '未提供集名'}',
+            _danmakuEnabled && _danmakuApis.isNotEmpty
                 ? (_danmakuError == null
                       ? '已读取 ${_danmakuComments.length} 条弹幕'
                       : '读取失败：$_danmakuError')
@@ -1624,20 +1835,11 @@ class _PlayerPageState extends State<PlayerPage> {
         ];
       case '画面':
         return [
-          _consoleGroup('画面', [
-            '硬件解码  ${_hardware ? 'D3D11VA' : '关闭'}',
-            '渲染器  gpu-next',
-            'HDR 输出  ${_hdr ? '自动' : '关闭'}',
-            '画面比例  $_aspect',
-          ]),
+          _consoleGroup('画面', ['画面比例  $_aspect']),
         ];
       case '播放':
         return [
-          _consoleGroup('播放', [
-            '播放速度  ${_speed.toStringAsFixed(2)}x',
-            '预读缓存  ${_cacheSeconds.round()} 秒',
-            '记忆播放位置  已开启',
-          ]),
+          _consoleGroup('播放', ['播放速度  ${_speed.toStringAsFixed(2)}x']),
         ];
       case '章节':
         return [
@@ -1721,7 +1923,19 @@ class _PlayerPageState extends State<PlayerPage> {
     String label,
     bool value,
     ValueChanged<bool> onChanged,
-  ) => FilterChip(label: Text(label), selected: value, onSelected: onChanged);
+  ) => FilterChip(
+    label: Text(label),
+    selected: value,
+    onSelected: onChanged,
+    selectedColor: YingjiGlass.surface(strength: 1.15),
+    backgroundColor: YingjiGlass.surface(),
+    checkmarkColor: Colors.white,
+    labelStyle: const TextStyle(
+      color: Colors.white,
+      fontWeight: FontWeight.w600,
+    ),
+    side: BorderSide(color: value ? Colors.white : YingjiGlass.line()),
+  );
 
   Widget _danmakuSlider(
     String label,
@@ -1979,7 +2193,7 @@ class _PlayerPageState extends State<PlayerPage> {
     const icons = <IconData>[
       YingjiIcons.speaker_2_fill,
       YingjiIcons.captions_bubble,
-      YingjiIcons.dot_radiowaves_left_right,
+      YingjiIcons.danmaku,
       YingjiIcons.film,
       YingjiIcons.play_circle,
       YingjiIcons.bookmark,
@@ -1988,17 +2202,77 @@ class _PlayerPageState extends State<PlayerPage> {
     ];
     return [
       for (var i = 0; i < tabs.length; i++) ...[
-        YingjiMotionIconButton(
-          icon: icons[i],
-          tooltip: tabs[i],
-          selected: _settingsOpen && _consoleTab == tabs[i],
-          size: 40,
-          onPressed: () => _openConsoleTab(tabs[i]),
-        ),
+        if (tabs[i] == '播放')
+          _quickChoice<double>(
+            icon: YingjiIcons.gauge,
+            label: '播放速度',
+            value: _speed,
+            values: const [.5, .75, 1, 1.25, 1.5, 2],
+            labelBuilder: (v) => '${v}x',
+            onChanged: _setPlaybackSpeed,
+          )
+        else if (tabs[i] == '画面')
+          _quickChoice<String>(
+            icon: YingjiIcons.fullscreen,
+            label: '画面比例',
+            value: _aspect,
+            values: const ['自动', '16:9', '4:3', '21:9'],
+            labelBuilder: (v) => v,
+            onChanged: _setAspect,
+          )
+        else
+          YingjiMotionIconButton(
+            icon: icons[i],
+            tooltip: tabs[i],
+            selected: _settingsOpen && _consoleTab == tabs[i],
+            size: 40,
+            onPressed: () => _openConsoleTab(tabs[i]),
+          ),
         if (i != tabs.length - 1) const SizedBox(width: 5),
       ],
     ];
   }
+
+  Widget _quickChoice<T>({
+    required IconData icon,
+    required String label,
+    required T value,
+    required List<T> values,
+    required String Function(T) labelBuilder,
+    required ValueChanged<T> onChanged,
+  }) => Tooltip(
+    message: '$label · ${labelBuilder(value)}',
+    child: YingjiGlassMenu(
+      onOpen: () {
+        _quickMenuOpen = true;
+        _controlsTimer?.cancel();
+      },
+      onClose: () {
+        _quickMenuOpen = false;
+        _scheduleControlsHide();
+      },
+      entries: [
+        for (final item in values)
+          MenuItemButton(
+            onPressed: () => onChanged(item),
+            trailingIcon: item == value
+                ? const Icon(YingjiIcons.checkmark_circle_fill, size: 16)
+                : null,
+            child: Text(labelBuilder(item)),
+          ),
+      ],
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: YingjiGlass.chrome(),
+          shape: BoxShape.circle,
+          border: Border.all(color: YingjiGlass.line()),
+        ),
+        child: Icon(icon, size: 18),
+      ),
+    ),
+  );
 
   Widget _consoleGroup(String title, List<String> rows) => Padding(
     padding: const EdgeInsets.only(bottom: 12),
@@ -2159,6 +2433,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     _player.setAudioTrack(choice.audio!);
                   }
                   if (!audio && choice.subtitle != null) {
+                    _subtitleChosen = true;
                     _player.setSubtitleTrack(choice.subtitle!);
                   }
                 },
@@ -2315,6 +2590,10 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
           _mediaRate = 0;
         }
       }
+      if ((value - _samplePos).inMilliseconds.abs() > 3000) {
+        _spawnMs.clear();
+        _position = value;
+      }
       _samplePos = value;
       _sampleAt = now;
     });
@@ -2327,18 +2606,17 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
     final at = _sampleAt;
     if (at != null && _mediaRate > 0) {
       final since = elapsed - at;
-      if (since > Duration.zero && since < const Duration(milliseconds: 250)) {
+      if (since > Duration.zero) {
         effective += Duration(
-          milliseconds: (_mediaRate * since.inMilliseconds).round(),
+          milliseconds: (_mediaRate * math.min(since.inMilliseconds, 250))
+              .round(),
         );
       }
     }
     if (effective == _lastPainted) return;
-    if (effective < _position) {
-      // A backward seek (or an episode/timeline reset): re-seed every visible
-      // comment so the lines re-enter from the right edge.
-      _spawnMs.clear();
-    }
+    // Small interpolation corrections are not seeks. Keep motion monotonic;
+    // real seeks reset the anchor in the position listener above.
+    if (effective < _position) effective = _position;
     _lastPainted = effective;
     _position = effective;
     // A ValueNotifier bump only repaints this overlay's layer; nothing else in
@@ -2490,7 +2768,7 @@ class _DanmakuPainter extends CustomPainter {
       double top;
       if (mode == DanmakuMode.scroll) {
         final progress = (ageMs / lifetimeMs).clamp(0.0, 1.0);
-        left = size.width - progress * (size.width + 460);
+        left = size.width - progress * (size.width + boxWidth);
         top = 82 + (lane % laneCount) * laneHeight;
       } else {
         left = (size.width - boxWidth) / 2;

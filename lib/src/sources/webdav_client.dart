@@ -15,6 +15,33 @@ class WebDavClient {
     required String password,
   }) async {
     final auth = base64Encode(utf8.encode('$username:$password'));
+    Object? lastError;
+    for (final endpoint in source.endpoints) {
+      try {
+        return await _listAt(
+          source: MediaSource(
+            id: source.id,
+            name: source.name,
+            kind: source.kind,
+            endpoint: endpoint,
+            alternateEndpoints: source.endpoints
+                .where((value) => value != endpoint)
+                .toList(growable: false),
+            iconUrl: source.iconUrl,
+          ),
+          auth: auth,
+        );
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? Exception('所有 WebDAV 线路均无法连接');
+  }
+
+  Future<List<MediaItem>> _listAt({
+    required MediaSource source,
+    required String auth,
+  }) async {
     final request = http.Request('PROPFIND', source.endpoint)
       ..headers.addAll({
         'Authorization': 'Basic $auth',
