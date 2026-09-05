@@ -84,9 +84,61 @@ class TraktPlaybackProgress {
   final DateTime? pausedAt;
 }
 
+class TraktDiscoveryItem {
+  const TraktDiscoveryItem({required this.tmdbId, required this.kind});
+  final int tmdbId;
+  final String kind;
+}
+
 class TraktClient {
   TraktClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
+
+  Future<List<TraktDiscoveryItem>> discover({
+    required String clientId,
+    required String type,
+    required String list,
+    int page = 1,
+  }) async {
+    if (clientId.trim().isEmpty) {
+      throw Exception('请先在设置中配置 Trakt Client ID');
+    }
+    final kind = type == 'shows' ? '剧集' : '电影';
+    final response = await _client
+        .get(
+          Uri.https('api.trakt.tv', '/$type/$list', {
+            'page': '$page',
+            'limit': '20',
+            'extended': 'full',
+            if (list == 'watched' || list == 'played' || list == 'collected')
+              'period': 'weekly',
+          }),
+          headers: {
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 榜单读取失败（HTTP ${response.statusCode}）');
+    }
+    final rows = jsonDecode(response.body);
+    if (rows is! List) return const [];
+    final result = <TraktDiscoveryItem>[];
+    final seen = <int>{};
+    for (final row in rows.whereType<Map>()) {
+      final media = row[type == 'shows' ? 'show' : 'movie'];
+      if (media is! Map) continue;
+      final ids = media['ids'];
+      if (ids is! Map) continue;
+      final tmdbId = (ids['tmdb'] as num?)?.toInt() ?? 0;
+      if (tmdbId > 0 && seen.add(tmdbId)) {
+        result.add(TraktDiscoveryItem(tmdbId: tmdbId, kind: kind));
+      }
+    }
+    return result;
+  }
 
   Future<List<TraktPlaybackProgress>> playbackProgress({
     required String clientId,

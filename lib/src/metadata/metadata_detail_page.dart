@@ -749,111 +749,161 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   Future<void> _showTrackPicker() async {
     final resource = _selectedResource;
     if (resource == null) return;
-    await showModalBottomSheet<void>(
+    await showDialog<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      barrierColor: Colors.black54,
+      barrierColor: Colors.black.withValues(alpha: .62),
       builder: (context) => StatefulBuilder(
-        builder: (context, setSheetState) => SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+        builder: (context, updateDialog) => Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(28),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: 920,
+              maxHeight: math.min(MediaQuery.sizeOf(context).height * .84, 720),
+            ),
             child: GlassPanel(
               radius: 20,
-              padding: const EdgeInsets.all(18),
-              child: ListView(
-                shrinkWrap: true,
+              padding: const EdgeInsets.fromLTRB(22, 20, 22, 22),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Row(
+                  Row(
                     children: [
-                      Icon(YingjiIcons.captions_bubble, size: 19),
-                      SizedBox(width: 8),
-                      Text(
-                        '预选音轨与字幕',
-                        style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.w800,
+                      const _TrackPickerHeadingIcon(),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '预选音轨与字幕',
+                              style: TextStyle(
+                                fontSize: 21,
+                                height: 1.15,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            SizedBox(height: 5),
+                            Text(
+                              '播放此版本时优先使用；仍可在播放器中随时切换。',
+                              style: TextStyle(
+                                color: YingjiColors.muted,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
                         ),
+                      ),
+                      YingjiMotionIconButton(
+                        icon: YingjiIcons.xmark,
+                        tooltip: '关闭',
+                        size: 38,
+                        onPressed: () => Navigator.pop(context),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 5),
-                  const Text(
-                    '仅影响下一次开始播放时的默认选择。',
-                    style: TextStyle(color: YingjiColors.muted, fontSize: 12),
-                  ),
-                  const SizedBox(height: 12),
-                  const SizedBox(height: 12),
-                  const Text(
-                    '音轨',
-                    style: TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                  for (final track in resource.audioTracks)
-                    ListTile(
-                      leading: Icon(
-                        _selectedAudioTrack == track.index
-                            ? YingjiIcons.checkmark_circle_fill
-                            : YingjiIcons.circle,
-                      ),
-                      title: Text(track.title),
-                      subtitle: Text(_trackSummary(track)),
-                      selected: _selectedAudioTrack == track.index,
-                      selectedTileColor: Colors.white.withValues(alpha: .10),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      onTap: () {
-                        setState(() => _selectedAudioTrack = track.index);
-                        setSheetState(() {});
+                  const SizedBox(height: 14),
+                  _TrackResourceSummary(resource: resource),
+                  const SizedBox(height: 18),
+                  Expanded(
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final audio = _TrackPickerPane(
+                          icon: YingjiIcons.speaker_2_fill,
+                          title: '音轨',
+                          count: resource.audioTracks.length,
+                          children: [
+                            _TrackPickerOption(
+                              icon: YingjiIcons.sparkles,
+                              title: '自动选择',
+                              detail: '使用服务器默认音轨',
+                              selected: _selectedAudioTrack == null,
+                              onTap: () {
+                                setState(() {
+                                  _selectedAudioTrack = null;
+                                });
+                                updateDialog(() {});
+                              },
+                            ),
+                            for (final track in resource.audioTracks)
+                              _TrackPickerOption(
+                                icon: YingjiIcons.speaker_2_fill,
+                                title: track.title,
+                                detail: _trackSummary(track),
+                                badge: track.isDefault ? '默认' : null,
+                                selected: _selectedAudioTrack == track.index,
+                                onTap: () {
+                                  setState(() {
+                                    _selectedAudioTrack = track.index;
+                                  });
+                                  updateDialog(() {});
+                                },
+                              ),
+                          ],
+                        );
+                        final subtitles = _TrackPickerPane(
+                          icon: YingjiIcons.captions_bubble,
+                          title: '字幕',
+                          count: resource.subtitleTracks.length,
+                          children: [
+                            _TrackPickerOption(
+                              icon: YingjiIcons.sparkles,
+                              title: '自动选择',
+                              detail: '按字幕语言偏好智能选择',
+                              selected: _selectedSubtitleTrack == null,
+                              onTap: () {
+                                setState(() {
+                                  _selectedSubtitleTrack = null;
+                                });
+                                updateDialog(() {});
+                              },
+                            ),
+                            _TrackPickerOption(
+                              icon: YingjiIcons.captions_bubble,
+                              title: '关闭字幕',
+                              detail: '播放时不加载字幕轨道',
+                              selected: _selectedSubtitleTrack == -1,
+                              onTap: () {
+                                setState(() {
+                                  _selectedSubtitleTrack = -1;
+                                });
+                                updateDialog(() {});
+                              },
+                            ),
+                            for (final track in resource.subtitleTracks)
+                              _TrackPickerOption(
+                                icon: YingjiIcons.captions_bubble,
+                                title: track.title,
+                                detail: _trackSummary(track),
+                                badge: track.isDefault ? '默认' : null,
+                                selected: _selectedSubtitleTrack == track.index,
+                                onTap: () {
+                                  setState(() {
+                                    _selectedSubtitleTrack = track.index;
+                                  });
+                                  updateDialog(() {});
+                                },
+                              ),
+                          ],
+                        );
+                        if (constraints.maxWidth < 680) {
+                          return ListView(
+                            children: [
+                              SizedBox(height: 360, child: audio),
+                              const SizedBox(height: 14),
+                              SizedBox(height: 360, child: subtitles),
+                            ],
+                          );
+                        }
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Expanded(child: audio),
+                            const SizedBox(width: 14),
+                            Expanded(child: subtitles),
+                          ],
+                        );
                       },
-                    ),
-                  const Divider(),
-                  const Text(
-                    '字幕',
-                    style: TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                  ListTile(
-                    leading: Icon(
-                      _selectedSubtitleTrack == -1
-                          ? YingjiIcons.checkmark_circle_fill
-                          : YingjiIcons.circle,
-                    ),
-                    title: const Text('关闭字幕'),
-                    selected: _selectedSubtitleTrack == -1,
-                    selectedTileColor: Colors.white.withValues(alpha: .10),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    onTap: () {
-                      setState(() => _selectedSubtitleTrack = -1);
-                      setSheetState(() {});
-                    },
-                  ),
-                  for (final track in resource.subtitleTracks)
-                    ListTile(
-                      leading: Icon(
-                        _selectedSubtitleTrack == track.index
-                            ? YingjiIcons.checkmark_circle_fill
-                            : YingjiIcons.circle,
-                      ),
-                      title: Text(track.title),
-                      subtitle: Text(_trackSummary(track)),
-                      selected: _selectedSubtitleTrack == track.index,
-                      selectedTileColor: Colors.white.withValues(alpha: .10),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      onTap: () {
-                        setState(() => _selectedSubtitleTrack = track.index);
-                        setSheetState(() {});
-                      },
-                    ),
-                  const SizedBox(height: 10),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: FilledButton.icon(
-                      onPressed: () => Navigator.pop(context),
-                      icon: const Icon(YingjiIcons.checkmark_circle_fill),
-                      label: const Text('完成'),
                     ),
                   ),
                 ],
@@ -2814,6 +2864,260 @@ class _FilterChipState extends State<_FilterChip> {
                   ),
                 ],
               ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class _TrackPickerHeadingIcon extends StatelessWidget {
+  const _TrackPickerHeadingIcon();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 42,
+    height: 42,
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(strength: 1.05),
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: YingjiGlass.line(strength: 1.1)),
+    ),
+    child: const Icon(YingjiIcons.captions_bubble, size: 20),
+  );
+}
+
+class _TrackResourceSummary extends StatelessWidget {
+  const _TrackResourceSummary({required this.resource});
+  final MediaItem resource;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(strength: .68),
+      borderRadius: BorderRadius.circular(14),
+    ),
+    child: Row(
+      children: [
+        _ResourceServerMark(source: resource.source),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            resource.source.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Text(
+          [
+            if (resource.width != null && resource.height != null)
+              '${resource.width}×${resource.height}',
+            if (resource.container?.isNotEmpty == true)
+              resource.container!.toUpperCase(),
+          ].join(' · '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: YingjiColors.muted,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _TrackPickerPane extends StatelessWidget {
+  const _TrackPickerPane({
+    required this.icon,
+    required this.title,
+    required this.count,
+    required this.children,
+  });
+  final IconData icon;
+  final String title;
+  final int count;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.fromLTRB(12, 13, 12, 12),
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(strength: .58),
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Row(
+            children: [
+              Icon(icon, size: 17),
+              const SizedBox(width: 8),
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: YingjiGlass.chrome(strength: .74),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '$count 条',
+                  style: const TextStyle(
+                    color: YingjiColors.muted,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          child: Scrollbar(
+            thumbVisibility: children.length > 5,
+            child: ListView.separated(
+              padding: const EdgeInsets.only(right: 4),
+              itemCount: children.length,
+              separatorBuilder: (_, _) => const SizedBox(height: 7),
+              itemBuilder: (_, index) => children[index],
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _TrackPickerOption extends StatelessWidget {
+  const _TrackPickerOption({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.selected,
+    required this.onTap,
+    this.badge,
+  });
+  final IconData icon;
+  final String title;
+  final String detail;
+  final bool selected;
+  final VoidCallback onTap;
+  final String? badge;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    selected: selected,
+    label: '$title，$detail',
+    child: _DetailCardMotion(
+      selected: selected,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(14),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 170),
+            curve: Curves.easeOutCubic,
+            constraints: const BoxConstraints(minHeight: 68),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: selected
+                  ? YingjiGlass.surface(strength: 1.14)
+                  : YingjiGlass.surface(strength: .72),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: selected ? Colors.white : YingjiGlass.line(),
+                width: selected ? 2 : 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: selected
+                        ? Colors.white.withValues(alpha: .16)
+                        : YingjiGlass.chrome(strength: .64),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(icon, size: 17),
+                ),
+                const SizedBox(width: 11),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                          if (badge != null) ...[
+                            const SizedBox(width: 6),
+                            Text(
+                              badge!,
+                              style: const TextStyle(
+                                color: YingjiColors.muted,
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        detail.isEmpty ? '未提供详细信息' : detail,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 150),
+                  child: Icon(
+                    selected
+                        ? YingjiIcons.checkmark_circle_fill
+                        : YingjiIcons.circle,
+                    key: ValueKey(selected),
+                    size: 19,
+                    color: selected ? Colors.white : YingjiColors.muted,
+                  ),
+                ),
+              ],
             ),
           ),
         ),

@@ -115,6 +115,8 @@ void main() {
     await tester.tap(find.byType(Switch).first);
     await tester.tap(find.text('TMDB · 今日热门电视剧').first);
     await tester.pumpAndSettle();
+    expect(find.text('Trakt 电影榜单'), findsOneWidget);
+    expect(find.text('Trakt · 趋势电影'), findsOneWidget);
     expect(find.text('TMDB · 科幻电影'), findsOneWidget);
     await tester.ensureVisible(find.text('TMDB · 科幻电影'));
     await tester.pumpAndSettle();

@@ -159,6 +159,42 @@ void main() {
       client.dispose();
     },
   );
+  test(
+    'Trakt discovery keeps TMDB identity and weekly ranking period',
+    () async {
+      late Uri requested;
+      final client = TraktClient(
+        client: MockClient((request) async {
+          requested = request.url;
+          return http.Response(
+            jsonEncode([
+              {
+                'watcher_count': 42,
+                'show': {
+                  'title': 'Test show',
+                  'ids': {'tmdb': 321},
+                },
+              },
+            ]),
+            200,
+          );
+        }),
+      );
+
+      final rows = await client.discover(
+        clientId: 'client',
+        type: 'shows',
+        list: 'watched',
+        page: 2,
+      );
+      expect(requested.path, '/shows/watched');
+      expect(requested.queryParameters['period'], 'weekly');
+      expect(requested.queryParameters['page'], '2');
+      expect(rows.single.tmdbId, 321);
+      expect(rows.single.kind, '剧集');
+      client.dispose();
+    },
+  );
   testWidgets(
     'cached multi-source scores fit narrow poster and expanded detail',
     (tester) async {

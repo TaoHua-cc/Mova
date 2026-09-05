@@ -1362,6 +1362,7 @@ class _DiscoverPage extends StatefulWidget {
 
 class _DiscoverPageState extends State<_DiscoverPage> {
   final _tmdb = TmdbClient();
+  final _trakt = TraktClient();
   static const _sectionsKey = 'yingji.discover.sections';
   static const _stylesKey = 'yingji.discover.card-styles';
   static const _sourcesKey = 'yingji.discover.section-sources';
@@ -1421,6 +1422,78 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     '流媒体综合': 'TMDB · 流媒体综合',
     '按分类': 'TMDB · 动作分类',
     '按平台': 'TMDB · 流媒体综合',
+    'trakt.movies.trending': 'Trakt · 趋势电影',
+    'trakt.movies.popular': 'Trakt · 热门电影',
+    'trakt.movies.anticipated': 'Trakt · 最受期待电影',
+    'trakt.movies.boxoffice': 'Trakt · 周末票房',
+    'trakt.movies.watched': 'Trakt · 本周观看电影',
+    'trakt.movies.collected': 'Trakt · 本周收藏电影',
+    'trakt.movies.played': 'Trakt · 本周播放电影',
+    'trakt.shows.trending': 'Trakt · 趋势剧集',
+    'trakt.shows.popular': 'Trakt · 热门剧集',
+    'trakt.shows.anticipated': 'Trakt · 最受期待剧集',
+    'trakt.shows.watched': 'Trakt · 本周观看剧集',
+    'trakt.shows.collected': 'Trakt · 本周收藏剧集',
+    'trakt.shows.played': 'Trakt · 本周播放剧集',
+  };
+  static const _sourceGroups = <String, List<String>>{
+    'TMDB 官方榜单': [
+      '今日热门电视剧',
+      '今日热门电影',
+      '本周热门电视剧',
+      '本周热门电影',
+      '热门电视剧',
+      '热门电影',
+      '今日播出剧集',
+      '本周播出剧集',
+      '院线热映',
+      '即将上映',
+      '高分电影',
+      '高分剧集',
+    ],
+    'TMDB 类型与地区': [
+      '热门国产电视剧',
+      '热门国产电影',
+      '热门综艺',
+      '热门国产动漫',
+      '热门番剧',
+      '热门韩剧',
+      '热门日剧',
+      '热门台剧',
+      '动作电影',
+      '喜剧电影',
+      '科幻电影',
+      '悬疑电影',
+      '恐怖电影',
+      '纪录片',
+      '家庭电影',
+      '按分类',
+    ],
+    'TMDB 流媒体': [
+      'Netflix',
+      'Disney+',
+      'Prime Video',
+      'Apple TV+',
+      '流媒体综合',
+      '按平台',
+    ],
+    'Trakt 电影榜单': [
+      'trakt.movies.trending',
+      'trakt.movies.popular',
+      'trakt.movies.anticipated',
+      'trakt.movies.boxoffice',
+      'trakt.movies.watched',
+      'trakt.movies.collected',
+      'trakt.movies.played',
+    ],
+    'Trakt 剧集榜单': [
+      'trakt.shows.trending',
+      'trakt.shows.popular',
+      'trakt.shows.anticipated',
+      'trakt.shows.watched',
+      'trakt.shows.collected',
+      'trakt.shows.played',
+    ],
   };
   final Map<String, int> _cardStyles = {};
   final Map<String, String> _sectionSources = {};
@@ -1437,6 +1510,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   @override
   void dispose() {
     _tmdb.dispose();
+    _trakt.dispose();
     super.dispose();
   }
 
@@ -1638,16 +1712,14 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                         ),
                                       ),
                                       const Spacer(),
-                                      YingjiGlassChoiceButton<String>(
+                                      _DiscoverSourceMenu(
                                         value: source,
-                                        items: _sourceLabels.keys.toList(),
-                                        labelBuilder: (value) =>
-                                            _sourceLabels[value] ?? value,
+                                        labels: _sourceLabels,
+                                        groups: _sourceGroups,
                                         onChanged: (value) {
-                                          updateDialog(
-                                            () => _sectionSources[section] =
-                                                value,
-                                          );
+                                          updateDialog(() {
+                                            _sectionSources[section] = value;
+                                          });
                                           changed = true;
                                         },
                                       ),
@@ -1725,54 +1797,82 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     return Map<String, List<TmdbItem>>.fromEntries(entries);
   }
 
-  Future<List<TmdbItem>> _loadSection(String section, int page) =>
-      switch (section) {
-        '今日热门电视剧' => _tmdb.trendingToday('tv', page: page),
-        '今日热门电影' => _tmdb.trendingToday('movie', page: page),
-        '本周热门电视剧' => _tmdb.trendingThisWeek('tv', page: page),
-        '本周热门电影' => _tmdb.trendingThisWeek('movie', page: page),
-        '热门电视剧' => _tmdb.officialList('popular', 'tv', page: page),
-        '热门电影' => _tmdb.officialList('popular', 'movie', page: page),
-        '今日播出剧集' => _tmdb.officialList('airing_today', 'tv', page: page),
-        '本周播出剧集' => _tmdb.officialList('on_the_air', 'tv', page: page),
-        '院线热映' => _tmdb.officialList('now_playing', 'movie', page: page),
-        '即将上映' => _tmdb.officialList('upcoming', 'movie', page: page),
-        '高分电影' => _tmdb.officialList('top_rated', 'movie', page: page),
-        '高分剧集' => _tmdb.officialList('top_rated', 'tv', page: page),
-        '热门国产电视剧' => _tmdb.discover('tv', page: page, originCountry: 'CN'),
-        '热门国产电影' => _tmdb.discover('movie', page: page, originCountry: 'CN'),
-        '热门综艺' => _tmdb.discover('tv', page: page, genre: 10764),
-        '热门国产动漫' => _tmdb.discover(
-          'tv',
-          page: page,
-          originCountry: 'CN',
-          genre: 16,
-        ),
-        '热门番剧' => _tmdb.discover(
-          'tv',
-          page: page,
-          originCountry: 'JP',
-          genre: 16,
-        ),
-        '热门韩剧' => _tmdb.discover('tv', page: page, originCountry: 'KR'),
-        '热门日剧' => _tmdb.discover('tv', page: page, originCountry: 'JP'),
-        '热门台剧' => _tmdb.discover('tv', page: page, originCountry: 'TW'),
-        '动作电影' => _tmdb.discover('movie', page: page, genre: 28),
-        '喜剧电影' => _tmdb.discover('movie', page: page, genre: 35),
-        '科幻电影' => _tmdb.discover('movie', page: page, genre: 878),
-        '悬疑电影' => _tmdb.discover('movie', page: page, genre: 9648),
-        '恐怖电影' => _tmdb.discover('movie', page: page, genre: 27),
-        '纪录片' => _tmdb.discover('movie', page: page, genre: 99),
-        '家庭电影' => _tmdb.discover('movie', page: page, genre: 10751),
-        'Netflix' => _tmdb.discover('tv', page: page, provider: '8'),
-        'Disney+' => _tmdb.discover('tv', page: page, provider: '337'),
-        'Prime Video' => _tmdb.discover('tv', page: page, provider: '119'),
-        'Apple TV+' => _tmdb.discover('tv', page: page, provider: '350'),
-        '流媒体综合' => _tmdb.discover('tv', page: page, provider: '8|119|337|350'),
-        '按分类' => _tmdb.discover('movie', page: page, genre: 28),
-        '按平台' => _tmdb.discover('tv', page: page, provider: '8|337|350'),
-        _ => _tmdb.trendingToday('movie', page: page),
-      };
+  Future<List<TmdbItem>> _loadSection(
+    String section,
+    int page,
+  ) => switch (section) {
+    '今日热门电视剧' => _tmdb.trendingToday('tv', page: page),
+    '今日热门电影' => _tmdb.trendingToday('movie', page: page),
+    '本周热门电视剧' => _tmdb.trendingThisWeek('tv', page: page),
+    '本周热门电影' => _tmdb.trendingThisWeek('movie', page: page),
+    '热门电视剧' => _tmdb.officialList('popular', 'tv', page: page),
+    '热门电影' => _tmdb.officialList('popular', 'movie', page: page),
+    '今日播出剧集' => _tmdb.officialList('airing_today', 'tv', page: page),
+    '本周播出剧集' => _tmdb.officialList('on_the_air', 'tv', page: page),
+    '院线热映' => _tmdb.officialList('now_playing', 'movie', page: page),
+    '即将上映' => _tmdb.officialList('upcoming', 'movie', page: page),
+    '高分电影' => _tmdb.officialList('top_rated', 'movie', page: page),
+    '高分剧集' => _tmdb.officialList('top_rated', 'tv', page: page),
+    '热门国产电视剧' => _tmdb.discover('tv', page: page, originCountry: 'CN'),
+    '热门国产电影' => _tmdb.discover('movie', page: page, originCountry: 'CN'),
+    '热门综艺' => _tmdb.discover('tv', page: page, genre: 10764),
+    '热门国产动漫' => _tmdb.discover(
+      'tv',
+      page: page,
+      originCountry: 'CN',
+      genre: 16,
+    ),
+    '热门番剧' => _tmdb.discover('tv', page: page, originCountry: 'JP', genre: 16),
+    '热门韩剧' => _tmdb.discover('tv', page: page, originCountry: 'KR'),
+    '热门日剧' => _tmdb.discover('tv', page: page, originCountry: 'JP'),
+    '热门台剧' => _tmdb.discover('tv', page: page, originCountry: 'TW'),
+    '动作电影' => _tmdb.discover('movie', page: page, genre: 28),
+    '喜剧电影' => _tmdb.discover('movie', page: page, genre: 35),
+    '科幻电影' => _tmdb.discover('movie', page: page, genre: 878),
+    '悬疑电影' => _tmdb.discover('movie', page: page, genre: 9648),
+    '恐怖电影' => _tmdb.discover('movie', page: page, genre: 27),
+    '纪录片' => _tmdb.discover('movie', page: page, genre: 99),
+    '家庭电影' => _tmdb.discover('movie', page: page, genre: 10751),
+    'Netflix' => _tmdb.discover('tv', page: page, provider: '8'),
+    'Disney+' => _tmdb.discover('tv', page: page, provider: '337'),
+    'Prime Video' => _tmdb.discover('tv', page: page, provider: '119'),
+    'Apple TV+' => _tmdb.discover('tv', page: page, provider: '350'),
+    '流媒体综合' => _tmdb.discover('tv', page: page, provider: '8|119|337|350'),
+    '按分类' => _tmdb.discover('movie', page: page, genre: 28),
+    '按平台' => _tmdb.discover('tv', page: page, provider: '8|337|350'),
+    final source when source.startsWith('trakt.') => _loadTrakt(source, page),
+    _ => _tmdb.trendingToday('movie', page: page),
+  };
+
+  Future<List<TmdbItem>> _loadTrakt(String source, int page) async {
+    final parts = source.split('.');
+    if (parts.length != 3) return const [];
+    final prefs = await SharedPreferences.getInstance();
+    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
+    final rows = await _trakt.discover(
+      clientId: clientId,
+      type: parts[1],
+      list: parts[2],
+      page: page,
+    );
+    final items = <TmdbItem>[];
+    // Resolve Trakt's canonical TMDB IDs in small batches so cards retain the
+    // same artwork, Chinese metadata and detail-page behavior as other shelves.
+    for (var start = 0; start < rows.length; start += 5) {
+      final end = math.min(start + 5, rows.length);
+      final batch = await Future.wait(
+        rows.sublist(start, end).map((row) async {
+          try {
+            return await _tmdb.details(row.tmdbId, kind: row.kind);
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      items.addAll(batch.whereType<TmdbItem>());
+    }
+    return items;
+  }
 
   Future<List<TmdbItem>> _loadSectionFor(String section, int page) =>
       _loadSection(_sectionSources[section] ?? section, page);
@@ -1875,6 +1975,111 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           );
         },
       );
+}
+
+class _DiscoverSourceMenu extends StatelessWidget {
+  const _DiscoverSourceMenu({
+    required this.value,
+    required this.labels,
+    required this.groups,
+    required this.onChanged,
+  });
+  final String value;
+  final Map<String, String> labels;
+  final Map<String, List<String>> groups;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) => YingjiGlassMenu(
+    entries: [
+      for (final group in groups.entries) ...[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+          child: Row(
+            children: [
+              Icon(
+                group.key.startsWith('Trakt')
+                    ? YingjiIcons.refresh
+                    : group.key.contains('流媒体')
+                    ? YingjiIcons.play_rectangle
+                    : YingjiIcons.rectangle_stack,
+                size: 14,
+                color: YingjiColors.muted,
+              ),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  group.key,
+                  style: const TextStyle(
+                    color: YingjiColors.muted,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              if (group.key.startsWith('Trakt'))
+                const Tooltip(
+                  message: '需要在设置中配置 Trakt Client ID',
+                  child: Icon(YingjiIcons.info_circle, size: 13),
+                ),
+            ],
+          ),
+        ),
+        for (final source in group.value)
+          MenuItemButton(
+            onPressed: () => onChanged(source),
+            trailingIcon: source == value
+                ? const Icon(YingjiIcons.checkmark_circle_fill, size: 16)
+                : null,
+            child: Text(
+              labels[source] ?? source,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontWeight: source == value ? FontWeight.w800 : FontWeight.w600,
+              ),
+            ),
+          ),
+      ],
+    ],
+    child: Semantics(
+      button: true,
+      label: '选择数据来源，当前${labels[value] ?? value}',
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: YingjiGlass.surface(strength: .9),
+          borderRadius: BorderRadius.circular(13),
+          border: Border.all(color: YingjiGlass.line()),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 230),
+                child: Text(
+                  labels[value] ?? value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 7),
+              const Icon(
+                YingjiIcons.chevron_down,
+                size: 15,
+                color: Colors.white70,
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 class _DiscoverBlock extends StatefulWidget {
