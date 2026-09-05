@@ -126,6 +126,39 @@ void main() {
       client.dispose();
     },
   );
+  test(
+    'Trakt playback returns resumable episode progress with identity',
+    () async {
+      final client = TraktClient(
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode([
+              {
+                'progress': 36.5,
+                'paused_at': '2026-09-05T08:30:00Z',
+                'show': {
+                  'ids': {'tmdb': 42},
+                },
+                'episode': {'season': 2, 'number': 5},
+              },
+            ]),
+            200,
+          ),
+        ),
+      );
+
+      final rows = await client.playbackProgress(
+        clientId: 'client',
+        accessToken: 'token',
+      );
+      expect(rows.single.tmdbId, 42);
+      expect(rows.single.seasonNumber, 2);
+      expect(rows.single.episodeNumber, 5);
+      expect(rows.single.progress, 36.5);
+      expect(rows.single.pausedAt, DateTime.utc(2026, 9, 5, 8, 30));
+      client.dispose();
+    },
+  );
   testWidgets(
     'cached multi-source scores fit narrow poster and expanded detail',
     (tester) async {

@@ -68,9 +68,69 @@ class TraktDeviceCode {
   final int interval;
 }
 
+class TraktPlaybackProgress {
+  const TraktPlaybackProgress({
+    required this.tmdbId,
+    required this.seasonNumber,
+    required this.episodeNumber,
+    required this.progress,
+    required this.pausedAt,
+  });
+
+  final int tmdbId;
+  final int seasonNumber;
+  final int episodeNumber;
+  final double progress;
+  final DateTime? pausedAt;
+}
+
 class TraktClient {
   TraktClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
+
+  Future<List<TraktPlaybackProgress>> playbackProgress({
+    required String clientId,
+    required String accessToken,
+  }) async {
+    if (clientId.trim().isEmpty || accessToken.trim().isEmpty) return const [];
+    final response = await _client
+        .get(
+          Uri.parse(
+            'https://api.trakt.tv/sync/playback/episodes?extended=full',
+          ),
+          headers: {
+            'Authorization': 'Bearer ${accessToken.trim()}',
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 续播记录读取失败（HTTP ${response.statusCode}）');
+    }
+    final data = jsonDecode(response.body);
+    if (data is! List) return const [];
+    return data
+        .whereType<Map>()
+        .map((row) {
+          final show = row['show'] as Map? ?? const {};
+          final episode = row['episode'] as Map? ?? const {};
+          final ids = show['ids'] as Map? ?? const {};
+          return TraktPlaybackProgress(
+            tmdbId: (ids['tmdb'] as num?)?.toInt() ?? 0,
+            seasonNumber: (episode['season'] as num?)?.toInt() ?? 0,
+            episodeNumber: (episode['number'] as num?)?.toInt() ?? 0,
+            progress: ((row['progress'] as num?)?.toDouble() ?? 0).clamp(
+              0,
+              100,
+            ),
+            pausedAt: DateTime.tryParse('${row['paused_at'] ?? ''}'),
+          );
+        })
+        .where((row) => row.tmdbId > 0 && row.progress > 0 && row.progress < 92)
+        .toList(growable: false);
+  }
 
   Future<TraktDeviceCode> requestDeviceCode(String clientId) async {
     final response = await _client

@@ -23,6 +23,8 @@ class WatchState {
     this.episodeNumber,
     this.updatedAt,
     this.isPlayed = false,
+    this.progressOrigin = 'local',
+    this.progressOriginName,
   });
   final String mediaId;
   final String title;
@@ -37,6 +39,10 @@ class WatchState {
   final int? episodeNumber;
   final DateTime? updatedAt;
   final bool isPlayed;
+
+  /// Where the latest progress value was read from: local, server, or trakt.
+  final String progressOrigin;
+  final String? progressOriginName;
   bool get isCompleted =>
       isPlayed || (duration > Duration.zero && progress >= .92);
   double get progress => duration.inMilliseconds == 0
@@ -56,6 +62,8 @@ class WatchState {
     'episodeNumber': episodeNumber,
     'updatedAt': updatedAt?.toIso8601String(),
     'isPlayed': isPlayed,
+    'progressOrigin': progressOrigin,
+    'progressOriginName': progressOriginName,
   };
   factory WatchState.fromJson(Map<String, dynamic> value) => WatchState(
     mediaId: '${value['mediaId']}',
@@ -71,6 +79,8 @@ class WatchState {
     episodeNumber: (value['episodeNumber'] as num?)?.toInt(),
     updatedAt: DateTime.tryParse('${value['updatedAt'] ?? ''}'),
     isPlayed: value['isPlayed'] == true,
+    progressOrigin: '${value['progressOrigin'] ?? 'local'}',
+    progressOriginName: value['progressOriginName'] as String?,
   );
 
   WatchState withUpdatedAt(DateTime? value) => WatchState(
@@ -87,6 +97,31 @@ class WatchState {
     episodeNumber: episodeNumber,
     updatedAt: value,
     isPlayed: isPlayed,
+    progressOrigin: progressOrigin,
+    progressOriginName: progressOriginName,
+  );
+
+  WatchState withProgress({
+    required Duration position,
+    required DateTime? updatedAt,
+    required String origin,
+    String? originName,
+  }) => WatchState(
+    mediaId: mediaId,
+    title: title,
+    position: position,
+    duration: duration,
+    imageUrl: imageUrl,
+    sourceId: sourceId,
+    serverItemId: serverItemId,
+    tmdbId: tmdbId,
+    episodeTitle: episodeTitle,
+    seasonNumber: seasonNumber,
+    episodeNumber: episodeNumber,
+    updatedAt: updatedAt,
+    isPlayed: isPlayed,
+    progressOrigin: origin,
+    progressOriginName: originName,
   );
 }
 

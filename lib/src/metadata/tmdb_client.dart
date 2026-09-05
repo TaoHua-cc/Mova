@@ -299,6 +299,15 @@ class TmdbClient {
     'page': '$page',
   }, typeHint: type);
 
+  Future<List<TmdbItem>> trendingThisWeek(
+    String type, {
+    int page = 1,
+    String apiKey = '',
+  }) => _list('/trending/$type/week', apiKey, {
+    'language': 'zh-CN',
+    'page': '$page',
+  }, typeHint: type);
+
   Future<List<TmdbItem>> discover(
     String type, {
     int page = 1,

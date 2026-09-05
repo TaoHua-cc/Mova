@@ -71,4 +71,19 @@ void main() {
       );
     },
   );
+
+  test('watch progress origin survives local storage serialization', () {
+    final source = WatchState(
+      mediaId: 'server-url',
+      title: '示例剧',
+      position: const Duration(minutes: 8),
+      duration: const Duration(minutes: 45),
+      progressOrigin: 'server',
+      progressOriginName: '客厅服务器',
+    );
+
+    final restored = WatchState.fromJson(source.toJson());
+    expect(restored.progressOrigin, 'server');
+    expect(restored.progressOriginName, '客厅服务器');
+  });
 }

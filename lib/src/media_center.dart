@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
@@ -10,6 +11,7 @@ import 'package:flutter/rendering.dart'
     show RenderAbstractViewport, ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:image/image.dart' as image_lib;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -17,6 +19,7 @@ import 'app_route_observer.dart';
 import 'brand.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
+import 'images/icon_background.dart';
 import 'metadata/metadata_detail_page.dart';
 import 'metadata/tmdb_client.dart';
 import 'metadata/ratings.dart';
@@ -1132,8 +1135,11 @@ Future<List<WatchState>> _mergeServerWatchHistory(
               imageUrl: item.imageUrl?.toString(),
               sourceId: item.source.id,
               serverItemId: item.id,
+              tmdbId: int.tryParse(item.providerIds['Tmdb'] ?? ''),
               updatedAt: item.lastPlayedAt,
               isPlayed: item.isPlayed,
+              progressOrigin: 'server',
+              progressOriginName: source.name,
             ),
           ),
         );
@@ -1195,6 +1201,50 @@ Future<List<WatchState>> _mergeServerWatchHistory(
         : localTime;
     final adopted = bestTime == null ? state : state.withUpdatedAt(bestTime);
     merged[existingIndex] = adopted;
+  }
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
+    final token = prefs.getString('yingji.trakt.access-token') ?? '';
+    if (clientId.isNotEmpty && token.isNotEmpty) {
+      final trakt = TraktClient();
+      try {
+        final rows = await trakt.playbackProgress(
+          clientId: clientId,
+          accessToken: token,
+        );
+        for (final row in rows) {
+          final index = merged.indexWhere(
+            (state) =>
+                state.tmdbId == row.tmdbId &&
+                state.seasonNumber == row.seasonNumber &&
+                state.episodeNumber == row.episodeNumber &&
+                state.duration > Duration.zero,
+          );
+          if (index < 0) continue;
+          final current = merged[index];
+          final traktNewer =
+              row.pausedAt != null &&
+              (current.updatedAt == null ||
+                  row.pausedAt!.isAfter(current.updatedAt!));
+          final position = Duration(
+            milliseconds: (current.duration.inMilliseconds * row.progress / 100)
+                .round(),
+          );
+          if (!traktNewer && position <= current.position) continue;
+          merged[index] = current.withProgress(
+            position: position,
+            updatedAt: row.pausedAt ?? current.updatedAt,
+            origin: 'trakt',
+            originName: 'Trakt',
+          );
+        }
+      } finally {
+        trakt.dispose();
+      }
+    }
+  } catch (_) {
+    // Trakt is optional; playable local and server rows remain available.
   }
   _demoteFabricatedImportBursts(merged);
   final ordered = _orderForShelf(merged, remote);
@@ -1295,7 +1345,9 @@ bool _sameWatchStates(List<WatchState> a, List<WatchState> b) {
   for (var i = 0; i < a.length; i++) {
     if (a[i].mediaId != b[i].mediaId ||
         a[i].position != b[i].position ||
-        a[i].duration != b[i].duration) {
+        a[i].duration != b[i].duration ||
+        a[i].progressOrigin != b[i].progressOrigin ||
+        a[i].progressOriginName != b[i].progressOriginName) {
       return false;
     }
   }
@@ -1312,11 +1364,10 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final _tmdb = TmdbClient();
   static const _sectionsKey = 'yingji.discover.sections';
   static const _stylesKey = 'yingji.discover.card-styles';
+  static const _sourcesKey = 'yingji.discover.section-sources';
+  static const _hiddenKey = 'yingji.discover.hidden-sections';
   static const _styleNames = ['竖版海报', '横版剧照', '排行卡片'];
-  final Map<String, int> _cardStyles = {};
-  late Future<Map<String, List<TmdbItem>>> _items;
-  final bool _edit = false;
-  List<String> _sections = <String>[
+  static const _defaultSections = <String>[
     '今日热门电视剧',
     '今日热门电影',
     '今日播出剧集',
@@ -1335,12 +1386,52 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     '按分类',
     '按平台',
   ];
+  static const _sourceLabels = <String, String>{
+    '今日热门电视剧': 'TMDB · 今日热门电视剧',
+    '今日热门电影': 'TMDB · 今日热门电影',
+    '本周热门电视剧': 'TMDB · 本周热门电视剧',
+    '本周热门电影': 'TMDB · 本周热门电影',
+    '热门电视剧': 'TMDB · 热门电视剧',
+    '热门电影': 'TMDB · 热门电影',
+    '今日播出剧集': 'TMDB · 今日播出剧集',
+    '本周播出剧集': 'TMDB · 本周播出剧集',
+    '院线热映': 'TMDB · 院线热映',
+    '即将上映': 'TMDB · 即将上映',
+    '高分电影': 'TMDB · 高分电影',
+    '高分剧集': 'TMDB · 高分剧集',
+    '热门国产电视剧': 'TMDB · 国产电视剧',
+    '热门国产电影': 'TMDB · 国产电影',
+    '热门综艺': 'TMDB · 热门综艺',
+    '热门国产动漫': 'TMDB · 国产动漫',
+    '热门番剧': 'TMDB · 日本动漫',
+    '热门韩剧': 'TMDB · 韩国剧集',
+    '热门日剧': 'TMDB · 日本剧集',
+    '热门台剧': 'TMDB · 台湾剧集',
+    '动作电影': 'TMDB · 动作电影',
+    '喜剧电影': 'TMDB · 喜剧电影',
+    '科幻电影': 'TMDB · 科幻电影',
+    '悬疑电影': 'TMDB · 悬疑电影',
+    '恐怖电影': 'TMDB · 恐怖电影',
+    '纪录片': 'TMDB · 纪录片',
+    '家庭电影': 'TMDB · 家庭电影',
+    'Netflix': 'TMDB · Netflix',
+    'Disney+': 'TMDB · Disney+',
+    'Prime Video': 'TMDB · Prime Video',
+    'Apple TV+': 'TMDB · Apple TV+',
+    '流媒体综合': 'TMDB · 流媒体综合',
+    '按分类': 'TMDB · 动作分类',
+    '按平台': 'TMDB · 流媒体综合',
+  };
+  final Map<String, int> _cardStyles = {};
+  final Map<String, String> _sectionSources = {};
+  final Set<String> _hiddenSections = {};
+  late Future<Map<String, List<TmdbItem>>> _items;
+  List<String> _sections = List.of(_defaultSections);
 
   @override
   void initState() {
     super.initState();
-    _items = _loadSections();
-    _restoreLayout();
+    _items = _initializeSections();
   }
 
   @override
@@ -1349,49 +1440,76 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     super.dispose();
   }
 
+  Future<Map<String, List<TmdbItem>>> _initializeSections() async {
+    await _restoreLayout();
+    return _loadSections();
+  }
+
   Future<void> _restoreLayout() async {
     final prefs = await SharedPreferences.getInstance();
-    if (!mounted) return;
     final rawStyles = prefs.getString(_stylesKey);
     if (rawStyles != null) {
       try {
         final decoded = jsonDecode(rawStyles);
         if (decoded is Map) {
-          setState(() {
-            for (final entry in decoded.entries) {
-              if (_sections.contains(entry.key) &&
-                  entry.value is int &&
-                  entry.value >= 0 &&
-                  entry.value < _styleNames.length) {
-                _cardStyles[entry.key as String] = entry.value as int;
-              }
+          for (final entry in decoded.entries) {
+            if (_sections.contains(entry.key) &&
+                entry.value is int &&
+                entry.value >= 0 &&
+                entry.value < _styleNames.length) {
+              _cardStyles[entry.key as String] = entry.value as int;
             }
-          });
+          }
         }
       } on FormatException {
         // Retain the normal layout when old preference data is malformed.
       }
     }
+    final rawSources = prefs.getString(_sourcesKey);
+    if (rawSources != null) {
+      try {
+        final decoded = jsonDecode(rawSources);
+        if (decoded is Map) {
+          for (final entry in decoded.entries) {
+            final section = '${entry.key}';
+            final source = '${entry.value}';
+            if (_defaultSections.contains(section) &&
+                _sourceLabels.containsKey(source)) {
+              _sectionSources[section] = source;
+            }
+          }
+        }
+      } on FormatException {
+        // Ignore malformed preferences and retain each section's own feed.
+      }
+    }
+    _hiddenSections.addAll(
+      (prefs.getStringList(_hiddenKey) ?? const []).where(
+        _defaultSections.contains,
+      ),
+    );
     final saved = prefs.getStringList(_sectionsKey);
-    if (saved != null && saved.isNotEmpty && mounted) {
+    if (saved != null && saved.isNotEmpty) {
       final known = _sections.toList(growable: false);
-      setState(
-        () => _sections = [
-          ...saved.where(known.contains),
-          ...known.where((section) => !saved.contains(section)),
-        ],
-      );
+      _sections = [
+        ...saved.where(known.contains),
+        ...known.where((section) => !saved.contains(section)),
+      ];
     }
   }
 
   Future<void> _persistLayout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(_sectionsKey, _sections);
+    await prefs.setString(_stylesKey, jsonEncode(_cardStyles));
+    await prefs.setString(_sourcesKey, jsonEncode(_sectionSources));
+    await prefs.setStringList(_hiddenKey, _hiddenSections.toList());
   }
 
   Future<void> _showCardSettings() async {
     final previews = await _items;
     if (!mounted) return;
+    var changed = false;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -1399,8 +1517,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           backgroundColor: Colors.transparent,
           child: ConstrainedBox(
             constraints: BoxConstraints(
-              maxWidth: 640,
-              maxHeight: MediaQuery.sizeOf(context).height * .8,
+              maxWidth: 760,
+              maxHeight: MediaQuery.sizeOf(context).height * .84,
             ),
             child: GlassPanel(
               child: Column(
@@ -1411,7 +1529,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                     children: [
                       const Expanded(
                         child: Text(
-                          '发现页卡片样式',
+                          '发现页栏目编排',
                           style: TextStyle(
                             fontSize: 22,
                             fontWeight: FontWeight.w800,
@@ -1428,59 +1546,147 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '每个榜单独立设置，选择后立即生效并保存。',
+                    '拖动调整顺序；每个栏目可独立选择数据、显示状态和卡片样式。',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   const SizedBox(height: 16),
                   Flexible(
-                    child: ListView.separated(
+                    child: ReorderableListView.builder(
                       shrinkWrap: true,
                       itemCount: _sections.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 16),
+                      buildDefaultDragHandles: false,
+                      onReorderItem: (oldIndex, newIndex) {
+                        updateDialog(() {
+                          final section = _sections.removeAt(oldIndex);
+                          _sections.insert(newIndex, section);
+                        });
+                        changed = true;
+                      },
                       itemBuilder: (_, index) {
                         final section = _sections[index];
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              section,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w800,
-                              ),
+                        final visible = !_hiddenSections.contains(section);
+                        final source = _sectionSources[section] ?? section;
+                        return Padding(
+                          key: ValueKey('discover-setting-$section'),
+                          padding: const EdgeInsets.only(bottom: 14),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: YingjiGlass.surface(strength: .72),
+                              borderRadius: BorderRadius.circular(15),
+                              border: Border.all(color: YingjiGlass.line()),
                             ),
-                            const SizedBox(height: 10),
-                            Row(
-                              children: [
-                                for (var style = 0; style < 3; style++)
-                                  Expanded(
-                                    child: Padding(
-                                      padding: const EdgeInsets.only(right: 8),
-                                      child: _DiscoveryStylePreview(
-                                        label: _styleNames[style],
-                                        style: style,
-                                        selected:
-                                            (_cardStyles[section] ??
-                                                index % 3) ==
-                                            style,
-                                        items: previews[section] ?? const [],
-                                        onTap: () async {
-                                          setState(
-                                            () => _cardStyles[section] = style,
-                                          );
-                                          updateDialog(() {});
-                                          final prefs =
-                                              await SharedPreferences.getInstance();
-                                          await prefs.setString(
-                                            _stylesKey,
-                                            jsonEncode(_cardStyles),
-                                          );
+                            child: Padding(
+                              padding: const EdgeInsets.all(14),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      ReorderableDragStartListener(
+                                        index: index,
+                                        child: const Padding(
+                                          padding: EdgeInsets.all(6),
+                                          child: Icon(
+                                            YingjiIcons.line_horizontal_3,
+                                            size: 18,
+                                            color: YingjiColors.muted,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          section,
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                        ),
+                                      ),
+                                      Text(
+                                        visible ? '显示' : '隐藏',
+                                        style: const TextStyle(
+                                          color: YingjiColors.muted,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Switch(
+                                        value: visible,
+                                        onChanged: (value) {
+                                          updateDialog(() {
+                                            if (value) {
+                                              _hiddenSections.remove(section);
+                                            } else {
+                                              _hiddenSections.add(section);
+                                            }
+                                          });
+                                          changed = true;
                                         },
                                       ),
-                                    ),
+                                    ],
                                   ),
-                              ],
+                                  const SizedBox(height: 10),
+                                  Row(
+                                    children: [
+                                      const Text(
+                                        '数据来源',
+                                        style: TextStyle(
+                                          color: YingjiColors.muted,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      YingjiGlassChoiceButton<String>(
+                                        value: source,
+                                        items: _sourceLabels.keys.toList(),
+                                        labelBuilder: (value) =>
+                                            _sourceLabels[value] ?? value,
+                                        onChanged: (value) {
+                                          updateDialog(
+                                            () => _sectionSources[section] =
+                                                value,
+                                          );
+                                          changed = true;
+                                        },
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Row(
+                                    children: [
+                                      for (var style = 0; style < 3; style++)
+                                        Expanded(
+                                          child: Padding(
+                                            padding: EdgeInsets.only(
+                                              right: style == 2 ? 0 : 8,
+                                            ),
+                                            child: _DiscoveryStylePreview(
+                                              label: _styleNames[style],
+                                              style: style,
+                                              selected:
+                                                  (_cardStyles[section] ??
+                                                      index % 3) ==
+                                                  style,
+                                              items:
+                                                  previews[section] ?? const [],
+                                              onTap: () {
+                                                updateDialog(
+                                                  () => _cardStyles[section] =
+                                                      style,
+                                                );
+                                                changed = true;
+                                              },
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ],
+                              ),
                             ),
-                          ],
+                          ),
                         );
                       },
                     ),
@@ -1492,11 +1698,20 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ),
       ),
     );
+    if (changed && mounted) {
+      await _persistLayout();
+      if (!mounted) return;
+      setState(() {
+        _items = _loadSections();
+      });
+    }
   }
 
   Future<Map<String, List<TmdbItem>>> _loadSections() async {
     final requests = <String, Future<List<TmdbItem>> Function()>{
-      for (final section in _sections) section: () => _loadSection(section, 1),
+      for (final section in _sections)
+        if (!_hiddenSections.contains(section))
+          section: () => _loadSectionFor(section, 1),
     };
     final entries = await Future.wait(
       requests.entries.map((entry) async {
@@ -1514,9 +1729,14 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       switch (section) {
         '今日热门电视剧' => _tmdb.trendingToday('tv', page: page),
         '今日热门电影' => _tmdb.trendingToday('movie', page: page),
+        '本周热门电视剧' => _tmdb.trendingThisWeek('tv', page: page),
+        '本周热门电影' => _tmdb.trendingThisWeek('movie', page: page),
+        '热门电视剧' => _tmdb.officialList('popular', 'tv', page: page),
+        '热门电影' => _tmdb.officialList('popular', 'movie', page: page),
         '今日播出剧集' => _tmdb.officialList('airing_today', 'tv', page: page),
         '本周播出剧集' => _tmdb.officialList('on_the_air', 'tv', page: page),
         '院线热映' => _tmdb.officialList('now_playing', 'movie', page: page),
+        '即将上映' => _tmdb.officialList('upcoming', 'movie', page: page),
         '高分电影' => _tmdb.officialList('top_rated', 'movie', page: page),
         '高分剧集' => _tmdb.officialList('top_rated', 'tv', page: page),
         '热门国产电视剧' => _tmdb.discover('tv', page: page, originCountry: 'CN'),
@@ -1537,10 +1757,25 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         '热门韩剧' => _tmdb.discover('tv', page: page, originCountry: 'KR'),
         '热门日剧' => _tmdb.discover('tv', page: page, originCountry: 'JP'),
         '热门台剧' => _tmdb.discover('tv', page: page, originCountry: 'TW'),
+        '动作电影' => _tmdb.discover('movie', page: page, genre: 28),
+        '喜剧电影' => _tmdb.discover('movie', page: page, genre: 35),
+        '科幻电影' => _tmdb.discover('movie', page: page, genre: 878),
+        '悬疑电影' => _tmdb.discover('movie', page: page, genre: 9648),
+        '恐怖电影' => _tmdb.discover('movie', page: page, genre: 27),
+        '纪录片' => _tmdb.discover('movie', page: page, genre: 99),
+        '家庭电影' => _tmdb.discover('movie', page: page, genre: 10751),
+        'Netflix' => _tmdb.discover('tv', page: page, provider: '8'),
+        'Disney+' => _tmdb.discover('tv', page: page, provider: '337'),
+        'Prime Video' => _tmdb.discover('tv', page: page, provider: '119'),
+        'Apple TV+' => _tmdb.discover('tv', page: page, provider: '350'),
+        '流媒体综合' => _tmdb.discover('tv', page: page, provider: '8|119|337|350'),
         '按分类' => _tmdb.discover('movie', page: page, genre: 28),
         '按平台' => _tmdb.discover('tv', page: page, provider: '8|337|350'),
         _ => _tmdb.trendingToday('movie', page: page),
       };
+
+  Future<List<TmdbItem>> _loadSectionFor(String section, int page) =>
+      _loadSection(_sectionSources[section] ?? section, page);
 
   @override
   Widget build(BuildContext context) =>
@@ -1549,30 +1784,24 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         builder: (context, snapshot) {
           final sections = snapshot.data ?? const <String, List<TmdbItem>>{};
           final items = sections.values.expand((value) => value).toList();
+          final visibleSections = _sections
+              .where((section) => !_hiddenSections.contains(section))
+              .toList(growable: false);
           if (items.isEmpty &&
               snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (items.isEmpty) {
+          if (items.isEmpty && visibleSections.isNotEmpty) {
             return _LoadFailure(
-              onRetry: () => setState(() => _items = _loadSections()),
+              onRetry: () => setState(() {
+                _items = _loadSections();
+              }),
               message: _networkError(snapshot.error),
             );
           }
-          return ReorderableListView.builder(
+          return ListView.builder(
             padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
-            buildDefaultDragHandles: false,
-            itemCount: _sections.length + 1,
-            onReorderItem: (oldIndex, newIndex) {
-              if (!_edit || oldIndex == 0 || newIndex == 0) return;
-              setState(() {
-                final from = oldIndex - 1;
-                final to = newIndex - 1;
-                final section = _sections.removeAt(from);
-                _sections.insert(to.clamp(0, _sections.length), section);
-              });
-              _persistLayout();
-            },
+            itemCount: visibleSections.isEmpty ? 2 : visibleSections.length + 1,
             itemBuilder: (context, index) {
               if (index == 0) {
                 return Padding(
@@ -1595,7 +1824,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                             ),
                             SizedBox(height: 8),
                             Text(
-                              '浏览影视榜单，自定义每个列表的卡片样式。',
+                              '浏览影视榜单，自定义每个列表的数据、顺序与卡片样式。',
                               style: TextStyle(color: Color(0xFFABB1BE)),
                             ),
                           ],
@@ -1611,19 +1840,28 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                 );
               }
-              final section = _sections[index - 1];
+              if (visibleSections.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.only(top: 42),
+                  child: _EmptyStrip(
+                    icon: YingjiIcons.rectangle_stack,
+                    title: '所有栏目均已隐藏',
+                    detail: '点击右上角设置按钮，重新显示需要的栏目。',
+                  ),
+                );
+              }
+              final section = visibleSections[index - 1];
               final block = _DiscoverBlock(
                 title: section,
-                items: sections[section]?.isNotEmpty == true
-                    ? sections[section]!
-                    : items,
-                variant: _cardStyles[section] ?? (index - 1) % 3,
-                loadPage: (page) => _loadSection(section, page),
+                sourceLabel:
+                    _sourceLabels[_sectionSources[section] ?? section] ??
+                    'TMDB · $section',
+                items: sections[section] ?? const [],
+                variant: _cardStyles[section] ?? _sections.indexOf(section) % 3,
+                loadPage: (page) => _loadSectionFor(section, page),
               );
-              return ReorderableDelayedDragStartListener(
+              return KeyedSubtree(
                 key: ValueKey(section),
-                index: index,
-                enabled: _edit,
                 child: AnimatedOpacity(
                   opacity: 1,
                   duration: const Duration(milliseconds: 160),
@@ -1642,11 +1880,13 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 class _DiscoverBlock extends StatefulWidget {
   const _DiscoverBlock({
     required this.title,
+    required this.sourceLabel,
     required this.items,
     required this.variant,
     required this.loadPage,
   });
   final String title;
+  final String sourceLabel;
   final List<TmdbItem> items;
   final int variant;
   final Future<List<TmdbItem>> Function(int page) loadPage;
@@ -1664,6 +1904,15 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
   void initState() {
     super.initState();
     _items = List.of(widget.items);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DiscoverBlock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.items, widget.items)) {
+      _items = List.of(widget.items);
+      _page = 1;
+    }
   }
 
   Future<void> _moveNext() async {
@@ -1693,7 +1942,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
       children: [
         _SectionHeader(
           title: title,
-          subtitle: 'TMDB · 自动更新',
+          subtitle: widget.sourceLabel,
           trailingActions: [
             YingjiDirectionalArrow(
               previous: true,
@@ -4849,6 +5098,7 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _traktAuthorizing = false;
   String? _traktMessage;
   bool _jumpingToSetting = false;
+  int _settingJumpGeneration = 0;
   @override
   void initState() {
     super.initState();
@@ -5215,17 +5465,32 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _jumpToSetting(int index, GlobalKey key) async {
-    final targetContext = key.currentContext;
-    if (targetContext == null) return;
+    final target = key.currentContext?.findRenderObject();
+    if (target == null || !target.attached || !_settingsScroll.hasClients) {
+      return;
+    }
+    final generation = ++_settingJumpGeneration;
     _activeSetting.value = index;
     _jumpingToSetting = true;
-    await Scrollable.ensureVisible(
-      targetContext,
-      alignment: 0,
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOutCubic,
-    );
-    _jumpingToSetting = false;
+    final offset = RenderAbstractViewport.of(target)
+        .getOffsetToReveal(target, 0)
+        .offset
+        .clamp(
+          _settingsScroll.position.minScrollExtent,
+          _settingsScroll.position.maxScrollExtent,
+        );
+    try {
+      await _settingsScroll.animateTo(
+        offset,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOutCubic,
+      );
+    } finally {
+      if (generation == _settingJumpGeneration) {
+        _jumpingToSetting = false;
+        _syncActiveSetting();
+      }
+    }
   }
 
   @override
@@ -6825,6 +7090,11 @@ class _ContinueTile extends StatelessWidget {
                   ),
                   Positioned(
                     left: 10,
+                    top: 10,
+                    child: _WatchProgressOriginBadge(state: state),
+                  ),
+                  Positioned(
+                    left: 10,
                     right: 10,
                     bottom: 8,
                     child: Column(
@@ -6897,6 +7167,62 @@ class _ContinueTile extends StatelessWidget {
       ),
     ),
   );
+}
+
+class _WatchProgressOriginBadge extends StatelessWidget {
+  const _WatchProgressOriginBadge({required this.state});
+
+  final WatchState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, label) = switch (state.progressOrigin) {
+      'server' => (
+        YingjiIcons.server,
+        state.progressOriginName?.trim().isNotEmpty == true
+            ? state.progressOriginName!.trim()
+            : '服务器',
+      ),
+      'trakt' => (YingjiIcons.refresh, 'Trakt'),
+      _ => (YingjiIcons.play_rectangle, '本机'),
+    };
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 132),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      decoration: BoxDecoration(
+        color: YingjiGlass.chrome(strength: 1.08),
+        borderRadius: BorderRadius.circular(99),
+        border: Border.all(color: YingjiGlass.line(strength: 1.1)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x52000000),
+            blurRadius: 14,
+            offset: Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: Colors.white),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10.5,
+                height: 1,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _ContinueArtworkFallback extends StatelessWidget {
@@ -8273,41 +8599,48 @@ class _ServerMark extends StatelessWidget {
         ? const [Color(0xFF9B5DE5), Color(0xFF3157C8)]
         : const [Color(0xFF58D568), Color(0xFF18853A)];
     final customIcon = Uri.tryParse(source.iconUrl ?? '');
+    final hasImage = customIcon != null && customIcon.hasScheme;
     return Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: colors,
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
+        gradient: hasImage
+            ? null
+            : LinearGradient(
+                colors: colors,
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
         borderRadius: BorderRadius.circular(size * .29),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x4D000000),
-            blurRadius: 16,
-            offset: Offset(0, 8),
-          ),
-        ],
+        boxShadow: hasImage
+            ? null
+            : const [
+                BoxShadow(
+                  color: Color(0x4D000000),
+                  blurRadius: 16,
+                  offset: Offset(0, 8),
+                ),
+              ],
       ),
-      child: customIcon != null && customIcon.hasScheme
+      child: hasImage
           ? ClipRRect(
               borderRadius: BorderRadius.circular(size * .29),
-              child: Padding(
-                padding: EdgeInsets.all(size * .08),
-                child: Image.network(
-                  customIcon.toString(),
-                  headers:
-                      customIcon.host == source.endpoint.host &&
-                          token != null &&
-                          token!.isNotEmpty
-                      ? {'X-Emby-Token': token!}
-                      : null,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
-                ),
-              ),
+              child: source.customIcon
+                  ? _BackgroundFreeNetworkIcon(
+                      url: customIcon.toString(),
+                      fallback: _defaultMark(webdav, colors),
+                    )
+                  : Image.network(
+                      customIcon.toString(),
+                      headers:
+                          customIcon.host == source.endpoint.host &&
+                              token != null &&
+                              token!.isNotEmpty
+                          ? {'X-Emby-Token': token!}
+                          : null,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
+                    ),
             )
           : _defaultMark(webdav, colors),
     );
@@ -8336,6 +8669,57 @@ class _ServerMark extends StatelessWidget {
             ),
           ),
         );
+}
+
+final Map<String, Future<Uint8List?>> _backgroundFreeIconCache = {};
+
+class _BackgroundFreeNetworkIcon extends StatelessWidget {
+  const _BackgroundFreeNetworkIcon({required this.url, required this.fallback});
+
+  final String url;
+  final Widget fallback;
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
+    future: _backgroundFreeIconCache.putIfAbsent(
+      url,
+      () => _loadBackgroundFreeIcon(url),
+    ),
+    builder: (context, snapshot) {
+      final bytes = snapshot.data;
+      if (bytes == null) {
+        return snapshot.connectionState == ConnectionState.done
+            ? fallback
+            : const SizedBox.shrink();
+      }
+      return Image.memory(bytes, fit: BoxFit.contain, gaplessPlayback: true);
+    },
+  );
+}
+
+Future<Uint8List?> _loadBackgroundFreeIcon(String value) async {
+  final uri = Uri.tryParse(value);
+  if (uri == null || !uri.hasScheme) return null;
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+  try {
+    final response = await (await client.getUrl(uri)).close();
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    final output = BytesBuilder(copy: false);
+    await for (final chunk in response) {
+      output.add(chunk);
+    }
+    final decoded = image_lib.decodeImage(output.takeBytes());
+    if (decoded == null) return null;
+    final rgba = decoded.numChannels == 4
+        ? decoded
+        : decoded.convert(numChannels: 4);
+    removeFlatIconBackground(rgba);
+    return Uint8List.fromList(image_lib.encodePng(rgba));
+  } catch (_) {
+    return null;
+  } finally {
+    client.close(force: true);
+  }
 }
 
 class _CapabilityTile extends StatelessWidget {
