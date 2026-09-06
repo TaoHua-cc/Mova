@@ -3,7 +3,7 @@ setlocal
 rem ============================================================
 rem  Mova Windows release build + Inno Setup installer
 rem  Usage:  build-release.cmd
-rem  Output: dist-installer\Mova-3.1.64-Windows-x64-Setup.exe
+rem  Output: dist-installer\Mova-3.1.65-Windows-x64-Setup.exe
 rem ============================================================
 
 rem -- Restore Windows env vars that may be dropped when launched

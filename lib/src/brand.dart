@@ -390,12 +390,14 @@ class YingjiGlassMenu extends StatelessWidget {
     this.secondaryOnly = false,
     this.onOpen,
     this.onClose,
+    this.borderRadius = 13,
   });
   final List<Widget> entries;
   final Widget child;
   final bool secondaryOnly;
   final VoidCallback? onOpen;
   final VoidCallback? onClose;
+  final double borderRadius;
 
   @override
   Widget build(BuildContext context) => MenuAnchor(
@@ -431,17 +433,97 @@ class YingjiGlassMenu extends StatelessWidget {
         ),
       ),
     ],
-    builder: (context, controller, _) => InkWell(
-      borderRadius: BorderRadius.circular(13),
-      onSecondaryTapUp: secondaryOnly
-          ? (details) => controller.open(position: details.localPosition)
-          : null,
-      onTap: secondaryOnly
-          ? null
-          : () => controller.isOpen ? controller.close() : controller.open(),
-      child: child,
+    builder: (context, controller, _) => YingjiMotionSurface(
+      borderRadius: borderRadius,
+      selected: controller.isOpen,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(borderRadius),
+        onSecondaryTapUp: secondaryOnly
+            ? (details) => controller.open(position: details.localPosition)
+            : null,
+        onTap: secondaryOnly
+            ? null
+            : () => controller.isOpen ? controller.close() : controller.open(),
+        child: child,
+      ),
     ),
   );
+}
+
+/// Shared pointer and focus feedback for clickable surfaces that are not icon
+/// buttons. It never changes layout: only scale, outline and elevation animate.
+class YingjiMotionSurface extends StatefulWidget {
+  const YingjiMotionSurface({
+    super.key,
+    required this.child,
+    this.selected = false,
+    this.borderRadius = 16,
+  });
+
+  final Widget child;
+  final bool selected;
+  final double borderRadius;
+
+  @override
+  State<YingjiMotionSurface> createState() => _YingjiMotionSurfaceState();
+}
+
+class _YingjiMotionSurfaceState extends State<YingjiMotionSurface> {
+  bool _hovered = false;
+  bool _pressed = false;
+  bool _focused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = widget.selected || _hovered || _focused;
+    return Focus(
+      onFocusChange: (value) => setState(() => _focused = value),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() {
+          _hovered = false;
+          _pressed = false;
+        }),
+        child: Listener(
+          onPointerDown: (_) => setState(() => _pressed = true),
+          onPointerUp: (_) => setState(() => _pressed = false),
+          onPointerCancel: (_) => setState(() => _pressed = false),
+          child: AnimatedScale(
+            scale: _pressed ? .975 : (active ? 1.012 : 1),
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOutCubic,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              foregroundDecoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(widget.borderRadius),
+                border: Border.all(
+                  color: active
+                      ? Colors.white.withValues(alpha: .92)
+                      : Colors.transparent,
+                  width: 1.6,
+                ),
+              ),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(widget.borderRadius),
+                boxShadow: active
+                    ? const [
+                        BoxShadow(
+                          color: Color(0x5C000000),
+                          blurRadius: 22,
+                          offset: Offset(0, 9),
+                        ),
+                      ]
+                    : null,
+              ),
+              child: widget.child,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// Adapter for legacy form selectors; all options use the shared glass menu.

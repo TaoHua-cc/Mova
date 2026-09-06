@@ -2135,10 +2135,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     final response = await _tvMaze
         .get(
           Uri.https('api.tvmaze.com', path, query),
-          headers: const {
-            'Accept': 'application/json',
-            'User-Agent': 'Mova/3',
-          },
+          headers: const {'Accept': 'application/json', 'User-Agent': 'Mova/3'},
         )
         .timeout(const Duration(seconds: 15));
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -3244,6 +3241,9 @@ class _DiscoverListPage extends StatefulWidget {
 }
 
 class _DiscoverListPageState extends State<_DiscoverListPage> {
+  static const _filterKeyPrefix = 'yingji.discover.all-list.filters.';
+  static const _types = ['全部', '电影', '剧集'];
+  static const _sorts = ['热度', '评分', '年份'];
   final _controller = ScrollController();
   late List<TmdbItem> _items;
   int _page = 1;
@@ -3251,12 +3251,52 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   bool _hasMore = true;
   String _type = '全部';
   String _sort = '热度';
+  bool _filterChanged = false;
+
+  String get _filterKey =>
+      '$_filterKeyPrefix${base64Url.encode(utf8.encode(widget.title))}';
 
   @override
   void initState() {
     super.initState();
     _items = List.of(widget.items);
     _controller.addListener(_onScroll);
+    unawaited(_restoreFilters());
+  }
+
+  Future<void> _restoreFilters() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_filterKey);
+    if (saved == null || _filterChanged) return;
+    try {
+      final value = jsonDecode(saved) as Map<String, dynamic>;
+      final type = value['type'] as String?;
+      final sort = value['sort'] as String?;
+      if (!mounted || _filterChanged) return;
+      setState(() {
+        if (_types.contains(type)) _type = type!;
+        if (_sorts.contains(sort)) _sort = sort!;
+      });
+    } catch (_) {
+      // Ignore preferences written by an older or incomplete build.
+    }
+  }
+
+  void _selectFilter({String? type, String? sort}) {
+    setState(() {
+      _filterChanged = true;
+      if (type != null) _type = type;
+      if (sort != null) _sort = sort;
+    });
+    unawaited(_saveFilters());
+  }
+
+  Future<void> _saveFilters() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _filterKey,
+      jsonEncode({'type': _type, 'sort': _sort}),
+    );
   }
 
   void _onScroll() {
@@ -3336,17 +3376,17 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               spacing: 8,
                               runSpacing: 8,
                               children: [
-                                for (final label in const ['全部', '电影', '剧集'])
+                                for (final label in _types)
                                   _RankingFilter(
                                     label: label,
                                     selected: _type == label,
-                                    onTap: () => setState(() => _type = label),
+                                    onTap: () => _selectFilter(type: label),
                                   ),
-                                for (final label in const ['热度', '评分', '年份'])
+                                for (final label in _sorts)
                                   _RankingFilter(
                                     label: label,
                                     selected: _sort == label,
-                                    onTap: () => setState(() => _sort = label),
+                                    onTap: () => _selectFilter(sort: label),
                                   ),
                               ],
                             ),
@@ -4604,6 +4644,16 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
     });
   }
 
+  void _detectScheme(String input) {
+    final match = RegExp(r'https?://', caseSensitive: false).firstMatch(input);
+    if (match == null) return;
+    final scheme = match
+        .group(0)!
+        .substring(0, match.group(0)!.length - 3)
+        .toLowerCase();
+    if (_scheme != scheme) setState(() => _scheme = scheme);
+  }
+
   @override
   void dispose() {
     _name.dispose();
@@ -4915,6 +4965,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
                 TextField(
                   controller: _url,
                   keyboardType: TextInputType.url,
+                  onChanged: _detectScheme,
                   decoration: const InputDecoration(
                     labelText: '服务器线路',
                     hintText: 'https://server.example.com/（可直接粘贴多条）',
@@ -4958,6 +5009,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
                         child: TextField(
                           controller: _alternateUrlControllers[index],
                           keyboardType: TextInputType.url,
+                          onChanged: _detectScheme,
                           decoration: InputDecoration(
                             labelText: '线路 ${index + 2}',
                             hintText: 'https://mirror.example.com/',
@@ -7432,7 +7484,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                     context: context,
                                     applicationName: 'Mova',
                                     applicationIcon: const YingjiMark(size: 56),
-                                    applicationVersion: '3.1.64',
+                                    applicationVersion: '3.1.65',
                                     applicationLegalese: '私人媒体中心 · 内置 libmpv',
                                   ),
                                 ),

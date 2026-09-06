@@ -308,7 +308,7 @@ class _PlayerPageState extends State<PlayerPage> {
         unawaited(_syncProgress());
         _scheduleControlsHide();
       } else {
-        _revealControls(keepVisible: true);
+        _revealControls();
       }
     });
     _bufferSubscription = _player.stream.buffer.listen((buffer) async {
@@ -330,18 +330,20 @@ class _PlayerPageState extends State<PlayerPage> {
     });
   }
 
-  void _revealControls({bool keepVisible = false}) {
+  void _revealControls() {
     if (!mounted) return;
     if (!_showControls) setState(() => _showControls = true);
     _controlsTimer?.cancel();
-    if (!keepVisible && !_settingsOpen) _scheduleControlsHide();
+    if (!_settingsOpen) _scheduleControlsHide();
   }
 
-  void _scheduleControlsHide() {
+  void _scheduleControlsHide({
+    Duration delay = const Duration(milliseconds: 1100),
+  }) {
     _controlsTimer?.cancel();
-    if (_settingsOpen || _quickMenuOpen || !_player.state.playing) return;
-    _controlsTimer = Timer(const Duration(milliseconds: 1800), () {
-      if (mounted && !_settingsOpen && _player.state.playing) {
+    if (_settingsOpen || _quickMenuOpen) return;
+    _controlsTimer = Timer(delay, () {
+      if (mounted && !_settingsOpen && !_quickMenuOpen) {
         setState(() => _showControls = false);
       }
     });
@@ -541,12 +543,12 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _togglePlayback() async {
     _focusNode.requestFocus();
-    _revealControls(keepVisible: true);
+    _revealControls();
     await _player.playOrPause();
   }
 
   Future<void> _seekBy(Duration delta) async {
-    _revealControls(keepVisible: true);
+    _revealControls();
     final target = _player.state.position + delta;
     final duration = _player.state.duration;
     await _player.seek(
@@ -584,7 +586,7 @@ class _PlayerPageState extends State<PlayerPage> {
         final prefs = await SharedPreferences.getInstance();
         unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
       }
-      _revealControls(keepVisible: true);
+      _revealControls();
     } finally {
       _switchingEpisode = false;
     }
@@ -1347,6 +1349,8 @@ class _PlayerPageState extends State<PlayerPage> {
         body: MouseRegion(
           onEnter: (_) => _revealControls(),
           onHover: (_) => _revealControls(),
+          onExit: (_) =>
+              _scheduleControlsHide(delay: const Duration(milliseconds: 250)),
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
             onTap: _togglePlayback,
@@ -1645,7 +1649,7 @@ class _PlayerPageState extends State<PlayerPage> {
                                 builder: (_, playing) => YingjiMotionIconButton(
                                   tooltip: playing.data == true ? '暂停' : '播放',
                                   onPressed: () {
-                                    _revealControls(keepVisible: true);
+                                    _revealControls();
                                     _player.playOrPause();
                                   },
                                   selected: playing.data == true,
@@ -1687,50 +1691,53 @@ class _PlayerPageState extends State<PlayerPage> {
                           ),
                         ),
                         const SizedBox(width: 14),
-                        Flexible(
-                          child: GlassPanel(
-                            radius: 28,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 8,
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              mainAxisAlignment: MainAxisAlignment.end,
-                              children: [
-                                YingjiMotionIconButton(
-                                  tooltip: _muted ? '恢复声音' : '静音',
-                                  onPressed: _toggleMute,
-                                  icon: _muted
-                                      ? YingjiIcons.speaker_slash
-                                      : YingjiIcons.speaker_2_fill,
-                                  selected: _muted,
-                                  size: 40,
-                                ),
-                                SizedBox(
-                                  width: 116,
-                                  height: 40,
-                                  child: Slider(
-                                    value: _volume,
-                                    min: 0,
-                                    max: 100,
-                                    onChanged: _setVolume,
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                ..._playerToolButtons(),
-                                if (widget.episodes.isNotEmpty) ...[
-                                  const SizedBox(width: 8),
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: GlassPanel(
+                              radius: 28,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
                                   YingjiMotionIconButton(
-                                    icon: YingjiIcons.rectangle_stack,
-                                    tooltip: '全集列表',
-                                    selected:
-                                        _settingsOpen && _consoleTab == '全集',
+                                    tooltip: _muted ? '恢复声音' : '静音',
+                                    onPressed: _toggleMute,
+                                    icon: _muted
+                                        ? YingjiIcons.speaker_slash
+                                        : YingjiIcons.speaker_2_fill,
+                                    selected: _muted,
                                     size: 40,
-                                    onPressed: _showEpisodeList,
                                   ),
+                                  SizedBox(
+                                    width: 116,
+                                    height: 40,
+                                    child: Slider(
+                                      value: _volume,
+                                      min: 0,
+                                      max: 100,
+                                      onChanged: _setVolume,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  ..._playerToolButtons(),
+                                  if (widget.episodes.isNotEmpty) ...[
+                                    const SizedBox(width: 8),
+                                    YingjiMotionIconButton(
+                                      icon: YingjiIcons.rectangle_stack,
+                                      tooltip: '全集列表',
+                                      selected:
+                                          _settingsOpen && _consoleTab == '全集',
+                                      size: 40,
+                                      onPressed: _showEpisodeList,
+                                    ),
+                                  ],
                                 ],
-                              ],
+                              ),
                             ),
                           ),
                         ),
@@ -2099,43 +2106,47 @@ class _PlayerPageState extends State<PlayerPage> {
   Widget _episodePanel() => Column(
     children: [
       for (var index = 0; index < widget.episodes.length; index++) ...[
-        GlassPanel(
-          radius: 16,
-          padding: EdgeInsets.zero,
-          child: ListTile(
-            selected: index == _activeEpisodeIndex,
-            leading: SizedBox(
-              width: 86,
-              child: AspectRatio(
-                aspectRatio: 16 / 9,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(9),
-                  child: widget.episodes[index].imageUrl?.isNotEmpty == true
-                      ? Image.network(
-                          widget.episodes[index].imageUrl!,
-                          fit: BoxFit.cover,
-                        )
-                      : const ColoredBox(
-                          color: Colors.white10,
-                          child: Icon(YingjiIcons.film),
-                        ),
+        YingjiMotionSurface(
+          selected: index == _activeEpisodeIndex,
+          borderRadius: 16,
+          child: GlassPanel(
+            radius: 16,
+            padding: EdgeInsets.zero,
+            child: ListTile(
+              selected: index == _activeEpisodeIndex,
+              leading: SizedBox(
+                width: 86,
+                child: AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(9),
+                    child: widget.episodes[index].imageUrl?.isNotEmpty == true
+                        ? Image.network(
+                            widget.episodes[index].imageUrl!,
+                            fit: BoxFit.cover,
+                          )
+                        : const ColoredBox(
+                            color: Colors.white10,
+                            child: Icon(YingjiIcons.film),
+                          ),
+                  ),
                 ),
               ),
+              title: Text(
+                '第 ${widget.episodes[index].episodeNumber ?? index + 1} 集 · ${widget.episodes[index].episodeTitle ?? '未命名'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                widget.episodes[index].resourceInfo ?? '点击切换播放',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: index == _activeEpisodeIndex
+                  ? const Icon(YingjiIcons.checkmark_circle_fill)
+                  : null,
+              onTap: () => unawaited(_switchEpisode(index)),
             ),
-            title: Text(
-              '第 ${widget.episodes[index].episodeNumber ?? index + 1} 集 · ${widget.episodes[index].episodeTitle ?? '未命名'}',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text(
-              widget.episodes[index].resourceInfo ?? '点击切换播放',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            trailing: index == _activeEpisodeIndex
-                ? const Icon(YingjiIcons.checkmark_circle_fill)
-                : null,
-            onTap: () => unawaited(_switchEpisode(index)),
           ),
         ),
         if (index != widget.episodes.length - 1) const SizedBox(height: 8),
@@ -2243,6 +2254,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }) => Tooltip(
     message: '$label · ${labelBuilder(value)}',
     child: YingjiGlassMenu(
+      borderRadius: 999,
       onOpen: () {
         _quickMenuOpen = true;
         _controlsTimer?.cancel();

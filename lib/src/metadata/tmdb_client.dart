@@ -840,7 +840,7 @@ class TmdbClient {
                 uri,
                 headers: const {
                   'Accept': 'application/json',
-                  'User-Agent': 'Mova/3.1.64 (Windows; Flutter)',
+                  'User-Agent': 'Mova/3.1.65 (Windows; Flutter)',
                 },
               )
               .timeout(const Duration(seconds: 12));
@@ -883,7 +883,7 @@ class TmdbClient {
             uri,
             headers: const {
               'Accept': 'application/json',
-              'User-Agent': 'Mova/3.1.64 (Windows; Flutter)',
+              'User-Agent': 'Mova/3.1.65 (Windows; Flutter)',
             },
           )
           .timeout(const Duration(seconds: 12));

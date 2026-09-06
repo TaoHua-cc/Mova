@@ -43,6 +43,10 @@ class YingjiApp extends StatelessWidget {
         fontFamily: YingjiFonts.family,
         fontFamilyFallback: [...YingjiFonts.fallback, 'Segoe UI'],
         visualDensity: VisualDensity.compact,
+        hoverColor: Colors.white.withValues(alpha: .09),
+        focusColor: Colors.white.withValues(alpha: .13),
+        splashColor: Colors.white.withValues(alpha: .16),
+        highlightColor: Colors.white.withValues(alpha: .11),
         textTheme:
             const TextTheme(
               displayLarge: TextStyle(
@@ -141,6 +145,31 @@ class YingjiApp extends StatelessWidget {
               }
               return Colors.transparent;
             }),
+          ),
+        ),
+        menuButtonTheme: MenuButtonThemeData(
+          style: ButtonStyle(
+            animationDuration: const Duration(milliseconds: 160),
+            shape: WidgetStatePropertyAll(
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(11)),
+            ),
+            backgroundColor: WidgetStateProperty.resolveWith((states) {
+              if (states.contains(WidgetState.pressed)) {
+                return Colors.white.withValues(alpha: .16);
+              }
+              if (states.contains(WidgetState.hovered) ||
+                  states.contains(WidgetState.focused)) {
+                return Colors.white.withValues(alpha: .09);
+              }
+              return Colors.transparent;
+            }),
+          ),
+        ),
+        listTileTheme: ListTileThemeData(
+          selectedColor: YingjiColors.ink,
+          selectedTileColor: Colors.white.withValues(alpha: .09),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
           ),
         ),
         dividerTheme: const DividerThemeData(
