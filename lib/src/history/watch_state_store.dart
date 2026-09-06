@@ -206,19 +206,30 @@ class WatchStateStore {
   Future<void> clear() => _prefs.remove(key);
 }
 
-/// Sorts watch states by most recent watch time first. Entries that carry an
-/// [WatchState.updatedAt] are ordered newest first; entries without one are
-/// appended after them, preserving their previous relative order, so legacy
-/// rows never leap over genuinely fresh ones.
+/// Sorts continue-watching states by their real playback time. Dated entries
+/// always come first and are newest-first. When a provider cannot supply a
+/// timestamp, its rows follow in provider priority: Trakt, server, then local.
 List<WatchState> sortWatchStatesByRecency(Iterable<WatchState> source) {
-  final rows = source.toList(growable: false);
-  final dated = <WatchState>[];
-  final undated = <WatchState>[];
-  for (final row in rows) {
-    (row.updatedAt == null ? undated : dated).add(row);
-  }
-  dated.sort((a, b) => b.updatedAt!.compareTo(a.updatedAt!));
-  return [...dated, ...undated];
+  int originPriority(WatchState row) => switch (row.progressOrigin) {
+    'trakt' => 0,
+    'server' => 1,
+    _ => 2,
+  };
+
+  final indexed = source.toList(growable: false).indexed.toList();
+  indexed.sort((a, b) {
+    final aTime = a.$2.updatedAt;
+    final bTime = b.$2.updatedAt;
+    if (aTime != null && bTime != null) {
+      final byTime = bTime.compareTo(aTime);
+      return byTime != 0 ? byTime : a.$1.compareTo(b.$1);
+    }
+    if (aTime != null) return -1;
+    if (bTime != null) return 1;
+    final byOrigin = originPriority(a.$2).compareTo(originPriority(b.$2));
+    return byOrigin != 0 ? byOrigin : a.$1.compareTo(b.$1);
+  });
+  return indexed.map((entry) => entry.$2).toList(growable: false);
 }
 
 /// A display projection only: episode history stays intact for resume/rewatch.

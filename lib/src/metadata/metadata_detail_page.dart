@@ -2667,8 +2667,42 @@ class _ResourceSection extends StatefulWidget {
 }
 
 class _ResourceSectionState extends State<_ResourceSection> {
+  static const _sortPreferenceKey = 'yingji.detail.resource-sort';
+  static const _viewPreferenceKey = 'yingji.detail.resource-view';
   String _sort = 'range';
   String _viewMode = 'server';
+
+  @override
+  void initState() {
+    super.initState();
+    _restorePreferences();
+  }
+
+  Future<void> _restorePreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final sort = prefs.getString(_sortPreferenceKey);
+    final view = prefs.getString(_viewPreferenceKey);
+    if (!mounted) return;
+    setState(() {
+      if (const {'range', 'resolution', 'bitrate', 'size'}.contains(sort)) {
+        _sort = sort!;
+      }
+      if (const {'server', 'resource'}.contains(view)) _viewMode = view!;
+    });
+  }
+
+  Future<void> _selectSort(String value) async {
+    setState(() => _sort = value);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_sortPreferenceKey, value);
+  }
+
+  Future<void> _toggleViewMode() async {
+    final value = _viewMode == 'server' ? 'resource' : 'server';
+    setState(() => _viewMode = value);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_viewPreferenceKey, value);
+  }
 
   List<MediaItem> get _sorted {
     final rows = [...widget.resources];
@@ -2713,25 +2747,25 @@ class _ResourceSectionState extends State<_ResourceSection> {
             label: '色彩范围',
             icon: YingjiIcons.sparkles,
             active: _sort == 'range',
-            onTap: () => setState(() => _sort = 'range'),
+            onTap: () => _selectSort('range'),
           ),
           _FilterChip(
             label: '分辨率',
             icon: YingjiIcons.play_rectangle,
             active: _sort == 'resolution',
-            onTap: () => setState(() => _sort = 'resolution'),
+            onTap: () => _selectSort('resolution'),
           ),
           _FilterChip(
             label: '码率',
             icon: YingjiIcons.gauge,
             active: _sort == 'bitrate',
-            onTap: () => setState(() => _sort = 'bitrate'),
+            onTap: () => _selectSort('bitrate'),
           ),
           _FilterChip(
             label: '大小',
             icon: YingjiIcons.rectangle_stack,
             active: _sort == 'size',
-            onTap: () => setState(() => _sort = 'size'),
+            onTap: () => _selectSort('size'),
           ),
           const Spacer(),
           YingjiMotionIconButton(
@@ -2741,9 +2775,7 @@ class _ResourceSectionState extends State<_ResourceSection> {
             tooltip: _viewMode == 'server' ? '按服务器展示' : '按资源展示',
             selected: true,
             size: 38,
-            onPressed: () => setState(() {
-              _viewMode = _viewMode == 'server' ? 'resource' : 'server';
-            }),
+            onPressed: _toggleViewMode,
           ),
         ],
       ),

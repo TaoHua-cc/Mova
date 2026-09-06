@@ -1,9 +1,9 @@
 @echo off
 setlocal
 rem ============================================================
-rem  Yingji Windows release build + Inno Setup installer
+rem  Mova Windows release build + Inno Setup installer
 rem  Usage:  build-release.cmd
-rem  Output: dist-installer\Yingji-3.1.42-Windows-x64-Setup.exe
+rem  Output: dist-installer\Mova-3.1.64-Windows-x64-Setup.exe
 rem ============================================================
 
 rem -- Restore Windows env vars that may be dropped when launched
@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 echo [2/2] Inno Setup packaging ...
-"C:\Users\gctyk\AppData\Local\Programs\Inno Setup 6\ISCC.exe" "%~dp0installer\Yingji.iss"
+"C:\Users\gctyk\AppData\Local\Programs\Inno Setup 6\ISCC.exe" "%~dp0installer\Mova.iss"
 if errorlevel 1 (
   echo INNO_PACKAGING_FAILED
   exit /b 1

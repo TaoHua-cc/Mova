@@ -9,6 +9,6 @@ Push-Location $root
 try {
   & $flutter build windows --release
   if ($LASTEXITCODE -ne 0) { throw "Flutter Windows build failed: exit code $LASTEXITCODE" }
-  & $iscc (Join-Path $root 'installer\Yingji.iss')
+  & $iscc (Join-Path $root 'installer\Mova.iss')
   if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed: exit code $LASTEXITCODE" }
 } finally { Pop-Location }

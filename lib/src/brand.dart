@@ -697,68 +697,15 @@ class YingjiMark extends StatelessWidget {
   final String? style;
 
   @override
-  Widget build(BuildContext context) => Container(
+  Widget build(BuildContext context) => SizedBox(
     width: size,
     height: size,
-    decoration: BoxDecoration(
-      color: YingjiColors.ink,
-      borderRadius: BorderRadius.circular(size * .31),
-      border: Border.all(color: const Color(0x66FFFFFF)),
-      boxShadow: const [
-        BoxShadow(color: Colors.black54, blurRadius: 20, offset: Offset(0, 8)),
-        BoxShadow(color: Color(0x44FFFFFF), blurRadius: 1),
-      ],
+    child: Image.asset(
+      'app/assets/mova-logo.png',
+      width: size,
+      height: size,
+      filterQuality: FilterQuality.high,
     ),
-    child: switch (style ?? yingjiAppearance.iconStyle) {
-      'spark' => Icon(
-        YingjiIcons.sparkles,
-        size: size * .48,
-        color: YingjiColors.canvas,
-      ),
-      'letter' => Text(
-        '映',
-        style: TextStyle(
-          color: YingjiColors.canvas,
-          fontSize: size * .48,
-          fontWeight: FontWeight.w900,
-          height: 1,
-        ),
-      ),
-      _ => Stack(
-        alignment: Alignment.center,
-        children: [
-          Icon(
-            YingjiIcons.play_fill,
-            size: size * .48,
-            color: YingjiColors.canvas,
-          ),
-          Positioned(
-            left: size * .21,
-            top: size * .37,
-            child: Container(
-              width: size * .08,
-              height: size * .08,
-              decoration: const BoxDecoration(
-                color: YingjiColors.canvas,
-                shape: BoxShape.circle,
-              ),
-            ),
-          ),
-          Positioned(
-            right: size * .17,
-            top: size * .2,
-            child: Container(
-              width: size * .075,
-              height: size * .075,
-              decoration: const BoxDecoration(
-                color: YingjiColors.canvas,
-                shape: BoxShape.circle,
-              ),
-            ),
-          ),
-        ],
-      ),
-    },
   );
 }
 

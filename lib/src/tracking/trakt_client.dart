@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../metadata/tmdb_client.dart';
+
 class TraktEvent {
   const TraktEvent({
     required this.title,
@@ -104,22 +106,39 @@ class TraktClient {
       throw Exception('请先在设置中配置 Trakt Client ID');
     }
     final kind = type == 'shows' ? '剧集' : '电影';
-    final response = await _client
-        .get(
-          Uri.https('api.trakt.tv', '/$type/$list', {
-            'page': '$page',
-            'limit': '20',
-            'extended': 'full',
-            if (list == 'watched' || list == 'played' || list == 'collected')
-              'period': 'weekly',
-          }),
-          headers: {
-            'trakt-api-version': '2',
-            'trakt-api-key': clientId.trim(),
-            'Accept': 'application/json',
-          },
-        )
-        .timeout(const Duration(seconds: 15));
+    final query = {
+      'page': '$page',
+      'limit': '20',
+      'extended': 'full',
+      if (list == 'watched' || list == 'played' || list == 'collected')
+        'period': 'weekly',
+    };
+    final headers = {
+      'trakt-api-version': '2',
+      'trakt-api-key': clientId.trim(),
+      'Accept': 'application/json',
+    };
+    http.Response? response;
+    Object? lastError;
+    for (final uri in [
+      Uri.parse('${TmdbClient.managedEndpoint}/discover/trakt/$type/$list')
+          .replace(queryParameters: query),
+      Uri.https('api.trakt.tv', '/$type/$list', query),
+    ]) {
+      try {
+        response = await _client
+            .get(uri, headers: headers)
+            .timeout(const Duration(seconds: 15));
+        if (response.statusCode >= 200 && response.statusCode < 300) break;
+        lastError = Exception('HTTP ${response.statusCode}');
+        response = null;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (response == null) {
+      throw Exception('Trakt 榜单读取失败：$lastError');
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception('Trakt 榜单读取失败（HTTP ${response.statusCode}）');
     }
@@ -128,8 +147,10 @@ class TraktClient {
     final result = <TraktDiscoveryItem>[];
     final seen = <int>{};
     for (final row in rows.whereType<Map>()) {
-      final media = row[type == 'shows' ? 'show' : 'movie'];
-      if (media is! Map) continue;
+      final nested = row[type == 'shows' ? 'show' : 'movie'];
+      // Trakt wraps ranked feeds (trending, watched, anticipated) but returns
+      // popular feeds as direct movie/show objects.
+      final Map media = nested is Map ? nested : row;
       final ids = media['ids'];
       if (ids is! Map) continue;
       final tmdbId = (ids['tmdb'] as num?)?.toInt() ?? 0;

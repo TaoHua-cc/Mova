@@ -1,6 +1,10 @@
-# 映迹 Yingji
+# Mova
 
-映迹是一款面向 Windows 的沉浸式私人影音客户端。它把 TMDB 中文影视资料、Emby / Jellyfin / WebDAV 媒体来源、Trakt 观看记录与 libmpv 播放器整合到统一的海报背景界面中。
+<p align="center">
+  <img src="app/assets/mova-logo.png" alt="Mova" width="128" />
+</p>
+
+Mova 是一款面向 Windows 的沉浸式私人影音客户端。它把 TMDB 中文影视资料、Emby / Jellyfin / WebDAV 媒体来源、Trakt 观看记录与 libmpv 播放器整合到统一的海报背景界面中。
 
 ## 主要体验
 
@@ -27,7 +31,7 @@
 
 请从 [GitHub Releases](https://github.com/TaoHua-cc/yingji/releases) 下载最新的 Windows x64 安装程序。
 
-安装包会部署映迹、Flutter Windows 运行组件和 libmpv 播放依赖。服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
+安装包会部署 Mova、Flutter Windows 运行组件和 libmpv 播放依赖。服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
 
 ## 系统要求
 
@@ -37,8 +41,8 @@
 
 ## 隐私与授权
 
-映迹不会将媒体服务器凭据提交到本仓库。服务器访问令牌使用 Windows 数据保护机制存储。
+Mova 不会将媒体服务器凭据提交到本仓库。服务器访问令牌使用 Windows 数据保护机制存储。
 
-本仓库用于映迹产品发布与问题跟踪，不授予源代码开源许可。未经明确授权，不得复制、修改、再分发或将本项目代码用于派生产品。
+本仓库用于 Mova 产品发布与问题跟踪，不授予源代码开源许可。未经明确授权，不得复制、修改、再分发或将本项目代码用于派生产品。
 
 第三方组件信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

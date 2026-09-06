@@ -109,6 +109,190 @@ export async function handleRatings(request, env, ctx, {
   finally { pending.delete(key); }
 }
 
+const officialLists = new Set([
+  'anticipated', 'justwatch-streaming-charts', 'most-watched',
+  'most-watched-week', 'moviemeter', 'popular', 'streaming-charts', 'trending',
+]);
+
+export async function handleDiscovery(request, env, ctx, {
+  fetcher = fetch,
+  cache = globalThis.caches?.default,
+} = {}) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/discover/mdblist/')) return null;
+  if (request.method === 'OPTIONS') return new Response(null, { headers });
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const match = /^\/discover\/mdblist\/(movie|tv)\/([a-z-]+)\/?$/.exec(url.pathname);
+  const page = Number(url.searchParams.get('page') ?? '1');
+  const country = (url.searchParams.get('country') ?? 'all').toUpperCase();
+  if (!match || !officialLists.has(match[2]) || !Number.isInteger(page) || page < 1 || page > 50 ||
+      !/^(ALL|[A-Z]{2})$/.test(country)) {
+    return json({ error: 'invalid_discovery_request' }, 400);
+  }
+  if (typeof env.MDBList !== 'string' || !env.MDBList.trim()) {
+    return json({ error: 'discovery_not_configured' }, 503);
+  }
+  const [, type, list] = match;
+  const cacheKey = new Request(`${url.origin}${url.pathname}?page=${page}&country=${country}`);
+  const cached = cache ? await cache.match(cacheKey) : null;
+  if (cached) return cached;
+  try {
+    const upstream = new URL(`https://api.mdblist.com/lists/official/${type === 'tv' ? 'shows' : 'movies'}/${list}/items`);
+    upstream.searchParams.set('apikey', env.MDBList.trim());
+    upstream.searchParams.set('mediatype', type === 'tv' ? 'show' : 'movie');
+    if (country === 'ALL') upstream.searchParams.set('extended', 'ids_only');
+    // Fetch enough rows to apply the country filter without exposing MDBList data.
+    upstream.searchParams.set('limit', country === 'ALL' ? '20' : '250');
+    upstream.searchParams.set('offset', `${(page - 1) * (country === 'ALL' ? 20 : 250)}`);
+    const response = await fetchSameOrigin(upstream, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    }, fetcher);
+    if (!response.ok) {
+      return json({ error: response.status === 429 ? 'discovery_rate_limited' : 'discovery_unavailable', upstreamStatus: response.status }, 503);
+    }
+    const data = await response.json();
+    const bucket = type === 'tv' ? data?.shows : data?.movies;
+    if (!Array.isArray(bucket)) return json({ error: 'discovery_invalid_response' }, 502);
+    const results = [];
+    for (const row of bucket) {
+      if (country !== 'ALL' && String(row?.country ?? '').toUpperCase() !== country) continue;
+      const tmdbId = Number(row?.ids?.tmdb ?? row?.tmdb_id);
+      if (Number.isInteger(tmdbId) && tmdbId > 0 && !results.some(item => item.tmdbId === tmdbId)) {
+        results.push({ tmdbId, mediaType: type });
+      }
+      if (results.length === 20) break;
+    }
+    const result = json({ provider: 'MDBList', type, list, page, results }, 200, 1800);
+    if (cache) {
+      const write = cache.put(cacheKey, result.clone()).catch(() => {});
+      if (ctx?.waitUntil) ctx.waitUntil(write);
+      else await write;
+    }
+    return result;
+  } catch (error) {
+    return json({ error: 'discovery_unavailable', reason: safeFailure(error) }, 503);
+  }
+}
+
+const traktLists = new Set([
+  'anticipated', 'boxoffice', 'collected', 'played', 'popular', 'trending', 'watched',
+]);
+
+export async function handleTraktDiscovery(request, _env, ctx, {
+  fetcher = fetch,
+  cache = globalThis.caches?.default,
+} = {}) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/discover/trakt/')) return null;
+  if (request.method === 'OPTIONS') return new Response(null, { headers });
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const match = /^\/discover\/trakt\/(movies|shows)\/([a-z]+)\/?$/.exec(url.pathname);
+  const page = Number(url.searchParams.get('page') ?? '1');
+  if (!match || !traktLists.has(match[2]) || !Number.isInteger(page) || page < 1 || page > 100) {
+    return json({ error: 'invalid_trakt_request' }, 400);
+  }
+  if (match[1] === 'shows' && match[2] === 'boxoffice') {
+    return json({ error: 'invalid_trakt_request' }, 400);
+  }
+  const clientId = request.headers.get('trakt-api-key')?.trim();
+  if (!clientId) return json({ error: 'trakt_not_configured' }, 503);
+  const [, type, list] = match;
+  const cacheKey = new Request(`${url.origin}${url.pathname}?page=${page}`);
+  const cached = cache ? await cache.match(cacheKey) : null;
+  if (cached) return cached;
+  try {
+    const upstream = new URL(`https://api.trakt.tv/${type}/${list}`);
+    upstream.searchParams.set('page', `${page}`);
+    upstream.searchParams.set('limit', '20');
+    upstream.searchParams.set('extended', 'full');
+    if (['watched', 'played', 'collected'].includes(list)) {
+      upstream.searchParams.set('period', 'weekly');
+    }
+    const response = await fetchSameOrigin(upstream, {
+      headers: {
+        'trakt-api-version': '2',
+        'trakt-api-key': clientId,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(10000),
+    }, fetcher);
+    if (!response.ok) {
+      return json({ error: 'trakt_unavailable', upstreamStatus: response.status }, 503);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) return json({ error: 'trakt_invalid_response' }, 502);
+    const result = json(data, 200, 900);
+    if (cache) {
+      const write = cache.put(cacheKey, result.clone()).catch(() => {});
+      if (ctx?.waitUntil) ctx.waitUntil(write);
+      else await write;
+    }
+    return result;
+  } catch (error) {
+    return json({ error: 'trakt_unavailable', reason: safeFailure(error) }, 503);
+  }
+}
+
+function decodeHtml(value) {
+  return value
+    .replaceAll('&amp;', '&')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
+}
+
+export async function handleDoubanDiscovery(request, _env, ctx, {
+  fetcher = fetch,
+  cache = globalThis.caches?.default,
+} = {}) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/discover/douban/')) return null;
+  if (request.method === 'OPTIONS') return new Response(null, { headers });
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const match = /^\/discover\/douban\/movie\/(chart|top250)\/?$/.exec(url.pathname);
+  const page = Number(url.searchParams.get('page') ?? '1');
+  if (!match || !Number.isInteger(page) || page < 1 || page > 10 || (match[1] === 'chart' && page !== 1)) {
+    return json({ error: 'invalid_douban_request' }, 400);
+  }
+  const list = match[1];
+  const cacheKey = new Request(`${url.origin}${url.pathname}?page=${page}`);
+  const cached = cache ? await cache.match(cacheKey) : null;
+  if (cached) return cached;
+  try {
+    const upstream = new URL(list === 'top250'
+      ? `https://movie.douban.com/top250?start=${(page - 1) * 25}&filter=`
+      : 'https://movie.douban.com/chart');
+    const response = await fetchSameOrigin(upstream, {
+      headers: { Accept: 'text/html', 'User-Agent': 'Mozilla/5.0 (compatible; Mova/3)' },
+      signal: AbortSignal.timeout(10000),
+    }, fetcher);
+    if (!response.ok) return json({ error: 'douban_unavailable', upstreamStatus: response.status }, 503);
+    const html = await response.text();
+    const results = [];
+    const seen = new Set();
+    for (const match of html.matchAll(/class=["']nbg["'][^>]*title=["']([^"']+)["']/gi)) {
+      const title = decodeHtml(match[1]).trim();
+      if (title && !seen.has(title)) {
+        seen.add(title);
+        results.push({ title, mediaType: 'movie' });
+      }
+    }
+    if (!results.length) return json({ error: 'douban_invalid_response' }, 502);
+    const result = json({ provider: '豆瓣公开榜单', type: 'movie', list, page, results }, 200, 3600);
+    if (cache) {
+      const write = cache.put(cacheKey, result.clone()).catch(() => {});
+      if (ctx?.waitUntil) ctx.waitUntil(write);
+      else await write;
+    }
+    return result;
+  } catch (error) {
+    return json({ error: 'douban_unavailable', reason: safeFailure(error) }, 503);
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const incoming = new URL(request.url);
@@ -122,6 +306,12 @@ export default {
     if (incoming.pathname === '/health') return Response.json({ ok: true }, { headers: cors });
     const ratingResponse = await handleRatings(request, env, ctx);
     if (ratingResponse) return ratingResponse;
+    const discoveryResponse = await handleDiscovery(request, env, ctx);
+    if (discoveryResponse) return discoveryResponse;
+    const traktResponse = await handleTraktDiscovery(request, env, ctx);
+    if (traktResponse) return traktResponse;
+    const doubanResponse = await handleDoubanDiscovery(request, env, ctx);
+    if (doubanResponse) return doubanResponse;
     if (!incoming.pathname.startsWith('/tmdb/')) return new Response('Not found', { status: 404, headers: cors });
 
     const upstream = new URL(`https://api.themoviedb.org/3/${incoming.pathname.slice(6)}`);

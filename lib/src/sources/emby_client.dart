@@ -263,7 +263,7 @@ class EmbyClient {
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'X-Emby-Authorization': 'MediaBrowser Client="Yingji", Device="Windows", DeviceId="yingji-windows", Version="3.1.42"',
+            'X-Emby-Authorization': 'MediaBrowser Client="Mova", Device="Windows", DeviceId="mova-windows", Version="3.1.64"',
           },
           body: jsonEncode({'Username': username, 'Pw': password}),
         )

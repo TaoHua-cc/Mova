@@ -16,7 +16,7 @@ Future<void> main() async {
     size: Size(1440, 900),
     minimumSize: Size(1060, 680),
     center: true,
-    title: '映迹',
+    title: 'Mova',
     titleBarStyle: TitleBarStyle.hidden,
     windowButtonVisibility: false,
     backgroundColor: Colors.transparent,

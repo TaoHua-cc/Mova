@@ -26,7 +26,7 @@ void main() {
     final scrollable = tester
         .widget<SingleChildScrollView>(find.byType(SingleChildScrollView))
         .controller!;
-    for (final label in ['关于映迹', '首页', '字幕与弹幕', '外观', '关于映迹']) {
+    for (final label in ['关于 Mova', '首页', '字幕与弹幕', '外观', '关于 Mova']) {
       await tester.tap(find.widgetWithText(TextButton, label).first);
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
@@ -64,7 +64,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(outer.offset, 120);
 
-    await tester.tap(find.widgetWithText(TextButton, '关于映迹').first);
+    await tester.tap(find.widgetWithText(TextButton, '关于 Mova').first);
     await tester.pumpAndSettle();
 
     expect(outer.offset, 120);
@@ -111,7 +111,7 @@ void main() {
     await tester.tap(find.byTooltip('发现页设置'));
     await tester.pumpAndSettle();
     expect(find.text('发现页栏目编排'), findsOneWidget);
-    expect(find.text('数据来源'), findsWidgets);
+    expect(find.text('列表内容'), findsWidgets);
     await tester.tap(find.byType(Switch).first);
     await tester.pumpAndSettle();
     expect(find.text('显示的列表'), findsOneWidget);
@@ -120,20 +120,28 @@ void main() {
       tester.getTopLeft(find.text('显示的列表')).dy,
       lessThan(tester.getTopLeft(find.text('隐藏的列表')).dy),
     );
-    await tester.tap(find.text('TMDB · 今日热门电视剧').first);
+    expect(find.text('来源'), findsWidgets);
+    expect(find.text('影视类型'), findsWidgets);
+    expect(find.text('地区'), findsWidgets);
+    expect(find.text('来源榜单'), findsWidgets);
+    expect(find.text('节目类型'), findsNothing);
+    expect(find.text('最低评分'), findsNothing);
+    await tester.tap(find.byTooltip('添加列表'));
     await tester.pumpAndSettle();
-    expect(find.text('TMDB · 科幻电影'), findsOneWidget);
-    await tester.ensureVisible(find.text('TMDB · 科幻电影'));
+    expect(find.text('新列表 18'), findsWidgets);
+    await tester.enterText(
+      find.byKey(const ValueKey('discover-name-新列表 18')),
+      '我的电影榜',
+    );
+    await tester.tap(find.byTooltip('保存列表名称'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('TMDB · 科幻电影'));
+    expect(find.text('我的电影榜'), findsWidgets);
+    await tester.tap(find.text('TMDB').last);
     await tester.pumpAndSettle();
-    await tester.tap(find.text('固定列表').first);
+    expect(find.text('TVmaze'), findsOneWidget);
+    await tester.tap(find.text('TVmaze'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('自定义筛选').last);
-    await tester.pumpAndSettle();
-    expect(find.text('影视'), findsWidgets);
-    expect(find.text('类型'), findsWidgets);
-    expect(find.text('热度类别'), findsWidgets);
+    expect(find.text('地区今日播出'), findsWidgets);
     await tester.tap(find.byTooltip('关闭').last);
     await tester.pump(const Duration(milliseconds: 400));
 
@@ -145,13 +153,16 @@ void main() {
     );
     expect(
       prefs.getString('yingji.discover.section-sources'),
-      contains('custom|tmdb|movie|all|popularity.desc'),
+      contains(
+        'custom|tvmaze|tv|all|schedule|US|all|all|all|all|all|all|HK|all',
+      ),
     );
+    expect(prefs.getStringList('yingji.discover.sections'), contains('我的电影榜'));
     await tester.pumpWidget(const SizedBox.shrink());
   });
-  testWidgets('renders the Yingji shell', (WidgetTester tester) async {
+  testWidgets('renders the Mova shell', (WidgetTester tester) async {
     await tester.pumpWidget(const YingjiApp());
-    expect(find.byIcon(YingjiIcons.play_fill), findsWidgets);
+    expect(find.byType(YingjiMark), findsWidgets);
     await tester.pumpWidget(const SizedBox.shrink());
     for (var i = 0; i < 5; i++) {
       await tester.pump(const Duration(seconds: 1));

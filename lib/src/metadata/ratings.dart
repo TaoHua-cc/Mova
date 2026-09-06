@@ -161,9 +161,17 @@ class RatingPlatformIcon extends StatelessWidget {
 }
 
 class MediaRatingRow extends StatefulWidget {
-  const MediaRatingRow({super.key, required this.item, this.expanded = false});
+  const MediaRatingRow({
+    super.key,
+    required this.item,
+    this.expanded = false,
+    this.maxItems,
+    this.emphasizeFirst = false,
+  });
   final TmdbItem item;
   final bool expanded;
+  final int? maxItems;
+  final bool emphasizeFirst;
   @override
   State<MediaRatingRow> createState() => _MediaRatingRowState();
 }
@@ -195,30 +203,46 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
             rows.insert(0, MediaRating('tmdb', widget.item.rating * 10));
           }
           if (rows.isEmpty) return const SizedBox.shrink();
-          final chips = rows
+          final visibleRows = widget.maxItems == null
+              ? rows
+              : rows.take(widget.maxItems!).toList();
+          final chips = visibleRows.indexed
               .map(
-                (r) => Tooltip(
-                  message: '${r.label} ${r.formatted}',
+                (entry) => Tooltip(
+                  message: '${entry.$2.label} ${entry.$2.formatted}',
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
+                    padding: EdgeInsets.symmetric(
+                      horizontal: entry.$1 == 0 && widget.emphasizeFirst
+                          ? 9
+                          : 7,
                       vertical: 4,
                     ),
                     decoration: BoxDecoration(
-                      color: YingjiGlass.surface(),
+                      color: entry.$1 == 0 && widget.emphasizeFirst
+                          ? Colors.white.withValues(alpha: .13)
+                          : YingjiGlass.surface(),
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(color: YingjiGlass.line()),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        RatingPlatformIcon(source: r.source, value: r.value),
+                        RatingPlatformIcon(
+                          source: entry.$2.source,
+                          value: entry.$2.value,
+                        ),
                         const SizedBox(width: 5),
                         Text(
-                          r.formatted,
-                          style: const TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w700,
+                          entry.$2.formatted,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: entry.$1 == 0 && widget.emphasizeFirst
+                                ? 12
+                                : 11,
+                            fontWeight: entry.$1 == 0 && widget.emphasizeFirst
+                                ? FontWeight.w900
+                                : FontWeight.w700,
+                            decoration: TextDecoration.none,
                           ),
                         ),
                       ],
@@ -227,6 +251,38 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
                 ),
               )
               .toList();
+          if (visibleRows.length < rows.length) {
+            chips.add(
+              Tooltip(
+                message: rows
+                    .skip(visibleRows.length)
+                    .map((r) => '${r.label} ${r.formatted}')
+                    .join('\n'),
+                child: SizedBox(
+                  width: 42,
+                  height: 28,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: YingjiGlass.surface(),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: YingjiGlass.line()),
+                    ),
+                    child: Center(
+                      child: Text(
+                        '+${rows.length - visibleRows.length}',
+                        style: const TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w800,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
           if (widget.expanded)
             return Wrap(spacing: 6, runSpacing: 6, children: chips);
           return Tooltip(

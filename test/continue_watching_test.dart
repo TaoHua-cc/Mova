@@ -86,4 +86,31 @@ void main() {
     expect(restored.progressOrigin, 'server');
     expect(restored.progressOriginName, '客厅服务器');
   });
+
+  test('dated rows lead by time, then undated rows use source priority', () {
+    WatchState row(String id, String origin, {DateTime? time}) => WatchState(
+      mediaId: id,
+      title: id,
+      position: const Duration(minutes: 5),
+      duration: const Duration(minutes: 45),
+      updatedAt: time,
+      progressOrigin: origin,
+    );
+
+    final sorted = sortWatchStatesByRecency([
+      row('local-undated', 'local'),
+      row('server-undated', 'server'),
+      row('older-local', 'local', time: DateTime(2026, 9, 4)),
+      row('trakt-undated', 'trakt'),
+      row('newer-server', 'server', time: DateTime(2026, 9, 5)),
+    ]);
+
+    expect(sorted.map((state) => state.mediaId), [
+      'newer-server',
+      'older-local',
+      'trakt-undated',
+      'server-undated',
+      'local-undated',
+    ]);
+  });
 }

@@ -21,7 +21,7 @@ class YingjiApp extends StatelessWidget {
                 Brightness.light);
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: '映迹',
+      title: 'Mova',
       theme: ThemeData(
         brightness: isLight ? Brightness.light : Brightness.dark,
         useMaterial3: true,

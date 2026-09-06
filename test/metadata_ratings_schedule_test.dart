@@ -187,7 +187,7 @@ void main() {
         list: 'watched',
         page: 2,
       );
-      expect(requested.path, '/shows/watched');
+      expect(requested.path, '/discover/trakt/shows/watched');
       expect(requested.queryParameters['period'], 'weekly');
       expect(requested.queryParameters['page'], '2');
       expect(rows.single.tmdbId, 321);
@@ -195,6 +195,30 @@ void main() {
       client.dispose();
     },
   );
+  test('Trakt discovery accepts direct popular movie responses', () async {
+    final client = TraktClient(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode([
+            {
+              'title': 'Direct movie',
+              'ids': {'tmdb': 550},
+            },
+          ]),
+          200,
+        ),
+      ),
+    );
+
+    final rows = await client.discover(
+      clientId: 'client',
+      type: 'movies',
+      list: 'popular',
+    );
+    expect(rows.single.tmdbId, 550);
+    expect(rows.single.kind, '电影');
+    client.dispose();
+  });
   testWidgets(
     'cached multi-source scores fit narrow poster and expanded detail',
     (tester) async {

@@ -12,6 +12,7 @@ import 'package:flutter/rendering.dart'
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:image/image.dart' as image_lib;
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -827,7 +828,7 @@ class _CinematicHomeState extends State<_CinematicHome>
         final baseSelected = items.isEmpty
             ? const TmdbItem(
                 id: 0,
-                title: '映迹',
+                title: 'Mova',
                 kind: '媒体中心',
                 overview: '元数据服务暂时不可用，但你仍可以从继续观看中播放本地记录。',
               )
@@ -1258,11 +1259,8 @@ Future<List<WatchState>> _mergeServerWatchHistory(
 }
 
 /// Orders the reconciled rows for the continue-watching shelf. Rows carrying
-/// a real last-watch time go first, newest first. Rows without one — which
-/// the server itself cannot date (it reports no LastPlayedDate), so the only
-/// sensible order is the order the server's own rail returned them in —
-/// follow in that server order; local-only rows (e.g. files from a webdav
-/// source) trail behind in their stored order.
+/// a real last-watch time go first, newest first. The final shared sort applies
+/// the fallback priority Trakt, server, then local to every undated row.
 List<WatchState> _orderForShelf(
   List<WatchState> merged,
   List<WatchState> remote,
@@ -1301,7 +1299,7 @@ List<WatchState> _orderForShelf(
   for (var i = 0; i < merged.length; i++) {
     place(i);
   }
-  return ordered;
+  return sortWatchStatesByRecency(ordered);
 }
 
 /// Undoes the damage of an older merge bug that stamped server rows with
@@ -1363,6 +1361,7 @@ class _DiscoverPage extends StatefulWidget {
 class _DiscoverPageState extends State<_DiscoverPage> {
   final _tmdb = TmdbClient();
   final _trakt = TraktClient();
+  final _tvMaze = http.Client();
   static const _sectionsKey = 'yingji.discover.sections';
   static const _stylesKey = 'yingji.discover.card-styles';
   static const _sourcesKey = 'yingji.discover.section-sources';
@@ -1436,88 +1435,31 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     'trakt.shows.collected': 'Trakt · 本周收藏剧集',
     'trakt.shows.played': 'Trakt · 本周播放剧集',
   };
-  static const _sourceGroups = <String, List<String>>{
-    'TMDB 官方榜单': [
-      '今日热门电视剧',
-      '今日热门电影',
-      '本周热门电视剧',
-      '本周热门电影',
-      '热门电视剧',
-      '热门电影',
-      '今日播出剧集',
-      '本周播出剧集',
-      '院线热映',
-      '即将上映',
-      '高分电影',
-      '高分剧集',
-    ],
-    'TMDB 类型与地区': [
-      '热门国产电视剧',
-      '热门国产电影',
-      '热门综艺',
-      '热门国产动漫',
-      '热门番剧',
-      '热门韩剧',
-      '热门日剧',
-      '热门台剧',
-      '动作电影',
-      '喜剧电影',
-      '科幻电影',
-      '悬疑电影',
-      '恐怖电影',
-      '纪录片',
-      '家庭电影',
-      '按分类',
-    ],
-    'TMDB 流媒体': [
-      'Netflix',
-      'Disney+',
-      'Prime Video',
-      'Apple TV+',
-      '流媒体综合',
-      '按平台',
-    ],
-    'Trakt 电影榜单': [
-      'trakt.movies.trending',
-      'trakt.movies.popular',
-      'trakt.movies.anticipated',
-      'trakt.movies.boxoffice',
-      'trakt.movies.watched',
-      'trakt.movies.collected',
-      'trakt.movies.played',
-    ],
-    'Trakt 剧集榜单': [
-      'trakt.shows.trending',
-      'trakt.shows.popular',
-      'trakt.shows.anticipated',
-      'trakt.shows.watched',
-      'trakt.shows.collected',
-      'trakt.shows.played',
-    ],
-  };
   static const _providerLabels = <String, String>{
     'tmdb': 'TMDB',
     'trakt': 'Trakt',
+    'mdblist': 'MDBList',
+    'douban': '豆瓣公开榜单',
+    'tvmaze': 'TVmaze',
   };
   static const _mediaLabels = <String, String>{'movie': '电影', 'tv': '剧集'};
-  static const _genreLabels = <String, String>{
-    'all': '全部类型',
-    'action': '动作',
-    'comedy': '喜剧',
-    'scifi': '科幻',
-    'mystery': '悬疑',
-    'animation': '动画',
-    'documentary': '纪录片',
-  };
-  static const _heatLabels = <String, String>{
-    'popularity.desc': '当前热门',
-    'vote_average.desc': '高分口碑',
-    'date.desc': '最近更新',
-  };
-  static const _traktHeatLabels = <String, String>{
-    'trending': '实时趋势',
-    'popular': '长期热门',
-    'anticipated': '最受期待',
+  static const _countryLabels = <String, String>{
+    'all': '全部地区',
+    'CN': '中国大陆',
+    'HK': '中国香港',
+    'TW': '中国台湾',
+    'US': '美国',
+    'GB': '英国',
+    'JP': '日本',
+    'KR': '韩国',
+    'TH': '泰国',
+    'IN': '印度',
+    'FR': '法国',
+    'DE': '德国',
+    'ES': '西班牙',
+    'IT': '意大利',
+    'CA': '加拿大',
+    'AU': '澳大利亚',
   };
   final Map<String, int> _cardStyles = {};
   final Map<String, String> _sectionSources = {};
@@ -1535,6 +1477,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   void dispose() {
     _tmdb.dispose();
     _trakt.dispose();
+    _tvMaze.close();
     super.dispose();
   }
 
@@ -1545,6 +1488,10 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 
   Future<void> _restoreLayout() async {
     final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList(_sectionsKey);
+    if (saved != null) {
+      _sections = saved.toSet().toList(growable: true);
+    }
     final rawStyles = prefs.getString(_stylesKey);
     if (rawStyles != null) {
       try {
@@ -1571,7 +1518,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           for (final entry in decoded.entries) {
             final section = '${entry.key}';
             final source = '${entry.value}';
-            if (_defaultSections.contains(section) &&
+            if (_sections.contains(section) &&
                 (_sourceLabels.containsKey(source) ||
                     _DiscoverFeedSelection.tryParse(source) != null)) {
               _sectionSources[section] = source;
@@ -1583,18 +1530,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       }
     }
     _hiddenSections.addAll(
-      (prefs.getStringList(_hiddenKey) ?? const []).where(
-        _defaultSections.contains,
-      ),
+      (prefs.getStringList(_hiddenKey) ?? const []).where(_sections.contains),
     );
-    final saved = prefs.getStringList(_sectionsKey);
-    if (saved != null && saved.isNotEmpty) {
-      final known = _sections.toList(growable: false);
-      _sections = [
-        ...saved.where(known.contains),
-        ...known.where((section) => !saved.contains(section)),
-      ];
-    }
     _groupSectionsByVisibility();
   }
 
@@ -1616,10 +1553,26 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   String _sourceLabel(String source) {
     final custom = _DiscoverFeedSelection.tryParse(source);
     if (custom == null) return _sourceLabels[source] ?? source;
+    final listLabels = custom.provider == 'tmdb'
+        ? (custom.mediaType == 'tv'
+              ? _DiscoverSourceEditor._tmdbTvLists
+              : _DiscoverSourceEditor._tmdbMovieLists)
+        : custom.provider == 'trakt'
+        ? (custom.mediaType == 'tv'
+              ? _DiscoverSourceEditor._traktTvLists
+              : _DiscoverSourceEditor._traktMovieLists)
+        : custom.provider == 'mdblist'
+        ? _DiscoverSourceEditor._mdbListLists
+        : custom.provider == 'douban'
+        ? _DiscoverSourceEditor._doubanLists
+        : _DiscoverSourceEditor._tvMazeLists;
+    final details = <String>[
+      _mediaLabels[custom.mediaType]!,
+      if (custom.country != 'all') _countryLabels[custom.country]!,
+      listLabels[custom.heat] ?? custom.heat,
+    ];
     return '${_providerLabels[custom.provider]} · '
-        '${_mediaLabels[custom.mediaType]} · '
-        '${custom.provider == 'tmdb' ? '${_genreLabels[custom.genre]} · ' : ''}'
-        '${custom.provider == 'trakt' ? _traktHeatLabels[custom.heat] : _heatLabels[custom.heat]}';
+        '${details.join(' · ')}';
   }
 
   Future<void> _showCardSettings() async {
@@ -1627,6 +1580,38 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     if (!mounted) return;
     _groupSectionsByVisibility();
     var changed = false;
+    String? expandedSection = _sections.firstOrNull;
+    final titleDrafts = <String, String>{
+      for (final section in _sections) section: section,
+    };
+    final nameErrors = <String, String>{};
+
+    void renameSection(String section, StateSetter updateDialog) {
+      final next = (titleDrafts[section] ?? section).trim();
+      if (next.isEmpty || (next != section && _sections.contains(next))) {
+        updateDialog(() {
+          nameErrors[section] = next.isEmpty ? '列表名称不能为空' : '已有同名列表';
+        });
+        return;
+      }
+      if (next == section) return;
+      updateDialog(() {
+        final index = _sections.indexOf(section);
+        if (index < 0) return;
+        _sections[index] = next;
+        final source = _sectionSources.remove(section);
+        if (source != null) _sectionSources[next] = source;
+        final style = _cardStyles.remove(section);
+        if (style != null) _cardStyles[next] = style;
+        if (_hiddenSections.remove(section)) _hiddenSections.add(next);
+        titleDrafts.remove(section);
+        titleDrafts[next] = next;
+        nameErrors.remove(section);
+        expandedSection = next;
+        changed = true;
+      });
+    }
+
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -1654,6 +1639,33 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                         ),
                       ),
                       YingjiMotionIconButton(
+                        icon: YingjiIcons.plus,
+                        tooltip: '添加列表',
+                        size: 36,
+                        onPressed: () => updateDialog(() {
+                          var suffix = _sections.length + 1;
+                          var title = '新列表 $suffix';
+                          while (_sections.contains(title)) {
+                            suffix++;
+                            title = '新列表 $suffix';
+                          }
+                          final visibleCount = _sections
+                              .where((item) => !_hiddenSections.contains(item))
+                              .length;
+                          _sections.insert(visibleCount, title);
+                          _sectionSources[title] = const _DiscoverFeedSelection(
+                            provider: 'tmdb',
+                            mediaType: 'movie',
+                            genre: 'all',
+                            heat: 'popularity.desc',
+                          ).encoded;
+                          titleDrafts[title] = title;
+                          expandedSection = title;
+                          changed = true;
+                        }),
+                      ),
+                      const SizedBox(width: 8),
+                      YingjiMotionIconButton(
                         icon: YingjiIcons.xmark,
                         tooltip: '关闭',
                         size: 36,
@@ -1663,7 +1675,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '显示栏目按页面顺序排列，隐藏栏目统一收纳在下方。数据配置按来源、列表与筛选条件逐步选择。',
+                    '列表可添加、删除和排序；内容只按来源、影视类型、地区与来源榜单配置。',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   const SizedBox(height: 16),
@@ -1684,6 +1696,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                         final section = _sections[index];
                         final visible = !_hiddenSections.contains(section);
                         final source = _sectionSources[section] ?? section;
+                        final expanded = expandedSection == section;
                         final firstVisible =
                             visible &&
                             _sections
@@ -1749,13 +1762,61 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                           ),
                                           const SizedBox(width: 8),
                                           Expanded(
-                                            child: Text(
-                                              section,
-                                              style: const TextStyle(
-                                                fontWeight: FontWeight.w800,
-                                              ),
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  section,
+                                                  style: const TextStyle(
+                                                    fontWeight: FontWeight.w800,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 3),
+                                                Text(
+                                                  _sourceLabel(source),
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: YingjiColors.muted,
+                                                    fontSize: 11,
+                                                  ),
+                                                ),
+                                              ],
                                             ),
                                           ),
+                                          YingjiMotionIconButton(
+                                            icon: expanded
+                                                ? YingjiIcons.chevron_up
+                                                : YingjiIcons.chevron_down,
+                                            tooltip: expanded ? '收起编辑' : '编辑栏目',
+                                            size: 34,
+                                            onPressed: () => updateDialog(() {
+                                              expandedSection = expanded
+                                                  ? null
+                                                  : section;
+                                            }),
+                                          ),
+                                          const SizedBox(width: 6),
+                                          YingjiMotionIconButton(
+                                            icon: YingjiIcons.trash,
+                                            tooltip: '删除列表',
+                                            size: 34,
+                                            onPressed: () => updateDialog(() {
+                                              _sections.remove(section);
+                                              _sectionSources.remove(section);
+                                              _cardStyles.remove(section);
+                                              _hiddenSections.remove(section);
+                                              titleDrafts.remove(section);
+                                              nameErrors.remove(section);
+                                              if (expandedSection == section) {
+                                                expandedSection = null;
+                                              }
+                                              changed = true;
+                                            }),
+                                          ),
+                                          const SizedBox(width: 8),
                                           Text(
                                             visible ? '显示' : '隐藏',
                                             style: const TextStyle(
@@ -1783,58 +1844,114 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                           ),
                                         ],
                                       ),
-                                      const SizedBox(height: 10),
-                                      _DiscoverSourceEditor(
-                                        value: source,
-                                        labels: _sourceLabels,
-                                        groups: _sourceGroups,
-                                        providerLabels: _providerLabels,
-                                        mediaLabels: _mediaLabels,
-                                        genreLabels: _genreLabels,
-                                        heatLabels: _heatLabels,
-                                        traktHeatLabels: _traktHeatLabels,
-                                        onChanged: (value) {
-                                          updateDialog(() {
-                                            _sectionSources[section] = value;
-                                          });
-                                          changed = true;
-                                        },
-                                      ),
-                                      const SizedBox(height: 12),
-                                      Row(
-                                        children: [
-                                          for (
-                                            var style = 0;
-                                            style < 3;
-                                            style++
-                                          )
-                                            Expanded(
-                                              child: Padding(
-                                                padding: EdgeInsets.only(
-                                                  right: style == 2 ? 0 : 8,
-                                                ),
-                                                child: _DiscoveryStylePreview(
-                                                  label: _styleNames[style],
-                                                  style: style,
-                                                  selected:
-                                                      (_cardStyles[section] ??
-                                                          index % 3) ==
-                                                      style,
-                                                  items:
-                                                      previews[section] ??
-                                                      const [],
-                                                  onTap: () {
-                                                    updateDialog(
-                                                      () =>
-                                                          _cardStyles[section] =
-                                                              style,
-                                                    );
-                                                    changed = true;
-                                                  },
-                                                ),
-                                              ),
-                                            ),
-                                        ],
+                                      AnimatedSize(
+                                        duration: const Duration(
+                                          milliseconds: 220,
+                                        ),
+                                        curve: Curves.easeOutCubic,
+                                        alignment: Alignment.topCenter,
+                                        child: expanded
+                                            ? Column(
+                                                children: [
+                                                  const SizedBox(height: 12),
+                                                  TextFormField(
+                                                    key: ValueKey(
+                                                      'discover-name-$section',
+                                                    ),
+                                                    initialValue:
+                                                        titleDrafts[section] ??
+                                                        section,
+                                                    onChanged: (value) {
+                                                      titleDrafts[section] =
+                                                          value;
+                                                      nameErrors.remove(
+                                                        section,
+                                                      );
+                                                    },
+                                                    onFieldSubmitted: (_) =>
+                                                        renameSection(
+                                                          section,
+                                                          updateDialog,
+                                                        ),
+                                                    decoration: InputDecoration(
+                                                      labelText: '列表名称',
+                                                      errorText:
+                                                          nameErrors[section],
+                                                      suffixIcon:
+                                                          YingjiMotionIconButton(
+                                                            icon: YingjiIcons
+                                                                .checkmark_circle_fill,
+                                                            tooltip: '保存列表名称',
+                                                            size: 34,
+                                                            onPressed: () =>
+                                                                renameSection(
+                                                                  section,
+                                                                  updateDialog,
+                                                                ),
+                                                          ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 12),
+                                                  _DiscoverSourceEditor(
+                                                    value: source,
+                                                    providerLabels:
+                                                        _providerLabels,
+                                                    mediaLabels: _mediaLabels,
+                                                    countryLabels:
+                                                        _countryLabels,
+                                                    onChanged: (value) {
+                                                      updateDialog(() {
+                                                        _sectionSources[section] =
+                                                            value;
+                                                      });
+                                                      changed = true;
+                                                    },
+                                                  ),
+                                                  const SizedBox(height: 12),
+                                                  Row(
+                                                    children: [
+                                                      for (
+                                                        var style = 0;
+                                                        style < 3;
+                                                        style++
+                                                      )
+                                                        Expanded(
+                                                          child: Padding(
+                                                            padding:
+                                                                EdgeInsets.only(
+                                                                  right:
+                                                                      style == 2
+                                                                      ? 0
+                                                                      : 8,
+                                                                ),
+                                                            child: _DiscoveryStylePreview(
+                                                              label:
+                                                                  _styleNames[style],
+                                                              style: style,
+                                                              selected:
+                                                                  (_cardStyles[section] ??
+                                                                      index %
+                                                                          3) ==
+                                                                  style,
+                                                              items:
+                                                                  previews[section] ??
+                                                                  const [],
+                                                              onTap: () {
+                                                                updateDialog(
+                                                                  () =>
+                                                                      _cardStyles[section] =
+                                                                          style,
+                                                                );
+                                                                changed = true;
+                                                              },
+                                                            ),
+                                                          ),
+                                                        ),
+                                                    ],
+                                                  ),
+                                                ],
+                                              )
+                                            : const SizedBox.shrink(),
                                       ),
                                     ],
                                   ),
@@ -1916,13 +2033,43 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     '恐怖电影' => _tmdb.discover('movie', page: page, genre: 27),
     '纪录片' => _tmdb.discover('movie', page: page, genre: 99),
     '家庭电影' => _tmdb.discover('movie', page: page, genre: 10751),
-    'Netflix' => _tmdb.discover('tv', page: page, provider: '8'),
-    'Disney+' => _tmdb.discover('tv', page: page, provider: '337'),
-    'Prime Video' => _tmdb.discover('tv', page: page, provider: '119'),
-    'Apple TV+' => _tmdb.discover('tv', page: page, provider: '350'),
-    '流媒体综合' => _tmdb.discover('tv', page: page, provider: '8|119|337|350'),
+    'Netflix' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '8',
+      watchRegion: 'HK',
+    ),
+    'Disney+' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '337',
+      watchRegion: 'HK',
+    ),
+    'Prime Video' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '119',
+      watchRegion: 'HK',
+    ),
+    'Apple TV+' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '350',
+      watchRegion: 'HK',
+    ),
+    '流媒体综合' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '8|119|337|350',
+      watchRegion: 'HK',
+    ),
     '按分类' => _tmdb.discover('movie', page: page, genre: 28),
-    '按平台' => _tmdb.discover('tv', page: page, provider: '8|337|350'),
+    '按平台' => _tmdb.discover(
+      'tv',
+      page: page,
+      provider: '8|337|350',
+      watchRegion: 'HK',
+    ),
     final source when source.startsWith('trakt.') => _loadTrakt(source, page),
     final source when source.startsWith('custom|') => _loadCustomSection(
       source,
@@ -1940,29 +2087,90 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         page,
       );
     }
-    final genre = switch ((selection.mediaType, selection.genre)) {
-      (_, 'all') => null,
-      ('movie', 'action') => 28,
-      ('tv', 'action') => 10759,
-      (_, 'comedy') => 35,
-      (_, 'scifi') => 10765,
-      ('movie', 'mystery') => 9648,
-      ('tv', 'mystery') => 9648,
-      (_, 'animation') => 16,
-      (_, 'documentary') => 99,
-      _ => null,
-    };
+    if (selection.provider == 'tvmaze') {
+      return _loadTvMaze(selection, page);
+    }
+    if (selection.provider == 'mdblist') {
+      return _tmdb.mdblistOfficial(
+        selection.mediaType,
+        selection.heat,
+        page: page,
+        country: selection.country,
+      );
+    }
+    if (selection.provider == 'douban') {
+      return _tmdb.doubanPublicList(selection.heat, page: page);
+    }
+    if (selection.heat == 'trending' && selection.country == 'all') {
+      return _tmdb.trendingToday(selection.mediaType, page: page);
+    }
     final sortBy = selection.heat == 'date.desc'
         ? selection.mediaType == 'tv'
               ? 'first_air_date.desc'
               : 'primary_release_date.desc'
+        : selection.heat == 'trending'
+        ? 'popularity.desc'
         : selection.heat;
     return _tmdb.discover(
       selection.mediaType,
       page: page,
-      genre: genre,
+      originCountry: selection.country == 'all' ? null : selection.country,
+      minimumVoteCount: selection.heat == 'vote_average.desc' ? 50 : null,
       sortBy: sortBy,
     );
+  }
+
+  Future<List<TmdbItem>> _loadTvMaze(
+    _DiscoverFeedSelection selection,
+    int page,
+  ) async {
+    final today = DateTime.now();
+    final date =
+        '${today.year.toString().padLeft(4, '0')}-'
+        '${today.month.toString().padLeft(2, '0')}-'
+        '${today.day.toString().padLeft(2, '0')}';
+    final path = selection.heat == 'web' ? '/schedule/web' : '/schedule';
+    final query = <String, String>{'date': date};
+    if (selection.country != 'all') query['country'] = selection.country;
+    final response = await _tvMaze
+        .get(
+          Uri.https('api.tvmaze.com', path, query),
+          headers: const {
+            'Accept': 'application/json',
+            'User-Agent': 'Mova/3',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('TVmaze 榜单读取失败（HTTP ${response.statusCode}）');
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! List) return const [];
+    final ids = <String>[];
+    for (final row in decoded.whereType<Map>()) {
+      final show = row['show'];
+      final externals = show is Map ? show['externals'] : null;
+      final imdb = externals is Map ? '${externals['imdb'] ?? ''}' : '';
+      if (imdb.startsWith('tt') && !ids.contains(imdb)) ids.add(imdb);
+    }
+    final start = (page - 1) * 20;
+    if (start >= ids.length) return const [];
+    final selectedIds = ids.skip(start).take(20).toList(growable: false);
+    final result = <TmdbItem>[];
+    for (var offset = 0; offset < selectedIds.length; offset += 5) {
+      final batch = selectedIds.skip(offset).take(5);
+      final rows = await Future.wait(
+        batch.map((id) async {
+          try {
+            return await _tmdb.findByImdbId(id);
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      result.addAll(rows.whereType<TmdbItem>());
+    }
+    return result;
   }
 
   Future<List<TmdbItem>> _loadTrakt(String source, int page) async {
@@ -2102,19 +2310,55 @@ class _DiscoverFeedSelection {
     required this.mediaType,
     required this.genre,
     required this.heat,
+    this.country = 'all',
+    this.language = 'all',
+    this.year = 'all',
+    this.minimumRating = 'all',
+    this.minimumVotes = 'all',
+    this.runtime = 'all',
+    this.platform = 'all',
+    this.watchRegion = 'HK',
+    this.releaseWindow = 'all',
   });
 
   final String provider;
   final String mediaType;
   final String genre;
   final String heat;
+  final String country;
+  final String language;
+  final String year;
+  final String minimumRating;
+  final String minimumVotes;
+  final String runtime;
+  final String platform;
+  final String watchRegion;
+  final String releaseWindow;
 
-  String get encoded => 'custom|$provider|$mediaType|$genre|$heat';
+  String get encoded => [
+    'custom',
+    provider,
+    mediaType,
+    genre,
+    heat,
+    country,
+    language,
+    year,
+    minimumRating,
+    minimumVotes,
+    runtime,
+    platform,
+    watchRegion,
+    releaseWindow,
+  ].join('|');
 
   static _DiscoverFeedSelection? tryParse(String value) {
     final parts = value.split('|');
-    if (parts.length != 5 || parts.first != 'custom') return null;
-    const providers = {'tmdb', 'trakt'};
+    if ((parts.length != 5 && parts.length != 13 && parts.length != 14) ||
+        parts.first != 'custom') {
+      return null;
+    }
+    const providers = {'tmdb', 'trakt', 'mdblist', 'douban', 'tvmaze'};
     const mediaTypes = {'movie', 'tv'};
     const genres = {
       'all',
@@ -2124,13 +2368,155 @@ class _DiscoverFeedSelection {
       'mystery',
       'animation',
       'documentary',
+      'adventure',
+      'crime',
+      'drama',
+      'family',
+      'fantasy',
+      'history',
+      'horror',
+      'music',
+      'romance',
+      'thriller',
+      'war',
+      'western',
+      'kids',
+      'news',
+      'reality',
+      'soap',
+      'talk',
+      'variety',
     };
-    const tmdbHeat = {'popularity.desc', 'vote_average.desc', 'date.desc'};
-    const traktHeat = {'trending', 'popular', 'anticipated'};
+    const tmdbHeat = {
+      'popularity.desc',
+      'popularity.asc',
+      'vote_average.desc',
+      'vote_count.desc',
+      'date.desc',
+      'trending',
+    };
+    const traktHeat = {
+      'trending',
+      'popular',
+      'anticipated',
+      'boxoffice',
+      'watched',
+      'collected',
+      'played',
+    };
+    const tvMazeLists = {'schedule', 'web'};
+    const mdbListLists = {
+      'trending',
+      'popular',
+      'anticipated',
+      'most-watched',
+      'most-watched-week',
+      'moviemeter',
+      'streaming-charts',
+      'justwatch-streaming-charts',
+    };
+    const doubanLists = {'chart', 'top250'};
     if (!providers.contains(parts[1]) ||
         !mediaTypes.contains(parts[2]) ||
         !genres.contains(parts[3]) ||
-        !(parts[1] == 'trakt' ? traktHeat : tmdbHeat).contains(parts[4])) {
+        !(parts[1] == 'trakt'
+                ? traktHeat
+                : parts[1] == 'tvmaze'
+                ? tvMazeLists
+                : parts[1] == 'mdblist'
+                ? mdbListLists
+                : parts[1] == 'douban'
+                ? doubanLists
+                : tmdbHeat)
+            .contains(parts[4])) {
+      return null;
+    }
+    if (parts.length >= 13 &&
+        (!_validOption(parts[5], const {
+              'all',
+              'CN',
+              'HK',
+              'TW',
+              'US',
+              'GB',
+              'JP',
+              'KR',
+              'TH',
+              'IN',
+              'FR',
+              'DE',
+              'ES',
+              'IT',
+              'CA',
+              'AU',
+            }) ||
+            !_validOption(parts[6], const {
+              'all',
+              'zh',
+              'en',
+              'ja',
+              'ko',
+              'th',
+              'fr',
+              'de',
+              'es',
+              'it',
+              'hi',
+              'ru',
+            }) ||
+            (parts[7] != 'all' && int.tryParse(parts[7]) == null) ||
+            !_validOption(parts[8], const {'all', '6', '7', '8', '9'}) ||
+            !_validOption(parts[9], const {
+              'all',
+              '50',
+              '200',
+              '1000',
+              '5000',
+            }) ||
+            !_validOption(parts[10], const {
+              'all',
+              'short',
+              'standard',
+              'long',
+            }) ||
+            !_validOption(parts[11], const {
+              'all',
+              '8',
+              '337',
+              '119',
+              '350',
+              '1899',
+              '531',
+              '15',
+              '581',
+              '509',
+            }) ||
+            !_validOption(parts[12], const {
+              'all',
+              'CN',
+              'HK',
+              'TW',
+              'US',
+              'GB',
+              'JP',
+              'KR',
+              'TH',
+              'IN',
+              'FR',
+              'DE',
+              'ES',
+              'IT',
+              'CA',
+              'AU',
+            }) ||
+            (parts.length == 14 &&
+                !_validOption(parts[13], const {
+                  'all',
+                  'recent30',
+                  'recent90',
+                  'thisYear',
+                  'upcoming30',
+                })))) {
       return null;
     }
     return _DiscoverFeedSelection(
@@ -2138,70 +2524,166 @@ class _DiscoverFeedSelection {
       mediaType: parts[2],
       genre: parts[3],
       heat: parts[4],
+      country: parts.length >= 13 ? parts[5] : 'all',
+      language: parts.length >= 13 ? parts[6] : 'all',
+      year: parts.length >= 13 ? parts[7] : 'all',
+      minimumRating: parts.length >= 13 ? parts[8] : 'all',
+      minimumVotes: parts.length >= 13 ? parts[9] : 'all',
+      runtime: parts.length >= 13 ? parts[10] : 'all',
+      platform: parts.length >= 13 ? parts[11] : 'all',
+      watchRegion:
+          parts.length >= 13 && !const {'CN', 'all'}.contains(parts[12])
+          ? parts[12]
+          : 'HK',
+      releaseWindow: parts.length == 14 ? parts[13] : 'all',
     );
   }
+
+  static bool _validOption(String value, Set<String> options) =>
+      options.contains(value);
 }
 
 class _DiscoverSourceEditor extends StatelessWidget {
   const _DiscoverSourceEditor({
     required this.value,
-    required this.labels,
-    required this.groups,
     required this.providerLabels,
     required this.mediaLabels,
-    required this.genreLabels,
-    required this.heatLabels,
-    required this.traktHeatLabels,
+    required this.countryLabels,
     required this.onChanged,
   });
+
   final String value;
-  final Map<String, String> labels;
-  final Map<String, List<String>> groups;
   final Map<String, String> providerLabels;
   final Map<String, String> mediaLabels;
-  final Map<String, String> genreLabels;
-  final Map<String, String> heatLabels;
-  final Map<String, String> traktHeatLabels;
+  final Map<String, String> countryLabels;
   final ValueChanged<String> onChanged;
+
+  static const _tmdbMovieLists = <String, String>{
+    'trending': '今日趋势',
+    'popularity.desc': '当前热门',
+    'vote_average.desc': '高分口碑',
+    'date.desc': '最新上映',
+  };
+  static const _tmdbTvLists = <String, String>{
+    'trending': '今日趋势',
+    'popularity.desc': '当前热门',
+    'vote_average.desc': '高分口碑',
+    'date.desc': '最新播出',
+  };
+  static const _traktMovieLists = <String, String>{
+    'trending': '实时趋势',
+    'popular': '长期热门',
+    'anticipated': '最受期待',
+    'boxoffice': '周末票房',
+    'watched': '本周观看',
+    'collected': '本周收藏',
+    'played': '本周播放',
+  };
+  static const _traktTvLists = <String, String>{
+    'trending': '实时趋势',
+    'popular': '长期热门',
+    'anticipated': '最受期待',
+    'watched': '本周观看',
+    'collected': '本周收藏',
+    'played': '本周播放',
+  };
+  static const _tvMazeLists = <String, String>{
+    'schedule': '地区今日播出',
+    'web': '流媒体今日更新',
+  };
+  static const _mdbListLists = <String, String>{
+    'trending': '实时趋势',
+    'popular': '当前热门',
+    'anticipated': '最受期待',
+    'most-watched': '最多观看',
+    'most-watched-week': '本周最多观看',
+    'moviemeter': 'IMDb 热度',
+    'streaming-charts': '流媒体趋势',
+    'justwatch-streaming-charts': 'JustWatch 趋势',
+  };
+  static const _doubanLists = <String, String>{
+    'chart': '豆瓣新片榜',
+    'top250': '豆瓣电影 Top 250',
+  };
 
   @override
   Widget build(BuildContext context) {
-    final custom = _DiscoverFeedSelection.tryParse(value);
-    final provider =
-        custom?.provider ?? (value.startsWith('trakt.') ? 'trakt' : 'tmdb');
-    final mode = custom == null ? 'fixed' : 'custom';
-    final fixedSources = groups.entries
-        .where(
-          (entry) => provider == 'trakt'
-              ? entry.key.startsWith('Trakt')
-              : entry.key.startsWith('TMDB'),
-        )
-        .expand((entry) => entry.value)
-        .toList(growable: false);
-    final fixedValue = fixedSources.contains(value)
-        ? value
-        : fixedSources.first;
-    final selection =
-        custom ??
-        _DiscoverFeedSelection(
-          provider: provider,
-          mediaType: 'movie',
-          genre: 'all',
-          heat: 'popularity.desc',
-        );
+    final parsed = _DiscoverFeedSelection.tryParse(value);
+    final legacyTrakt = value.startsWith('trakt.');
+    final provider = parsed?.provider ?? (legacyTrakt ? 'trakt' : 'tmdb');
+    final legacyTv =
+        value.contains('电视剧') ||
+        value.contains('剧集') ||
+        value.contains('综艺') ||
+        value.contains('动漫') ||
+        value.contains('番剧') ||
+        value.contains('.shows.');
+    final mediaType = provider == 'tvmaze'
+        ? 'tv'
+        : provider == 'douban'
+        ? 'movie'
+        : parsed?.mediaType ?? (legacyTv ? 'tv' : 'movie');
+    final country = const {'trakt', 'douban'}.contains(provider)
+        ? 'all'
+        : parsed?.country ?? 'all';
+    final lists = provider == 'tmdb'
+        ? (mediaType == 'tv' ? _tmdbTvLists : _tmdbMovieLists)
+        : provider == 'trakt'
+        ? (mediaType == 'tv' ? _traktTvLists : _traktMovieLists)
+        : provider == 'mdblist'
+        ? _mdbListLists
+        : provider == 'douban'
+        ? _doubanLists
+        : _tvMazeLists;
+    final legacyList = legacyTrakt ? value.split('.').last : null;
+    final list = lists.containsKey(parsed?.heat)
+        ? parsed!.heat
+        : lists.containsKey(legacyList)
+        ? legacyList!
+        : lists.keys.first;
+    final regionLabels = const {'trakt', 'douban'}.contains(provider)
+        ? const {'all': '全球'}
+        : countryLabels;
 
-    void updateCustom({
+    void update({
       String? nextProvider,
-      String? mediaType,
-      String? genre,
-      String? heat,
+      String? nextMediaType,
+      String? nextCountry,
+      String? nextList,
     }) {
+      final source = nextProvider ?? provider;
+      final type = source == 'tvmaze'
+          ? 'tv'
+          : source == 'douban'
+          ? 'movie'
+          : nextMediaType ?? mediaType;
+      var region = const {'trakt', 'douban'}.contains(source)
+          ? 'all'
+          : nextCountry ?? country;
+      final allowedLists = source == 'tmdb'
+          ? (type == 'tv' ? _tmdbTvLists : _tmdbMovieLists)
+          : source == 'trakt'
+          ? (type == 'tv' ? _traktTvLists : _traktMovieLists)
+          : source == 'mdblist'
+          ? _mdbListLists
+          : source == 'douban'
+          ? _doubanLists
+          : _tvMazeLists;
+      final selectedList = allowedLists.containsKey(nextList)
+          ? nextList!
+          : allowedLists.containsKey(list)
+          ? list
+          : allowedLists.keys.first;
+      if (source == 'tvmaze' && selectedList == 'schedule' && region == 'all') {
+        region = 'US';
+      }
       onChanged(
         _DiscoverFeedSelection(
-          provider: nextProvider ?? selection.provider,
-          mediaType: mediaType ?? selection.mediaType,
-          genre: genre ?? selection.genre,
-          heat: heat ?? selection.heat,
+          provider: source,
+          mediaType: type,
+          genre: 'all',
+          heat: selectedList,
+          country: region,
         ).encoded,
       );
     }
@@ -2218,124 +2700,89 @@ class _DiscoverSourceEditor extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              '数据来源',
+              '列表内容',
               style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             Wrap(
-              spacing: 14,
-              runSpacing: 14,
+              spacing: 12,
+              runSpacing: 12,
               children: [
-                SizedBox(
-                  width: 190,
-                  child: YingjiGlassChoiceField<String>(
-                    label: '来源',
-                    value: provider,
-                    items: providerLabels.keys.toList(growable: false),
-                    labelBuilder: (item) => providerLabels[item] ?? item,
-                    onChanged: (item) {
-                      if (mode == 'custom') {
-                        updateCustom(
-                          nextProvider: item,
-                          genre: 'all',
-                          heat: item == 'trakt'
-                              ? 'trending'
-                              : 'popularity.desc',
-                        );
-                      } else {
-                        final first = groups.entries
-                            .where(
-                              (entry) => item == 'trakt'
-                                  ? entry.key.startsWith('Trakt')
-                                  : entry.key.startsWith('TMDB'),
-                            )
-                            .expand((entry) => entry.value)
-                            .first;
-                        onChanged(first);
-                      }
-                    },
-                  ),
+                _DiscoverFilterField(
+                  label: '来源',
+                  value: provider,
+                  labels: providerLabels,
+                  onChanged: (item) => update(nextProvider: item),
                 ),
-                SizedBox(
-                  width: 190,
-                  child: YingjiGlassChoiceField<String>(
-                    label: '列表',
-                    value: mode,
-                    items: const ['fixed', 'custom'],
-                    labelBuilder: (item) => item == 'fixed' ? '固定列表' : '自定义筛选',
-                    onChanged: (item) {
-                      if (item == 'custom') {
-                        updateCustom(
-                          nextProvider: provider,
-                          heat: provider == 'trakt'
-                              ? 'trending'
-                              : 'popularity.desc',
-                        );
-                      } else {
-                        onChanged(fixedValue);
-                      }
-                    },
-                  ),
+                _DiscoverFilterField(
+                  label: '影视类型',
+                  value: mediaType,
+                  labels: provider == 'tvmaze'
+                      ? const {'tv': '剧集'}
+                      : provider == 'douban'
+                      ? const {'movie': '电影'}
+                      : mediaLabels,
+                  onChanged: (item) => update(nextMediaType: item),
+                ),
+                _DiscoverFilterField(
+                  label: '地区',
+                  value: country,
+                  labels: regionLabels,
+                  onChanged: (item) => update(nextCountry: item),
+                ),
+                _DiscoverFilterField(
+                  label: '来源榜单',
+                  value: list,
+                  labels: lists,
+                  onChanged: (item) => update(nextList: item),
                 ),
               ],
             ),
-            const SizedBox(height: 14),
-            if (mode == 'fixed')
-              YingjiGlassChoiceField<String>(
-                label: '选择固定列表',
-                value: fixedValue,
-                items: fixedSources,
-                labelBuilder: (item) => labels[item] ?? item,
-                onChanged: onChanged,
-              )
-            else
-              Wrap(
-                spacing: 14,
-                runSpacing: 14,
-                children: [
-                  SizedBox(
-                    width: 150,
-                    child: YingjiGlassChoiceField<String>(
-                      label: '影视',
-                      value: selection.mediaType,
-                      items: mediaLabels.keys.toList(growable: false),
-                      labelBuilder: (item) => mediaLabels[item] ?? item,
-                      onChanged: (item) => updateCustom(mediaType: item),
-                    ),
-                  ),
-                  if (provider == 'tmdb')
-                    SizedBox(
-                      width: 150,
-                      child: YingjiGlassChoiceField<String>(
-                        label: '类型',
-                        value: selection.genre,
-                        items: genreLabels.keys.toList(growable: false),
-                        labelBuilder: (item) => genreLabels[item] ?? item,
-                        onChanged: (item) => updateCustom(genre: item),
-                      ),
-                    ),
-                  SizedBox(
-                    width: 150,
-                    child: YingjiGlassChoiceField<String>(
-                      label: '热度类别',
-                      value: selection.heat,
-                      items:
-                          (provider == 'trakt' ? traktHeatLabels : heatLabels)
-                              .keys
-                              .toList(growable: false),
-                      labelBuilder: (item) => provider == 'trakt'
-                          ? traktHeatLabels[item] ?? item
-                          : heatLabels[item] ?? item,
-                      onChanged: (item) => updateCustom(heat: item),
-                    ),
-                  ),
-                ],
+            if (provider == 'trakt') ...[
+              const SizedBox(height: 10),
+              const Text(
+                'Trakt 榜单不提供地区过滤，因此地区固定为全球。',
+                style: TextStyle(fontSize: 11, color: YingjiColors.muted),
               ),
+            ],
+            if (provider == 'douban') ...[
+              const SizedBox(height: 10),
+              const Text(
+                '读取豆瓣公开电影榜单标题，并通过 TMDB 匹配中文海报与详情。',
+                style: TextStyle(fontSize: 11, color: YingjiColors.muted),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
+}
+
+class _DiscoverFilterField extends StatelessWidget {
+  const _DiscoverFilterField({
+    required this.label,
+    required this.value,
+    required this.labels,
+    required this.onChanged,
+  });
+
+  final String label;
+  final String value;
+  final Map<String, String> labels;
+  final ValueChanged<String> onChanged;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 148,
+    child: YingjiGlassChoiceField<String>(
+      label: label,
+      value: value,
+      items: labels.keys.toList(growable: false),
+      labelBuilder: (item) => labels[item] ?? item,
+      onChanged: onChanged,
+    ),
+  );
 }
 
 class _DiscoverBlock extends StatefulWidget {
@@ -2960,12 +3407,11 @@ class _RankingPosterCard extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Expanded(
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned.fill(
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(17),
+          child: _MediaHover(
+            borderRadius: 17,
+            child: Stack(
+              children: [
+                Positioned.fill(
                   child: item.posterUrl == null
                       ? DecoratedBox(
                           decoration: BoxDecoration(
@@ -2983,30 +3429,30 @@ class _RankingPosterCard extends StatelessWidget {
                           ),
                         ),
                 ),
-              ),
-              Positioned(
-                left: 10,
-                top: 10,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 9,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: YingjiGlass.chrome(strength: 1.15),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: YingjiGlass.line()),
-                  ),
-                  child: Text(
-                    '#$rank',
-                    style: const TextStyle(
-                      fontFeatures: [FontFeature.tabularFigures()],
-                      fontWeight: FontWeight.w900,
+                Positioned(
+                  left: 10,
+                  top: 10,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: YingjiGlass.chrome(strength: 1.15),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: YingjiGlass.line()),
+                    ),
+                    child: Text(
+                      '#$rank',
+                      style: const TextStyle(
+                        fontFeatures: [FontFeature.tabularFigures()],
+                        fontWeight: FontWeight.w900,
+                      ),
                     ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
         const SizedBox(height: 10),
@@ -3980,7 +4426,7 @@ class _SourceHubState extends State<_SourceHub> {
                 ),
                 SizedBox(height: 8),
                 Text(
-                  '连接、验证并管理聚合到映迹的媒体来源。',
+                  '连接、验证并管理聚合到 Mova 的媒体来源。',
                   style: TextStyle(color: Color(0xFFABB1BE)),
                 ),
               ],
@@ -5984,7 +6430,7 @@ class _SettingsPageState extends State<SettingsPage> {
       ('网络与同步', YingjiIcons.wifi),
       ('字幕与弹幕', YingjiIcons.captions_bubble),
       ('缓存与数据', YingjiIcons.archivebox),
-      ('关于映迹', YingjiIcons.info_circle),
+      ('关于 Mova', YingjiIcons.info_circle),
     ];
     final keys = <GlobalKey>[
       _homeKey,
@@ -6272,11 +6718,11 @@ class _SettingsPageState extends State<SettingsPage> {
                                   items: const [
                                     DropdownMenuItem(
                                       value: 'round',
-                                      child: Text('映迹圆润无衬线（内置）'),
+                                      child: Text('Mova 圆润无衬线（内置）'),
                                     ),
                                     DropdownMenuItem(
                                       value: 'wenkai',
-                                      child: Text('映迹温润文楷（内置）'),
+                                      child: Text('Mova 温润文楷（内置）'),
                                     ),
                                     DropdownMenuItem(
                                       value: 'dengxian',
@@ -6563,7 +7009,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                 ),
                                 const SizedBox(height: 8),
                                 const Text(
-                                  'TMDB 默认通过映迹托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
+                                  'TMDB 默认通过 Mova 托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
                                   style: TextStyle(color: Color(0xFFABB1BE)),
                                 ),
                                 const SizedBox(height: 14),
@@ -6572,7 +7018,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                   obscureText: true,
                                   decoration: const InputDecoration(
                                     labelText: 'TMDB API Key（可选）',
-                                    hintText: '留空使用映迹托管网关',
+                                    hintText: '留空使用 Mova 托管网关',
                                   ),
                                 ),
                                 const SizedBox(height: 14),
@@ -6953,7 +7399,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                         CrossAxisAlignment.start,
                                     children: [
                                       const Text(
-                                        '映迹',
+                                        'Mova',
                                         style: TextStyle(
                                           fontSize: 30,
                                           fontWeight: FontWeight.w800,
@@ -6984,9 +7430,9 @@ class _SettingsPageState extends State<SettingsPage> {
                                   tooltip: '关于与许可',
                                   onPressed: () => showAboutDialog(
                                     context: context,
-                                    applicationName: '映迹',
+                                    applicationName: 'Mova',
                                     applicationIcon: const YingjiMark(size: 56),
-                                    applicationVersion: '3.1.56',
+                                    applicationVersion: '3.1.64',
                                     applicationLegalese: '私人媒体中心 · 内置 libmpv',
                                   ),
                                 ),
@@ -7259,51 +7705,367 @@ class _LandscapeTile extends StatelessWidget {
   );
 }
 
-class _RankTile extends StatelessWidget {
+class _RankTile extends StatefulWidget {
   const _RankTile({required this.index, required this.item});
   final int index;
   final TmdbItem item;
+
   @override
-  Widget build(BuildContext context) => SizedBox(
-    width: 166,
-    child: InkWell(
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-      ),
-      child: Stack(
-        children: [
-          Positioned(
-            left: 0,
-            bottom: 0,
-            child: Text(
-              '$index',
-              style: TextStyle(
-                fontSize: 104,
-                height: .8,
-                fontWeight: FontWeight.w900,
-                color: Colors.white.withValues(alpha: .18),
+  State<_RankTile> createState() => _RankTileState();
+}
+
+class _RankTileState extends State<_RankTile>
+    with SingleTickerProviderStateMixin {
+  final _link = LayerLink();
+  final _cardKey = GlobalKey();
+  OverlayEntry? _preview;
+  bool _hovered = false;
+  late final AnimationController _previewController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 190),
+    reverseDuration: const Duration(milliseconds: 130),
+  );
+
+  void _showPreview() {
+    if (_preview != null) {
+      _previewController.forward();
+      return;
+    }
+    final overlay = Overlay.of(context);
+    final box = _cardKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final rect = box.localToGlobal(Offset.zero) & box.size;
+    final showOnRight = MediaQuery.sizeOf(context).width - rect.left >= 520;
+    final reveal = CurvedAnimation(
+      parent: _previewController,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+    _preview = OverlayEntry(
+      builder: (context) => IgnorePointer(
+        child: CompositedTransformFollower(
+          link: _link,
+          showWhenUnlinked: false,
+          targetAnchor: showOnRight ? Alignment.topLeft : Alignment.topRight,
+          followerAnchor: showOnRight ? Alignment.topLeft : Alignment.topRight,
+          offset: Offset(showOnRight ? 36 : 0, 0),
+          child: UnconstrainedBox(
+            alignment: showOnRight ? Alignment.topLeft : Alignment.topRight,
+            child: AnimatedBuilder(
+              animation: reveal,
+              child: _RankHoverPreview(
+                index: widget.index,
+                item: widget.item,
+                reverse: !showOnRight,
+              ),
+              builder: (context, child) => ClipRect(
+                child: Align(
+                  alignment: showOnRight
+                      ? Alignment.centerLeft
+                      : Alignment.centerRight,
+                  widthFactor: .27 + reveal.value * .73,
+                  child: Opacity(
+                    opacity: .92 + reveal.value * .08,
+                    child: child,
+                  ),
+                ),
               ),
             ),
           ),
-          Positioned(
-            left: 36,
-            top: 0,
-            bottom: 0,
-            right: 0,
-            child: _MediaHover(
-              borderRadius: 13,
-              child: item.posterUrl == null
-                  ? const ColoredBox(color: Color(0xFF1A1D25))
-                  : CachedNetworkImage(
-                      imageUrl: item.posterUrl.toString(),
-                      fit: BoxFit.cover,
-                      errorWidget: (_, _, _) =>
-                          const ColoredBox(color: Color(0xFF1A1D25)),
-                    ),
+        ),
+      ),
+    );
+    overlay.insert(_preview!);
+    _previewController.forward(from: 0);
+  }
+
+  Future<void> _hidePreview() async {
+    if (_preview == null) return;
+    await _previewController.reverse();
+    _preview?.remove();
+    _preview = null;
+  }
+
+  @override
+  void didUpdateWidget(covariant _RankTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.item.id != widget.item.id ||
+        oldWidget.item.kind != widget.item.kind) {
+      _preview?.remove();
+      _preview = null;
+      _previewController.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _preview?.remove();
+    _previewController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => CompositedTransformTarget(
+    link: _link,
+    child: MouseRegion(
+      key: _cardKey,
+      onEnter: (_) {
+        setState(() => _hovered = true);
+        _showPreview();
+      },
+      onExit: (_) {
+        setState(() => _hovered = false);
+        unawaited(_hidePreview());
+      },
+      child: SizedBox(
+        width: 166,
+        child: InkWell(
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => MetadataDetailPage(item: widget.item),
             ),
           ),
-        ],
+          child: Stack(
+            children: [
+              Positioned(
+                left: 0,
+                bottom: 0,
+                child: Text(
+                  '${widget.index}',
+                  style: TextStyle(
+                    fontSize: 104,
+                    height: .8,
+                    fontWeight: FontWeight.w900,
+                    color: Colors.white.withValues(alpha: .18),
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 36,
+                top: 0,
+                bottom: 0,
+                right: 0,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  curve: Curves.easeOutCubic,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: Colors.white.withValues(
+                        alpha: _hovered ? .76 : .12,
+                      ),
+                      width: _hovered ? 2.2 : 1,
+                    ),
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(13),
+                    child: widget.item.posterUrl == null
+                        ? const ColoredBox(color: Color(0xFF1A1D25))
+                        : CachedNetworkImage(
+                            imageUrl: widget.item.posterUrl.toString(),
+                            fit: BoxFit.cover,
+                            errorWidget: (_, _, _) =>
+                                const ColoredBox(color: Color(0xFF1A1D25)),
+                          ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class _RankHoverPreview extends StatelessWidget {
+  const _RankHoverPreview({
+    required this.index,
+    required this.item,
+    required this.reverse,
+  });
+
+  final int index;
+  final TmdbItem item;
+  final bool reverse;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 500,
+    height: 226,
+    child: ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(
+          sigmaX: YingjiGlass.blur,
+          sigmaY: YingjiGlass.blur,
+        ),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: YingjiGlass.surface(strength: 1.14),
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x80000000),
+                blurRadius: 30,
+                offset: Offset(0, 14),
+              ),
+            ],
+          ),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (item.backdropUrl != null)
+                Opacity(
+                  opacity: .12,
+                  child: CachedNetworkImage(
+                    imageUrl: item.backdropUrl.toString(),
+                    fit: BoxFit.cover,
+                  ),
+                ),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: reverse
+                        ? Alignment.centerRight
+                        : Alignment.centerLeft,
+                    end: reverse ? Alignment.centerLeft : Alignment.centerRight,
+                    colors: [
+                      YingjiGlass.chrome(strength: 1.24),
+                      YingjiGlass.surface(strength: 1.16),
+                    ],
+                  ),
+                ),
+              ),
+              Row(
+                textDirection: reverse ? TextDirection.rtl : TextDirection.ltr,
+                children: [
+                  SizedBox(
+                    width: 135,
+                    height: double.infinity,
+                    child: item.posterUrl == null
+                        ? const ColoredBox(color: Color(0xFF1A1D25))
+                        : CachedNetworkImage(
+                            imageUrl: item.posterUrl.toString(),
+                            fit: BoxFit.cover,
+                            errorWidget: (_, _, _) =>
+                                const ColoredBox(color: Color(0xFF1A1D25)),
+                          ),
+                  ),
+                  Container(
+                    width: 1,
+                    margin: const EdgeInsets.symmetric(vertical: 12),
+                    color: Colors.white.withValues(alpha: .09),
+                  ),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 15, 18, 14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: .14),
+                                  borderRadius: BorderRadius.circular(9),
+                                ),
+                                child: Text(
+                                  '#$index',
+                                  style: const TextStyle(
+                                    color: YingjiColors.ink,
+                                    fontFeatures: [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w900,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  [
+                                    if (item.year != null) '${item.year}',
+                                    item.kind,
+                                    ...item.genres.take(2),
+                                  ].join(' · '),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 9),
+                          Text(
+                            item.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 20,
+                              height: 1.12,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: -.35,
+                              decoration: TextDecoration.none,
+                            ),
+                          ),
+                          const SizedBox(height: 9),
+                          MediaRatingRow(
+                            item: item,
+                            expanded: true,
+                            maxItems: 3,
+                            emphasizeFirst: true,
+                          ),
+                          if ((item.overview ?? '').trim().isNotEmpty) ...[
+                            const SizedBox(height: 11),
+                            Expanded(
+                              child: Text(
+                                item.overview!.trim(),
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: Colors.white.withValues(alpha: .82),
+                                  fontSize: 12,
+                                  height: 1.55,
+                                  decoration: TextDecoration.none,
+                                ),
+                              ),
+                            ),
+                          ] else
+                            const Spacer(),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: .76),
+                      width: 2.2,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     ),
   );

@@ -269,11 +269,11 @@ class _PlayerPageState extends State<PlayerPage> {
     _player = Player(
       configuration: const PlayerConfiguration(
         vo: 'gpu-next',
-        title: '映迹',
+        title: 'Mova',
         libass: true,
       ),
     );
-    _focusNode = FocusNode(debugLabel: '映迹播放器快捷键');
+    _focusNode = FocusNode(debugLabel: 'Mova 播放器快捷键');
     _controller = VideoController(_player);
     _subtitleSubscription = _player.stream.tracks.listen((tracks) {
       if (!_preferChineseSubtitle ||
@@ -1086,7 +1086,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _copyDiagnostics() async {
     final diagnostics = <String>[
-      '映迹播放诊断',
+      'Mova 播放诊断',
       '标题: ${_activeEpisode.title}',
       '内核: libmpv / gpu-next',
       '硬件解码: ${_hardware ? 'D3D11VA' : '关闭'}',

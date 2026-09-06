@@ -266,6 +266,67 @@ class TmdbClient {
     return _items(data);
   }
 
+  Future<TmdbItem?> searchFirst(
+    String query, {
+    required String type,
+    String apiKey = '',
+  }) async {
+    final data = await _get('/search/$type', apiKey, {
+      'query': query,
+      'language': 'zh-CN',
+      'include_adult': 'false',
+      'page': '1',
+    });
+    final rows = _items(data, typeHint: type);
+    return rows.firstOrNull;
+  }
+
+  Future<List<TmdbItem>> doubanPublicList(String list, {int page = 1}) async {
+    final uri = Uri.parse('$managedEndpoint/discover/douban/movie/$list')
+        .replace(queryParameters: {'page': '$page'});
+    final response = await _client
+        .get(uri, headers: const {'Accept': 'application/json'})
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('豆瓣公开榜单读取失败（HTTP ${response.statusCode}）');
+    }
+    final data = jsonDecode(response.body);
+    final rows = data is Map ? data['results'] : null;
+    if (rows is! List) return const [];
+    final titles = rows
+        .whereType<Map>()
+        .map((row) => '${row['title'] ?? ''}'.trim())
+        .where((title) => title.isNotEmpty)
+        .toSet()
+        .toList(growable: false);
+    final items = <TmdbItem>[];
+    for (var offset = 0; offset < titles.length; offset += 5) {
+      final resolved = await Future.wait(
+        titles.skip(offset).take(5).map((title) async {
+          try {
+            return await searchFirst(title, type: 'movie');
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      items.addAll(resolved.whereType<TmdbItem>());
+    }
+    return items;
+  }
+
+  Future<TmdbItem?> findByImdbId(String imdbId, {String apiKey = ''}) async {
+    final data = await _get('/find/$imdbId', apiKey, {
+      'external_source': 'imdb_id',
+      'language': 'zh-CN',
+    });
+    final rows = data['tv_results'];
+    if (rows is! List || rows.isEmpty || rows.first is! Map) return null;
+    final id = ((rows.first as Map)['id'] as num?)?.toInt();
+    if (id == null) return null;
+    return details(id, kind: '剧集', apiKey: apiKey);
+  }
+
   Future<List<TmdbItem>> popularMovies({String apiKey = ''}) => _list(
     '/movie/popular',
     apiKey,
@@ -308,13 +369,64 @@ class TmdbClient {
     'page': '$page',
   }, typeHint: type);
 
+  Future<List<TmdbItem>> mdblistOfficial(
+    String type,
+    String list, {
+    int page = 1,
+    String country = 'all',
+  }) async {
+    final uri = Uri.parse('$managedEndpoint/discover/mdblist/$type/$list')
+        .replace(queryParameters: {'page': '$page', 'country': country});
+    final response = await _client
+        .get(uri, headers: const {'Accept': 'application/json'})
+        .timeout(const Duration(seconds: 12));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('MDBList 榜单读取失败（HTTP ${response.statusCode}）');
+    }
+    final data = jsonDecode(response.body);
+    final rows = data is Map ? data['results'] : null;
+    if (rows is! List) return const [];
+    final ids = rows
+        .whereType<Map>()
+        .map((row) => (row['tmdbId'] as num?)?.toInt())
+        .whereType<int>()
+        .toSet()
+        .toList(growable: false);
+    final items = <TmdbItem>[];
+    for (var offset = 0; offset < ids.length; offset += 5) {
+      final batch = ids.skip(offset).take(5);
+      final resolved = await Future.wait(
+        batch.map((id) async {
+          try {
+            return await details(id, kind: type == 'tv' ? '剧集' : '电影');
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      items.addAll(resolved.whereType<TmdbItem>());
+    }
+    return items;
+  }
+
   Future<List<TmdbItem>> discover(
     String type, {
     int page = 1,
     String? originCountry,
     int? genre,
+    String? genres,
     String? provider,
+    String? originalLanguage,
+    String? region,
+    int? year,
+    double? minimumRating,
+    int? minimumVoteCount,
+    int? minimumRuntime,
+    int? maximumRuntime,
+    String? watchRegion,
     String sortBy = 'popularity.desc',
+    DateTime? dateFrom,
+    DateTime? dateTo,
     String apiKey = '',
   }) => _list('/discover/$type', apiKey, {
     'language': 'zh-CN',
@@ -322,12 +434,31 @@ class TmdbClient {
     'sort_by': sortBy,
     'include_adult': 'false',
     'with_origin_country': ?originCountry,
-    'with_genres': ?(genre == null ? null : '$genre'),
+    'with_original_language': ?originalLanguage,
+    'with_genres': ?(genres ?? (genre == null ? null : '$genre')),
+    'region': ?region,
+    if (year != null)
+      type == 'tv' ? 'first_air_date_year' : 'primary_release_year': '$year',
+    if (dateFrom != null)
+      type == 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte':
+          _dateQuery(dateFrom),
+    if (dateTo != null)
+      type == 'tv' ? 'first_air_date.lte' : 'primary_release_date.lte':
+          _dateQuery(dateTo),
+    'vote_average.gte': ?(minimumRating == null ? null : '$minimumRating'),
+    'vote_count.gte': ?(minimumVoteCount == null ? null : '$minimumVoteCount'),
+    'with_runtime.gte': ?(minimumRuntime == null ? null : '$minimumRuntime'),
+    'with_runtime.lte': ?(maximumRuntime == null ? null : '$maximumRuntime'),
     if (provider != null) ...{
       'with_watch_providers': provider,
-      'watch_region': 'CN',
+      'watch_region': ?watchRegion,
     },
   }, typeHint: type);
+
+  static String _dateQuery(DateTime value) =>
+      '${value.year.toString().padLeft(4, '0')}-'
+      '${value.month.toString().padLeft(2, '0')}-'
+      '${value.day.toString().padLeft(2, '0')}';
 
   Future<List<TmdbItem>> _list(
     String path,
@@ -645,7 +776,7 @@ class TmdbClient {
     }
     try {
       final response = await _client
-          .get(uri, headers: const {'User-Agent': 'Yingji/3 schedule-client'})
+          .get(uri, headers: const {'User-Agent': 'Mova/3 schedule-client'})
           .timeout(const Duration(seconds: 8));
       if (response.statusCode != 200) throw Exception('Schedule unavailable');
       final data = jsonDecode(response.body);
@@ -709,7 +840,7 @@ class TmdbClient {
                 uri,
                 headers: const {
                   'Accept': 'application/json',
-                  'User-Agent': 'Yingji/3.1.42 (Windows; Flutter)',
+                  'User-Agent': 'Mova/3.1.64 (Windows; Flutter)',
                 },
               )
               .timeout(const Duration(seconds: 12));
@@ -752,7 +883,7 @@ class TmdbClient {
             uri,
             headers: const {
               'Accept': 'application/json',
-              'User-Agent': 'Yingji/3.1.42 (Windows; Flutter)',
+              'User-Agent': 'Mova/3.1.64 (Windows; Flutter)',
             },
           )
           .timeout(const Duration(seconds: 12));
