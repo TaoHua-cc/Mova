@@ -1894,7 +1894,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       _mediaLabels[custom.mediaType]!,
       if (custom.country != 'all') _countryLabels[custom.country]!,
       if (custom.platform != 'all')
-        _resolvedPlatformLabels[custom.platform] ?? '平台 ${custom.platform}',
+        custom.platforms
+            .map((value) => _resolvedPlatformLabels[value] ?? '平台 $value')
+            .join('、'),
       listLabels[custom.heat] ?? custom.heat,
     ];
     return '${_providerLabels[custom.provider]} · '
@@ -1938,7 +1940,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         _DiscoverSourceEditor._releaseLabels[value.releaseWindow] ??
             value.releaseWindow,
       if (value.platform != 'all')
-        _resolvedPlatformLabels[value.platform] ?? value.platform,
+        value.platforms
+            .map((item) => _resolvedPlatformLabels[item] ?? item)
+            .join('、'),
     ].join(' · ');
   }
 
@@ -2852,6 +2856,14 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       'long' => (selection.mediaType == 'tv' ? 70 : 150, null),
       _ => (null, null),
     };
+    final watchProviders = selection.platforms
+        .where((value) => value.startsWith('watch:'))
+        .map((value) => value.substring(6))
+        .join('|');
+    final companies = selection.platforms
+        .where((value) => value.startsWith('company:'))
+        .map((value) => value.substring(8))
+        .join('|');
     return _tmdb.discover(
       selection.mediaType,
       page: page,
@@ -2873,14 +2885,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       maximumRuntime: maximumRuntime,
       dateFrom: dateFrom,
       dateTo: dateTo,
-      provider: selection.platform.startsWith('watch:')
-          ? selection.platform.substring(6)
-          : int.tryParse(selection.platform) != null
-          ? selection.platform
-          : null,
-      company: selection.platform.startsWith('company:')
-          ? selection.platform.substring(8)
-          : null,
+      provider: watchProviders.isEmpty ? null : watchProviders,
+      company: companies.isEmpty ? null : companies,
       watchRegion: selection.watchRegion,
       sortBy: sortBy,
     );
@@ -3093,6 +3099,10 @@ class _DiscoverFeedSelection {
   final String watchRegion;
   final String releaseWindow;
 
+  List<String> get platforms => platform == 'all'
+      ? const []
+      : platform.split(',').where((value) => value.isNotEmpty).toList();
+
   String get encoded => [
     'custom',
     provider,
@@ -3261,8 +3271,13 @@ class _DiscoverFeedSelection {
               'long',
             }) ||
             (parts[11] != 'all' &&
-                !RegExp(r'^(watch|company):\d+$').hasMatch(parts[11]) &&
-                int.tryParse(parts[11]) == null) ||
+                !parts[11]
+                    .split(',')
+                    .every(
+                      (value) =>
+                          RegExp(r'^(watch|company):\d+$').hasMatch(value) ||
+                          int.tryParse(value) != null,
+                    )) ||
             !_validOption(parts[12], const {
               'all',
               'CN',
@@ -3701,6 +3716,63 @@ class _DiscoverSourceEditor extends StatelessWidget {
                       builder: (context, snapshot) {
                         final labels =
                             snapshot.data ?? const {'all': '正在获取平台…'};
+                        if (style == 3) {
+                          final selectedPlatforms = platform == 'all'
+                              ? <String>{}
+                              : platform.split(',').toSet();
+                          final platformEntries = labels.entries
+                              .where((entry) => entry.key != 'all')
+                              .toList(growable: false);
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                '播放平台（可多选）',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 7),
+                              SizedBox(
+                                height: 38,
+                                child: ListView.separated(
+                                  scrollDirection: Axis.horizontal,
+                                  itemCount: platformEntries.length,
+                                  separatorBuilder: (_, _) =>
+                                      const SizedBox(width: 7),
+                                  itemBuilder: (context, index) {
+                                    final entry = platformEntries[index];
+                                    final selected = selectedPlatforms.contains(
+                                      entry.key,
+                                    );
+                                    return FilterChip(
+                                      label: Text(entry.value),
+                                      selected: selected,
+                                      onSelected: (_) {
+                                        final next = {...selectedPlatforms};
+                                        selected
+                                            ? next.remove(entry.key)
+                                            : next.add(entry.key);
+                                        update(
+                                          nextPlatform: next.isEmpty
+                                              ? 'all'
+                                              : next.join(','),
+                                          nextWatchRegion:
+                                              entry.key.startsWith('company:')
+                                              ? 'CN'
+                                              : watchRegion == 'CN'
+                                              ? 'HK'
+                                              : watchRegion,
+                                        );
+                                      },
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                          );
+                        }
                         final selected = labels.containsKey(platform)
                             ? platform
                             : 'all';
@@ -3844,6 +3916,8 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
     final title = widget.title;
     final items = _items;
     final variant = widget.variant;
+    final platformCount =
+        _DiscoverFeedSelection.tryParse(widget.source)?.platforms.length ?? 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -3857,7 +3931,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
             onPressed: widget.onConfigure,
           ),
           trailingActions: [
-            if (variant != 3) ...[
+            if (variant != 3 || platformCount > 1) ...[
               YingjiDirectionalArrow(
                 previous: true,
                 tooltip: '向左浏览',
@@ -3873,29 +3947,31 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
               ),
             ],
           ],
-          action: '打开$title完整列表',
-          onAction: () {
-            if (title == '排行榜') {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => _RankingPage(initialItems: items),
-                ),
-              );
-              return;
-            }
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => _DiscoverListPage(
-                  title: title,
-                  items: items,
-                  source: widget.source,
-                  loadSourcePage: widget.loadSourcePage,
-                ),
-              ),
-            );
-          },
+          action: variant == 3 ? null : '打开$title完整列表',
+          onAction: variant == 3
+              ? null
+              : () {
+                  if (title == '排行榜') {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => _RankingPage(initialItems: items),
+                      ),
+                    );
+                    return;
+                  }
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => _DiscoverListPage(
+                        title: title,
+                        items: items,
+                        source: widget.source,
+                        loadSourcePage: widget.loadSourcePage,
+                      ),
+                    ),
+                  );
+                },
         ),
         const SizedBox(height: 14),
         if (variant == 1)
@@ -3903,23 +3979,12 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
         else if (variant == 2)
           _RankStrip(items: items, shelf: _shelf)
         else if (variant == 3)
-          _PlatformEntryCard(
+          _PlatformEntryStrip(
             items: items,
             source: widget.source,
+            shelf: _shelf,
+            loadSourcePage: widget.loadSourcePage,
             onConfigure: widget.onConfigure,
-            onOpen: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => _DiscoverListPage(
-                    title: title,
-                    items: items,
-                    source: widget.source,
-                    loadSourcePage: widget.loadSourcePage,
-                  ),
-                ),
-              );
-            },
           )
         else
           _PosterStrip(items: items, shelf: _shelf),
@@ -9028,6 +9093,95 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
   );
 }
 
+class _PlatformEntryStrip extends StatefulWidget {
+  const _PlatformEntryStrip({
+    required this.items,
+    required this.source,
+    required this.shelf,
+    required this.loadSourcePage,
+    required this.onConfigure,
+  });
+
+  final List<TmdbItem> items;
+  final String source;
+  final _ShelfNavigator shelf;
+  final Future<List<TmdbItem>> Function(String source, int page) loadSourcePage;
+  final VoidCallback onConfigure;
+
+  @override
+  State<_PlatformEntryStrip> createState() => _PlatformEntryStripState();
+}
+
+class _PlatformEntryStripState extends State<_PlatformEntryStrip> {
+  final _controller = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    widget.shelf.attach(_controller);
+  }
+
+  @override
+  void dispose() {
+    widget.shelf.detach(_controller);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selection = _DiscoverFeedSelection.tryParse(widget.source);
+    final platforms = selection?.platforms ?? const [];
+    if (selection == null || platforms.isEmpty) {
+      return _PlatformEntryCard(
+        items: widget.items,
+        source: widget.source,
+        onConfigure: widget.onConfigure,
+        onOpen: widget.onConfigure,
+      );
+    }
+    return SizedBox(
+      height: 258,
+      child: ListView.separated(
+        controller: _controller,
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        physics: const BouncingScrollPhysics(),
+        itemCount: platforms.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 16),
+        itemBuilder: (context, index) {
+          final platformSource = selection
+              .withPlatform(platforms[index])
+              .encoded;
+          return FutureBuilder<List<TmdbItem>>(
+            future: widget.loadSourcePage(platformSource, 1),
+            builder: (context, snapshot) {
+              final items = snapshot.data ?? const <TmdbItem>[];
+              return _PlatformEntryCard(
+                items: items,
+                source: platformSource,
+                onConfigure: widget.onConfigure,
+                onOpen: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => _DiscoverListPage(
+                      title:
+                          _resolvedPlatformLabels[platforms[index]] ?? '平台内容',
+                      items: items,
+                      source: platformSource,
+                      loadSourcePage: widget.loadSourcePage,
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
 class _PlatformEntryCard extends StatefulWidget {
   const _PlatformEntryCard({
     required this.items,
@@ -9152,11 +9306,10 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
                             width: widget.compact ? 128 : 178,
                             height: widget.compact ? 42 : 64,
                             child: platformLogo != null
-                                ? CachedNetworkImage(
-                                    imageUrl: platformLogo.toString(),
-                                    fit: BoxFit.contain,
+                                ? _BackgroundFreeNetworkIcon(
+                                    url: platformLogo.toString(),
                                     alignment: Alignment.centerLeft,
-                                    errorWidget: (_, _, _) => _PlatformName(
+                                    fallback: _PlatformName(
                                       name: platformName,
                                       compact: widget.compact,
                                     ),
@@ -11888,10 +12041,15 @@ class _ServerMark extends StatelessWidget {
 final Map<String, Future<Uint8List?>> _backgroundFreeIconCache = {};
 
 class _BackgroundFreeNetworkIcon extends StatelessWidget {
-  const _BackgroundFreeNetworkIcon({required this.url, required this.fallback});
+  const _BackgroundFreeNetworkIcon({
+    required this.url,
+    required this.fallback,
+    this.alignment = Alignment.center,
+  });
 
   final String url;
   final Widget fallback;
+  final AlignmentGeometry alignment;
 
   @override
   Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
@@ -11906,7 +12064,12 @@ class _BackgroundFreeNetworkIcon extends StatelessWidget {
             ? fallback
             : const SizedBox.shrink();
       }
-      return Image.memory(bytes, fit: BoxFit.contain, gaplessPlayback: true);
+      return Image.memory(
+        bytes,
+        fit: BoxFit.contain,
+        alignment: alignment,
+        gaplessPlayback: true,
+      );
     },
   );
 }
