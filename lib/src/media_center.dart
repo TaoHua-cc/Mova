@@ -9028,7 +9028,7 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
   );
 }
 
-class _PlatformEntryCard extends StatelessWidget {
+class _PlatformEntryCard extends StatefulWidget {
   const _PlatformEntryCard({
     required this.items,
     required this.source,
@@ -9044,166 +9044,157 @@ class _PlatformEntryCard extends StatelessWidget {
   final bool compact;
 
   @override
+  State<_PlatformEntryCard> createState() => _PlatformEntryCardState();
+}
+
+class _PlatformEntryCardState extends State<_PlatformEntryCard> {
+  bool _hovered = false;
+
+  @override
   Widget build(BuildContext context) {
-    final selection = _DiscoverFeedSelection.tryParse(source);
+    final selection = _DiscoverFeedSelection.tryParse(widget.source);
     final platformId = selection?.platform ?? 'all';
     final hasPlatform = platformId != 'all';
     final platformName =
         _resolvedPlatformLabels[platformId] ??
         (hasPlatform ? '平台 $platformId' : '选择播放平台');
     final platformLogo = _resolvedPlatformLogos[platformId];
-    final backdrop = items
+    final artwork = widget.items
         .map((item) => item.backdropUrl)
         .whereType<Uri>()
-        .firstOrNull;
+        .take(3)
+        .toList(growable: false);
     return SizedBox(
-      height: compact ? 132 : 206,
+      height: widget.compact ? 132 : 258,
       child: Align(
         alignment: Alignment.centerLeft,
         child: SizedBox(
-          width: compact ? 520 : 600,
+          width: widget.compact ? 520 : 570,
           child: InkWell(
             borderRadius: BorderRadius.circular(16),
-            onTap: hasPlatform ? onOpen : onConfigure,
-            child: _MediaHover(
-              borderRadius: 16,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (backdrop != null)
-                    CachedNetworkImage(
-                      imageUrl: backdrop.toString(),
-                      fit: BoxFit.cover,
-                      errorWidget: (_, _, _) =>
-                          const ColoredBox(color: Color(0xFF1A1D25)),
-                    )
-                  else
-                    const ColoredBox(color: Color(0xFF1A1D25)),
-                  DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.centerLeft,
-                        end: Alignment.centerRight,
-                        colors: [
-                          YingjiGlass.chrome(strength: 1.22),
-                          YingjiGlass.surface(strength: 1.04),
-                          Colors.black.withValues(alpha: .22),
-                        ],
-                      ),
-                    ),
+            onTap: hasPlatform ? widget.onOpen : widget.onConfigure,
+            child: MouseRegion(
+              onEnter: (_) => setState(() => _hovered = true),
+              onExit: (_) => setState(() => _hovered = false),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOutCubic,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: _hovered
+                        ? Colors.white.withValues(alpha: .82)
+                        : Colors.white.withValues(alpha: .11),
+                    width: _hovered ? 2.2 : 1,
                   ),
-                  Padding(
-                    padding: EdgeInsets.all(compact ? 18 : 24),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: compact ? 58 : 78,
-                          height: compact ? 58 : 78,
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .96),
-                            borderRadius: BorderRadius.circular(20),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: .72),
-                            ),
-                            boxShadow: const [
-                              BoxShadow(
-                                color: Color(0x52000000),
-                                blurRadius: 22,
-                                offset: Offset(0, 10),
-                              ),
-                            ],
+                  boxShadow: _hovered
+                      ? const [
+                          BoxShadow(
+                            color: Color(0xA0000000),
+                            blurRadius: 28,
+                            offset: Offset(0, 14),
                           ),
-                          child: platformLogo != null
-                              ? Padding(
-                                  padding: const EdgeInsets.all(8),
-                                  child: CachedNetworkImage(
+                        ]
+                      : const [],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(15),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) => Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        const ColoredBox(color: Color(0xFF12151B)),
+                        if (artwork.isNotEmpty)
+                          _PlatformArtwork(
+                            uri: artwork.first,
+                            alignment: Alignment.center,
+                          ),
+                        if (artwork.length > 1)
+                          Positioned(
+                            left: constraints.maxWidth * .43,
+                            top: 0,
+                            bottom: 0,
+                            width: constraints.maxWidth * .40,
+                            child: _PlatformArtwork(
+                              uri: artwork[1],
+                              fadeEdges: true,
+                            ),
+                          ),
+                        if (artwork.length > 2)
+                          Positioned(
+                            right: 0,
+                            top: 0,
+                            bottom: 0,
+                            width: constraints.maxWidth * .32,
+                            child: _PlatformArtwork(
+                              uri: artwork[2],
+                              fadeEdges: true,
+                            ),
+                          ),
+                        DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.centerLeft,
+                              end: Alignment.centerRight,
+                              colors: [
+                                Colors.black.withValues(alpha: .88),
+                                Colors.black.withValues(alpha: .42),
+                                Colors.black.withValues(alpha: .08),
+                                Colors.black.withValues(alpha: .28),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          left: widget.compact ? 18 : 28,
+                          bottom: widget.compact ? 18 : 27,
+                          child: SizedBox(
+                            width: widget.compact ? 128 : 178,
+                            height: widget.compact ? 42 : 64,
+                            child: platformLogo != null
+                                ? CachedNetworkImage(
                                     imageUrl: platformLogo.toString(),
                                     fit: BoxFit.contain,
-                                    errorWidget: (_, _, _) => Center(
-                                      child: Text(
-                                        platformName.characters.first
-                                            .toUpperCase(),
-                                        style: TextStyle(
-                                          color: YingjiColors.canvas,
-                                          fontSize: compact ? 22 : 28,
-                                          fontWeight: FontWeight.w900,
-                                        ),
-                                      ),
+                                    alignment: Alignment.centerLeft,
+                                    errorWidget: (_, _, _) => _PlatformName(
+                                      name: platformName,
+                                      compact: widget.compact,
                                     ),
+                                  )
+                                : _PlatformName(
+                                    name: hasPlatform ? platformName : '+',
+                                    compact: widget.compact,
                                   ),
-                                )
-                              : Center(
-                                  child: Text(
-                                    hasPlatform
-                                        ? platformName.characters.first
-                                              .toUpperCase()
-                                        : '+',
-                                    style: TextStyle(
-                                      color: YingjiColors.canvas,
-                                      fontSize: compact ? 22 : 28,
-                                      fontWeight: FontWeight.w900,
-                                    ),
-                                  ),
-                                ),
-                        ),
-                        SizedBox(width: compact ? 14 : 20),
-                        Expanded(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                platformName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: compact ? 20 : 28,
-                                  fontWeight: FontWeight.w900,
-                                  letterSpacing: -.4,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                hasPlatform
-                                    ? '${platformId.startsWith('company:') ? '国内平台' : '${selection?.watchRegion ?? 'HK'} 地区'} · ${items.length} 部内容预览'
-                                    : '选择一个平台，创建专属影视入口',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: YingjiColors.muted,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              if (!compact) ...[
-                                const SizedBox(height: 15),
-                                Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      hasPlatform
-                                          ? YingjiIcons.arrow_right_circle_fill
-                                          : YingjiIcons.slider_horizontal_3,
-                                      size: 17,
-                                    ),
-                                    const SizedBox(width: 7),
-                                    Text(
-                                      hasPlatform ? '进入 $platformName' : '选择平台',
-                                      style: const TextStyle(
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ],
                           ),
                         ),
+                        if (!widget.compact)
+                          Positioned(
+                            right: 18,
+                            bottom: 18,
+                            child: AnimatedOpacity(
+                              opacity: _hovered ? 1 : 0,
+                              duration: const Duration(milliseconds: 150),
+                              child: Container(
+                                width: 36,
+                                height: 36,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: Colors.black.withValues(alpha: .58),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: .28),
+                                  ),
+                                ),
+                                child: const Icon(
+                                  YingjiIcons.chevron_right,
+                                  size: 18,
+                                ),
+                              ),
+                            ),
+                          ),
                       ],
                     ),
                   ),
-                ],
+                ),
               ),
             ),
           ),
@@ -9211,6 +9202,59 @@ class _PlatformEntryCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _PlatformArtwork extends StatelessWidget {
+  const _PlatformArtwork({
+    required this.uri,
+    this.fadeEdges = false,
+    this.alignment = Alignment.center,
+  });
+
+  final Uri uri;
+  final bool fadeEdges;
+  final Alignment alignment;
+
+  @override
+  Widget build(BuildContext context) {
+    final image = CachedNetworkImage(
+      imageUrl: uri.toString(),
+      fit: BoxFit.cover,
+      alignment: alignment,
+      errorWidget: (_, _, _) => const SizedBox.shrink(),
+    );
+    if (!fadeEdges) return image;
+    return ShaderMask(
+      blendMode: BlendMode.dstIn,
+      shaderCallback: (bounds) => const LinearGradient(
+        colors: [Colors.transparent, Colors.white, Colors.white],
+        stops: [0, .28, 1],
+      ).createShader(bounds),
+      child: image,
+    );
+  }
+}
+
+class _PlatformName extends StatelessWidget {
+  const _PlatformName({required this.name, required this.compact});
+
+  final String name;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) => Align(
+    alignment: Alignment.centerLeft,
+    child: Text(
+      name,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: compact ? 22 : 30,
+        fontWeight: FontWeight.w900,
+        letterSpacing: -.6,
+      ),
+    ),
+  );
 }
 
 class _RankStrip extends StatefulWidget {
