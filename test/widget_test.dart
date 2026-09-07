@@ -123,7 +123,7 @@ void main() {
     expect(find.text('影视类型'), findsWidgets);
     expect(find.text('地区'), findsWidgets);
     expect(find.text('来源榜单'), findsWidgets);
-    expect(find.text('内容类型'), findsWidgets);
+    expect(find.text('题材类型'), findsWidgets);
     expect(find.text('原始语言'), findsWidgets);
     expect(find.text('发行年份'), findsWidgets);
     expect(find.text('发行时间'), findsWidgets);

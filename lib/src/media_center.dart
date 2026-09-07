@@ -3031,8 +3031,16 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     return items;
   }
 
-  Future<List<TmdbItem>> _loadSectionFor(String section, int page) =>
-      _loadSection(_sectionSources[section] ?? section, page);
+  Future<List<TmdbItem>> _loadSectionFor(String section, int page) async {
+    final filters = await _readDiscoverListFilters(section);
+    final baseSource = _sectionSources[section] ?? section;
+    final selection = _DiscoverFeedSelection.tryParse(baseSource);
+    final source = selection == null || filters.platform.isEmpty
+        ? baseSource
+        : selection.withPlatform(filters.platform).encoded;
+    final rows = await _loadSection(source, page);
+    return _applyDiscoverListFilters(rows, filters.type, filters.sort);
+  }
 
   @override
   Widget build(BuildContext context) =>
@@ -3733,7 +3741,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
                 if (provider == 'tmdb' &&
                     const {'movie', 'tv'}.contains(contentType)) ...[
                   _DiscoverFilterField(
-                    label: '内容类型',
+                    label: '题材类型',
                     value: genre,
                     labels: mediaType == 'tv' ? _tvGenres : _movieGenres,
                     onChanged: (item) => update(nextGenre: item),
@@ -3824,41 +3832,66 @@ class _DiscoverSourceEditor extends StatelessWidget {
                                 ),
                               ),
                               const SizedBox(height: 7),
-                              SizedBox(
-                                height: 38,
-                                child: ListView.separated(
-                                  scrollDirection: Axis.horizontal,
-                                  itemCount: platformEntries.length,
-                                  separatorBuilder: (_, _) =>
-                                      const SizedBox(width: 7),
-                                  itemBuilder: (context, index) {
-                                    final entry = platformEntries[index];
-                                    final selected = selectedPlatforms.contains(
-                                      entry.key,
-                                    );
-                                    return FilterChip(
-                                      label: Text(entry.value),
-                                      selected: selected,
-                                      onSelected: (_) {
-                                        final next = {...selectedPlatforms};
-                                        selected
-                                            ? next.remove(entry.key)
-                                            : next.add(entry.key);
-                                        update(
-                                          nextPlatform: next.isEmpty
-                                              ? 'all'
-                                              : next.join(','),
-                                          nextWatchRegion:
-                                              entry.key.startsWith('company:')
-                                              ? 'CN'
-                                              : watchRegion == 'CN'
-                                              ? 'HK'
-                                              : watchRegion,
+                              Wrap(
+                                spacing: 7,
+                                runSpacing: 7,
+                                children: [
+                                  for (final entry in platformEntries)
+                                    Builder(
+                                      builder: (context) {
+                                        final selected = selectedPlatforms
+                                            .contains(entry.key);
+                                        return FilterChip(
+                                          label: Text(
+                                            entry.value,
+                                            style: TextStyle(
+                                              color: selected
+                                                  ? YingjiColors.canvas
+                                                  : Colors.white,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          selected: selected,
+                                          selectedColor: Colors.white,
+                                          backgroundColor: YingjiGlass.chrome(),
+                                          checkmarkColor: YingjiColors.canvas,
+                                          side: BorderSide(
+                                            color: selected
+                                                ? Colors.white
+                                                : YingjiGlass.line(),
+                                          ),
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              13,
+                                            ),
+                                          ),
+                                          visualDensity: VisualDensity.compact,
+                                          materialTapTargetSize:
+                                              MaterialTapTargetSize.shrinkWrap,
+                                          onSelected: (_) {
+                                            final next = {...selectedPlatforms};
+                                            selected
+                                                ? next.remove(entry.key)
+                                                : next.add(entry.key);
+                                            update(
+                                              nextPlatform: next.isEmpty
+                                                  ? 'all'
+                                                  : next.join(','),
+                                              nextWatchRegion:
+                                                  entry.key.startsWith(
+                                                    'company:',
+                                                  )
+                                                  ? 'CN'
+                                                  : watchRegion == 'CN'
+                                                  ? 'HK'
+                                                  : watchRegion,
+                                            );
+                                          },
                                         );
                                       },
-                                    );
-                                  },
-                                ),
+                                    ),
+                                ],
                               ),
                             ],
                           );
@@ -4001,6 +4034,26 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
     }
   }
 
+  Future<void> _openAllItems() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _DiscoverListPage(
+          title: widget.title,
+          items: _items,
+          source: widget.source,
+          loadSourcePage: widget.loadSourcePage,
+        ),
+      ),
+    );
+    final refreshed = await widget.loadPage(1);
+    if (!mounted) return;
+    setState(() {
+      _items = refreshed;
+      _page = 1;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final title = widget.title;
@@ -4050,17 +4103,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
                     );
                     return;
                   }
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => _DiscoverListPage(
-                        title: title,
-                        items: items,
-                        source: widget.source,
-                        loadSourcePage: widget.loadSourcePage,
-                      ),
-                    ),
-                  );
+                  unawaited(_openAllItems());
                 },
         ),
         const SizedBox(height: 14),
@@ -4396,6 +4439,54 @@ class _RankingPageState extends State<_RankingPage> {
   );
 }
 
+const _discoverListFilterKeyPrefix = 'yingji.discover.all-list.filters.';
+
+String _discoverListFilterKey(String title) =>
+    '$_discoverListFilterKeyPrefix${base64Url.encode(utf8.encode(title))}';
+
+Future<({String type, String sort, String platform})> _readDiscoverListFilters(
+  String title,
+) async {
+  final prefs = await SharedPreferences.getInstance();
+  final saved = prefs.getString(_discoverListFilterKey(title));
+  if (saved == null) return (type: 'all', sort: '热度', platform: '');
+  try {
+    final value = jsonDecode(saved) as Map<String, dynamic>;
+    return (
+      type: value['type'] as String? ?? 'all',
+      sort: value['sort'] as String? ?? '热度',
+      platform: value['platform'] as String? ?? 'all',
+    );
+  } catch (_) {
+    return (type: 'all', sort: '热度', platform: '');
+  }
+}
+
+List<TmdbItem> _applyDiscoverListFilters(
+  Iterable<TmdbItem> source,
+  String type,
+  String sort,
+) {
+  bool animation(TmdbItem item) => item.genres.contains('动画');
+  bool variety(TmdbItem item) =>
+      item.genres.any(const {'真人秀', '脱口秀', '综艺'}.contains);
+  final rows = source.where((item) {
+    return switch (type) {
+      'movie' => item.kind == 'movie' && !animation(item),
+      'tv' => item.kind == 'tv' && !animation(item) && !variety(item),
+      'animation' => animation(item),
+      'variety' => variety(item),
+      _ => true,
+    };
+  }).toList();
+  if (sort == '评分') {
+    rows.sort((a, b) => b.rating.compareTo(a.rating));
+  } else if (sort == '年份') {
+    rows.sort((a, b) => (b.year ?? 0).compareTo(a.year ?? 0));
+  }
+  return rows;
+}
+
 class _RankingFilter extends StatelessWidget {
   const _RankingFilter({
     required this.label,
@@ -4409,23 +4500,48 @@ class _RankingFilter extends StatelessWidget {
   @override
   Widget build(BuildContext context) => InkWell(
     onTap: onTap,
-    borderRadius: BorderRadius.circular(22),
+    borderRadius: BorderRadius.circular(13),
     child: AnimatedContainer(
       duration: const Duration(milliseconds: 180),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: selected ? Colors.white : YingjiGlass.chrome(),
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(13),
         border: Border.all(color: selected ? Colors.white : YingjiGlass.line()),
       ),
       child: Text(
         label,
         style: TextStyle(
+          fontSize: 12,
           color: selected ? YingjiColors.canvas : Colors.white,
           fontWeight: FontWeight.w700,
         ),
       ),
     ),
+  );
+}
+
+class _DiscoverListFilterGroup extends StatelessWidget {
+  const _DiscoverListFilterGroup({required this.label, required this.child});
+
+  final String label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(
+        label,
+        style: const TextStyle(
+          color: YingjiColors.muted,
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      const SizedBox(width: 9),
+      child,
+    ],
   );
 }
 
@@ -4446,7 +4562,6 @@ class _DiscoverListPage extends StatefulWidget {
 }
 
 class _DiscoverListPageState extends State<_DiscoverListPage> {
-  static const _filterKeyPrefix = 'yingji.discover.all-list.filters.';
   static const _types = <String, String>{
     'all': '全部',
     'movie': '电影',
@@ -4472,8 +4587,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   String get _activeSource =>
       _selection?.withPlatform(_platform).encoded ?? widget.source;
 
-  String get _filterKey =>
-      '$_filterKeyPrefix${base64Url.encode(utf8.encode(widget.title))}';
+  String get _filterKey => _discoverListFilterKey(widget.title);
 
   @override
   void initState() {
@@ -4597,23 +4711,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
 
   @override
   Widget build(BuildContext context) {
-    bool animation(TmdbItem item) => item.genres.contains('动画');
-    bool variety(TmdbItem item) =>
-        item.genres.any(const {'真人秀', '脱口秀', '综艺'}.contains);
-    var rows = _items.where((item) {
-      return switch (_type) {
-        'movie' => item.kind == 'movie' && !animation(item),
-        'tv' => item.kind == 'tv' && !animation(item) && !variety(item),
-        'animation' => animation(item),
-        'variety' => variety(item),
-        _ => true,
-      };
-    }).toList();
-    if (_sort == '评分') {
-      rows.sort((a, b) => b.rating.compareTo(a.rating));
-    } else if (_sort == '年份') {
-      rows.sort((a, b) => (b.year ?? 0).compareTo(a.year ?? 0));
-    }
+    final rows = _applyDiscoverListFilters(_items, _type, _sort);
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: YingjiBackdrop(
@@ -4653,21 +4751,13 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               style: const TextStyle(color: YingjiColors.muted),
                             ),
                             const SizedBox(height: 18),
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                            Wrap(
+                              spacing: 22,
+                              runSpacing: 12,
+                              crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
-                                const Padding(
-                                  padding: EdgeInsets.only(top: 9, right: 10),
-                                  child: Text(
-                                    '内容类型',
-                                    style: TextStyle(
-                                      color: YingjiColors.muted,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ),
-                                Expanded(
+                                _DiscoverListFilterGroup(
+                                  label: '影视类型',
                                   child: Wrap(
                                     spacing: 8,
                                     runSpacing: 8,
@@ -4682,65 +4772,51 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                                     ],
                                   ),
                                 ),
-                                const Padding(
-                                  padding: EdgeInsets.only(
-                                    top: 9,
-                                    left: 18,
-                                    right: 10,
+                                _DiscoverListFilterGroup(
+                                  label: '排序',
+                                  child: Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      for (final label in _sorts)
+                                        _RankingFilter(
+                                          label: label,
+                                          selected: _sort == label,
+                                          onTap: () =>
+                                              _selectFilter(sort: label),
+                                        ),
+                                    ],
                                   ),
-                                  child: Text(
-                                    '排序',
-                                    style: TextStyle(
-                                      color: YingjiColors.muted,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w700,
+                                ),
+                                if (_selection?.provider == 'tmdb')
+                                  FutureBuilder<Map<String, String>>(
+                                    future: _watchProviders(
+                                      _selection!.mediaType,
+                                      _selection!.watchRegion,
                                     ),
+                                    builder: (context, snapshot) {
+                                      final platforms =
+                                          snapshot.data ??
+                                          const {'all': '全部平台'};
+                                      final selected =
+                                          platforms.containsKey(_platform)
+                                          ? _platform
+                                          : 'all';
+                                      return _DiscoverListFilterGroup(
+                                        label: '播放平台',
+                                        child: YingjiGlassChoiceButton<String>(
+                                          value: selected,
+                                          items: platforms.keys.toList(),
+                                          labelBuilder: (value) =>
+                                              platforms[value] ?? value,
+                                          onChanged: (value) =>
+                                              unawaited(_selectPlatform(value)),
+                                        ),
+                                      );
+                                    },
                                   ),
-                                ),
-                                Wrap(
-                                  spacing: 8,
-                                  runSpacing: 8,
-                                  children: [
-                                    for (final label in _sorts)
-                                      _RankingFilter(
-                                        label: label,
-                                        selected: _sort == label,
-                                        onTap: () => _selectFilter(sort: label),
-                                      ),
-                                  ],
-                                ),
                               ],
                             ),
-                            if (_selection?.provider == 'tmdb') ...[
-                              const SizedBox(height: 12),
-                              FutureBuilder<Map<String, String>>(
-                                future: _watchProviders(
-                                  _selection!.mediaType,
-                                  _selection!.watchRegion,
-                                ),
-                                builder: (context, snapshot) {
-                                  final platforms =
-                                      snapshot.data ?? const {'all': '全部平台'};
-                                  final selected =
-                                      platforms.containsKey(_platform)
-                                      ? _platform
-                                      : 'all';
-                                  return SizedBox(
-                                    width: 280,
-                                    child: YingjiGlassChoiceField<String>(
-                                      label: '播放平台',
-                                      helper: '切换后重新获取该平台的影视内容',
-                                      value: selected,
-                                      items: platforms.keys.toList(),
-                                      labelBuilder: (value) =>
-                                          platforms[value] ?? value,
-                                      onChanged: (value) =>
-                                          unawaited(_selectPlatform(value)),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ],
                           ],
                         ),
                       ),
