@@ -1459,23 +1459,61 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   static const _styleNames = ['沉浸海报', '剧照横幅', '动态排行', '平台入口'];
   static const _defaultSections = <String>[
     '今日热门电视剧',
+    '热门国产电视剧',
     '今日热门电影',
+    '热门番剧',
+    '热门国产动漫',
     '今日播出剧集',
     '本周播出剧集',
     '院线热映',
-    '高分电影',
-    '高分剧集',
-    '热门国产电视剧',
     '热门国产电影',
     '热门综艺',
-    '热门国产动漫',
-    '热门番剧',
     '热门韩剧',
     '热门日剧',
     '热门台剧',
+    '高分剧集',
+    '高分电影',
     '按分类',
     '按平台',
   ];
+  static const _defaultCardStyles = <String, int>{
+    '按平台': 3,
+    '热门国产电视剧': 0,
+    '热门番剧': 0,
+    '本周播出剧集': 0,
+    '热门日剧': 1,
+    '按分类': 0,
+    '院线热映': 0,
+  };
+  static const _defaultSectionSources = <String, String>{
+    '按平台': 'custom|tmdb|movie|all|trending|all|all|all|all|all|all|watch:8,watch:337,watch:350,watch:119|HK|all',
+    '热门国产电视剧':
+        'custom|tmdb|tv|all|popularity.desc|CN|all|all|all|all|all|all|HK|all',
+    '热门番剧': 'custom|tmdb|tv|animation|popularity.desc|all|all|all|all|all|all|all|HK|all',
+    '本周播出剧集':
+        'custom|tmdb|tv|all|on_the_air|all|all|all|all|all|all|all|HK|all',
+    '热门日剧':
+        'custom|tmdb|tv|all|popularity.desc|JP|all|all|all|all|all|all|HK|all',
+    '今日热门电视剧': 'custom|tmdb|tv|all|trending|all|all|all|all|all|all|all|HK|all',
+    '今日热门电影':
+        'custom|tmdb|movie|all|trending|all|all|all|all|all|all|all|HK|all',
+    '今日播出剧集':
+        'custom|tmdb|tv|all|airing_today|all|all|all|all|all|all|all|HK|all',
+    '院线热映':
+        'custom|tmdb|movie|all|now_playing|CN|all|all|all|all|all|all|HK|all',
+    '高分电影':
+        'custom|tmdb|movie|all|top_rated|all|all|all|all|all|all|all|HK|all',
+    '高分剧集': 'custom|tmdb|tv|all|top_rated|all|all|all|all|all|all|all|HK|all',
+    '热门国产电影': 'custom|tmdb|movie|all|popularity.desc|CN|all|all|all|all|all|all|HK|all',
+    '热门综艺': 'custom|tmdb|tv|reality|popularity.desc|all|all|all|all|all|all|all|HK|all',
+    '热门国产动漫': 'custom|tmdb|tv|animation|popularity.desc|CN|all|all|all|all|all|all|HK|all',
+    '热门韩剧':
+        'custom|tmdb|tv|all|popularity.desc|KR|all|all|all|all|all|all|HK|all',
+    '热门台剧':
+        'custom|tmdb|tv|all|popularity.desc|TW|all|all|all|all|all|all|HK|all',
+    '按分类':
+        'custom|tmdb|tv|all|popularity.desc|all|all|all|all|all|all|all|HK|all',
+  };
   static const _sourceLabels = <String, String>{
     '今日热门电视剧': 'TMDB · 今日热门电视剧',
     '今日热门电影': 'TMDB · 今日热门电影',
@@ -1822,6 +1860,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     final saved = prefs.getStringList(_sectionsKey);
     if (saved != null) {
       _sections = saved.toSet().toList(growable: true);
+    } else {
+      _cardStyles.addAll(_defaultCardStyles);
+      _sectionSources.addAll(_defaultSectionSources);
     }
     final rawStyles = prefs.getString(_stylesKey);
     if (rawStyles != null) {
