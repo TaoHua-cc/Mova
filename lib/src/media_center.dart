@@ -4837,140 +4837,161 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
       backgroundColor: Colors.transparent,
       body: YingjiBackdrop(
         blur: 22,
-        overlay: SafeArea(
-          child: Column(
-            children: [
-              YingjiPageChrome(
-                onBack: () async {
-                  await _saveFilters();
-                  if (context.mounted) Navigator.pop(context);
-                },
-              ),
-              Expanded(
-                child: CustomScrollView(
-                  controller: _controller,
-                  scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
-                  slivers: [
-                    SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(74, 32, 64, 24),
-                      sliver: SliverToBoxAdapter(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              widget.title,
-                              style: const TextStyle(
-                                fontSize: 48,
-                                height: 1,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: -1.2,
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            Text(
-                              '${_hasMore ? '持续加载' : '已加载全部'} · 当前 ${rows.length} 部',
-                              style: const TextStyle(color: YingjiColors.muted),
-                            ),
-                            const SizedBox(height: 18),
-                            Wrap(
-                              spacing: 22,
-                              runSpacing: 12,
-                              crossAxisAlignment: WrapCrossAlignment.center,
-                              children: [
-                                _DiscoverListFilterGroup(
-                                  label: '影视题材',
-                                  child: YingjiGlassChoiceButton<String>(
-                                    value: _genre,
-                                    items: _genres.keys.toList(),
-                                    labelBuilder: (value) =>
-                                        _genres[value] ?? value,
-                                    onChanged: (value) =>
-                                        unawaited(_selectGenre(value)),
-                                  ),
-                                ),
-                                _DiscoverListFilterGroup(
-                                  label: '排序',
-                                  child: Wrap(
-                                    spacing: 8,
-                                    runSpacing: 8,
-                                    children: [
-                                      for (final label in _sorts)
-                                        _RankingFilter(
-                                          label: label,
-                                          selected: _sort == label,
-                                          trailingIcon: _sort == label
-                                              ? (_sortDescending
-                                                    ? YingjiIcons.chevron_down
-                                                    : YingjiIcons.chevron_up)
-                                              : null,
-                                          onTap: () => _selectSort(label),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                                if (_selection?.provider == 'tmdb')
-                                  FutureBuilder<Map<String, String>>(
-                                    future: _watchProviders(
-                                      _selection!.mediaType,
-                                      _selection!.watchRegion,
-                                    ),
-                                    builder: (context, snapshot) {
-                                      final platforms =
-                                          snapshot.data ??
-                                          const {'all': '全部平台'};
-                                      final selected =
-                                          platforms.containsKey(_platform)
-                                          ? _platform
-                                          : 'all';
-                                      return _DiscoverListFilterGroup(
-                                        label: '播放平台',
-                                        child: YingjiGlassChoiceButton<String>(
-                                          value: selected,
-                                          items: platforms.keys.toList(),
-                                          labelBuilder: (value) =>
-                                              platforms[value] ?? value,
-                                          onChanged: (value) =>
-                                              unawaited(_selectPlatform(value)),
-                                        ),
-                                      );
-                                    },
-                                  ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(74, 0, 64, 56),
-                      sliver: SliverGrid(
-                        gridDelegate:
-                            const SliverGridDelegateWithMaxCrossAxisExtent(
-                              maxCrossAxisExtent: 224,
-                              mainAxisExtent: 372,
-                              mainAxisSpacing: 20,
-                              crossAxisSpacing: 16,
-                            ),
-                        delegate: SliverChildBuilderDelegate(
-                          (context, index) => _RankingPosterCard(
-                            rank: index + 1,
-                            item: rows[index],
-                          ),
-                          childCount: rows.length,
-                        ),
-                      ),
-                    ),
-                    if (_loading)
-                      const SliverToBoxAdapter(
-                        child: Padding(
-                          padding: EdgeInsets.only(bottom: 32),
-                          child: Center(child: CircularProgressIndicator()),
-                        ),
-                      ),
-                  ],
+        overlay: DecoratedBox(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xDF07090D), Color(0xCD07090D), Color(0xB807090D)],
+              stops: [0, .42, 1],
+            ),
+          ),
+          child: SafeArea(
+            child: Column(
+              children: [
+                YingjiPageChrome(
+                  onBack: () async {
+                    await _saveFilters();
+                    if (context.mounted) Navigator.pop(context);
+                  },
                 ),
-              ),
-            ],
+                Expanded(
+                  child: CustomScrollView(
+                    controller: _controller,
+                    scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
+                    slivers: [
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(74, 32, 64, 24),
+                        sliver: SliverToBoxAdapter(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.title,
+                                style: const TextStyle(
+                                  fontSize: 48,
+                                  height: 1,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: -1.2,
+                                  shadows: [
+                                    Shadow(
+                                      color: Color(0xC0000000),
+                                      blurRadius: 18,
+                                      offset: Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                '${_hasMore ? '持续加载' : '已加载全部'} · 当前 ${rows.length} 部',
+                                style: const TextStyle(
+                                  color: YingjiColors.muted,
+                                ),
+                              ),
+                              const SizedBox(height: 18),
+                              Wrap(
+                                spacing: 22,
+                                runSpacing: 12,
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                children: [
+                                  _DiscoverListFilterGroup(
+                                    label: '影视题材',
+                                    child: YingjiGlassChoiceButton<String>(
+                                      value: _genre,
+                                      items: _genres.keys.toList(),
+                                      labelBuilder: (value) =>
+                                          _genres[value] ?? value,
+                                      onChanged: (value) =>
+                                          unawaited(_selectGenre(value)),
+                                    ),
+                                  ),
+                                  _DiscoverListFilterGroup(
+                                    label: '排序',
+                                    child: Wrap(
+                                      spacing: 8,
+                                      runSpacing: 8,
+                                      children: [
+                                        for (final label in _sorts)
+                                          _RankingFilter(
+                                            label: label,
+                                            selected: _sort == label,
+                                            trailingIcon: _sort == label
+                                                ? (_sortDescending
+                                                      ? YingjiIcons.chevron_down
+                                                      : YingjiIcons.chevron_up)
+                                                : null,
+                                            onTap: () => _selectSort(label),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (_selection?.provider == 'tmdb')
+                                    FutureBuilder<Map<String, String>>(
+                                      future: _watchProviders(
+                                        _selection!.mediaType,
+                                        _selection!.watchRegion,
+                                      ),
+                                      builder: (context, snapshot) {
+                                        final platforms =
+                                            snapshot.data ??
+                                            const {'all': '全部平台'};
+                                        final selected =
+                                            platforms.containsKey(_platform)
+                                            ? _platform
+                                            : 'all';
+                                        return _DiscoverListFilterGroup(
+                                          label: '播放平台',
+                                          child:
+                                              YingjiGlassChoiceButton<String>(
+                                                value: selected,
+                                                items: platforms.keys.toList(),
+                                                labelBuilder: (value) =>
+                                                    platforms[value] ?? value,
+                                                onChanged: (value) => unawaited(
+                                                  _selectPlatform(value),
+                                                ),
+                                              ),
+                                        );
+                                      },
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(74, 0, 64, 56),
+                        sliver: SliverGrid(
+                          gridDelegate:
+                              const SliverGridDelegateWithMaxCrossAxisExtent(
+                                maxCrossAxisExtent: 224,
+                                mainAxisExtent: 372,
+                                mainAxisSpacing: 20,
+                                crossAxisSpacing: 16,
+                              ),
+                          delegate: SliverChildBuilderDelegate(
+                            (context, index) => _RankingPosterCard(
+                              rank: index + 1,
+                              item: rows[index],
+                            ),
+                            childCount: rows.length,
+                          ),
+                        ),
+                      ),
+                      if (_loading)
+                        const SliverToBoxAdapter(
+                          child: Padding(
+                            padding: EdgeInsets.only(bottom: 32),
+                            child: Center(child: CircularProgressIndicator()),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

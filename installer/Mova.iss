@@ -1,5 +1,5 @@
 #define AppName "Mova"
-#define AppVersion "3.1.71"
+#define AppVersion "3.1.72"
 #define AppPublisher "Mova"
 #define AppExeName "mova.exe"
 
