@@ -4879,17 +4879,13 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               children: [
                                 _DiscoverListFilterGroup(
                                   label: '影视题材',
-                                  child: Wrap(
-                                    spacing: 8,
-                                    runSpacing: 8,
-                                    children: [
-                                      for (final entry in _genres.entries)
-                                        _RankingFilter(
-                                          label: entry.value,
-                                          selected: _genre == entry.key,
-                                          onTap: () => _selectGenre(entry.key),
-                                        ),
-                                    ],
+                                  child: YingjiGlassChoiceButton<String>(
+                                    value: _genre,
+                                    items: _genres.keys.toList(),
+                                    labelBuilder: (value) =>
+                                        _genres[value] ?? value,
+                                    onChanged: (value) =>
+                                        unawaited(_selectGenre(value)),
                                   ),
                                 ),
                                 _DiscoverListFilterGroup(

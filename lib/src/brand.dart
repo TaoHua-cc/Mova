@@ -931,10 +931,12 @@ class YingjiWindowControls extends StatefulWidget {
     super.key,
     this.onClose,
     this.fullscreen = false,
+    this.size = 46,
   });
 
   final VoidCallback? onClose;
   final bool fullscreen;
+  final double size;
 
   @override
   State<YingjiWindowControls> createState() => _YingjiWindowControlsState();
@@ -966,7 +968,7 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
       YingjiMotionIconButton(
         icon: YingjiIcons.minus,
         tooltip: '最小化',
-        size: 38,
+        size: widget.size,
         onPressed: windowManager.minimize,
       ),
       const SizedBox(width: 7),
@@ -975,14 +977,14 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
         tooltip: widget.fullscreen
             ? (_maximized ? '退出全屏' : '全屏')
             : (_maximized ? '还原' : '最大化'),
-        size: 38,
+        size: widget.size,
         onPressed: _toggleMaximize,
       ),
       const SizedBox(width: 7),
       YingjiMotionIconButton(
         icon: YingjiIcons.xmark,
         tooltip: '关闭',
-        size: 38,
+        size: widget.size,
         onPressed: widget.onClose ?? windowManager.close,
       ),
     ],
