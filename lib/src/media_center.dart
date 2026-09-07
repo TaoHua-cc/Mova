@@ -11439,7 +11439,7 @@ class _CircleAction extends StatelessWidget {
     icon: icon,
     tooltip: tooltip,
     onPressed: onPressed,
-    size: 52,
+    size: 46,
   );
 }
 
