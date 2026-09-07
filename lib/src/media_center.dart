@@ -1532,7 +1532,19 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     'douban': '豆瓣公开榜单',
     'tvmaze': 'TVmaze',
   };
-  static const _mediaLabels = <String, String>{'movie': '电影', 'tv': '剧集'};
+  static const _mediaLabels = <String, String>{
+    'movie': '电影',
+    'tv': '剧集',
+    'animation': '动画',
+    'variety': '综艺',
+  };
+
+  static String _contentType(_DiscoverFeedSelection value) =>
+      switch (value.genre) {
+        'animation' => 'animation',
+        'reality' || 'talk' || 'variety' => 'variety',
+        _ => value.mediaType,
+      };
   static const _countryLabels = <String, String>{
     'all': '全部地区',
     'CN': '中国大陆',
@@ -1891,7 +1903,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ? _DiscoverSourceEditor._doubanLists
         : _DiscoverSourceEditor._tvMazeLists;
     final details = <String>[
-      _mediaLabels[custom.mediaType]!,
+      _mediaLabels[_contentType(custom)]!,
       if (custom.country != 'all') _countryLabels[custom.country]!,
       if (custom.platform != 'all')
         custom.platforms
@@ -1924,7 +1936,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         : _DiscoverSourceEditor._movieGenres;
     return <String>[
       _providerLabels[value.provider] ?? value.provider,
-      _mediaLabels[value.mediaType] ?? value.mediaType,
+      _mediaLabels[_contentType(value)] ?? value.mediaType,
       if (value.country != 'all')
         _countryLabels[value.country] ?? value.country,
       lists[value.heat] ?? value.heat,
@@ -2197,7 +2209,6 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     await _persistLayout();
   }
 
-  // ignore: unused_element
   Future<void> _showCardSettings() async {
     final previews = await _items;
     if (!mounted) return;
@@ -2706,31 +2717,43 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _ => _tmdb.trendingToday('movie', page: page),
   };
 
-  Future<List<TmdbItem>> _loadCustomSection(String source, int page) {
+  Future<List<TmdbItem>> _loadCustomSection(String source, int page) async {
     final selection = _DiscoverFeedSelection.tryParse(source);
     if (selection == null) return _tmdb.trendingToday('movie', page: page);
     if (selection.provider == 'trakt') {
-      return _loadTrakt(
-        'trakt.${selection.mediaType == 'tv' ? 'shows' : 'movies'}.${selection.heat}',
-        page,
+      return _filterSelectedContent(
+        selection,
+        await _loadTrakt(
+          'trakt.${selection.mediaType == 'tv' ? 'shows' : 'movies'}.${selection.heat}',
+          page,
+        ),
       );
     }
     if (selection.provider == 'tvmaze') {
-      return _loadTvMaze(selection, page);
+      return _filterSelectedContent(
+        selection,
+        await _loadTvMaze(selection, page),
+      );
     }
     if (selection.provider == 'mdblist') {
-      return _tmdb.mdblistOfficial(
-        selection.mediaType,
-        selection.heat,
-        page: page,
-        country: selection.country,
+      return _filterSelectedContent(
+        selection,
+        await _tmdb.mdblistOfficial(
+          selection.mediaType,
+          selection.heat,
+          page: page,
+          country: selection.country,
+        ),
       );
     }
     if (selection.provider == 'douban') {
       return _tmdb.doubanPublicList(selection.heat, page: page);
     }
     if (selection.heat == 'trending_week') {
-      return _tmdb.trendingThisWeek(selection.mediaType, page: page);
+      return _filterSelectedContent(
+        selection,
+        await _tmdb.trendingThisWeek(selection.mediaType, page: page),
+      );
     }
     final hasExtraFilters =
         selection.genre != 'all' ||
@@ -2750,10 +2773,13 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           'airing_today',
           'on_the_air',
         }.contains(selection.heat)) {
-      return _tmdb.officialList(
-        selection.heat,
-        selection.mediaType,
-        page: page,
+      return _filterSelectedContent(
+        selection,
+        await _tmdb.officialList(
+          selection.heat,
+          selection.mediaType,
+          page: page,
+        ),
       );
     }
     if (selection.heat == 'trending' &&
@@ -2766,7 +2792,10 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         selection.minimumVotes == 'all' &&
         selection.runtime == 'all' &&
         selection.releaseWindow == 'all') {
-      return _tmdb.trendingToday(selection.mediaType, page: page);
+      return _filterSelectedContent(
+        selection,
+        await _tmdb.trendingToday(selection.mediaType, page: page),
+      );
     }
     final sortBy = switch (selection.heat) {
       'date.desc' ||
@@ -2864,32 +2893,62 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         .where((value) => value.startsWith('company:'))
         .map((value) => value.substring(8))
         .join('|');
-    return _tmdb.discover(
-      selection.mediaType,
-      page: page,
-      originCountry: selection.country == 'all' ? null : selection.country,
-      genre: (selection.mediaType == 'tv'
-          ? tvGenres
-          : movieGenres)[selection.genre],
-      originalLanguage: selection.language == 'all' ? null : selection.language,
-      year: selection.year == 'all' ? null : int.tryParse(selection.year),
-      minimumRating: selection.minimumRating == 'all'
-          ? null
-          : double.tryParse(selection.minimumRating),
-      minimumVoteCount: selection.minimumVotes == 'all'
-          ? (const {'vote_average.desc', 'top_rated'}.contains(selection.heat)
-                ? 50
-                : null)
-          : int.tryParse(selection.minimumVotes),
-      minimumRuntime: minimumRuntime,
-      maximumRuntime: maximumRuntime,
-      dateFrom: dateFrom,
-      dateTo: dateTo,
-      provider: watchProviders.isEmpty ? null : watchProviders,
-      company: companies.isEmpty ? null : companies,
-      watchRegion: selection.watchRegion,
-      sortBy: sortBy,
+    return _filterSelectedContent(
+      selection,
+      await _tmdb.discover(
+        selection.mediaType,
+        page: page,
+        originCountry: selection.country == 'all' ? null : selection.country,
+        genre: (selection.mediaType == 'tv'
+            ? tvGenres
+            : movieGenres)[selection.genre],
+        withoutGenres: selection.mediaType == 'tv' && selection.genre == 'all'
+            ? '16,10764,10767'
+            : null,
+        originalLanguage: selection.language == 'all'
+            ? null
+            : selection.language,
+        year: selection.year == 'all' ? null : int.tryParse(selection.year),
+        minimumRating: selection.minimumRating == 'all'
+            ? null
+            : double.tryParse(selection.minimumRating),
+        minimumVoteCount: selection.minimumVotes == 'all'
+            ? (const {'vote_average.desc', 'top_rated'}.contains(selection.heat)
+                  ? 50
+                  : null)
+            : int.tryParse(selection.minimumVotes),
+        minimumRuntime: minimumRuntime,
+        maximumRuntime: maximumRuntime,
+        dateFrom: dateFrom,
+        dateTo: dateTo,
+        provider: watchProviders.isEmpty ? null : watchProviders,
+        company: companies.isEmpty ? null : companies,
+        watchRegion: selection.watchRegion,
+        sortBy: sortBy,
+      ),
     );
+  }
+
+  List<TmdbItem> _filterSelectedContent(
+    _DiscoverFeedSelection selection,
+    List<TmdbItem> rows,
+  ) {
+    if (selection.mediaType != 'tv') return rows;
+    bool animation(TmdbItem item) => item.genres.contains('动画');
+    bool variety(TmdbItem item) =>
+        item.genres.any(const {'真人秀', '脱口秀', '综艺'}.contains);
+    return rows
+        .where((item) {
+          if (selection.genre == 'animation') return animation(item);
+          if (const {'reality', 'talk', 'variety'}.contains(selection.genre)) {
+            return variety(item);
+          }
+          if (selection.genre == 'all') {
+            return !animation(item) && !variety(item);
+          }
+          return true;
+        })
+        .toList(growable: false);
   }
 
   Future<List<TmdbItem>> _loadTvMaze(
@@ -3020,6 +3079,13 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                           ],
                         ),
                       ),
+                      YingjiMotionIconButton(
+                        icon: YingjiIcons.line_horizontal_3,
+                        tooltip: '排序与显示栏目',
+                        onPressed: _showCardSettings,
+                        size: 44,
+                      ),
+                      const SizedBox(width: 8),
                       YingjiMotionIconButton(
                         icon: YingjiIcons.plus,
                         tooltip: '添加列表',
@@ -3506,6 +3572,16 @@ class _DiscoverSourceEditor extends StatelessWidget {
     final watchRegion = parsed?.watchRegion ?? 'HK';
     final platform = parsed?.platform ?? 'all';
     final genre = parsed?.genre ?? 'all';
+    final inferredContentType = switch (genre) {
+      'animation' => 'animation',
+      'reality' || 'talk' || 'variety' => 'variety',
+      _ => mediaType,
+    };
+    final contentType = provider == 'douban'
+        ? 'movie'
+        : provider == 'tvmaze'
+        ? 'tv'
+        : inferredContentType;
     final language = parsed?.language ?? 'all';
     final year = parsed?.year ?? 'all';
     final minimumRating = parsed?.minimumRating ?? 'all';
@@ -3547,11 +3623,24 @@ class _DiscoverSourceEditor extends StatelessWidget {
       String? nextReleaseWindow,
     }) {
       final source = nextProvider ?? provider;
+      final requestedType = nextMediaType ?? contentType;
       final type = source == 'tvmaze'
           ? 'tv'
           : source == 'douban'
           ? 'movie'
-          : nextMediaType ?? mediaType;
+          : const {'animation', 'variety'}.contains(requestedType)
+          ? 'tv'
+          : requestedType;
+      final requestedGenre = nextMediaType == 'animation'
+          ? 'animation'
+          : nextMediaType == 'variety'
+          ? 'reality'
+          : nextMediaType != null
+          ? 'all'
+          : nextGenre ?? genre;
+      final selectedGenre = const {'douban', 'tvmaze'}.contains(source)
+          ? 'all'
+          : requestedGenre;
       var region = const {'trakt', 'douban'}.contains(source)
           ? 'all'
           : nextCountry ?? country;
@@ -3576,7 +3665,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
         _DiscoverFeedSelection(
           provider: source,
           mediaType: type,
-          genre: nextMediaType != null ? 'all' : nextGenre ?? genre,
+          genre: selectedGenre,
           heat: selectedList,
           country: region,
           language: nextLanguage ?? language,
@@ -3621,7 +3710,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
                 ),
                 _DiscoverFilterField(
                   label: '影视类型',
-                  value: mediaType,
+                  value: contentType,
                   labels: provider == 'tvmaze'
                       ? const {'tv': '剧集'}
                       : provider == 'douban'
@@ -3641,7 +3730,8 @@ class _DiscoverSourceEditor extends StatelessWidget {
                   labels: lists,
                   onChanged: (item) => update(nextList: item),
                 ),
-                if (provider == 'tmdb') ...[
+                if (provider == 'tmdb' &&
+                    const {'movie', 'tv'}.contains(contentType)) ...[
                   _DiscoverFilterField(
                     label: '内容类型',
                     value: genre,
@@ -4361,6 +4451,8 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     'all': '全部',
     'movie': '电影',
     'tv': '剧集',
+    'animation': '动画',
+    'variety': '综艺',
   };
   static const _sorts = ['热度', '评分', '年份'];
   final _controller = ScrollController();
@@ -4407,6 +4499,8 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
         final normalizedType = switch (type) {
           '电影' => 'movie',
           '剧集' => 'tv',
+          '动画' => 'animation',
+          '综艺' => 'variety',
           '全部' => 'all',
           _ => type,
         };
@@ -4503,9 +4597,18 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
 
   @override
   Widget build(BuildContext context) {
-    var rows = _items
-        .where((item) => _type == 'all' || item.kind == _type)
-        .toList();
+    bool animation(TmdbItem item) => item.genres.contains('动画');
+    bool variety(TmdbItem item) =>
+        item.genres.any(const {'真人秀', '脱口秀', '综艺'}.contains);
+    var rows = _items.where((item) {
+      return switch (_type) {
+        'movie' => item.kind == 'movie' && !animation(item),
+        'tv' => item.kind == 'tv' && !animation(item) && !variety(item),
+        'animation' => animation(item),
+        'variety' => variety(item),
+        _ => true,
+      };
+    }).toList();
     if (_sort == '评分') {
       rows.sort((a, b) => b.rating.compareTo(a.rating));
     } else if (_sort == '年份') {
@@ -4518,7 +4621,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
         overlay: SafeArea(
           child: Column(
             children: [
-              YingjiPageChrome(onBack: () => Navigator.pop(context)),
+              YingjiPageChrome(
+                onBack: () async {
+                  await _saveFilters();
+                  if (context.mounted) Navigator.pop(context);
+                },
+              ),
               Expanded(
                 child: CustomScrollView(
                   controller: _controller,
@@ -4545,22 +4653,62 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               style: const TextStyle(color: YingjiColors.muted),
                             ),
                             const SizedBox(height: 18),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                for (final entry in _types.entries)
-                                  _RankingFilter(
-                                    label: entry.value,
-                                    selected: _type == entry.key,
-                                    onTap: () => _selectFilter(type: entry.key),
+                                const Padding(
+                                  padding: EdgeInsets.only(top: 9, right: 10),
+                                  child: Text(
+                                    '内容类型',
+                                    style: TextStyle(
+                                      color: YingjiColors.muted,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                    ),
                                   ),
-                                for (final label in _sorts)
-                                  _RankingFilter(
-                                    label: label,
-                                    selected: _sort == label,
-                                    onTap: () => _selectFilter(sort: label),
+                                ),
+                                Expanded(
+                                  child: Wrap(
+                                    spacing: 8,
+                                    runSpacing: 8,
+                                    children: [
+                                      for (final entry in _types.entries)
+                                        _RankingFilter(
+                                          label: entry.value,
+                                          selected: _type == entry.key,
+                                          onTap: () =>
+                                              _selectFilter(type: entry.key),
+                                        ),
+                                    ],
                                   ),
+                                ),
+                                const Padding(
+                                  padding: EdgeInsets.only(
+                                    top: 9,
+                                    left: 18,
+                                    right: 10,
+                                  ),
+                                  child: Text(
+                                    '排序',
+                                    style: TextStyle(
+                                      color: YingjiColors.muted,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    for (final label in _sorts)
+                                      _RankingFilter(
+                                        label: label,
+                                        selected: _sort == label,
+                                        onTap: () => _selectFilter(sort: label),
+                                      ),
+                                  ],
+                                ),
                               ],
                             ),
                             if (_selection?.provider == 'tmdb') ...[

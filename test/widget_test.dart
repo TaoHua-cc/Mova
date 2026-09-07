@@ -107,6 +107,12 @@ void main() {
     yingjiSectionRequest.value = 'discover';
     await tester.pumpAndSettle();
     expect(find.text('所有栏目均已隐藏'), findsOneWidget);
+    expect(find.byTooltip('排序与显示栏目'), findsOneWidget);
+    await tester.tap(find.byTooltip('排序与显示栏目'));
+    await tester.pumpAndSettle();
+    expect(find.text('发现页栏目编排'), findsOneWidget);
+    await tester.tap(find.byTooltip('关闭').last);
+    await tester.pumpAndSettle();
 
     await tester.tap(find.byTooltip('添加列表'));
     await tester.pumpAndSettle();

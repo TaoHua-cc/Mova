@@ -60,6 +60,7 @@ void main() {
     await client.discover(
       'tv',
       genres: '10764|10767',
+      withoutGenres: '16,10764,10767',
       originCountry: 'JP',
       originalLanguage: 'ja',
       year: 2026,
@@ -76,6 +77,7 @@ void main() {
 
     expect(requested?.path, endsWith('/discover/tv'));
     expect(requested?.queryParameters['with_genres'], '10764|10767');
+    expect(requested?.queryParameters['without_genres'], '16,10764,10767');
     expect(requested?.queryParameters['sort_by'], 'vote_average.desc');
     expect(requested?.queryParameters['with_origin_country'], 'JP');
     expect(requested?.queryParameters['with_original_language'], 'ja');
