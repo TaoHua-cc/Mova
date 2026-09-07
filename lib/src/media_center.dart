@@ -2309,7 +2309,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '列表可添加、删除和排序；内容只按来源、影视题材、地区与来源榜单配置。',
+                    '列表可添加、删除和排序；内容只按来源、影视类型、地区与来源榜单配置。',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   const SizedBox(height: 16),
@@ -3035,13 +3035,24 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     final filters = await _readDiscoverListFilters(section);
     final baseSource = _sectionSources[section] ?? section;
     final selection = _DiscoverFeedSelection.tryParse(baseSource);
-    final source = selection == null || filters.platform.isEmpty
+    final source = selection == null
         ? baseSource
-        : selection.withPlatform(filters.platform).encoded;
+        : selection
+              .withPlatform(
+                filters.platform.isEmpty
+                    ? selection.platform
+                    : filters.platform,
+              )
+              .withGenre(
+                selection.provider == 'tmdb' && filters.genre.isNotEmpty
+                    ? filters.genre
+                    : selection.genre,
+              )
+              .encoded;
     final rows = await _loadSection(source, page);
     return _applyDiscoverListFilters(
       rows,
-      filters.type,
+      filters.genre,
       filters.sort,
       filters.descending,
     );
@@ -3211,6 +3222,22 @@ class _DiscoverFeedSelection {
     minimumVotes: minimumVotes,
     runtime: runtime,
     platform: value,
+    watchRegion: watchRegion,
+    releaseWindow: releaseWindow,
+  );
+
+  _DiscoverFeedSelection withGenre(String value) => _DiscoverFeedSelection(
+    provider: provider,
+    mediaType: mediaType,
+    genre: value,
+    heat: heat,
+    country: country,
+    language: language,
+    year: year,
+    minimumRating: minimumRating,
+    minimumVotes: minimumVotes,
+    runtime: runtime,
+    platform: platform,
     watchRegion: watchRegion,
     releaseWindow: releaseWindow,
   );
@@ -3722,7 +3749,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
                   onChanged: (item) => update(nextProvider: item),
                 ),
                 _DiscoverFilterField(
-                  label: '影视题材',
+                  label: '影视类型',
                   value: contentType,
                   labels: provider == 'tvmaze'
                       ? const {'tv': '剧集'}
@@ -4449,44 +4476,67 @@ const _discoverListFilterKeyPrefix = 'yingji.discover.all-list.filters.';
 String _discoverListFilterKey(String title) =>
     '$_discoverListFilterKeyPrefix${base64Url.encode(utf8.encode(title))}';
 
-Future<({String type, String sort, String platform, bool descending})>
+Future<({String genre, String sort, String platform, bool descending})>
 _readDiscoverListFilters(String title) async {
   final prefs = await SharedPreferences.getInstance();
   final saved = prefs.getString(_discoverListFilterKey(title));
   if (saved == null) {
-    return (type: 'all', sort: '热度', platform: '', descending: true);
+    return (genre: '', sort: '热度', platform: '', descending: true);
   }
   try {
     final value = jsonDecode(saved) as Map<String, dynamic>;
     return (
-      type: value['type'] as String? ?? 'all',
+      genre: value['genre'] as String? ?? '',
       sort: value['sort'] as String? ?? '热度',
       platform: value['platform'] as String? ?? 'all',
       descending: value['descending'] as bool? ?? true,
     );
   } catch (_) {
-    return (type: 'all', sort: '热度', platform: '', descending: true);
+    return (genre: '', sort: '热度', platform: '', descending: true);
   }
+}
+
+@visibleForTesting
+bool matchesDiscoverGenre(TmdbItem item, String genre) {
+  if (genre.isEmpty || genre == 'all') return true;
+  final accepted = switch (genre) {
+    'action' => const {'动作', '动作冒险'},
+    'adventure' => const {'冒险'},
+    'animation' => const {'动画'},
+    'comedy' => const {'喜剧'},
+    'crime' => const {'犯罪'},
+    'documentary' => const {'纪录', '纪录片'},
+    'drama' => const {'剧情'},
+    'family' => const {'家庭'},
+    'fantasy' => const {'奇幻', '科幻奇幻'},
+    'history' => const {'历史'},
+    'horror' => const {'恐怖'},
+    'music' => const {'音乐'},
+    'mystery' => const {'悬疑'},
+    'romance' => const {'爱情'},
+    'scifi' => const {'科幻', '科幻奇幻'},
+    'thriller' => const {'惊悚'},
+    'war' => const {'战争', '战争政治'},
+    'western' => const {'西部'},
+    'kids' => const {'儿童'},
+    'news' => const {'新闻'},
+    'reality' || 'variety' => const {'真人秀', '综艺'},
+    'soap' => const {'肥皂剧'},
+    'talk' => const {'脱口秀'},
+    _ => const <String>{},
+  };
+  return item.genres.any(accepted.contains);
 }
 
 List<TmdbItem> _applyDiscoverListFilters(
   Iterable<TmdbItem> source,
-  String type,
+  String genre,
   String sort,
   bool descending,
 ) {
-  bool animation(TmdbItem item) => item.genres.contains('动画');
-  bool variety(TmdbItem item) =>
-      item.genres.any(const {'真人秀', '脱口秀', '综艺'}.contains);
-  final rows = source.where((item) {
-    return switch (type) {
-      'movie' => item.kind == 'movie' && !animation(item),
-      'tv' => item.kind == 'tv' && !animation(item) && !variety(item),
-      'animation' => animation(item),
-      'variety' => variety(item),
-      _ => true,
-    };
-  }).toList();
+  final rows = source
+      .where((item) => matchesDiscoverGenre(item, genre))
+      .toList();
   if (sort == '评分') {
     rows.sort(
       (a, b) => descending
@@ -4595,13 +4645,6 @@ class _DiscoverListPage extends StatefulWidget {
 }
 
 class _DiscoverListPageState extends State<_DiscoverListPage> {
-  static const _types = <String, String>{
-    'all': '全部',
-    'movie': '电影',
-    'tv': '剧集',
-    'animation': '动画',
-    'variety': '综艺',
-  };
   static const _sorts = ['热度', '评分', '年份'];
   final _controller = ScrollController();
   late List<TmdbItem> _items;
@@ -4609,7 +4652,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   bool _loading = false;
   bool _hasMore = true;
   int _feedRevision = 0;
-  String _type = 'all';
+  String _genre = 'all';
   String _sort = '热度';
   bool _sortDescending = true;
   String _platform = 'all';
@@ -4618,8 +4661,30 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   _DiscoverFeedSelection? get _selection =>
       _DiscoverFeedSelection.tryParse(widget.source);
 
-  String get _activeSource =>
-      _selection?.withPlatform(_platform).encoded ?? widget.source;
+  String get _activeSource {
+    final selection = _selection;
+    if (selection == null) return widget.source;
+    final withPlatform = selection.withPlatform(_platform);
+    return (selection.provider == 'tmdb'
+            ? withPlatform.withGenre(_genre)
+            : withPlatform)
+        .encoded;
+  }
+
+  Map<String, String> get _genres {
+    final selection = _selection;
+    if (selection?.mediaType == 'tv') {
+      return {..._DiscoverSourceEditor._tvGenres, 'all': '全部题材'};
+    }
+    if (selection?.mediaType == 'movie') {
+      return {..._DiscoverSourceEditor._movieGenres, 'all': '全部题材'};
+    }
+    return {
+      ..._DiscoverSourceEditor._movieGenres,
+      ..._DiscoverSourceEditor._tvGenres,
+      'all': '全部题材',
+    };
+  }
 
   String get _filterKey => _discoverListFilterKey(widget.title);
 
@@ -4628,6 +4693,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     super.initState();
     _items = List.of(widget.items);
     _platform = _selection?.platform ?? 'all';
+    _genre = _selection?.genre ?? 'all';
     _controller.addListener(_onScroll);
     unawaited(_restoreFilters());
   }
@@ -4638,46 +4704,48 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     if (saved == null || _filterChanged) return;
     try {
       final value = jsonDecode(saved) as Map<String, dynamic>;
-      final type = value['type'] as String?;
+      final genre = value['genre'] as String? ?? _selection?.genre ?? 'all';
       final sort = value['sort'] as String?;
       final descending = value['descending'] as bool? ?? true;
       final platform = value['platform'] as String?;
       if (!mounted || _filterChanged) return;
       final platformChanged = platform != null && platform != _platform;
+      final genreChanged = genre != _genre;
       setState(() {
-        final normalizedType = switch (type) {
-          '电影' => 'movie',
-          '剧集' => 'tv',
-          '动画' => 'animation',
-          '综艺' => 'variety',
-          '全部' => 'all',
-          _ => type,
-        };
-        if (_types.containsKey(normalizedType)) _type = normalizedType!;
+        if (_genres.containsKey(genre)) _genre = genre;
         if (_sorts.contains(sort)) _sort = sort!;
         _sortDescending = descending;
         if (platform != null) _platform = platform;
       });
-      if (platformChanged) unawaited(_reloadPlatform());
+      if (platformChanged || (genreChanged && _selection?.provider == 'tmdb')) {
+        unawaited(_reloadSource());
+      }
     } catch (_) {
       // Ignore preferences written by an older or incomplete build.
     }
   }
 
-  void _selectFilter({String? type, String? sort}) {
+  void _selectSort(String sort) {
     setState(() {
       _filterChanged = true;
-      if (type != null) _type = type;
-      if (sort != null) {
-        if (_sort == sort) {
-          _sortDescending = !_sortDescending;
-        } else {
-          _sort = sort;
-          _sortDescending = true;
-        }
+      if (_sort == sort) {
+        _sortDescending = !_sortDescending;
+      } else {
+        _sort = sort;
+        _sortDescending = true;
       }
     });
     unawaited(_saveFilters());
+  }
+
+  Future<void> _selectGenre(String genre) async {
+    if (_genre == genre) return;
+    setState(() {
+      _filterChanged = true;
+      _genre = genre;
+    });
+    await _saveFilters();
+    if (_selection?.provider == 'tmdb') await _reloadSource();
   }
 
   Future<void> _saveFilters() async {
@@ -4685,7 +4753,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     await prefs.setString(
       _filterKey,
       jsonEncode({
-        'type': _type,
+        'genre': _genre,
         'sort': _sort,
         'descending': _sortDescending,
         'platform': _platform,
@@ -4700,10 +4768,10 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
       _platform = platform;
     });
     await _saveFilters();
-    await _reloadPlatform();
+    await _reloadSource();
   }
 
-  Future<void> _reloadPlatform() async {
+  Future<void> _reloadSource() async {
     final revision = ++_feedRevision;
     setState(() {
       _loading = true;
@@ -4761,7 +4829,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   Widget build(BuildContext context) {
     final rows = _applyDiscoverListFilters(
       _items,
-      _type,
+      _genre,
       _sort,
       _sortDescending,
     );
@@ -4815,12 +4883,11 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                                     spacing: 8,
                                     runSpacing: 8,
                                     children: [
-                                      for (final entry in _types.entries)
+                                      for (final entry in _genres.entries)
                                         _RankingFilter(
                                           label: entry.value,
-                                          selected: _type == entry.key,
-                                          onTap: () =>
-                                              _selectFilter(type: entry.key),
+                                          selected: _genre == entry.key,
+                                          onTap: () => _selectGenre(entry.key),
                                         ),
                                     ],
                                   ),
@@ -4840,8 +4907,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                                                     ? YingjiIcons.chevron_down
                                                     : YingjiIcons.chevron_up)
                                               : null,
-                                          onTap: () =>
-                                              _selectFilter(sort: label),
+                                          onTap: () => _selectSort(label),
                                         ),
                                     ],
                                   ),

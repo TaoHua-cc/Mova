@@ -914,13 +914,9 @@ class YingjiPageChrome extends StatelessWidget {
           ),
         ),
         ...actions,
-        const SizedBox(
-          width: 164,
-          height: 76,
-          child: WindowCaption(
-            brightness: Brightness.dark,
-            backgroundColor: Colors.transparent,
-          ),
+        const Padding(
+          padding: EdgeInsets.only(left: 14, right: 22),
+          child: YingjiWindowControls(),
         ),
       ],
     ),

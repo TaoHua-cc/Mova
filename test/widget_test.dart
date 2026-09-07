@@ -11,8 +11,32 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:yingji/src/app.dart';
 import 'package:yingji/src/brand.dart';
 import 'package:yingji/src/media_center.dart';
+import 'package:yingji/src/metadata/tmdb_client.dart';
 
 void main() {
+  test('all-list genre filter matches actual media genres', () {
+    const item = TmdbItem(
+      id: 1,
+      title: '测试影片',
+      kind: 'movie',
+      genres: ['剧情', '科幻'],
+    );
+    expect(matchesDiscoverGenre(item, 'all'), isTrue);
+    expect(matchesDiscoverGenre(item, 'drama'), isTrue);
+    expect(matchesDiscoverGenre(item, 'scifi'), isTrue);
+    expect(matchesDiscoverGenre(item, 'comedy'), isFalse);
+  });
+
+  testWidgets('pushed pages use unified window controls', (tester) async {
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: YingjiPageChrome())),
+    );
+    expect(find.byType(YingjiWindowControls), findsOneWidget);
+    expect(find.byTooltip('最小化'), findsOneWidget);
+    expect(find.byTooltip('最大化'), findsOneWidget);
+    expect(find.byTooltip('关闭'), findsOneWidget);
+  });
+
   testWidgets('settings menu reaches distant cards repeatedly', (tester) async {
     SharedPreferences.setMockInitialValues({});
     tester.view.physicalSize = const Size(1440, 1000);
@@ -120,7 +144,7 @@ void main() {
     expect(find.textContaining('当前筛选  TMDB · 电影'), findsOneWidget);
     expect(find.text('内容筛选'), findsWidgets);
     expect(find.text('来源'), findsWidgets);
-    expect(find.text('影视题材'), findsWidgets);
+    expect(find.text('影视类型'), findsWidgets);
     expect(find.text('地区'), findsWidgets);
     expect(find.text('来源榜单'), findsWidgets);
     expect(find.text('题材类型'), findsWidgets);
