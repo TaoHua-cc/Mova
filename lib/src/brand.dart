@@ -360,7 +360,7 @@ class YingjiGlassChoiceButton<T> extends StatelessWidget {
       decoration: BoxDecoration(
         color: YingjiGlass.surface(strength: .9),
         borderRadius: BorderRadius.circular(13),
-        border: Border.all(color: YingjiGlass.line()),
+        border: Border.all(color: YingjiGlass.line(strength: 1.35)),
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -565,20 +565,27 @@ class YingjiGlassDropdownField<T> extends StatelessWidget {
               child: item.child,
             ),
         ],
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              items
-                  .firstWhere(
-                    (item) => item.value == initialValue,
-                    orElse: () => items.first,
-                  )
-                  .child,
-              const SizedBox(width: 12),
-              const Icon(YingjiIcons.chevron_down, size: 16),
-            ],
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: YingjiGlass.surface(strength: .82),
+            borderRadius: BorderRadius.circular(13),
+            border: Border.all(color: YingjiGlass.line(strength: 1.35)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                items
+                    .firstWhere(
+                      (item) => item.value == initialValue,
+                      orElse: () => items.first,
+                    )
+                    .child,
+                const SizedBox(width: 12),
+                const Icon(YingjiIcons.chevron_down, size: 16),
+              ],
+            ),
           ),
         ),
       ),
@@ -767,6 +774,68 @@ class GlassPanel extends StatelessWidget {
         child: Padding(
           padding: padding ?? const EdgeInsets.all(20),
           child: child,
+        ),
+      ),
+    ),
+  );
+}
+
+/// Shared modal shell for forms and lists whose content can overflow.
+/// Header and actions stay visible while only the middle region scrolls.
+class YingjiPinnedDialog extends StatelessWidget {
+  const YingjiPinnedDialog({
+    super.key,
+    required this.header,
+    required this.body,
+    this.actions,
+    this.maxWidth = 720,
+    this.maxHeight = 760,
+    this.insetPadding = const EdgeInsets.all(28),
+  });
+
+  final Widget header;
+  final Widget body;
+  final Widget? actions;
+  final double maxWidth;
+  final double maxHeight;
+  final EdgeInsets insetPadding;
+
+  @override
+  Widget build(BuildContext context) => Dialog(
+    backgroundColor: Colors.transparent,
+    insetPadding: insetPadding,
+    child: ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: maxHeight),
+      child: GlassPanel(
+        radius: 22,
+        padding: EdgeInsets.zero,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
+              child: header,
+            ),
+            Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+            Flexible(
+              child: ScrollConfiguration(
+                behavior: ScrollConfiguration.of(context)
+                    .copyWith(scrollbars: false),
+                child: SingleChildScrollView(
+                  primary: false,
+                  padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
+                  child: body,
+                ),
+              ),
+            ),
+            if (actions != null) ...[
+              Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(22, 14, 22, 18),
+                child: actions!,
+              ),
+            ],
+          ],
         ),
       ),
     ),

@@ -21,7 +21,10 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#AppName}
-CloseApplications=yes
+; The app intentionally intercepts WM_CLOSE when close-to-tray is enabled.
+; We close the old process explicitly in PrepareToInstall instead of waiting
+; for Restart Manager, which would otherwise wait on the hidden tray instance.
+CloseApplications=no
 RestartApplications=no
 
 [Languages]
@@ -39,3 +42,13 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动{#AppName}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM mova.exe >nul 2>&1', '',
+    SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;

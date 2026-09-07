@@ -11,8 +11,10 @@ import 'package:flutter/rendering.dart'
     show RenderAbstractViewport, ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:image/image.dart' as image_lib;
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -35,6 +37,94 @@ import 'sources/source_store.dart';
 import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
+
+const _defaultPlayerShortcuts = <String, String>{
+  'playPause': 'Space',
+  'seekBack': 'Arrow Left',
+  'seekForward': 'Arrow Right',
+  'volumeUp': 'Arrow Up',
+  'volumeDown': 'Arrow Down',
+  'mute': 'M',
+  'fullscreen': 'F',
+  'exit': 'Escape',
+};
+const _shortcutNames = <String, String>{
+  'playPause': '播放 / 暂停',
+  'seekBack': '快退',
+  'seekForward': '快进',
+  'volumeUp': '增大音量',
+  'volumeDown': '减小音量',
+  'mute': '静音 / 恢复',
+  'fullscreen': '进入 / 退出全屏',
+  'exit': '返回详情页',
+};
+
+final Map<String, Future<Map<String, String>>> _watchProviderRequests = {};
+const _knownPlatformLabels = <String, String>{
+  'watch:8': 'Netflix',
+  'watch:119': 'Prime Video',
+  'watch:337': 'Disney+',
+  'watch:350': 'Apple TV+',
+  'watch:1899': 'Max',
+  'watch:15': 'Hulu',
+  'watch:386': 'Peacock',
+  'watch:531': 'Paramount+',
+  'company:74457': '腾讯视频',
+  'company:172414': '爱奇艺',
+  'company:48460': '优酷',
+  'company:139947': '芒果 TV',
+  'company:123270': '哔哩哔哩',
+};
+const _platformLogoPaths = <String, String>{
+  'watch:8': '/rK1KljqmbvO9HQa1PBFLILWah72.png',
+  'watch:119': '/gMZdpavHmxFNnLpMHwVxfqeux2g.png',
+  'watch:337': '/5eZ872CghnHFLB1j8grszbrx0dx.png',
+  'watch:350': '/9icYBfYFcwgCbky5VdGUIKJ4C5i.png',
+  'watch:1899': '/skypuy7SXuugIQeYg0IglmzoKaS.png',
+  'watch:15': '/44uAnmSqvA4yBOdbPWN8YgQHjWm.png',
+  'watch:386': '/a1UIdq5BrkcAxnxcUhFsNbXnxeu.png',
+  'company:74457': '/mPsCbXC5k20bpKErrbOQd1fG0L7.png',
+  'company:172414': '/fNxBFqWr7eWEgNeBDvvCxsSItXx.png',
+  'company:48460': '/7m3BMwdstKRqw7qg5vSYW2S0HrR.png',
+  'company:139947': '/yTjVB6bJfdbuuZOhKdmjkY70cxn.png',
+  'company:123270': '/4KxfGr13VXMr44og11hzpdwfQDQ.png',
+};
+final Map<String, String> _resolvedPlatformLabels = {..._knownPlatformLabels};
+final Map<String, Uri> _resolvedPlatformLogos = {
+  for (final entry in _platformLogoPaths.entries)
+    entry.key: Uri.parse('https://image.tmdb.org/t/p/w185${entry.value}'),
+};
+
+Future<Map<String, String>> _watchProviders(
+  String type,
+  String region,
+) => _watchProviderRequests.putIfAbsent('$type:$region', () async {
+  try {
+    final uri = Uri.parse(
+      '${TmdbClient.managedEndpoint}/tmdb/watch/providers/$type',
+    ).replace(queryParameters: {'language': 'zh-CN', 'watch_region': region});
+    final response = await http.get(uri).timeout(const Duration(seconds: 12));
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      final decoded = jsonDecode(response.body);
+      final rows = decoded is Map ? decoded['results'] : null;
+      for (final row in (rows is List ? rows : const []).whereType<Map>()) {
+        final id = row['provider_id'];
+        final logoPath = row['logo_path'];
+        final key = 'watch:$id';
+        if (_knownPlatformLabels.containsKey(key) &&
+            logoPath is String &&
+            logoPath.isNotEmpty) {
+          _resolvedPlatformLogos[key] = Uri.parse(
+            'https://image.tmdb.org/t/p/w185$logoPath',
+          );
+        }
+      }
+    }
+  } catch (_) {}
+  final platforms = <String, String>{'all': '全部平台', ..._knownPlatformLabels};
+  _resolvedPlatformLabels.addAll(platforms);
+  return platforms;
+});
 
 // THESIS: Film artwork is the application surface; navigation and tasks float
 // over it instead of living inside a dashboard frame.
@@ -1366,7 +1456,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   static const _stylesKey = 'yingji.discover.card-styles';
   static const _sourcesKey = 'yingji.discover.section-sources';
   static const _hiddenKey = 'yingji.discover.hidden-sections';
-  static const _styleNames = ['竖版海报', '横版剧照', '排行卡片'];
+  static const _styleNames = ['沉浸海报', '剧照横幅', '动态排行', '平台入口'];
   static const _defaultSections = <String>[
     '今日热门电视剧',
     '今日热门电影',
@@ -1461,6 +1551,235 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     'CA': '加拿大',
     'AU': '澳大利亚',
   };
+
+  static String _normalizedSource(String source) {
+    if (_DiscoverFeedSelection.tryParse(source) != null) return source;
+    if (source.startsWith('trakt.')) {
+      final parts = source.split('.');
+      return _DiscoverFeedSelection(
+        provider: 'trakt',
+        mediaType: parts.length > 1 && parts[1] == 'shows' ? 'tv' : 'movie',
+        genre: 'all',
+        heat: parts.last,
+      ).encoded;
+    }
+    final selection = switch (source) {
+      '今日热门电视剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'trending',
+      ),
+      '今日热门电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'trending',
+      ),
+      '本周热门电视剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'trending_week',
+      ),
+      '本周热门电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'trending_week',
+      ),
+      '热门电视剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popular',
+      ),
+      '热门电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'popular',
+      ),
+      '今日播出剧集' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'airing_today',
+      ),
+      '本周播出剧集' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'on_the_air',
+      ),
+      '院线热映' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'now_playing',
+        country: 'CN',
+      ),
+      '即将上映' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'upcoming',
+        country: 'CN',
+      ),
+      '高分电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'top_rated',
+      ),
+      '高分剧集' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'top_rated',
+      ),
+      '热门国产电视剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        country: 'CN',
+      ),
+      '热门国产电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'popularity.desc',
+        country: 'CN',
+      ),
+      '热门综艺' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'reality',
+        heat: 'popularity.desc',
+      ),
+      '热门国产动漫' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'animation',
+        heat: 'popularity.desc',
+        country: 'CN',
+      ),
+      '热门番剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'animation',
+        heat: 'popularity.desc',
+        country: 'JP',
+      ),
+      '热门韩剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        country: 'KR',
+      ),
+      '热门日剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        country: 'JP',
+      ),
+      '热门台剧' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        country: 'TW',
+      ),
+      '动作电影' || '按分类' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'action',
+        heat: 'popularity.desc',
+      ),
+      '喜剧电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'comedy',
+        heat: 'popularity.desc',
+      ),
+      '科幻电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'scifi',
+        heat: 'popularity.desc',
+      ),
+      '悬疑电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'mystery',
+        heat: 'popularity.desc',
+      ),
+      '恐怖电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'horror',
+        heat: 'popularity.desc',
+      ),
+      '纪录片' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'documentary',
+        heat: 'popularity.desc',
+      ),
+      '家庭电影' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'family',
+        heat: 'popularity.desc',
+      ),
+      'Netflix' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        platform: 'watch:8',
+      ),
+      'Disney+' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        platform: 'watch:337',
+      ),
+      'Prime Video' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        platform: 'watch:119',
+      ),
+      'Apple TV+' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        platform: 'watch:350',
+      ),
+      '流媒体综合' || '按平台' => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'tv',
+        genre: 'all',
+        heat: 'popularity.desc',
+        platform: 'watch:8',
+      ),
+      _ => const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'popularity.desc',
+      ),
+    };
+    return selection.encoded;
+  }
+
   final Map<String, int> _cardStyles = {};
   final Map<String, String> _sectionSources = {};
   final Set<String> _hiddenSections = {};
@@ -1529,6 +1848,11 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         // Ignore malformed preferences and retain each section's own feed.
       }
     }
+    for (final section in _sections) {
+      _sectionSources[section] = _normalizedSource(
+        _sectionSources[section] ?? section,
+      );
+    }
     _hiddenSections.addAll(
       (prefs.getStringList(_hiddenKey) ?? const []).where(_sections.contains),
     );
@@ -1569,12 +1893,307 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     final details = <String>[
       _mediaLabels[custom.mediaType]!,
       if (custom.country != 'all') _countryLabels[custom.country]!,
+      if (custom.platform != 'all')
+        _resolvedPlatformLabels[custom.platform] ?? '平台 ${custom.platform}',
       listLabels[custom.heat] ?? custom.heat,
     ];
     return '${_providerLabels[custom.provider]} · '
         '${details.join(' · ')}';
   }
 
+  String _filterSummary(String source) {
+    final value = _DiscoverFeedSelection.tryParse(_normalizedSource(source));
+    if (value == null) return _sourceLabel(source);
+    final lists = value.provider == 'tmdb'
+        ? (value.mediaType == 'tv'
+              ? _DiscoverSourceEditor._tmdbTvLists
+              : _DiscoverSourceEditor._tmdbMovieLists)
+        : value.provider == 'trakt'
+        ? (value.mediaType == 'tv'
+              ? _DiscoverSourceEditor._traktTvLists
+              : _DiscoverSourceEditor._traktMovieLists)
+        : value.provider == 'mdblist'
+        ? _DiscoverSourceEditor._mdbListLists
+        : value.provider == 'douban'
+        ? _DiscoverSourceEditor._doubanLists
+        : _DiscoverSourceEditor._tvMazeLists;
+    final genres = value.mediaType == 'tv'
+        ? _DiscoverSourceEditor._tvGenres
+        : _DiscoverSourceEditor._movieGenres;
+    return <String>[
+      _providerLabels[value.provider] ?? value.provider,
+      _mediaLabels[value.mediaType] ?? value.mediaType,
+      if (value.country != 'all')
+        _countryLabels[value.country] ?? value.country,
+      lists[value.heat] ?? value.heat,
+      if (value.genre != 'all') genres[value.genre] ?? value.genre,
+      if (value.language != 'all')
+        _DiscoverSourceEditor._languageLabels[value.language] ?? value.language,
+      if (value.year != 'all') '${value.year} 年',
+      if (value.minimumRating != 'all') '${value.minimumRating} 分以上',
+      if (value.minimumVotes != 'all') '${value.minimumVotes} 人评分以上',
+      if (value.runtime != 'all')
+        _DiscoverSourceEditor._runtimeLabels[value.runtime] ?? value.runtime,
+      if (value.releaseWindow != 'all')
+        _DiscoverSourceEditor._releaseLabels[value.releaseWindow] ??
+            value.releaseWindow,
+      if (value.platform != 'all')
+        _resolvedPlatformLabels[value.platform] ?? value.platform,
+    ].join(' · ');
+  }
+
+  Future<void> _addDiscoverSection() async {
+    var suffix = _sections.length + 1;
+    var title = '新列表 $suffix';
+    while (_sections.contains(title)) {
+      suffix++;
+      title = '新列表 $suffix';
+    }
+    final visibleCount = _sections
+        .where((item) => !_hiddenSections.contains(item))
+        .length;
+    setState(() {
+      _sections.insert(visibleCount, title);
+      _sectionSources[title] = const _DiscoverFeedSelection(
+        provider: 'tmdb',
+        mediaType: 'movie',
+        genre: 'all',
+        heat: 'popularity.desc',
+      ).encoded;
+      _cardStyles[title] = 0;
+      _items = _loadSections();
+    });
+    await _persistLayout();
+    if (mounted) await _showSectionSettings(title);
+  }
+
+  Future<void> _showSectionSettings(String initialSection) async {
+    if (!_sections.contains(initialSection)) return;
+    var titleDraft = initialSection;
+    var source = _normalizedSource(
+      _sectionSources[initialSection] ?? initialSection,
+    );
+    var previewItems = _loadSection(source, 1);
+    var style =
+        _cardStyles[initialSection] ?? _sections.indexOf(initialSection) % 4;
+    var visible = !_hiddenSections.contains(initialSection);
+    String? error;
+    var deleted = false;
+    var changed = false;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, updateDialog) => YingjiPinnedDialog(
+          maxWidth: 660,
+          maxHeight: 760,
+          header: Row(
+            children: [
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '列表设置',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    SizedBox(height: 5),
+                    Text(
+                      '只调整当前列表；添加、排序与其他列表互不受影响。',
+                      style: TextStyle(color: YingjiColors.muted),
+                    ),
+                  ],
+                ),
+              ),
+              YingjiMotionIconButton(
+                icon: YingjiIcons.trash,
+                tooltip: '删除列表',
+                size: 38,
+                onPressed: () {
+                  deleted = true;
+                  changed = true;
+                  Navigator.pop(dialogContext);
+                },
+              ),
+              const SizedBox(width: 8),
+              YingjiMotionIconButton(
+                icon: YingjiIcons.xmark,
+                tooltip: '关闭',
+                size: 38,
+                onPressed: () => Navigator.pop(dialogContext),
+              ),
+            ],
+          ),
+          body: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextFormField(
+                key: ValueKey('discover-name-$initialSection'),
+                initialValue: titleDraft,
+                decoration: InputDecoration(
+                  labelText: '列表名称',
+                  errorText: error,
+                ),
+                onChanged: (value) => updateDialog(() {
+                  titleDraft = value;
+                  error = null;
+                }),
+              ),
+              const SizedBox(height: 14),
+              _ToggleRow(
+                title: '显示此列表',
+                detail: visible ? '当前显示在发现页中' : '当前已隐藏，可随时重新显示',
+                value: visible,
+                onChanged: (value) => updateDialog(() {
+                  visible = value;
+                  changed = true;
+                }),
+              ),
+              const SizedBox(height: 14),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 13,
+                  vertical: 11,
+                ),
+                decoration: BoxDecoration(
+                  color: YingjiGlass.chrome(strength: .72),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '当前筛选  ${_filterSummary(source)}',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    height: 1.45,
+                    color: YingjiColors.muted,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              _DiscoverSourceEditor(
+                value: source,
+                style: style,
+                providerLabels: _providerLabels,
+                mediaLabels: _mediaLabels,
+                countryLabels: _countryLabels,
+                onChanged: (value) => updateDialog(() {
+                  source = value;
+                  previewItems = _loadSection(value, 1);
+                  changed = true;
+                }),
+              ),
+              const SizedBox(height: 18),
+              const Text('卡片样式', style: TextStyle(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 10),
+              FutureBuilder<List<TmdbItem>>(
+                future: previewItems,
+                builder: (context, snapshot) => Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    for (var index = 0; index < _styleNames.length; index++)
+                      SizedBox(
+                        width: 140,
+                        child: _DiscoveryStylePreview(
+                          label: _styleNames[index],
+                          style: index,
+                          selected: style == index,
+                          items: snapshot.data ?? const [],
+                          source: source,
+                          loading:
+                              snapshot.connectionState ==
+                              ConnectionState.waiting,
+                          onTap: () => updateDialog(() {
+                            style = index;
+                            if (index == 3) {
+                              final selection = _DiscoverFeedSelection.tryParse(
+                                source,
+                              );
+                              if (selection?.provider != 'tmdb') {
+                                source = const _DiscoverFeedSelection(
+                                  provider: 'tmdb',
+                                  mediaType: 'tv',
+                                  genre: 'all',
+                                  heat: 'popularity.desc',
+                                ).encoded;
+                                previewItems = _loadSection(source, 1);
+                              }
+                            }
+                            changed = true;
+                          }),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          actions: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('取消'),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: () {
+                  final title = titleDraft.trim();
+                  if (title.isEmpty ||
+                      (title != initialSection && _sections.contains(title))) {
+                    updateDialog(
+                      () => error = title.isEmpty ? '列表名称不能为空' : '已有同名列表',
+                    );
+                    return;
+                  }
+                  changed = true;
+                  Navigator.pop(dialogContext);
+                },
+                child: const Text('保存当前列表'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!changed || !mounted) return;
+    final title = titleDraft.trim();
+    setState(() {
+      if (deleted) {
+        _sections.remove(initialSection);
+        _sectionSources.remove(initialSection);
+        _cardStyles.remove(initialSection);
+        _hiddenSections.remove(initialSection);
+      } else {
+        if (title != initialSection) {
+          final index = _sections.indexOf(initialSection);
+          _sections[index] = title;
+          final previousSource = _sectionSources.remove(initialSection);
+          if (previousSource != null) _sectionSources[title] = previousSource;
+          final previousStyle = _cardStyles.remove(initialSection);
+          if (previousStyle != null) _cardStyles[title] = previousStyle;
+          if (_hiddenSections.remove(initialSection)) {
+            _hiddenSections.add(title);
+          }
+        }
+        _sectionSources[title] = source;
+        _cardStyles[title] = style;
+        if (visible) {
+          _hiddenSections.remove(title);
+        } else {
+          _hiddenSections.add(title);
+        }
+      }
+      _groupSectionsByVisibility();
+      _items = _loadSections();
+    });
+    await _persistLayout();
+  }
+
+  // ignore: unused_element
   Future<void> _showCardSettings() async {
     final previews = await _items;
     if (!mounted) return;
@@ -1894,6 +2513,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                                   const SizedBox(height: 12),
                                                   _DiscoverSourceEditor(
                                                     value: source,
+                                                    style:
+                                                        _cardStyles[section] ??
+                                                        index % 4,
                                                     providerLabels:
                                                         _providerLabels,
                                                     mediaLabels: _mediaLabels,
@@ -1912,7 +2534,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                                     children: [
                                                       for (
                                                         var style = 0;
-                                                        style < 3;
+                                                        style < 4;
                                                         style++
                                                       )
                                                         Expanded(
@@ -1920,7 +2542,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                                             padding:
                                                                 EdgeInsets.only(
                                                                   right:
-                                                                      style == 2
+                                                                      style == 3
                                                                       ? 0
                                                                       : 8,
                                                                 ),
@@ -1936,6 +2558,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                                               items:
                                                                   previews[section] ??
                                                                   const [],
+                                                              source: source,
+                                                              loading: false,
                                                               onTap: () {
                                                                 updateDialog(
                                                                   () =>
@@ -2101,21 +2725,163 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     if (selection.provider == 'douban') {
       return _tmdb.doubanPublicList(selection.heat, page: page);
     }
-    if (selection.heat == 'trending' && selection.country == 'all') {
+    if (selection.heat == 'trending_week') {
+      return _tmdb.trendingThisWeek(selection.mediaType, page: page);
+    }
+    final hasExtraFilters =
+        selection.genre != 'all' ||
+        selection.language != 'all' ||
+        selection.year != 'all' ||
+        selection.minimumRating != 'all' ||
+        selection.minimumVotes != 'all' ||
+        selection.runtime != 'all' ||
+        selection.platform != 'all' ||
+        selection.releaseWindow != 'all';
+    if (!hasExtraFilters &&
+        const {
+          'popular',
+          'top_rated',
+          'now_playing',
+          'upcoming',
+          'airing_today',
+          'on_the_air',
+        }.contains(selection.heat)) {
+      return _tmdb.officialList(
+        selection.heat,
+        selection.mediaType,
+        page: page,
+      );
+    }
+    if (selection.heat == 'trending' &&
+        selection.country == 'all' &&
+        selection.platform == 'all' &&
+        selection.genre == 'all' &&
+        selection.language == 'all' &&
+        selection.year == 'all' &&
+        selection.minimumRating == 'all' &&
+        selection.minimumVotes == 'all' &&
+        selection.runtime == 'all' &&
+        selection.releaseWindow == 'all') {
       return _tmdb.trendingToday(selection.mediaType, page: page);
     }
-    final sortBy = selection.heat == 'date.desc'
-        ? selection.mediaType == 'tv'
-              ? 'first_air_date.desc'
-              : 'primary_release_date.desc'
-        : selection.heat == 'trending'
-        ? 'popularity.desc'
-        : selection.heat;
+    final sortBy = switch (selection.heat) {
+      'date.desc' ||
+      'now_playing' ||
+      'upcoming' ||
+      'airing_today' ||
+      'on_the_air' =>
+        selection.mediaType == 'tv'
+            ? 'first_air_date.desc'
+            : 'primary_release_date.desc',
+      'trending' || 'popular' => 'popularity.desc',
+      'top_rated' => 'vote_average.desc',
+      _ => selection.heat,
+    };
+    const movieGenres = <String, int>{
+      'action': 28,
+      'adventure': 12,
+      'animation': 16,
+      'comedy': 35,
+      'crime': 80,
+      'documentary': 99,
+      'drama': 18,
+      'family': 10751,
+      'fantasy': 14,
+      'history': 36,
+      'horror': 27,
+      'music': 10402,
+      'mystery': 9648,
+      'romance': 10749,
+      'scifi': 878,
+      'thriller': 53,
+      'war': 10752,
+      'western': 37,
+    };
+    const tvGenres = <String, int>{
+      'action': 10759,
+      'animation': 16,
+      'comedy': 35,
+      'crime': 80,
+      'documentary': 99,
+      'drama': 18,
+      'family': 10751,
+      'kids': 10762,
+      'mystery': 9648,
+      'news': 10763,
+      'reality': 10764,
+      'scifi': 10765,
+      'soap': 10766,
+      'talk': 10767,
+      'war': 10768,
+      'western': 37,
+    };
+    final today = DateTime.now();
+    DateTime? dateFrom;
+    DateTime? dateTo;
+    switch (selection.releaseWindow) {
+      case 'recent30':
+        dateFrom = today.subtract(const Duration(days: 30));
+      case 'recent90':
+        dateFrom = today.subtract(const Duration(days: 90));
+      case 'thisYear':
+        dateFrom = DateTime(today.year);
+        dateTo = DateTime(today.year, 12, 31);
+      case 'upcoming30':
+        dateFrom = today;
+        dateTo = today.add(const Duration(days: 30));
+    }
+    if (selection.releaseWindow == 'all') {
+      switch (selection.heat) {
+        case 'now_playing':
+          dateFrom = today.subtract(const Duration(days: 90));
+          dateTo = today;
+        case 'upcoming':
+          dateFrom = today;
+          dateTo = today.add(const Duration(days: 90));
+        case 'airing_today':
+          dateFrom = DateTime(today.year, today.month, today.day);
+          dateTo = dateFrom;
+        case 'on_the_air':
+          dateFrom = today.subtract(const Duration(days: 7));
+          dateTo = today.add(const Duration(days: 7));
+      }
+    }
+    final (minimumRuntime, maximumRuntime) = switch (selection.runtime) {
+      'short' => (null, selection.mediaType == 'tv' ? 25 : 60),
+      'standard' => selection.mediaType == 'tv' ? (25, 70) : (60, 150),
+      'long' => (selection.mediaType == 'tv' ? 70 : 150, null),
+      _ => (null, null),
+    };
     return _tmdb.discover(
       selection.mediaType,
       page: page,
       originCountry: selection.country == 'all' ? null : selection.country,
-      minimumVoteCount: selection.heat == 'vote_average.desc' ? 50 : null,
+      genre: (selection.mediaType == 'tv'
+          ? tvGenres
+          : movieGenres)[selection.genre],
+      originalLanguage: selection.language == 'all' ? null : selection.language,
+      year: selection.year == 'all' ? null : int.tryParse(selection.year),
+      minimumRating: selection.minimumRating == 'all'
+          ? null
+          : double.tryParse(selection.minimumRating),
+      minimumVoteCount: selection.minimumVotes == 'all'
+          ? (const {'vote_average.desc', 'top_rated'}.contains(selection.heat)
+                ? 50
+                : null)
+          : int.tryParse(selection.minimumVotes),
+      minimumRuntime: minimumRuntime,
+      maximumRuntime: maximumRuntime,
+      dateFrom: dateFrom,
+      dateTo: dateTo,
+      provider: selection.platform.startsWith('watch:')
+          ? selection.platform.substring(6)
+          : int.tryParse(selection.platform) != null
+          ? selection.platform
+          : null,
+      company: selection.platform.startsWith('company:')
+          ? selection.platform.substring(8)
+          : null,
+      watchRegion: selection.watchRegion,
       sortBy: sortBy,
     );
   }
@@ -2217,14 +2983,6 @@ class _DiscoverPageState extends State<_DiscoverPage> {
               snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (items.isEmpty && visibleSections.isNotEmpty) {
-            return _LoadFailure(
-              onRetry: () => setState(() {
-                _items = _loadSections();
-              }),
-              message: _networkError(snapshot.error),
-            );
-          }
           return ListView.builder(
             padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
             itemCount: visibleSections.isEmpty ? 2 : visibleSections.length + 1,
@@ -2257,9 +3015,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                         ),
                       ),
                       YingjiMotionIconButton(
-                        icon: YingjiIcons.slider_horizontal_3,
-                        tooltip: '发现页设置',
-                        onPressed: _showCardSettings,
+                        icon: YingjiIcons.plus,
+                        tooltip: '添加列表',
+                        onPressed: _addDiscoverSection,
                         size: 44,
                       ),
                     ],
@@ -2272,17 +3030,20 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   child: _EmptyStrip(
                     icon: YingjiIcons.rectangle_stack,
                     title: '所有栏目均已隐藏',
-                    detail: '点击右上角设置按钮，重新显示需要的栏目。',
+                    detail: '在任意列表右侧打开设置，重新显示需要的栏目。',
                   ),
                 );
               }
               final section = visibleSections[index - 1];
               final block = _DiscoverBlock(
                 title: section,
+                source: _sectionSources[section] ?? section,
                 sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
                 items: sections[section] ?? const [],
-                variant: _cardStyles[section] ?? _sections.indexOf(section) % 3,
+                variant: _cardStyles[section] ?? _sections.indexOf(section) % 4,
+                onConfigure: () => _showSectionSettings(section),
                 loadPage: (page) => _loadSectionFor(section, page),
+                loadSourcePage: _loadSection,
               );
               return KeyedSubtree(
                 key: ValueKey(section),
@@ -2349,6 +3110,22 @@ class _DiscoverFeedSelection {
     releaseWindow,
   ].join('|');
 
+  _DiscoverFeedSelection withPlatform(String value) => _DiscoverFeedSelection(
+    provider: provider,
+    mediaType: mediaType,
+    genre: genre,
+    heat: heat,
+    country: country,
+    language: language,
+    year: year,
+    minimumRating: minimumRating,
+    minimumVotes: minimumVotes,
+    runtime: runtime,
+    platform: value,
+    watchRegion: watchRegion,
+    releaseWindow: releaseWindow,
+  );
+
   static _DiscoverFeedSelection? tryParse(String value) {
     final parts = value.split('|');
     if ((parts.length != 5 && parts.length != 13 && parts.length != 14) ||
@@ -2391,6 +3168,13 @@ class _DiscoverFeedSelection {
       'vote_count.desc',
       'date.desc',
       'trending',
+      'trending_week',
+      'popular',
+      'top_rated',
+      'now_playing',
+      'upcoming',
+      'airing_today',
+      'on_the_air',
     };
     const traktHeat = {
       'trending',
@@ -2476,18 +3260,9 @@ class _DiscoverFeedSelection {
               'standard',
               'long',
             }) ||
-            !_validOption(parts[11], const {
-              'all',
-              '8',
-              '337',
-              '119',
-              '350',
-              '1899',
-              '531',
-              '15',
-              '581',
-              '509',
-            }) ||
+            (parts[11] != 'all' &&
+                !RegExp(r'^(watch|company):\d+$').hasMatch(parts[11]) &&
+                int.tryParse(parts[11]) == null) ||
             !_validOption(parts[12], const {
               'all',
               'CN',
@@ -2528,10 +3303,7 @@ class _DiscoverFeedSelection {
       minimumVotes: parts.length >= 13 ? parts[9] : 'all',
       runtime: parts.length >= 13 ? parts[10] : 'all',
       platform: parts.length >= 13 ? parts[11] : 'all',
-      watchRegion:
-          parts.length >= 13 && !const {'CN', 'all'}.contains(parts[12])
-          ? parts[12]
-          : 'HK',
+      watchRegion: parts.length >= 13 && parts[12] != 'all' ? parts[12] : 'HK',
       releaseWindow: parts.length == 14 ? parts[13] : 'all',
     );
   }
@@ -2543,6 +3315,7 @@ class _DiscoverFeedSelection {
 class _DiscoverSourceEditor extends StatelessWidget {
   const _DiscoverSourceEditor({
     required this.value,
+    required this.style,
     required this.providerLabels,
     required this.mediaLabels,
     required this.countryLabels,
@@ -2550,6 +3323,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
   });
 
   final String value;
+  final int style;
   final Map<String, String> providerLabels;
   final Map<String, String> mediaLabels;
   final Map<String, String> countryLabels;
@@ -2557,12 +3331,22 @@ class _DiscoverSourceEditor extends StatelessWidget {
 
   static const _tmdbMovieLists = <String, String>{
     'trending': '今日趋势',
+    'trending_week': '本周趋势',
+    'popular': '热门电影',
+    'now_playing': '院线热映',
+    'upcoming': '即将上映',
+    'top_rated': '高分电影',
     'popularity.desc': '当前热门',
     'vote_average.desc': '高分口碑',
     'date.desc': '最新上映',
   };
   static const _tmdbTvLists = <String, String>{
     'trending': '今日趋势',
+    'trending_week': '本周趋势',
+    'popular': '热门剧集',
+    'airing_today': '今日播出',
+    'on_the_air': '本周播出',
+    'top_rated': '高分剧集',
     'popularity.desc': '当前热门',
     'vote_average.desc': '高分口碑',
     'date.desc': '最新播出',
@@ -2602,6 +3386,87 @@ class _DiscoverSourceEditor extends StatelessWidget {
     'chart': '豆瓣新片榜',
     'top250': '豆瓣电影 Top 250',
   };
+  static const _movieGenres = <String, String>{
+    'all': '全部类型',
+    'action': '动作',
+    'adventure': '冒险',
+    'animation': '动画',
+    'comedy': '喜剧',
+    'crime': '犯罪',
+    'documentary': '纪录片',
+    'drama': '剧情',
+    'family': '家庭',
+    'fantasy': '奇幻',
+    'history': '历史',
+    'horror': '恐怖',
+    'music': '音乐',
+    'mystery': '悬疑',
+    'romance': '爱情',
+    'scifi': '科幻',
+    'thriller': '惊悚',
+    'war': '战争',
+    'western': '西部',
+  };
+  static const _tvGenres = <String, String>{
+    'all': '全部类型',
+    'action': '动作冒险',
+    'animation': '动画',
+    'comedy': '喜剧',
+    'crime': '犯罪',
+    'documentary': '纪录片',
+    'drama': '剧情',
+    'family': '家庭',
+    'kids': '儿童',
+    'mystery': '悬疑',
+    'news': '新闻',
+    'reality': '真人秀',
+    'scifi': '科幻奇幻',
+    'soap': '肥皂剧',
+    'talk': '脱口秀',
+    'war': '战争政治',
+    'western': '西部',
+  };
+  static const _languageLabels = <String, String>{
+    'all': '全部语言',
+    'zh': '中文',
+    'en': '英语',
+    'ja': '日语',
+    'ko': '韩语',
+    'th': '泰语',
+    'fr': '法语',
+    'de': '德语',
+    'es': '西班牙语',
+    'it': '意大利语',
+    'hi': '印地语',
+    'ru': '俄语',
+  };
+  static const _ratingLabels = <String, String>{
+    'all': '不限评分',
+    '6': '6.0 分以上',
+    '7': '7.0 分以上',
+    '8': '8.0 分以上',
+    '9': '9.0 分以上',
+  };
+  static const _voteLabels = <String, String>{
+    'all': '不限评分人数',
+    '50': '50 人以上',
+    '200': '200 人以上',
+    '1000': '1,000 人以上',
+    '5000': '5,000 人以上',
+  };
+  static const _runtimeLabels = <String, String>{
+    'all': '不限时长',
+    'short': '短片 / 短剧',
+    'standard': '标准时长',
+    'long': '长片 / 长剧',
+  };
+  static const _releaseLabels = <String, String>{
+    'all': '不限时间',
+    'recent30': '最近 30 天',
+    'recent90': '最近 90 天',
+    'thisYear': '今年',
+    'upcoming30': '未来 30 天',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -2623,6 +3488,15 @@ class _DiscoverSourceEditor extends StatelessWidget {
     final country = const {'trakt', 'douban'}.contains(provider)
         ? 'all'
         : parsed?.country ?? 'all';
+    final watchRegion = parsed?.watchRegion ?? 'HK';
+    final platform = parsed?.platform ?? 'all';
+    final genre = parsed?.genre ?? 'all';
+    final language = parsed?.language ?? 'all';
+    final year = parsed?.year ?? 'all';
+    final minimumRating = parsed?.minimumRating ?? 'all';
+    final minimumVotes = parsed?.minimumVotes ?? 'all';
+    final runtime = parsed?.runtime ?? 'all';
+    final releaseWindow = parsed?.releaseWindow ?? 'all';
     final lists = provider == 'tmdb'
         ? (mediaType == 'tv' ? _tmdbTvLists : _tmdbMovieLists)
         : provider == 'trakt'
@@ -2647,6 +3521,15 @@ class _DiscoverSourceEditor extends StatelessWidget {
       String? nextMediaType,
       String? nextCountry,
       String? nextList,
+      String? nextPlatform,
+      String? nextWatchRegion,
+      String? nextGenre,
+      String? nextLanguage,
+      String? nextYear,
+      String? nextMinimumRating,
+      String? nextMinimumVotes,
+      String? nextRuntime,
+      String? nextReleaseWindow,
     }) {
       final source = nextProvider ?? provider;
       final type = source == 'tvmaze'
@@ -2678,9 +3561,19 @@ class _DiscoverSourceEditor extends StatelessWidget {
         _DiscoverFeedSelection(
           provider: source,
           mediaType: type,
-          genre: 'all',
+          genre: nextMediaType != null ? 'all' : nextGenre ?? genre,
           heat: selectedList,
           country: region,
+          language: nextLanguage ?? language,
+          year: nextYear ?? year,
+          minimumRating: nextMinimumRating ?? minimumRating,
+          minimumVotes: nextMinimumVotes ?? minimumVotes,
+          runtime: nextRuntime ?? runtime,
+          platform: source == 'tmdb'
+              ? (nextMediaType != null ? 'all' : nextPlatform ?? platform)
+              : 'all',
+          watchRegion: nextWatchRegion ?? watchRegion,
+          releaseWindow: nextReleaseWindow ?? releaseWindow,
         ).encoded,
       );
     }
@@ -2696,9 +3589,9 @@ class _DiscoverSourceEditor extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              '列表内容',
-              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
+            Text(
+              style == 3 ? '平台入口筛选' : '内容筛选',
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 10),
             Wrap(
@@ -2733,8 +3626,109 @@ class _DiscoverSourceEditor extends StatelessWidget {
                   labels: lists,
                   onChanged: (item) => update(nextList: item),
                 ),
+                if (provider == 'tmdb') ...[
+                  _DiscoverFilterField(
+                    label: '内容类型',
+                    value: genre,
+                    labels: mediaType == 'tv' ? _tvGenres : _movieGenres,
+                    onChanged: (item) => update(nextGenre: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: '原始语言',
+                    value: language,
+                    labels: _languageLabels,
+                    onChanged: (item) => update(nextLanguage: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: '发行年份',
+                    value: year,
+                    labels: {
+                      'all': '全部年份',
+                      for (
+                        var value = DateTime.now().year;
+                        value >= DateTime.now().year - 12;
+                        value--
+                      )
+                        '$value': '$value 年',
+                    },
+                    onChanged: (item) => update(nextYear: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: '发行时间',
+                    value: releaseWindow,
+                    labels: _releaseLabels,
+                    onChanged: (item) => update(nextReleaseWindow: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: '最低评分',
+                    value: minimumRating,
+                    labels: _ratingLabels,
+                    onChanged: (item) => update(nextMinimumRating: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: style == 2 ? '排行可信度' : '评分人数',
+                    value: minimumVotes,
+                    labels: _voteLabels,
+                    onChanged: (item) => update(nextMinimumVotes: item),
+                  ),
+                  _DiscoverFilterField(
+                    label: '内容时长',
+                    value: runtime,
+                    labels: _runtimeLabels,
+                    onChanged: (item) => update(nextRuntime: item),
+                  ),
+                ],
               ],
             ),
+            if (provider == 'tmdb') ...[
+              const SizedBox(height: 12),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  _DiscoverFilterField(
+                    label: '平台地区',
+                    value: watchRegion,
+                    labels: countryLabels,
+                    onChanged: (item) => update(
+                      nextWatchRegion: item == 'all' ? 'HK' : item,
+                      nextPlatform: 'all',
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: FutureBuilder<Map<String, String>>(
+                      future: _watchProviders(mediaType, watchRegion),
+                      builder: (context, snapshot) {
+                        final labels =
+                            snapshot.data ?? const {'all': '正在获取平台…'};
+                        final selected = labels.containsKey(platform)
+                            ? platform
+                            : 'all';
+                        return _DiscoverFilterField(
+                          label: '播放平台',
+                          value: selected,
+                          labels: labels,
+                          width: 240,
+                          onChanged: (item) => update(
+                            nextPlatform: item,
+                            nextWatchRegion: item.startsWith('company:')
+                                ? 'CN'
+                                : watchRegion == 'CN'
+                                ? 'HK'
+                                : watchRegion,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '海外平台按 TMDB 观看目录筛选；国内平台按官方出品公司筛选。选择国内平台时会自动切换到中国大陆地区。',
+                style: const TextStyle(fontSize: 11, color: YingjiColors.muted),
+              ),
+            ],
             if (provider == 'trakt') ...[
               const SizedBox(height: 10),
               const Text(
@@ -2762,16 +3756,18 @@ class _DiscoverFilterField extends StatelessWidget {
     required this.value,
     required this.labels,
     required this.onChanged,
+    this.width = 148,
   });
 
   final String label;
   final String value;
   final Map<String, String> labels;
   final ValueChanged<String> onChanged;
+  final double width;
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 148,
+    width: width,
     child: YingjiGlassChoiceField<String>(
       label: label,
       value: value,
@@ -2785,16 +3781,22 @@ class _DiscoverFilterField extends StatelessWidget {
 class _DiscoverBlock extends StatefulWidget {
   const _DiscoverBlock({
     required this.title,
+    required this.source,
     required this.sourceLabel,
     required this.items,
     required this.variant,
     required this.loadPage,
+    required this.loadSourcePage,
+    required this.onConfigure,
   });
   final String title;
+  final String source;
   final String sourceLabel;
   final List<TmdbItem> items;
   final int variant;
   final Future<List<TmdbItem>> Function(int page) loadPage;
+  final Future<List<TmdbItem>> Function(String source, int page) loadSourcePage;
+  final VoidCallback onConfigure;
   @override
   State<_DiscoverBlock> createState() => _DiscoverBlockState();
 }
@@ -2848,20 +3850,28 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
         _SectionHeader(
           title: title,
           subtitle: widget.sourceLabel,
+          titleAction: YingjiMotionIconButton(
+            icon: YingjiIcons.slider_horizontal_3,
+            tooltip: '设置$title',
+            size: 30,
+            onPressed: widget.onConfigure,
+          ),
           trailingActions: [
-            YingjiDirectionalArrow(
-              previous: true,
-              tooltip: '向左浏览',
-              size: 34,
-              onPressed: () => _shelf.move(-560),
-            ),
-            const SizedBox(width: 7),
-            YingjiDirectionalArrow(
-              previous: false,
-              tooltip: '向右浏览',
-              size: 34,
-              onPressed: _moveNext,
-            ),
+            if (variant != 3) ...[
+              YingjiDirectionalArrow(
+                previous: true,
+                tooltip: '向左浏览',
+                size: 34,
+                onPressed: () => _shelf.move(-560),
+              ),
+              const SizedBox(width: 7),
+              YingjiDirectionalArrow(
+                previous: false,
+                tooltip: '向右浏览',
+                size: 34,
+                onPressed: _moveNext,
+              ),
+            ],
           ],
           action: '打开$title完整列表',
           onAction: () {
@@ -2880,7 +3890,8 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
                 builder: (_) => _DiscoverListPage(
                   title: title,
                   items: items,
-                  loadPage: widget.loadPage,
+                  source: widget.source,
+                  loadSourcePage: widget.loadSourcePage,
                 ),
               ),
             );
@@ -2891,6 +3902,25 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
           _LandscapeStrip(items: items, shelf: _shelf)
         else if (variant == 2)
           _RankStrip(items: items, shelf: _shelf)
+        else if (variant == 3)
+          _PlatformEntryCard(
+            items: items,
+            source: widget.source,
+            onConfigure: widget.onConfigure,
+            onOpen: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => _DiscoverListPage(
+                    title: title,
+                    items: items,
+                    source: widget.source,
+                    loadSourcePage: widget.loadSourcePage,
+                  ),
+                ),
+              );
+            },
+          )
         else
           _PosterStrip(items: items, shelf: _shelf),
       ],
@@ -2904,12 +3934,16 @@ class _DiscoveryStylePreview extends StatelessWidget {
     required this.style,
     required this.selected,
     required this.items,
+    required this.source,
+    required this.loading,
     required this.onTap,
   });
   final String label;
   final int style;
   final bool selected;
   final List<TmdbItem> items;
+  final String source;
+  final bool loading;
   final VoidCallback onTap;
 
   @override
@@ -2939,7 +3973,14 @@ class _DiscoveryStylePreview extends StatelessWidget {
                 height: 128,
                 child: ClipRect(
                   child: IgnorePointer(
-                    child: items.isEmpty
+                    child: loading
+                        ? const Center(
+                            child: SizedBox.square(
+                              dimension: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : items.isEmpty
                         ? Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
@@ -2962,6 +4003,13 @@ class _DiscoveryStylePreview extends StatelessWidget {
                                   items: items.take(2).toList(),
                                 ),
                                 2 => _RankStrip(items: items.take(2).toList()),
+                                3 => _PlatformEntryCard(
+                                  items: items.take(3).toList(),
+                                  source: source,
+                                  compact: true,
+                                  onConfigure: onTap,
+                                  onOpen: onTap,
+                                ),
                                 _ => _PosterStrip(
                                   items: items.take(2).toList(),
                                 ),
@@ -3230,11 +4278,13 @@ class _DiscoverListPage extends StatefulWidget {
   const _DiscoverListPage({
     required this.title,
     required this.items,
-    required this.loadPage,
+    required this.source,
+    required this.loadSourcePage,
   });
   final String title;
   final List<TmdbItem> items;
-  final Future<List<TmdbItem>> Function(int page) loadPage;
+  final String source;
+  final Future<List<TmdbItem>> Function(String source, int page) loadSourcePage;
 
   @override
   State<_DiscoverListPage> createState() => _DiscoverListPageState();
@@ -3242,16 +4292,28 @@ class _DiscoverListPage extends StatefulWidget {
 
 class _DiscoverListPageState extends State<_DiscoverListPage> {
   static const _filterKeyPrefix = 'yingji.discover.all-list.filters.';
-  static const _types = ['全部', '电影', '剧集'];
+  static const _types = <String, String>{
+    'all': '全部',
+    'movie': '电影',
+    'tv': '剧集',
+  };
   static const _sorts = ['热度', '评分', '年份'];
   final _controller = ScrollController();
   late List<TmdbItem> _items;
   int _page = 1;
   bool _loading = false;
   bool _hasMore = true;
-  String _type = '全部';
+  int _feedRevision = 0;
+  String _type = 'all';
   String _sort = '热度';
+  String _platform = 'all';
   bool _filterChanged = false;
+
+  _DiscoverFeedSelection? get _selection =>
+      _DiscoverFeedSelection.tryParse(widget.source);
+
+  String get _activeSource =>
+      _selection?.withPlatform(_platform).encoded ?? widget.source;
 
   String get _filterKey =>
       '$_filterKeyPrefix${base64Url.encode(utf8.encode(widget.title))}';
@@ -3260,6 +4322,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   void initState() {
     super.initState();
     _items = List.of(widget.items);
+    _platform = _selection?.platform ?? 'all';
     _controller.addListener(_onScroll);
     unawaited(_restoreFilters());
   }
@@ -3272,11 +4335,21 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
       final value = jsonDecode(saved) as Map<String, dynamic>;
       final type = value['type'] as String?;
       final sort = value['sort'] as String?;
+      final platform = value['platform'] as String?;
       if (!mounted || _filterChanged) return;
+      final platformChanged = platform != null && platform != _platform;
       setState(() {
-        if (_types.contains(type)) _type = type!;
+        final normalizedType = switch (type) {
+          '电影' => 'movie',
+          '剧集' => 'tv',
+          '全部' => 'all',
+          _ => type,
+        };
+        if (_types.containsKey(normalizedType)) _type = normalizedType!;
         if (_sorts.contains(sort)) _sort = sort!;
+        if (platform != null) _platform = platform;
       });
+      if (platformChanged) unawaited(_reloadPlatform());
     } catch (_) {
       // Ignore preferences written by an older or incomplete build.
     }
@@ -3295,8 +4368,39 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       _filterKey,
-      jsonEncode({'type': _type, 'sort': _sort}),
+      jsonEncode({'type': _type, 'sort': _sort, 'platform': _platform}),
     );
+  }
+
+  Future<void> _selectPlatform(String platform) async {
+    if (_platform == platform) return;
+    setState(() {
+      _filterChanged = true;
+      _platform = platform;
+    });
+    await _saveFilters();
+    await _reloadPlatform();
+  }
+
+  Future<void> _reloadPlatform() async {
+    final revision = ++_feedRevision;
+    setState(() {
+      _loading = true;
+      _hasMore = true;
+      _page = 1;
+    });
+    try {
+      final rows = await widget.loadSourcePage(_activeSource, 1);
+      if (!mounted || revision != _feedRevision) return;
+      setState(() {
+        _items = rows;
+        _hasMore = rows.isNotEmpty;
+      });
+    } finally {
+      if (mounted && revision == _feedRevision) {
+        setState(() => _loading = false);
+      }
+    }
   }
 
   void _onScroll() {
@@ -3305,10 +4409,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
 
   Future<void> _loadMore() async {
     if (_loading || !_hasMore) return;
+    final revision = _feedRevision;
+    final source = _activeSource;
     setState(() => _loading = true);
     try {
-      final next = await widget.loadPage(_page + 1);
-      if (!mounted) return;
+      final next = await widget.loadSourcePage(source, _page + 1);
+      if (!mounted || revision != _feedRevision) return;
       final keys = _items.map((item) => '${item.kind}:${item.id}').toSet();
       setState(() {
         _page++;
@@ -3318,7 +4424,9 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
         _hasMore = next.isNotEmpty;
       });
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && revision == _feedRevision) {
+        setState(() => _loading = false);
+      }
     }
   }
 
@@ -3331,7 +4439,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   @override
   Widget build(BuildContext context) {
     var rows = _items
-        .where((item) => _type == '全部' || item.kind == _type)
+        .where((item) => _type == 'all' || item.kind == _type)
         .toList();
     if (_sort == '评分') {
       rows.sort((a, b) => b.rating.compareTo(a.rating));
@@ -3376,11 +4484,11 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               spacing: 8,
                               runSpacing: 8,
                               children: [
-                                for (final label in _types)
+                                for (final entry in _types.entries)
                                   _RankingFilter(
-                                    label: label,
-                                    selected: _type == label,
-                                    onTap: () => _selectFilter(type: label),
+                                    label: entry.value,
+                                    selected: _type == entry.key,
+                                    onTap: () => _selectFilter(type: entry.key),
                                   ),
                                 for (final label in _sorts)
                                   _RankingFilter(
@@ -3390,6 +4498,36 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                                   ),
                               ],
                             ),
+                            if (_selection?.provider == 'tmdb') ...[
+                              const SizedBox(height: 12),
+                              FutureBuilder<Map<String, String>>(
+                                future: _watchProviders(
+                                  _selection!.mediaType,
+                                  _selection!.watchRegion,
+                                ),
+                                builder: (context, snapshot) {
+                                  final platforms =
+                                      snapshot.data ?? const {'all': '全部平台'};
+                                  final selected =
+                                      platforms.containsKey(_platform)
+                                      ? _platform
+                                      : 'all';
+                                  return SizedBox(
+                                    width: 280,
+                                    child: YingjiGlassChoiceField<String>(
+                                      label: '播放平台',
+                                      helper: '切换后重新获取该平台的影视内容',
+                                      value: selected,
+                                      items: platforms.keys.toList(),
+                                      labelBuilder: (value) =>
+                                          platforms[value] ?? value,
+                                      onChanged: (value) =>
+                                          unawaited(_selectPlatform(value)),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ],
                           ],
                         ),
                       ),
@@ -4876,244 +6014,218 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
   }
 
   @override
-  Widget build(BuildContext context) => Dialog(
-    backgroundColor: Colors.transparent,
-    child: ConstrainedBox(
-      constraints: const BoxConstraints(maxHeight: 680),
-      child: GlassPanel(
-        radius: 22,
-        padding: const EdgeInsets.all(28),
-        child: ScrollConfiguration(
-          behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    if (widget.existing != null) ...[
-                      _ServerMark(source: widget.existing!, size: 42),
-                      const SizedBox(width: 12),
-                    ],
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            widget.existing == null ? '连接媒体服务器' : '修改媒体服务器',
-                            style: TextStyle(
-                              fontSize: 26,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: -.5,
-                            ),
-                          ),
-                          SizedBox(height: 6),
-                          Text(
-                            widget.existing == null
-                                ? '验证成功后自动读取服务器名称、媒体统计与播放能力。'
-                                : '留空用户名和密码可保留现有凭据；修改后可在卡片上测速。',
-                            style: TextStyle(color: YingjiColors.muted),
-                          ),
-                        ],
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: _saving ? null : () => Navigator.pop(context),
-                      icon: const Icon(YingjiIcons.xmark),
-                    ),
-                  ],
+  Widget build(BuildContext context) => YingjiPinnedDialog(
+    maxWidth: 720,
+    maxHeight: 680,
+    header: Row(
+      children: [
+        if (widget.existing != null) ...[
+          _ServerMark(source: widget.existing!, size: 42),
+          const SizedBox(width: 12),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.existing == null ? '连接媒体服务器' : '修改媒体服务器',
+                style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: -.5,
                 ),
-                const SizedBox(height: 24),
-                const Text(
-                  '来源类型',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+              ),
+              SizedBox(height: 6),
+              Text(
+                widget.existing == null
+                    ? '验证成功后自动读取服务器名称、媒体统计与播放能力。'
+                    : '留空用户名和密码可保留现有凭据；修改后可在卡片上测速。',
+                style: TextStyle(color: YingjiColors.muted),
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          onPressed: _saving ? null : () => Navigator.pop(context),
+          icon: const Icon(YingjiIcons.xmark),
+        ),
+      ],
+    ),
+    body: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '来源类型',
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            for (final kind in SourceKind.values) ...[
+              Expanded(
+                child: _SourceKindChoice(
+                  kind: kind,
+                  selected: _kind == kind,
+                  onTap: _saving ? null : () => setState(() => _kind = kind),
                 ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    for (final kind in SourceKind.values) ...[
-                      Expanded(
-                        child: _SourceKindChoice(
-                          kind: kind,
-                          selected: _kind == kind,
-                          onTap: _saving
-                              ? null
-                              : () => setState(() => _kind = kind),
-                        ),
-                      ),
-                      if (kind != SourceKind.values.last)
-                        const SizedBox(width: 10),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 24),
-                TextField(
-                  controller: _name,
-                  decoration: const InputDecoration(
-                    labelText: '显示名称',
-                    hintText: '例如：客厅 Emby',
-                    prefixIcon: Icon(YingjiIcons.rectangle_stack),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  '连接信息',
-                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _url,
+              ),
+              if (kind != SourceKind.values.last) const SizedBox(width: 10),
+            ],
+          ],
+        ),
+        const SizedBox(height: 24),
+        TextField(
+          controller: _name,
+          decoration: const InputDecoration(
+            labelText: '显示名称',
+            hintText: '例如：客厅 Emby',
+            prefixIcon: Icon(YingjiIcons.rectangle_stack),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          '连接信息',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _url,
+          keyboardType: TextInputType.url,
+          onChanged: _detectScheme,
+          decoration: const InputDecoration(
+            labelText: '服务器线路',
+            hintText: 'https://server.example.com/（可直接粘贴多条）',
+            prefixIcon: Icon(YingjiIcons.link),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            for (final scheme in const ['https', 'http']) ...[
+              ChoiceChip(
+                label: Text(scheme.toUpperCase()),
+                selected: _scheme == scheme,
+                onSelected: _saving ? null : (_) => _selectScheme(scheme),
+              ),
+              if (scheme == 'https') const SizedBox(width: 8),
+            ],
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                '优先使用选中协议；其他粘贴的地址会自动保存为可切换线路。',
+                style: TextStyle(color: YingjiColors.muted, fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+        for (
+          var index = 0;
+          index < _alternateUrlControllers.length;
+          index++
+        ) ...[
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _alternateUrlControllers[index],
                   keyboardType: TextInputType.url,
                   onChanged: _detectScheme,
-                  decoration: const InputDecoration(
-                    labelText: '服务器线路',
-                    hintText: 'https://server.example.com/（可直接粘贴多条）',
-                    prefixIcon: Icon(YingjiIcons.link),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    for (final scheme in const ['https', 'http']) ...[
-                      ChoiceChip(
-                        label: Text(scheme.toUpperCase()),
-                        selected: _scheme == scheme,
-                        onSelected: _saving
-                            ? null
-                            : (_) => _selectScheme(scheme),
-                      ),
-                      if (scheme == 'https') const SizedBox(width: 8),
-                    ],
-                    const SizedBox(width: 12),
-                    const Expanded(
-                      child: Text(
-                        '优先使用选中协议；其他粘贴的地址会自动保存为可切换线路。',
-                        style: TextStyle(
-                          color: YingjiColors.muted,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                for (
-                  var index = 0;
-                  index < _alternateUrlControllers.length;
-                  index++
-                ) ...[
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _alternateUrlControllers[index],
-                          keyboardType: TextInputType.url,
-                          onChanged: _detectScheme,
-                          decoration: InputDecoration(
-                            labelText: '线路 ${index + 2}',
-                            hintText: 'https://mirror.example.com/',
-                            prefixIcon: const Icon(YingjiIcons.link),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.trash,
-                        tooltip: '删除线路 ${index + 2}',
-                        size: 38,
-                        onPressed: () => setState(() {
-                          _alternateUrlControllers.removeAt(index).dispose();
-                        }),
-                      ),
-                    ],
-                  ),
-                ],
-                const SizedBox(height: 10),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: YingjiMotionIconButton(
-                    icon: YingjiIcons.plus,
-                    tooltip: '添加线路',
-                    size: 38,
-                    onPressed: () => setState(
-                      () =>
-                          _alternateUrlControllers.add(TextEditingController()),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  '每个输入框保存一条线路；验证后也会加入服务器发布的线路。',
-                  style: TextStyle(color: YingjiColors.muted, fontSize: 11),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _username,
                   decoration: InputDecoration(
-                    labelText: _kind == SourceKind.webdav ? '用户名（可选）' : '用户名',
-                    prefixIcon: const Icon(YingjiIcons.person),
+                    labelText: '线路 ${index + 2}',
+                    hintText: 'https://mirror.example.com/',
+                    prefixIcon: const Icon(YingjiIcons.link),
                   ),
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _password,
-                  obscureText: true,
-                  onSubmitted: (_) => _submit(),
-                  decoration: InputDecoration(
-                    labelText: _kind == SourceKind.webdav ? '密码（可选）' : '密码',
-                    prefixIcon: const Icon(YingjiIcons.lock),
-                  ),
-                ),
-                if (_error != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 14),
-                    child: Text(
-                      _error!,
-                      style: const TextStyle(color: YingjiColors.danger),
-                    ),
-                  ),
-                const SizedBox(height: 24),
-                Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        '凭据仅用于连接所填服务器，并保存在本机。',
-                        style: TextStyle(
-                          color: YingjiColors.muted,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _saving ? null : () => Navigator.pop(context),
-                      child: const Text('取消'),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton.icon(
-                      onPressed: _saving ? null : _submit,
-                      icon: _saving
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(YingjiIcons.checkmark_shield, size: 17),
-                      label: Text(
-                        _saving
-                            ? '正在验证'
-                            : widget.existing == null
-                            ? '验证并添加'
-                            : '保存修改',
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+              ),
+              const SizedBox(width: 8),
+              YingjiMotionIconButton(
+                icon: YingjiIcons.trash,
+                tooltip: '删除线路 ${index + 2}',
+                size: 38,
+                onPressed: () => setState(() {
+                  _alternateUrlControllers.removeAt(index).dispose();
+                }),
+              ),
+            ],
+          ),
+        ],
+        const SizedBox(height: 10),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: YingjiMotionIconButton(
+            icon: YingjiIcons.plus,
+            tooltip: '添加线路',
+            size: 38,
+            onPressed: () => setState(
+              () => _alternateUrlControllers.add(TextEditingController()),
             ),
           ),
         ),
-      ),
+        const SizedBox(height: 4),
+        const Text(
+          '每个输入框保存一条线路；验证后也会加入服务器发布的线路。',
+          style: TextStyle(color: YingjiColors.muted, fontSize: 11),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _username,
+          decoration: InputDecoration(
+            labelText: _kind == SourceKind.webdav ? '用户名（可选）' : '用户名',
+            prefixIcon: const Icon(YingjiIcons.person),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _password,
+          obscureText: true,
+          onSubmitted: (_) => _submit(),
+          decoration: InputDecoration(
+            labelText: _kind == SourceKind.webdav ? '密码（可选）' : '密码',
+            prefixIcon: const Icon(YingjiIcons.lock),
+          ),
+        ),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 14),
+            child: Text(
+              _error!,
+              style: const TextStyle(color: YingjiColors.danger),
+            ),
+          ),
+      ],
+    ),
+    actions: Row(
+      children: [
+        const Expanded(
+          child: Text(
+            '凭据仅用于连接所填服务器，并保存在本机。',
+            style: TextStyle(color: YingjiColors.muted, fontSize: 11),
+          ),
+        ),
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        const SizedBox(width: 8),
+        FilledButton.icon(
+          onPressed: _saving ? null : _submit,
+          icon: _saving
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(YingjiIcons.checkmark_shield, size: 17),
+          label: Text(
+            _saving
+                ? '正在验证'
+                : widget.existing == null
+                ? '验证并添加'
+                : '保存修改',
+          ),
+        ),
+      ],
     ),
   );
 }
@@ -6017,12 +7129,15 @@ class _SettingsPageState extends State<SettingsPage> {
   final _behaviorKey = GlobalKey();
   final _networkKey = GlobalKey();
   final _danmakuKey = GlobalKey();
+  final _systemKey = GlobalKey();
   final _maintenanceKey = GlobalKey();
   final _aboutKey = GlobalKey();
   final _activeSetting = ValueNotifier<int>(0);
   bool _hardware = true, _hdr = true, _downmix = false, _night = false;
   bool _preferChineseSubtitle = true;
   String _subtitleLanguage = 'zh';
+  bool _preferAudioTrack = false;
+  String _audioLanguage = 'zh';
   bool _voiceEnhance = false;
   bool _resumePrompt = true;
   bool _homeContinueWatching = true, _homeShowIcon = true;
@@ -6039,12 +7154,23 @@ class _SettingsPageState extends State<SettingsPage> {
       _subtitleDelay = 0,
       _cacheSeconds = 30;
   String _aspect = '自动';
+  bool _autoSkipSegments = true;
+  double _autoSkipDelaySeconds = 5;
+  bool _segmentServerSource = true;
+  bool _segmentIntroDbSource = true;
+  double _seekSeconds = 10;
+  double _volumeStep = 5;
+  bool _preloadNextEpisode = true;
+  double _preloadLeadMinutes = 5;
+  bool _closeToTray = true;
+  Map<String, String> _shortcuts = Map.of(_defaultPlayerShortcuts);
+  int _metadataCacheCount = 0;
+  int _imageCacheBytes = 0;
   final _tmdbApiKey = TextEditingController();
   bool _danmakuEnabled = false;
   final _traktClientId = TextEditingController();
   final _traktClientSecret = TextEditingController();
   final _traktToken = TextEditingController();
-  final _danmakuName = TextEditingController();
   final _danmakuUrl = TextEditingController();
   final _danmakuApiNameControllers = <TextEditingController>[];
   final _danmakuApiControllers = <TextEditingController>[];
@@ -6058,6 +7184,26 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _traktMessage;
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
+
+  void _changeShortcut(String action, String value) {
+    String label(String raw) => raw.contains('|')
+        ? raw.split('|').skip(1).join('|').toLowerCase()
+        : raw.toLowerCase();
+    final conflict = _shortcuts.entries
+        .where(
+          (entry) => entry.key != action && label(entry.value) == label(value),
+        )
+        .firstOrNull;
+    if (conflict != null) {
+      setState(
+        () => _savedMessage = '$value 已用于 ${_shortcutNames[conflict.key]}',
+      );
+      return;
+    }
+    setState(() => _shortcuts[action] = value);
+    _save();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -6115,15 +7261,42 @@ class _SettingsPageState extends State<SettingsPage> {
             true;
         _subtitleLanguage =
             prefs.getString('yingji.player.subtitle-language') ?? 'zh';
+        _preferAudioTrack =
+            prefs.getBool('yingji.player.audio-priority-enabled') ?? false;
+        _audioLanguage =
+            prefs.getString('yingji.player.audio-language') ?? 'zh';
         _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
         _aspect = prefs.getString('yingji.player.aspect') ?? '自动';
+        _autoSkipSegments = prefs.getBool('yingji.segment.auto-skip') ?? true;
+        _autoSkipDelaySeconds =
+            prefs.getDouble('yingji.segment.skip-delay-seconds') ?? 5;
+        _segmentServerSource =
+            prefs.getBool('yingji.segment.source-server') ?? true;
+        _segmentIntroDbSource =
+            prefs.getBool('yingji.segment.source-theintrodb') ?? true;
+        _seekSeconds = prefs.getDouble('yingji.player.seek-seconds') ?? 10;
+        _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
+        _preloadNextEpisode =
+            prefs.getBool('yingji.player.preload-next') ?? true;
+        _preloadLeadMinutes =
+            prefs.getDouble('yingji.player.preload-lead-minutes') ?? 5;
+        _closeToTray = prefs.getBool('yingji.system.close-to-tray') ?? true;
+        final shortcutJson = prefs.getString('yingji.player.shortcuts');
+        final shortcutData = shortcutJson == null
+            ? null
+            : jsonDecode(shortcutJson);
+        _shortcuts = shortcutData is Map
+            ? {
+                ..._defaultPlayerShortcuts,
+                ...shortcutData.map((k, v) => MapEntry('$k', '$v')),
+              }
+            : Map.of(_defaultPlayerShortcuts);
         _tmdbApiKey.text = prefs.getString('yingji.tmdb.api-key') ?? '';
         _danmakuEnabled = prefs.getBool('yingji.danmaku.enabled') ?? false;
         _traktClientId.text = prefs.getString('yingji.trakt.client-id') ?? '';
         _traktClientSecret.text =
             prefs.getString('yingji.trakt.client-secret') ?? '';
         _traktToken.text = prefs.getString('yingji.trakt.access-token') ?? '';
-        _danmakuName.text = prefs.getString('yingji.danmaku.name') ?? '';
         _danmakuUrl.text = prefs.getString('yingji.danmaku.url') ?? '';
         final savedApis =
             prefs.getStringList('yingji.danmaku.apis') ?? const [];
@@ -6160,6 +7333,7 @@ class _SettingsPageState extends State<SettingsPage> {
         _danmakuToken.text = prefs.getString('yingji.danmaku.token') ?? '';
       });
       _applyAppearance();
+      unawaited(_refreshCacheStats());
     }
   }
 
@@ -6215,8 +7389,32 @@ class _SettingsPageState extends State<SettingsPage> {
       _preferChineseSubtitle,
     );
     await prefs.setString('yingji.player.subtitle-language', _subtitleLanguage);
+    await prefs.setBool(
+      'yingji.player.audio-priority-enabled',
+      _preferAudioTrack,
+    );
+    await prefs.setString('yingji.player.audio-language', _audioLanguage);
     await prefs.setDouble('yingji.player.cache-seconds', _cacheSeconds);
     await prefs.setString('yingji.player.aspect', _aspect);
+    await prefs.setBool('yingji.segment.auto-skip', _autoSkipSegments);
+    await prefs.setDouble(
+      'yingji.segment.skip-delay-seconds',
+      _autoSkipDelaySeconds,
+    );
+    await prefs.setBool('yingji.segment.source-server', _segmentServerSource);
+    await prefs.setBool(
+      'yingji.segment.source-theintrodb',
+      _segmentIntroDbSource,
+    );
+    await prefs.setDouble('yingji.player.seek-seconds', _seekSeconds);
+    await prefs.setDouble('yingji.player.volume-step', _volumeStep);
+    await prefs.setBool('yingji.player.preload-next', _preloadNextEpisode);
+    await prefs.setDouble(
+      'yingji.player.preload-lead-minutes',
+      _preloadLeadMinutes,
+    );
+    await prefs.setBool('yingji.system.close-to-tray', _closeToTray);
+    await prefs.setString('yingji.player.shortcuts', jsonEncode(_shortcuts));
     await prefs.setString('yingji.tmdb.api-key', _tmdbApiKey.text.trim());
     await prefs.setString('yingji.trakt.client-id', _traktClientId.text.trim());
     await prefs.setString(
@@ -6225,7 +7423,7 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     await prefs.setString('yingji.trakt.access-token', _traktToken.text.trim());
     await prefs.setBool('yingji.danmaku.enabled', _danmakuEnabled);
-    await prefs.setString('yingji.danmaku.name', _danmakuName.text.trim());
+    await prefs.remove('yingji.danmaku.name');
     await prefs.setString('yingji.danmaku.url', danmakuApis.firstOrNull ?? '');
     await prefs.setStringList('yingji.danmaku.apis', danmakuApis);
     await prefs.setStringList(
@@ -6310,7 +7508,46 @@ class _SettingsPageState extends State<SettingsPage> {
             ? '没有可清理的 TMDB 缓存'
             : '已清理 $count 项 TMDB 缓存',
       );
+      unawaited(_refreshCacheStats());
     }
+  }
+
+  Future<void> _refreshCacheStats() async {
+    final prefs = await SharedPreferences.getInstance();
+    final metadata = prefs
+        .getKeys()
+        .where((key) => key.startsWith('yingji.tmdb.cache.'))
+        .length;
+    var bytes = 0;
+    try {
+      final root = await getTemporaryDirectory();
+      await for (final entity in root.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is File) bytes += await entity.length();
+      }
+    } catch (_) {}
+    if (mounted)
+      setState(() {
+        _metadataCacheCount = metadata;
+        _imageCacheBytes = bytes;
+      });
+  }
+
+  Future<void> _clearImageCache() async {
+    await DefaultCacheManager().emptyCache();
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
+    await _refreshCacheStats();
+    if (mounted) setState(() => _savedMessage = '海报、剧照与图标图片缓存已清理');
+  }
+
+  String get _imageCacheLabel {
+    final mb = _imageCacheBytes / 1024 / 1024;
+    return mb < 1
+        ? '${(_imageCacheBytes / 1024).round()} KB'
+        : '${mb.toStringAsFixed(1)} MB';
   }
 
   Future<void> _clearWatchHistory() async {
@@ -6404,6 +7641,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _behaviorKey,
     _networkKey,
     _danmakuKey,
+    _systemKey,
     _maintenanceKey,
     _aboutKey,
   ];
@@ -6460,7 +7698,6 @@ class _SettingsPageState extends State<SettingsPage> {
     _traktClientId.dispose();
     _traktClientSecret.dispose();
     _traktToken.dispose();
-    _danmakuName.dispose();
     _danmakuUrl.dispose();
     for (final controller in _danmakuApiNameControllers) {
       controller.dispose();
@@ -6481,6 +7718,7 @@ class _SettingsPageState extends State<SettingsPage> {
       ('播放行为', YingjiIcons.gauge),
       ('网络与同步', YingjiIcons.wifi),
       ('字幕与弹幕', YingjiIcons.captions_bubble),
+      ('快捷键与系统', YingjiIcons.gear_alt),
       ('缓存与数据', YingjiIcons.archivebox),
       ('关于 Mova', YingjiIcons.info_circle),
     ];
@@ -6491,6 +7729,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _behaviorKey,
       _networkKey,
       _danmakuKey,
+      _systemKey,
       _maintenanceKey,
       _aboutKey,
     ];
@@ -7015,6 +8254,60 @@ class _SettingsPageState extends State<SettingsPage> {
                                       setState(() => _cacheSeconds = value),
                                   onChangeEnd: (_) => _save(),
                                 ),
+                                _ToggleRow(
+                                  title: '预加载下一集',
+                                  detail: '播放接近片尾时预热下一集，减少连续播放等待',
+                                  value: _preloadNextEpisode,
+                                  onChanged: (value) {
+                                    setState(() => _preloadNextEpisode = value);
+                                    _save();
+                                  },
+                                ),
+                                if (_preloadNextEpisode) ...[
+                                  Text(
+                                    '距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载',
+                                  ),
+                                  Slider(
+                                    value: _preloadLeadMinutes,
+                                    min: 1,
+                                    max: 15,
+                                    divisions: 14,
+                                    label: '${_preloadLeadMinutes.round()} 分钟',
+                                    onChanged: (value) => setState(
+                                      () => _preloadLeadMinutes = value,
+                                    ),
+                                    onChangeEnd: (_) => _save(),
+                                  ),
+                                ],
+                                Text('快进 / 快退  ${_seekSeconds.round()} 秒'),
+                                const Text(
+                                  '播放器左右方向键每次跳转的时间；长片可调大，短片建议保持 10 秒。',
+                                  style: TextStyle(
+                                    color: Color(0xFFABB1BE),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                Slider(
+                                  value: _seekSeconds,
+                                  min: 5,
+                                  max: 60,
+                                  divisions: 11,
+                                  label: '${_seekSeconds.round()} 秒',
+                                  onChanged: (value) =>
+                                      setState(() => _seekSeconds = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
+                                Text('音量按键步长  ${_volumeStep.round()}%'),
+                                Slider(
+                                  value: _volumeStep,
+                                  min: 1,
+                                  max: 20,
+                                  divisions: 19,
+                                  label: '${_volumeStep.round()}%',
+                                  onChanged: (value) =>
+                                      setState(() => _volumeStep = value),
+                                  onChangeEnd: (_) => _save(),
+                                ),
                                 Text(
                                   '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
                                 ),
@@ -7170,7 +8463,38 @@ class _SettingsPageState extends State<SettingsPage> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                const SizedBox(height: 24),
+                                const Text(
+                                  '音轨、字幕与片头片尾',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '按语言智能选择音轨和字幕，并统一管理自动跳过的数据来源。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                _ToggleRow(
+                                  title: '启用首选音轨',
+                                  detail: '存在匹配语言时自动选择；手动选择仍然优先',
+                                  value: _preferAudioTrack,
+                                  onChanged: (value) {
+                                    setState(() => _preferAudioTrack = value);
+                                    _save();
+                                  },
+                                ),
+                                YingjiGlassChoiceField<String>(
+                                  label: '首选音轨语言',
+                                  value: _audioLanguage,
+                                  items: audioLanguages.keys.toList(),
+                                  labelBuilder: (v) => audioLanguages[v] ?? v,
+                                  onChanged: (v) {
+                                    setState(() => _audioLanguage = v);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 16),
                                 SwitchListTile.adaptive(
                                   contentPadding: EdgeInsets.zero,
                                   secondary: const Icon(
@@ -7201,6 +8525,65 @@ class _SettingsPageState extends State<SettingsPage> {
                                   },
                                 ),
                                 const SizedBox(height: 24),
+                                const Divider(color: Color(0x22FFFFFF)),
+                                const SizedBox(height: 12),
+                                const Text(
+                                  '自动跳过',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                _ToggleRow(
+                                  title: '自动跳过片头片尾',
+                                  detail: '播放器仍会先显示跳转提示，可手动取消',
+                                  value: _autoSkipSegments,
+                                  onChanged: (value) {
+                                    setState(() => _autoSkipSegments = value);
+                                    _save();
+                                  },
+                                ),
+                                if (_autoSkipSegments) ...[
+                                  Text(
+                                    '跳转提示停留  ${_autoSkipDelaySeconds.round()} 秒',
+                                  ),
+                                  Slider(
+                                    value: _autoSkipDelaySeconds,
+                                    min: 1,
+                                    max: 10,
+                                    divisions: 9,
+                                    label: '${_autoSkipDelaySeconds.round()} 秒',
+                                    onChanged: (value) => setState(
+                                      () => _autoSkipDelaySeconds = value,
+                                    ),
+                                    onChangeEnd: (_) => _save(),
+                                  ),
+                                ],
+                                _ToggleRow(
+                                  title: '服务器章节',
+                                  detail: '从 Emby / Jellyfin 媒体章节读取片头片尾',
+                                  value: _segmentServerSource,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _segmentServerSource = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: 'TheIntroDB',
+                                  detail: '按 TMDB、季和集匹配公共片头片尾数据',
+                                  value: _segmentIntroDbSource,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _segmentIntroDbSource = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 16),
+                                const Divider(color: Color(0x22FFFFFF)),
+                                const SizedBox(height: 16),
                                 const Text(
                                   '弹幕服务',
                                   style: TextStyle(
@@ -7210,7 +8593,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                 ),
                                 const SizedBox(height: 8),
                                 const Text(
-                                  '支持 TaoHua danmu_api 部署根地址，应用会自动匹配剧集并读取弹幕；也兼容带占位符的通用 API。',
+                                  '播放时并行请求下方 API，自动使用最先返回有效结果的线路。',
                                   style: TextStyle(color: Color(0xFFABB1BE)),
                                 ),
                                 _ToggleRow(
@@ -7224,15 +8607,6 @@ class _SettingsPageState extends State<SettingsPage> {
                                     _save();
                                   },
                                 ),
-                                const SizedBox(height: 6),
-                                TextField(
-                                  controller: _danmakuName,
-                                  decoration: const InputDecoration(
-                                    labelText: '服务名称（可选）',
-                                    hintText: '例如：我的弹幕服务',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
                                 const SizedBox(height: 8),
                                 const Text(
                                   '弹幕 API',
@@ -7386,13 +8760,13 @@ class _SettingsPageState extends State<SettingsPage> {
                           ),
                           const SizedBox(height: 18),
                           _FrostSurface(
-                            key: _maintenanceKey,
+                            key: _systemKey,
                             borderRadius: 22,
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 const Text(
-                                  '维护与数据',
+                                  '快捷键与系统',
                                   style: TextStyle(
                                     fontSize: 20,
                                     fontWeight: FontWeight.w800,
@@ -7400,8 +8774,64 @@ class _SettingsPageState extends State<SettingsPage> {
                                 ),
                                 const SizedBox(height: 8),
                                 const Text(
-                                  '清理仅影响本机缓存和观看记录，不会修改 Emby、Jellyfin 或 WebDAV 上的媒体。',
+                                  '播放器快捷键会立即保存；同一个按键不能绑定两个操作。',
                                   style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                _ToggleRow(
+                                  title: '关闭窗口时最小化到托盘',
+                                  detail: '从托盘菜单可重新显示 Mova；选择“退出”才结束进程',
+                                  value: _closeToTray,
+                                  onChanged: (value) {
+                                    setState(() => _closeToTray = value);
+                                    _save();
+                                  },
+                                ),
+                                const SizedBox(height: 10),
+                                for (final entry in _shortcutNames.entries) ...[
+                                  _ShortcutRecorder(
+                                    label: entry.value,
+                                    value: _shortcuts[entry.key]!,
+                                    onChanged: (value) =>
+                                        _changeShortcut(entry.key, value),
+                                  ),
+                                  const SizedBox(height: 10),
+                                ],
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          _FrostSurface(
+                            key: _maintenanceKey,
+                            borderRadius: 22,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  '缓存与数据',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  '分别管理元数据、海报剧照与观看记录；清理不会修改服务器媒体。',
+                                  style: TextStyle(color: Color(0xFFABB1BE)),
+                                ),
+                                const SizedBox(height: 14),
+                                Wrap(
+                                  spacing: 10,
+                                  runSpacing: 8,
+                                  children: [
+                                    _CacheStat(
+                                      label: '元数据',
+                                      value: '$_metadataCacheCount 项',
+                                    ),
+                                    _CacheStat(
+                                      label: '照片与其他临时缓存',
+                                      value: _imageCacheLabel,
+                                    ),
+                                  ],
                                 ),
                                 const SizedBox(height: 14),
                                 Wrap(
@@ -7415,6 +8845,14 @@ class _SettingsPageState extends State<SettingsPage> {
                                         size: 16,
                                       ),
                                       label: const Text('清理 TMDB 缓存'),
+                                    ),
+                                    FilledButton.tonalIcon(
+                                      onPressed: _clearImageCache,
+                                      icon: const Icon(
+                                        YingjiIcons.film,
+                                        size: 16,
+                                      ),
+                                      label: const Text('清理照片缓存'),
                                     ),
                                     FilledButton.tonalIcon(
                                       onPressed: _clearWatchHistory,
@@ -7466,7 +8904,7 @@ class _SettingsPageState extends State<SettingsPage> {
                                       ),
                                       const SizedBox(height: 12),
                                       const Text(
-                                        '版本 3.1.56 · Windows · Flutter + libmpv',
+                                        '版本 3.1.65 · Windows · Flutter + libmpv',
                                         style: TextStyle(
                                           fontSize: 12,
                                           color: YingjiColors.muted,
@@ -7532,7 +8970,7 @@ class _PosterStripState extends State<_PosterStrip> {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    height: 316,
+    height: 296,
     child: ListView.separated(
       controller: _controller,
       scrollDirection: Axis.horizontal,
@@ -7574,7 +9012,7 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    height: 170,
+    height: 184,
     child: ListView.separated(
       controller: _controller,
       scrollDirection: Axis.horizontal,
@@ -7588,6 +9026,191 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
       itemBuilder: (_, i) => _LandscapeTile(item: widget.items[i]),
     ),
   );
+}
+
+class _PlatformEntryCard extends StatelessWidget {
+  const _PlatformEntryCard({
+    required this.items,
+    required this.source,
+    required this.onConfigure,
+    required this.onOpen,
+    this.compact = false,
+  });
+
+  final List<TmdbItem> items;
+  final String source;
+  final VoidCallback onConfigure;
+  final VoidCallback onOpen;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final selection = _DiscoverFeedSelection.tryParse(source);
+    final platformId = selection?.platform ?? 'all';
+    final hasPlatform = platformId != 'all';
+    final platformName =
+        _resolvedPlatformLabels[platformId] ??
+        (hasPlatform ? '平台 $platformId' : '选择播放平台');
+    final platformLogo = _resolvedPlatformLogos[platformId];
+    final backdrop = items
+        .map((item) => item.backdropUrl)
+        .whereType<Uri>()
+        .firstOrNull;
+    return SizedBox(
+      height: compact ? 132 : 206,
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: SizedBox(
+          width: compact ? 520 : 600,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: hasPlatform ? onOpen : onConfigure,
+            child: _MediaHover(
+              borderRadius: 16,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (backdrop != null)
+                    CachedNetworkImage(
+                      imageUrl: backdrop.toString(),
+                      fit: BoxFit.cover,
+                      errorWidget: (_, _, _) =>
+                          const ColoredBox(color: Color(0xFF1A1D25)),
+                    )
+                  else
+                    const ColoredBox(color: Color(0xFF1A1D25)),
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: [
+                          YingjiGlass.chrome(strength: 1.22),
+                          YingjiGlass.surface(strength: 1.04),
+                          Colors.black.withValues(alpha: .22),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: EdgeInsets.all(compact ? 18 : 24),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: compact ? 58 : 78,
+                          height: compact ? 58 : 78,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: .96),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: .72),
+                            ),
+                            boxShadow: const [
+                              BoxShadow(
+                                color: Color(0x52000000),
+                                blurRadius: 22,
+                                offset: Offset(0, 10),
+                              ),
+                            ],
+                          ),
+                          child: platformLogo != null
+                              ? Padding(
+                                  padding: const EdgeInsets.all(8),
+                                  child: CachedNetworkImage(
+                                    imageUrl: platformLogo.toString(),
+                                    fit: BoxFit.contain,
+                                    errorWidget: (_, _, _) => Center(
+                                      child: Text(
+                                        platformName.characters.first
+                                            .toUpperCase(),
+                                        style: TextStyle(
+                                          color: YingjiColors.canvas,
+                                          fontSize: compact ? 22 : 28,
+                                          fontWeight: FontWeight.w900,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : Center(
+                                  child: Text(
+                                    hasPlatform
+                                        ? platformName.characters.first
+                                              .toUpperCase()
+                                        : '+',
+                                    style: TextStyle(
+                                      color: YingjiColors.canvas,
+                                      fontSize: compact ? 22 : 28,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                ),
+                        ),
+                        SizedBox(width: compact ? 14 : 20),
+                        Expanded(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                platformName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: compact ? 20 : 28,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: -.4,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                hasPlatform
+                                    ? '${platformId.startsWith('company:') ? '国内平台' : '${selection?.watchRegion ?? 'HK'} 地区'} · ${items.length} 部内容预览'
+                                    : '选择一个平台，创建专属影视入口',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: YingjiColors.muted,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              if (!compact) ...[
+                                const SizedBox(height: 15),
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      hasPlatform
+                                          ? YingjiIcons.arrow_right_circle_fill
+                                          : YingjiIcons.slider_horizontal_3,
+                                      size: 17,
+                                    ),
+                                    const SizedBox(width: 7),
+                                    Text(
+                                      hasPlatform ? '进入 $platformName' : '选择平台',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _RankStrip extends StatefulWidget {
@@ -7616,7 +9239,7 @@ class _RankStripState extends State<_RankStrip> {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    height: 242,
+    height: 252,
     child: ListView.separated(
       controller: _controller,
       scrollDirection: Axis.horizontal,
@@ -7639,7 +9262,7 @@ class _PosterTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 148,
+    width: 168,
     child: InkWell(
       borderRadius: BorderRadius.circular(14),
       onTap:
@@ -7648,39 +9271,89 @@ class _PosterTile extends StatelessWidget {
             context,
             MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
           ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            height: 222,
-            child: _MediaHover(
-              borderRadius: 14,
-              child: item.posterUrl == null
-                  ? const ColoredBox(color: Color(0xFF1A1D25))
-                  : CachedNetworkImage(
-                      imageUrl: item.posterUrl.toString(),
-                      fit: BoxFit.cover,
-                      errorWidget: (_, _, _) =>
-                          const ColoredBox(color: Color(0xFF1A1D25)),
+      child: SizedBox(
+        height: 280,
+        child: _MediaHover(
+          borderRadius: 16,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (item.posterUrl != null)
+                CachedNetworkImage(
+                  imageUrl: item.posterUrl.toString(),
+                  fit: BoxFit.cover,
+                  errorWidget: (_, _, _) =>
+                      const ColoredBox(color: Color(0xFF1A1D25)),
+                )
+              else
+                const ColoredBox(color: Color(0xFF1A1D25)),
+              const DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    stops: [.42, .72, 1],
+                    colors: [
+                      Colors.transparent,
+                      Color(0x99101418),
+                      Color(0xF20B0D11),
+                    ],
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 13,
+                right: 13,
+                bottom: 13,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      item.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        height: 1.18,
+                        fontWeight: FontWeight.w900,
+                      ),
                     ),
-            ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(
+                          YingjiIcons.sparkles,
+                          size: 12,
+                          color: Color(0xFFFFD76A),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          item.rating.toStringAsFixed(1),
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '${item.year ?? '—'} · ${item.kind}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              color: Color(0xFFCACED7),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 9),
-          Text(
-            item.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontWeight: FontWeight.w700),
-          ),
-          MediaRatingRow(item: item),
-          const SizedBox(height: 2),
-          Text(
-            '${item.year ?? '—'} · ${item.kind}',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, color: Color(0xFF9CA3B3)),
-          ),
-        ],
+        ),
       ),
     ),
   );
@@ -7692,7 +9365,7 @@ class _LandscapeTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 244,
+    width: 286,
     child: InkWell(
       borderRadius: BorderRadius.circular(16),
       onTap: () => Navigator.push(
@@ -7726,9 +9399,9 @@ class _LandscapeTile extends StatelessWidget {
               ),
             ),
             Positioned(
-              left: 13,
-              right: 13,
-              bottom: 12,
+              left: 16,
+              right: 16,
+              bottom: 14,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -7736,16 +9409,23 @@ class _LandscapeTile extends StatelessWidget {
                     item.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w800),
-                  ),
-                  MediaRatingRow(item: item),
-                  const SizedBox(height: 3),
-                  Text(
-                    '${item.year ?? '—'}',
                     style: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xFFD7DAE0),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w900,
                     ),
+                  ),
+                  const SizedBox(height: 7),
+                  Row(
+                    children: [
+                      _DiscoveryMetaPill(
+                        icon: YingjiIcons.sparkles,
+                        label: item.rating.toStringAsFixed(1),
+                      ),
+                      const SizedBox(width: 6),
+                      _DiscoveryMetaPill(
+                        label: '${item.year ?? '—'} · ${item.kind}',
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -7753,6 +9433,35 @@ class _LandscapeTile extends StatelessWidget {
           ],
         ),
       ),
+    ),
+  );
+}
+
+class _DiscoveryMetaPill extends StatelessWidget {
+  const _DiscoveryMetaPill({required this.label, this.icon});
+  final String label;
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: Colors.black.withValues(alpha: .48),
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: Colors.white.withValues(alpha: .16)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (icon != null) ...[
+          Icon(icon, size: 11, color: const Color(0xFFFFD76A)),
+          const SizedBox(width: 4),
+        ],
+        Text(
+          label,
+          style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w800),
+        ),
+      ],
     ),
   );
 }
@@ -7912,14 +9621,44 @@ class _RankTileState extends State<_RankTile>
                   ),
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(13),
-                    child: widget.item.posterUrl == null
-                        ? const ColoredBox(color: Color(0xFF1A1D25))
-                        : CachedNetworkImage(
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        if (widget.item.posterUrl != null)
+                          CachedNetworkImage(
                             imageUrl: widget.item.posterUrl.toString(),
                             fit: BoxFit.cover,
                             errorWidget: (_, _, _) =>
                                 const ColoredBox(color: Color(0xFF1A1D25)),
+                          )
+                        else
+                          const ColoredBox(color: Color(0xFF1A1D25)),
+                        const DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.center,
+                              end: Alignment.bottomCenter,
+                              colors: [Colors.transparent, Color(0xE60B0D11)],
+                            ),
                           ),
+                        ),
+                        Positioned(
+                          left: 10,
+                          right: 10,
+                          bottom: 10,
+                          child: Text(
+                            widget.item.title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              height: 1.2,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -8929,6 +10668,7 @@ class _SectionHeader extends StatelessWidget {
     this.action,
     this.onAction,
     this.actionIcon,
+    this.titleAction,
     this.trailingActions = const [],
   });
   final String title;
@@ -8936,6 +10676,7 @@ class _SectionHeader extends StatelessWidget {
   final String? action;
   final VoidCallback? onAction;
   final IconData? actionIcon;
+  final Widget? titleAction;
   final List<Widget> trailingActions;
   @override
   Widget build(BuildContext context) => Row(
@@ -8944,14 +10685,26 @@ class _SectionHeader extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              title,
-              style: const TextStyle(
-                fontSize: 25,
-                height: 1.08,
-                fontWeight: FontWeight.w800,
-                letterSpacing: -.3,
-              ),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    title,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 25,
+                      height: 1.08,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -.3,
+                    ),
+                  ),
+                ),
+                if (titleAction != null) ...[
+                  const SizedBox(width: 8),
+                  titleAction!,
+                ],
+              ],
             ),
             const SizedBox(height: 4),
             Text(
@@ -9512,6 +11265,60 @@ class _IconPackEntry {
   final String url;
 }
 
+class _IconPackData {
+  const _IconPackData({required this.icons, required this.metadata});
+  final List<_IconPackEntry> icons;
+  final _IconPackMetadata metadata;
+}
+
+class _IconPackMetadata {
+  const _IconPackMetadata({
+    required this.url,
+    required this.name,
+    required this.iconCount,
+    required this.updatedAt,
+    this.author,
+    this.version,
+    this.description,
+  });
+  final String url, name, updatedAt;
+  final int iconCount;
+  final String? author, version, description;
+
+  factory _IconPackMetadata.fromJson(String url, dynamic raw) {
+    if (raw is String) {
+      return _IconPackMetadata(
+        url: url,
+        name: Uri.tryParse(url)?.host ?? '图标包',
+        iconCount:
+            int.tryParse(RegExp(r'(\d+)').firstMatch(raw)?.group(1) ?? '') ?? 0,
+        updatedAt: '',
+        description: raw,
+      );
+    }
+    final map = raw is Map ? raw : const {};
+    return _IconPackMetadata(
+      url: url,
+      name: '${map['name'] ?? Uri.tryParse(url)?.host ?? '图标包'}',
+      iconCount: (map['iconCount'] as num?)?.toInt() ?? 0,
+      updatedAt: '${map['updatedAt'] ?? ''}',
+      author: map['author']?.toString(),
+      version: map['version']?.toString(),
+      description: map['description']?.toString(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'url': url,
+    'name': name,
+    'iconCount': iconCount,
+    'updatedAt': updatedAt,
+    if (author?.isNotEmpty == true) 'author': author,
+    if (version?.isNotEmpty == true) 'version': version,
+    if (description?.isNotEmpty == true) 'description': description,
+  };
+}
+
 class _ServerIconDialog extends StatefulWidget {
   const _ServerIconDialog({required this.source, required this.token});
   final MediaSource source;
@@ -9526,7 +11333,7 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
   final _query = TextEditingController();
   List<_IconPackEntry> _icons = const [];
   List<String> _packs = const [];
-  Map<String, String> _packInfo = const {};
+  Map<String, _IconPackMetadata> _packInfo = const {};
   String? _selectedPack;
   bool _loading = false;
   String? _message;
@@ -9545,8 +11352,11 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
     final rawInfo = prefs.getString('yingji.server.icon-pack-info');
     final decoded = rawInfo == null ? null : jsonDecode(rawInfo);
     final info = decoded is Map
-        ? decoded.map((key, value) => MapEntry('$key', '$value'))
-        : <String, String>{};
+        ? decoded.map(
+            (key, value) =>
+                MapEntry('$key', _IconPackMetadata.fromJson('$key', value)),
+          )
+        : <String, _IconPackMetadata>{};
     final selected =
         prefs.getString('yingji.server.icon-pack-selected') ??
         (packs.isEmpty ? null : packs.last);
@@ -9558,7 +11368,7 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
     if (selected != null) unawaited(_selectPack(selected));
   }
 
-  Future<List<_IconPackEntry>> _readPack(String value) async {
+  Future<_IconPackData> _readPack(String value) async {
     final uri = Uri.tryParse(value.trim());
     if (uri == null || !['http', 'https'].contains(uri.scheme)) {
       throw Exception('图标包链接无效');
@@ -9603,7 +11413,19 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
         }
       }
       if (result.isEmpty) throw Exception('图标包中没有可用图标');
-      return result;
+      final map = data is Map ? data : const {};
+      String? text(dynamic value) =>
+          value == null || '$value'.trim().isEmpty ? null : '$value';
+      final metadata = _IconPackMetadata(
+        url: value,
+        name: text(map['name'] ?? map['title'] ?? map['packName']) ?? uri.host,
+        iconCount: result.length,
+        updatedAt: DateTime.now().toIso8601String(),
+        author: text(map['author'] ?? map['publisher'] ?? map['maintainer']),
+        version: text(map['version']),
+        description: text(map['description'] ?? map['summary']),
+      );
+      return _IconPackData(icons: result, metadata: metadata);
     } finally {
       client.close(force: true);
     }
@@ -9617,23 +11439,26 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
     });
     try {
       final value = _packUrl.text.trim();
-      final icons = await _readPack(value);
+      final pack = await _readPack(value);
       final prefs = await SharedPreferences.getInstance();
       final packs = {..._packs, value}.toList(growable: false);
-      final info = <String, String>{
+      final info = <String, _IconPackMetadata>{
         ..._packInfo,
-        value: '${Uri.parse(value).host} · ${icons.length} 个图标',
+        value: pack.metadata,
       };
       await prefs.setStringList('yingji.server.icon-packs', packs);
       await prefs.setString('yingji.server.icon-pack-selected', value);
-      await prefs.setString('yingji.server.icon-pack-info', jsonEncode(info));
+      await prefs.setString(
+        'yingji.server.icon-pack-info',
+        jsonEncode(info.map((key, value) => MapEntry(key, value.toJson()))),
+      );
       if (mounted) {
         setState(() {
           _packs = packs;
           _packInfo = info;
           _selectedPack = value;
-          _icons = icons;
-          _message = '已加载 ${icons.length} 个图标';
+          _icons = pack.icons;
+          _message = '已更新 ${pack.metadata.name} · ${pack.icons.length} 个图标';
         });
       }
     } catch (error) {
@@ -9655,14 +11480,20 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
       _message = null;
     });
     try {
-      final icons = await _readPack(value);
+      final pack = await _readPack(value);
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('yingji.server.icon-pack-selected', value);
+      final info = {..._packInfo, value: pack.metadata};
+      await prefs.setString(
+        'yingji.server.icon-pack-info',
+        jsonEncode(info.map((key, value) => MapEntry(key, value.toJson()))),
+      );
       if (mounted) {
         setState(() {
-          _icons = icons;
+          _icons = pack.icons;
+          _packInfo = info;
           _selectedPack = value;
-          _message = '已加载 ${icons.length} 个图标';
+          _message = '已更新 ${pack.metadata.name} · ${pack.icons.length} 个图标';
         });
       }
     } catch (error) {
@@ -9763,10 +11594,9 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
                   children: [
                     for (final pack in _packs)
                       ChoiceChip(
+                        avatar: const Icon(YingjiIcons.archivebox, size: 15),
                         label: Text(
-                          Uri.tryParse(pack)?.host.isNotEmpty == true
-                              ? Uri.parse(pack).host
-                              : pack,
+                          '${_packInfo[pack]?.name ?? Uri.tryParse(pack)?.host ?? '图标包'} · ${_packInfo[pack]?.iconCount ?? 0}',
                         ),
                         selected: _selectedPack == pack,
                         onSelected: (_) {
@@ -9784,7 +11614,7 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
                       _message ??
                           (_selectedPack == null
                               ? '可添加多条 JSON 图标包链接。'
-                              : (_packInfo[_selectedPack!] ?? '已选中图标包。')),
+                              : '来源：${Uri.tryParse(_selectedPack!)?.host ?? _selectedPack!}'),
                       style: const TextStyle(
                         color: YingjiColors.muted,
                         fontSize: 12,
@@ -9797,6 +11627,71 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
                   ),
                 ],
               ),
+              if (_selectedPack != null &&
+                  _packInfo[_selectedPack!] != null) ...[
+                const SizedBox(height: 8),
+                Builder(
+                  builder: (context) {
+                    final info = _packInfo[_selectedPack!]!;
+                    final updated = DateTime.tryParse(info.updatedAt)
+                        ?.toLocal();
+                    final stamp = updated == null
+                        ? '尚未记录'
+                        : '${updated.year}-${updated.month.toString().padLeft(2, '0')}-${updated.day.toString().padLeft(2, '0')} ${updated.hour.toString().padLeft(2, '0')}:${updated.minute.toString().padLeft(2, '0')}';
+                    return _FrostSurface(
+                      borderRadius: 14,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 11,
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  info.name,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  [
+                                    if (info.author?.isNotEmpty == true)
+                                      '作者 ${info.author}',
+                                    if (info.version?.isNotEmpty == true)
+                                      '版本 ${info.version}',
+                                    '${info.iconCount} 个图标',
+                                    '更新 $stamp',
+                                  ].join('  ·  '),
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                                if (info.description?.isNotEmpty == true) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    info.description!,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: YingjiColors.muted,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
               const SizedBox(height: 10),
               TextField(
                 controller: _query,
@@ -10079,6 +11974,121 @@ class _PlaylistTile extends StatelessWidget {
           ],
         ),
       ),
+    ),
+  );
+}
+
+class _ShortcutRecorder extends StatefulWidget {
+  const _ShortcutRecorder({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+  final String label, value;
+  final ValueChanged<String> onChanged;
+
+  @override
+  State<_ShortcutRecorder> createState() => _ShortcutRecorderState();
+}
+
+class _ShortcutRecorderState extends State<_ShortcutRecorder> {
+  final _focusNode = FocusNode();
+  bool _recording = false;
+
+  String get _displayValue => widget.value.contains('|')
+      ? widget.value.split('|').skip(1).join('|')
+      : widget.value;
+
+  String _keyName(LogicalKeyboardKey key) {
+    if (key == LogicalKeyboardKey.space) return 'Space';
+    if (key == LogicalKeyboardKey.arrowLeft) return 'Arrow Left';
+    if (key == LogicalKeyboardKey.arrowRight) return 'Arrow Right';
+    if (key == LogicalKeyboardKey.arrowUp) return 'Arrow Up';
+    if (key == LogicalKeyboardKey.arrowDown) return 'Arrow Down';
+    return key.keyLabel.isEmpty ? key.debugName ?? '未知按键' : key.keyLabel;
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Focus(
+    focusNode: _focusNode,
+    onKeyEvent: (_, event) {
+      if (!_recording || event is! KeyDownEvent) return KeyEventResult.ignored;
+      final name = _keyName(event.logicalKey);
+      widget.onChanged('${event.logicalKey.keyId}|$name');
+      setState(() => _recording = false);
+      return KeyEventResult.handled;
+    },
+    child: Semantics(
+      button: true,
+      label: '${widget.label}快捷键',
+      child: YingjiMotionSurface(
+        selected: _recording,
+        borderRadius: 13,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(13),
+          onTap: () {
+            setState(() => _recording = true);
+            _focusNode.requestFocus();
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: YingjiGlass.surface(strength: .72),
+              borderRadius: BorderRadius.circular(13),
+              border: Border.all(color: YingjiGlass.line(strength: 1.35)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.label,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                Text(
+                  _recording ? '请按下键盘按键…' : _displayValue,
+                  style: TextStyle(
+                    color: _recording ? Colors.white : YingjiColors.muted,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class _CacheStat extends StatelessWidget {
+  const _CacheStat({required this.label, required this.value});
+  final String label, value;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(strength: .72),
+      borderRadius: BorderRadius.circular(13),
+      border: Border.all(color: YingjiGlass.line(strength: 1.35)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(color: YingjiColors.muted, fontSize: 12),
+        ),
+        const SizedBox(width: 10),
+        Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
+      ],
     ),
   );
 }

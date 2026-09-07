@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -18,6 +20,43 @@ import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/source_store.dart';
 import '../tracking/trakt_client.dart';
+
+const _defaultShortcuts = <String, String>{
+  'playPause': 'Space',
+  'seekBack': 'Arrow Left',
+  'seekForward': 'Arrow Right',
+  'volumeUp': 'Arrow Up',
+  'volumeDown': 'Arrow Down',
+  'mute': 'M',
+  'fullscreen': 'F',
+  'exit': 'Escape',
+};
+
+LogicalKeyboardKey _shortcutKey(String value) {
+  if (value.contains('|')) {
+    final keyId = int.tryParse(value.split('|').first);
+    if (keyId != null) return LogicalKeyboardKey(keyId);
+  }
+  return switch (value) {
+    'Arrow Left' => LogicalKeyboardKey.arrowLeft,
+    'Arrow Right' => LogicalKeyboardKey.arrowRight,
+    'Arrow Up' => LogicalKeyboardKey.arrowUp,
+    'Arrow Down' => LogicalKeyboardKey.arrowDown,
+    'Enter' => LogicalKeyboardKey.enter,
+    'Escape' => LogicalKeyboardKey.escape,
+    'Backspace' => LogicalKeyboardKey.backspace,
+    'J' => LogicalKeyboardKey.keyJ,
+    'K' => LogicalKeyboardKey.keyK,
+    'L' => LogicalKeyboardKey.keyL,
+    'A' => LogicalKeyboardKey.keyA,
+    'D' => LogicalKeyboardKey.keyD,
+    'W' => LogicalKeyboardKey.keyW,
+    'S' => LogicalKeyboardKey.keyS,
+    'M' => LogicalKeyboardKey.keyM,
+    'F' => LogicalKeyboardKey.keyF,
+    _ => LogicalKeyboardKey.space,
+  };
+}
 
 class PlayerResourceOption {
   const PlayerResourceOption({
@@ -195,15 +234,17 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _night = false;
   bool _voiceEnhance = false;
   bool _danmakuEnabled = false;
-  String _danmakuName = '';
   String _danmakuUrl = '';
   String _activeDanmakuApi = '';
   String _matchedDanmakuEpisode = '';
   int _danmakuRequest = 0;
   bool _preferChineseSubtitle = true;
   String _subtitleLanguage = 'zh';
+  bool _preferAudioTrack = false;
+  String _audioLanguage = 'zh';
   bool _quickMenuOpen = false;
   bool _subtitleChosen = false;
+  bool _audioChosen = false;
   StreamSubscription<Tracks>? _subtitleSubscription;
   List<String> _danmakuApis = const [];
   double _danmakuOpacity = .82;
@@ -234,6 +275,15 @@ class _PlayerPageState extends State<PlayerPage> {
   List<PlaybackSegment> _segments = const [];
   String? _segmentMessage;
   bool _autoSkipSegments = true;
+  double _autoSkipDelaySeconds = 5;
+  bool _segmentServerSource = true;
+  bool _segmentIntroDbSource = true;
+  double _seekSeconds = 10;
+  double _volumeStep = 5;
+  Map<String, String> _shortcuts = Map.of(_defaultShortcuts);
+  bool _preloadNextEpisode = true;
+  double _preloadLeadMinutes = 5;
+  String? _preloadedUrl;
   Timer? _segmentTimer;
   bool _segmentActionPending = false;
 
@@ -276,6 +326,15 @@ class _PlayerPageState extends State<PlayerPage> {
     _focusNode = FocusNode(debugLabel: 'Mova 播放器快捷键');
     _controller = VideoController(_player);
     _subtitleSubscription = _player.stream.tracks.listen((tracks) {
+      if (_preferAudioTrack &&
+          !_audioChosen &&
+          _activeEpisode.initialAudioTrack == null) {
+        final audio = preferredAudioTrack(tracks.audio, _audioLanguage);
+        if (audio != null) {
+          _audioChosen = true;
+          unawaited(_player.setAudioTrack(audio));
+        }
+      }
       if (!_preferChineseSubtitle ||
           _subtitleChosen ||
           _activeEpisode.initialSubtitleTrack != null)
@@ -292,10 +351,10 @@ class _PlayerPageState extends State<PlayerPage> {
       unawaited(_syncProgress());
       unawaited(_saveWatchState());
     });
-    _segmentTimer = Timer.periodic(
-      const Duration(milliseconds: 500),
-      (_) => unawaited(_applySegmentSkip()),
-    );
+    _segmentTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      unawaited(_applySegmentSkip());
+      unawaited(_preloadNextIfNeeded());
+    });
     _player.stream.error.listen((value) {
       if (mounted && value.isNotEmpty) setState(() => _error = value);
     });
@@ -418,13 +477,28 @@ class _PlayerPageState extends State<PlayerPage> {
         true;
     _subtitleLanguage =
         prefs.getString('yingji.player.subtitle-language') ?? 'zh';
+    _preferAudioTrack =
+        prefs.getBool('yingji.player.audio-priority-enabled') ?? false;
+    _audioLanguage = prefs.getString('yingji.player.audio-language') ?? 'zh';
     _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
+    _preloadNextEpisode = prefs.getBool('yingji.player.preload-next') ?? true;
+    _preloadLeadMinutes =
+        prefs.getDouble('yingji.player.preload-lead-minutes') ?? 5;
+    _seekSeconds = prefs.getDouble('yingji.player.seek-seconds') ?? 10;
+    _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
+    final shortcutJson = prefs.getString('yingji.player.shortcuts');
+    final shortcutData = shortcutJson == null ? null : jsonDecode(shortcutJson);
+    if (shortcutData is Map) {
+      _shortcuts = {
+        ..._defaultShortcuts,
+        ...shortcutData.map((k, v) => MapEntry('$k', '$v')),
+      };
+    }
     _aspect = prefs.getString('yingji.player.aspect') ?? '自动';
     _volume = (prefs.getDouble('yingji.player.volume') ?? 100).clamp(0, 100);
     _muted = _volume <= 0;
     if (!_muted) _lastAudibleVolume = _volume;
     _danmakuEnabled = prefs.getBool('yingji.danmaku.enabled') ?? false;
-    _danmakuName = prefs.getString('yingji.danmaku.name') ?? '';
     _danmakuUrl = prefs.getString('yingji.danmaku.url') ?? '';
     _danmakuApis = prefs.getStringList('yingji.danmaku.apis') ?? [_danmakuUrl];
     _danmakuApis = _danmakuApis
@@ -451,6 +525,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _openCurrentMedia() async {
     final episode = _activeEpisode;
     _subtitleChosen = false;
+    _audioChosen = false;
     _skipDismissed.clear();
     _skipKind = null;
     _skipTicks = 0;
@@ -579,6 +654,7 @@ class _PlayerPageState extends State<PlayerPage> {
         _danmakuComments = const [];
         _danmakuError = null;
       });
+      _preloadedUrl = null;
       await _loadSegmentPreferences(await SharedPreferences.getInstance());
       await _openCurrentMedia();
       unawaited(_loadSegmentData());
@@ -589,6 +665,38 @@ class _PlayerPageState extends State<PlayerPage> {
       _revealControls();
     } finally {
       _switchingEpisode = false;
+    }
+  }
+
+  Future<void> _preloadNextIfNeeded() async {
+    if (!_preloadNextEpisode ||
+        _switchingEpisode ||
+        widget.episodes.isEmpty ||
+        _activeEpisodeIndex >= widget.episodes.length - 1)
+      return;
+    final duration = _player.state.duration;
+    final position = _player.state.position;
+    if (duration <= Duration.zero ||
+        duration - position > Duration(minutes: _preloadLeadMinutes.round()))
+      return;
+    final next = widget.episodes[_activeEpisodeIndex + 1];
+    if (_preloadedUrl == next.url) return;
+    _preloadedUrl = next.url;
+    final uri = Uri.tryParse(next.url);
+    if (uri == null || !['http', 'https'].contains(uri.scheme)) return;
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final request = await client.getUrl(uri);
+      next.headers.forEach(request.headers.set);
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-2097151');
+      final response = await request.close().timeout(
+        const Duration(seconds: 8),
+      );
+      await response.drain<void>();
+    } catch (_) {
+      _preloadedUrl = null;
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -659,16 +767,26 @@ class _PlayerPageState extends State<PlayerPage> {
       _introEnd = intro == null ? null : Duration(milliseconds: intro);
       _outroStart = outro == null ? null : Duration(milliseconds: outro);
       _autoSkipSegments =
-          prefs.getBool('yingji.segment.$_segmentKey.enabled') ?? true;
+          prefs.getBool('yingji.segment.$_segmentKey.enabled') ??
+          prefs.getBool('yingji.segment.auto-skip') ??
+          true;
+      _autoSkipDelaySeconds =
+          prefs.getDouble('yingji.segment.skip-delay-seconds') ?? 5;
+      _segmentServerSource =
+          prefs.getBool('yingji.segment.source-server') ?? true;
+      _segmentIntroDbSource =
+          prefs.getBool('yingji.segment.source-theintrodb') ?? true;
     });
   }
 
   Future<void> _loadSegmentData() async {
     final episode = _activeEpisode;
-    final local = _segmentsFromChapters(episode.chapters);
+    final local = _segmentServerSource
+        ? _segmentsFromChapters(episode.chapters)
+        : const <PlaybackSegment>[];
     var fetched = const <PlaybackSegment>[];
     String? message;
-    if (episode.tmdbId != null) {
+    if (_segmentIntroDbSource && episode.tmdbId != null) {
       final client = SegmentClient();
       try {
         fetched = await client.theIntroDb(
@@ -787,7 +905,9 @@ class _PlayerPageState extends State<PlayerPage> {
         _player.state.buffering)
       return;
     setState(() => _skipTicks++);
-    if (_skipTicks >= 10) await _performSegmentSkip();
+    if (_skipTicks >= (_autoSkipDelaySeconds * 2).round()) {
+      await _performSegmentSkip();
+    }
   }
 
   Future<void> _performSegmentSkip() async {
@@ -1325,21 +1445,28 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   Widget build(BuildContext context) => CallbackShortcuts(
     bindings: {
-      const SingleActivator(LogicalKeyboardKey.escape): () {
+      SingleActivator(_shortcutKey(_shortcuts['exit']!)): () {
         if (_settingsOpen) {
           setState(() => _settingsOpen = false);
         } else {
           _exitPlayer(context);
         }
       },
-      const SingleActivator(LogicalKeyboardKey.space): _togglePlayback,
-      const SingleActivator(LogicalKeyboardKey.arrowLeft): () =>
-          _seekBy(const Duration(seconds: -10)),
-      const SingleActivator(LogicalKeyboardKey.arrowRight): () =>
-          _seekBy(const Duration(seconds: 10)),
-      const SingleActivator(LogicalKeyboardKey.arrowUp): () => _adjustVolume(5),
-      const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
-          _adjustVolume(-5),
+      SingleActivator(_shortcutKey(_shortcuts['playPause']!)): _togglePlayback,
+      SingleActivator(_shortcutKey(_shortcuts['seekBack']!)): () =>
+          _seekBy(Duration(seconds: -_seekSeconds.round())),
+      SingleActivator(_shortcutKey(_shortcuts['seekForward']!)): () =>
+          _seekBy(Duration(seconds: _seekSeconds.round())),
+      SingleActivator(_shortcutKey(_shortcuts['volumeUp']!)): () =>
+          _adjustVolume(_volumeStep),
+      SingleActivator(_shortcutKey(_shortcuts['volumeDown']!)): () =>
+          _adjustVolume(-_volumeStep),
+      SingleActivator(_shortcutKey(_shortcuts['mute']!)): _toggleMute,
+      SingleActivator(_shortcutKey(_shortcuts['fullscreen']!)): () async {
+        await windowManager.setFullScreen(
+          !(await windowManager.isFullScreen()),
+        );
+      },
     },
     child: Focus(
       focusNode: _focusNode,
@@ -1828,7 +1955,7 @@ class _PlayerPageState extends State<PlayerPage> {
       case '弹幕':
         return [
           _consoleGroup('弹幕', [
-            '服务  ${_danmakuEnabled ? (_danmakuName.isEmpty ? '已启用' : _danmakuName) : '未启用'}',
+            '服务  ${_danmakuEnabled ? '自动选择最快 API' : '未启用'}',
             'API 地址  ${_activeDanmakuApi.isEmpty ? '尚无成功返回的来源' : _displayDanmakuApi}',
             if (_activeDanmakuApi.isNotEmpty) '匹配结果  $_matchedDanmakuEpisode',
             '请求剧集  ${_activeEpisode.title} · 第 ${_activeEpisode.seasonNumber ?? 1} 季 · 第 ${_activeEpisode.episodeNumber ?? 1} 集 · ${_activeEpisode.episodeTitle ?? '未提供集名'}',

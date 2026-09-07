@@ -108,54 +108,44 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('所有栏目均已隐藏'), findsOneWidget);
 
-    await tester.tap(find.byTooltip('发现页设置'));
+    await tester.tap(find.byTooltip('添加列表'));
     await tester.pumpAndSettle();
-    expect(find.text('发现页栏目编排'), findsOneWidget);
-    expect(find.text('列表内容'), findsWidgets);
-    await tester.tap(find.byType(Switch).first);
-    await tester.pumpAndSettle();
-    expect(find.text('显示的列表'), findsOneWidget);
-    expect(find.text('隐藏的列表'), findsOneWidget);
-    expect(
-      tester.getTopLeft(find.text('显示的列表')).dy,
-      lessThan(tester.getTopLeft(find.text('隐藏的列表')).dy),
-    );
+    expect(find.text('列表设置'), findsOneWidget);
+    expect(find.textContaining('当前筛选  TMDB · 电影'), findsOneWidget);
+    expect(find.text('内容筛选'), findsWidgets);
     expect(find.text('来源'), findsWidgets);
     expect(find.text('影视类型'), findsWidgets);
     expect(find.text('地区'), findsWidgets);
     expect(find.text('来源榜单'), findsWidgets);
-    expect(find.text('节目类型'), findsNothing);
-    expect(find.text('最低评分'), findsNothing);
-    await tester.tap(find.byTooltip('添加列表'));
-    await tester.pumpAndSettle();
+    expect(find.text('内容类型'), findsWidgets);
+    expect(find.text('原始语言'), findsWidgets);
+    expect(find.text('发行年份'), findsWidgets);
+    expect(find.text('发行时间'), findsWidgets);
+    expect(find.text('最低评分'), findsWidgets);
+    expect(find.text('评分人数'), findsWidgets);
+    expect(find.text('内容时长'), findsWidgets);
     expect(find.text('新列表 18'), findsWidgets);
     await tester.enterText(
       find.byKey(const ValueKey('discover-name-新列表 18')),
       '我的电影榜',
     );
-    await tester.tap(find.byTooltip('保存列表名称'));
+    await tester.ensureVisible(find.text('保存当前列表'));
+    await tester.tap(find.text('保存当前列表'));
     await tester.pumpAndSettle();
     expect(find.text('我的电影榜'), findsWidgets);
-    await tester.tap(find.text('TMDB').last);
+    expect(find.byTooltip('设置我的电影榜'), findsOneWidget);
+    await tester.tap(find.byTooltip('设置我的电影榜'));
     await tester.pumpAndSettle();
-    expect(find.text('TVmaze'), findsOneWidget);
-    await tester.tap(find.text('TVmaze'));
-    await tester.pumpAndSettle();
-    expect(find.text('地区今日播出'), findsWidgets);
-    await tester.tap(find.byTooltip('关闭').last);
+    expect(find.text('列表设置'), findsOneWidget);
+    await tester.ensureVisible(find.text('保存当前列表'));
+    await tester.tap(find.text('保存当前列表'));
     await tester.pump(const Duration(milliseconds: 400));
 
     final prefs = await SharedPreferences.getInstance();
     expect(
       prefs.getStringList('yingji.discover.hidden-sections') ??
           const <String>[],
-      isNot(contains('今日热门电视剧')),
-    );
-    expect(
-      prefs.getString('yingji.discover.section-sources'),
-      contains(
-        'custom|tvmaze|tv|all|schedule|US|all|all|all|all|all|all|HK|all',
-      ),
+      contains('今日热门电视剧'),
     );
     expect(prefs.getStringList('yingji.discover.sections'), contains('我的电影榜'));
     await tester.pumpWidget(const SizedBox.shrink());

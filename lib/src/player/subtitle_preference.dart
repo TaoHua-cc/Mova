@@ -10,6 +10,33 @@ const subtitleLanguages = <String, String>{
   'es': '西班牙语',
 };
 
+const audioLanguages = subtitleLanguages;
+
+AudioTrack? preferredAudioTrack(List<AudioTrack> tracks, String preferred) {
+  for (final track in tracks) {
+    if (track.id == 'auto' || track.id == 'no') continue;
+    final language = (track.language ?? '').toLowerCase();
+    final title = (track.title ?? '').toLowerCase();
+    final aliases = switch (preferred) {
+      'zh' =>
+        r'^(zh|zho|chi|cmn|yue)(-|_|$)|chinese|mandarin|cantonese|中文|国语|普通话|粤语',
+      'en' => r'^(en|eng)(-|_|$)|english|英语|英文',
+      'ja' => r'^(ja|jpn)(-|_|$)|japanese|日语|日文',
+      'ko' => r'^(ko|kor)(-|_|$)|korean|韩语|韩文',
+      'fr' => r'^(fr|fra|fre)(-|_|$)|french|法语',
+      'de' => r'^(de|deu|ger)(-|_|$)|german|德语',
+      'es' => r'^(es|spa)(-|_|$)|spanish|西班牙',
+      _ => '',
+    };
+    if (aliases.isNotEmpty &&
+        (RegExp(aliases).hasMatch(language) ||
+            RegExp(aliases).hasMatch(title))) {
+      return track;
+    }
+  }
+  return null;
+}
+
 SubtitleTrack? preferredChineseSubtitle(List<SubtitleTrack> tracks) =>
     preferredSubtitle(tracks, 'zh');
 

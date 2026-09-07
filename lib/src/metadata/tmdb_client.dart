@@ -416,6 +416,7 @@ class TmdbClient {
     int? genre,
     String? genres,
     String? provider,
+    String? company,
     String? originalLanguage,
     String? region,
     int? year,
@@ -453,6 +454,7 @@ class TmdbClient {
       'with_watch_providers': provider,
       'watch_region': ?watchRegion,
     },
+    'with_companies': ?company,
   }, typeHint: type);
 
   static String _dateQuery(DateTime value) =>

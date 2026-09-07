@@ -34,4 +34,17 @@ void main() {
     );
     expect(preferredChineseSubtitle([]), isNull);
   });
+  test(
+    'selects preferred audio language without overriding absent matches',
+    () {
+      final tracks = [
+        AudioTrack('1', 'English 5.1', 'eng'),
+        AudioTrack('2', '国语', 'chi'),
+        AudioTrack('3', '日本語', 'jpn'),
+      ];
+      expect(preferredAudioTrack(tracks, 'zh')?.id, '2');
+      expect(preferredAudioTrack(tracks, 'ja')?.id, '3');
+      expect(preferredAudioTrack(tracks, 'ko'), isNull);
+    },
+  );
 }

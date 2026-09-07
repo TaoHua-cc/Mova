@@ -71,4 +71,51 @@ void main() {
     expect(tester.takeException(), isNull);
     yingjiAppearance.apply(glassBlur: 24, glassOpacity: .58);
   });
+
+  testWidgets('scrolling dialog keeps header and actions pinned', (
+    tester,
+  ) async {
+    const headerKey = Key('pinned-header');
+    const actionKey = Key('pinned-action');
+    tester.view.physicalSize = const Size(1000, 760);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: YingjiPinnedDialog(
+          maxHeight: 560,
+          header: const Text('固定标题', key: headerKey),
+          body: Column(
+            children: List.generate(
+              30,
+              (index) => SizedBox(height: 48, child: Text('滚动内容 $index')),
+            ),
+          ),
+          actions: const Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton(
+              key: actionKey,
+              onPressed: null,
+              child: Text('保存'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final headerBefore = tester.getTopLeft(find.byKey(headerKey));
+    final actionBefore = tester.getTopLeft(find.byKey(actionKey));
+    await tester.drag(
+      find.byType(SingleChildScrollView),
+      const Offset(0, -420),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.getTopLeft(find.byKey(headerKey)), headerBefore);
+    expect(tester.getTopLeft(find.byKey(actionKey)), actionBefore);
+    expect(find.text('滚动内容 20'), findsOneWidget);
+  });
 }
