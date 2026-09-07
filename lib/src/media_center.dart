@@ -2309,7 +2309,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    '列表可添加、删除和排序；内容只按来源、影视类型、地区与来源榜单配置。',
+                    '列表可添加、删除和排序；内容只按来源、影视题材、地区与来源榜单配置。',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   const SizedBox(height: 16),
@@ -3039,7 +3039,12 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ? baseSource
         : selection.withPlatform(filters.platform).encoded;
     final rows = await _loadSection(source, page);
-    return _applyDiscoverListFilters(rows, filters.type, filters.sort);
+    return _applyDiscoverListFilters(
+      rows,
+      filters.type,
+      filters.sort,
+      filters.descending,
+    );
   }
 
   @override
@@ -3717,7 +3722,7 @@ class _DiscoverSourceEditor extends StatelessWidget {
                   onChanged: (item) => update(nextProvider: item),
                 ),
                 _DiscoverFilterField(
-                  label: '影视类型',
+                  label: '影视题材',
                   value: contentType,
                   labels: provider == 'tvmaze'
                       ? const {'tv': '剧集'}
@@ -4444,21 +4449,23 @@ const _discoverListFilterKeyPrefix = 'yingji.discover.all-list.filters.';
 String _discoverListFilterKey(String title) =>
     '$_discoverListFilterKeyPrefix${base64Url.encode(utf8.encode(title))}';
 
-Future<({String type, String sort, String platform})> _readDiscoverListFilters(
-  String title,
-) async {
+Future<({String type, String sort, String platform, bool descending})>
+_readDiscoverListFilters(String title) async {
   final prefs = await SharedPreferences.getInstance();
   final saved = prefs.getString(_discoverListFilterKey(title));
-  if (saved == null) return (type: 'all', sort: '热度', platform: '');
+  if (saved == null) {
+    return (type: 'all', sort: '热度', platform: '', descending: true);
+  }
   try {
     final value = jsonDecode(saved) as Map<String, dynamic>;
     return (
       type: value['type'] as String? ?? 'all',
       sort: value['sort'] as String? ?? '热度',
       platform: value['platform'] as String? ?? 'all',
+      descending: value['descending'] as bool? ?? true,
     );
   } catch (_) {
-    return (type: 'all', sort: '热度', platform: '');
+    return (type: 'all', sort: '热度', platform: '', descending: true);
   }
 }
 
@@ -4466,6 +4473,7 @@ List<TmdbItem> _applyDiscoverListFilters(
   Iterable<TmdbItem> source,
   String type,
   String sort,
+  bool descending,
 ) {
   bool animation(TmdbItem item) => item.genres.contains('动画');
   bool variety(TmdbItem item) =>
@@ -4480,9 +4488,19 @@ List<TmdbItem> _applyDiscoverListFilters(
     };
   }).toList();
   if (sort == '评分') {
-    rows.sort((a, b) => b.rating.compareTo(a.rating));
+    rows.sort(
+      (a, b) => descending
+          ? b.rating.compareTo(a.rating)
+          : a.rating.compareTo(b.rating),
+    );
   } else if (sort == '年份') {
-    rows.sort((a, b) => (b.year ?? 0).compareTo(a.year ?? 0));
+    rows.sort(
+      (a, b) => descending
+          ? (b.year ?? 0).compareTo(a.year ?? 0)
+          : (a.year ?? 0).compareTo(b.year ?? 0),
+    );
+  } else if (!descending) {
+    return rows.reversed.toList();
   }
   return rows;
 }
@@ -4492,10 +4510,12 @@ class _RankingFilter extends StatelessWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.trailingIcon,
   });
   final String label;
   final bool selected;
   final VoidCallback onTap;
+  final IconData? trailingIcon;
 
   @override
   Widget build(BuildContext context) => InkWell(
@@ -4509,13 +4529,26 @@ class _RankingFilter extends StatelessWidget {
         borderRadius: BorderRadius.circular(13),
         border: Border.all(color: selected ? Colors.white : YingjiGlass.line()),
       ),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontSize: 12,
-          color: selected ? YingjiColors.canvas : Colors.white,
-          fontWeight: FontWeight.w700,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              color: selected ? YingjiColors.canvas : Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          if (trailingIcon != null) ...[
+            const SizedBox(width: 5),
+            Icon(
+              trailingIcon,
+              size: 14,
+              color: selected ? YingjiColors.canvas : Colors.white,
+            ),
+          ],
+        ],
       ),
     ),
   );
@@ -4578,6 +4611,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
   int _feedRevision = 0;
   String _type = 'all';
   String _sort = '热度';
+  bool _sortDescending = true;
   String _platform = 'all';
   bool _filterChanged = false;
 
@@ -4606,6 +4640,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
       final value = jsonDecode(saved) as Map<String, dynamic>;
       final type = value['type'] as String?;
       final sort = value['sort'] as String?;
+      final descending = value['descending'] as bool? ?? true;
       final platform = value['platform'] as String?;
       if (!mounted || _filterChanged) return;
       final platformChanged = platform != null && platform != _platform;
@@ -4620,6 +4655,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
         };
         if (_types.containsKey(normalizedType)) _type = normalizedType!;
         if (_sorts.contains(sort)) _sort = sort!;
+        _sortDescending = descending;
         if (platform != null) _platform = platform;
       });
       if (platformChanged) unawaited(_reloadPlatform());
@@ -4632,7 +4668,14 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     setState(() {
       _filterChanged = true;
       if (type != null) _type = type;
-      if (sort != null) _sort = sort;
+      if (sort != null) {
+        if (_sort == sort) {
+          _sortDescending = !_sortDescending;
+        } else {
+          _sort = sort;
+          _sortDescending = true;
+        }
+      }
     });
     unawaited(_saveFilters());
   }
@@ -4641,7 +4684,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       _filterKey,
-      jsonEncode({'type': _type, 'sort': _sort, 'platform': _platform}),
+      jsonEncode({
+        'type': _type,
+        'sort': _sort,
+        'descending': _sortDescending,
+        'platform': _platform,
+      }),
     );
   }
 
@@ -4711,7 +4759,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
 
   @override
   Widget build(BuildContext context) {
-    final rows = _applyDiscoverListFilters(_items, _type, _sort);
+    final rows = _applyDiscoverListFilters(
+      _items,
+      _type,
+      _sort,
+      _sortDescending,
+    );
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: YingjiBackdrop(
@@ -4757,7 +4810,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                               crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
                                 _DiscoverListFilterGroup(
-                                  label: '影视类型',
+                                  label: '影视题材',
                                   child: Wrap(
                                     spacing: 8,
                                     runSpacing: 8,
@@ -4782,6 +4835,11 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                                         _RankingFilter(
                                           label: label,
                                           selected: _sort == label,
+                                          trailingIcon: _sort == label
+                                              ? (_sortDescending
+                                                    ? YingjiIcons.chevron_down
+                                                    : YingjiIcons.chevron_up)
+                                              : null,
                                           onTap: () =>
                                               _selectFilter(sort: label),
                                         ),

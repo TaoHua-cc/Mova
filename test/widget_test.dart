@@ -120,7 +120,7 @@ void main() {
     expect(find.textContaining('当前筛选  TMDB · 电影'), findsOneWidget);
     expect(find.text('内容筛选'), findsWidgets);
     expect(find.text('来源'), findsWidgets);
-    expect(find.text('影视类型'), findsWidgets);
+    expect(find.text('影视题材'), findsWidgets);
     expect(find.text('地区'), findsWidgets);
     expect(find.text('来源榜单'), findsWidgets);
     expect(find.text('题材类型'), findsWidgets);
