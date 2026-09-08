@@ -7676,6 +7676,8 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _traktMessage;
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
+  Map<String, Object> _persistedSettings = const {};
+  Future<void> _saveQueue = Future<void>.value();
 
   void _changeShortcut(String action, String value) {
     String label(String raw) => raw.contains('|')
@@ -7824,110 +7826,150 @@ class _SettingsPageState extends State<SettingsPage> {
           );
         _danmakuToken.text = prefs.getString('yingji.danmaku.token') ?? '';
       });
+      _persistedSettings = _settingsSnapshot();
       _applyAppearance();
       unawaited(_refreshCacheStats());
     }
   }
 
-  Future<void> _save({bool feedback = false}) async {
+  Map<String, Object> _settingsSnapshot() {
     final danmakuApis = _danmakuApiControllers
         .map((controller) => controller.text.trim())
         .where((value) => value.isNotEmpty)
         .toList(growable: false);
-    if (_danmakuEnabled && danmakuApis.isEmpty) {
-      if (mounted) setState(() => _savedMessage = '请填写弹幕 API 地址，或关闭弹幕');
-      return;
-    }
-    for (final api in danmakuApis) {
-      final candidate = api.replaceAllMapped(
-        RegExp(r'\{(?:tmdbId|title|season|episode|url)\}'),
-        (_) => 'test',
-      );
-      final uri = Uri.tryParse(candidate);
-      if (uri == null || !['http', 'https'].contains(uri.scheme)) {
-        if (mounted) setState(() => _savedMessage = '弹幕 API 地址无效');
-        return;
-      }
-    }
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('yingji.player.hardware', _hardware);
-    await prefs.setBool('yingji.player.hdr', _hdr);
-    await prefs.setBool('yingji.player.downmix', _downmix);
-    await prefs.setBool('yingji.player.night', _night);
-    await prefs.setBool('yingji.player.voice-enhance', _voiceEnhance);
-    await prefs.setBool('yingji.player.resume-prompt', _resumePrompt);
-    await prefs.setBool('yingji.home.continue-watching', _homeContinueWatching);
-    await prefs.setBool('yingji.home.show-icon', _homeShowIcon);
-    await prefs.setBool('yingji.home.auto-carousel', _homeAutoCarousel);
-    await prefs.setBool('yingji.home.show-dots', _homeShowCarouselDots);
-    await prefs.setDouble('yingji.home.carousel-seconds', _homeCarouselSeconds);
-    await prefs.setString('yingji.home.carousel-source', _homeCarouselSource);
-    await prefs.setString('yingji.home.carousel-effect', _homeCarouselEffect);
-    yingjiBackdropEffect.value = _homeCarouselEffect;
-    await prefs.setString('yingji.appearance.theme', _appearanceTheme);
-    await prefs.setString('yingji.appearance.icon', _appearanceIcon);
-    await prefs.setString('yingji.appearance.font', _appearanceFont);
-    await prefs.setDouble(
-      'yingji.appearance.glass-opacity',
-      _appearanceGlassOpacity,
-    );
-    await prefs.setDouble('yingji.appearance.glass-blur', _appearanceGlassBlur);
-    await prefs.setDouble('yingji.appearance.card-depth', _appearanceCardDepth);
-    await prefs.setDouble('yingji.player.speed', _defaultSpeed);
-    await prefs.setDouble('yingji.player.audio-delay', _audioDelay);
-    await prefs.setDouble('yingji.player.subtitle-delay', _subtitleDelay);
-    await prefs.setBool(
-      'yingji.player.subtitle-priority-enabled',
-      _preferChineseSubtitle,
-    );
-    await prefs.setString('yingji.player.subtitle-language', _subtitleLanguage);
-    await prefs.setBool(
-      'yingji.player.audio-priority-enabled',
-      _preferAudioTrack,
-    );
-    await prefs.setString('yingji.player.audio-language', _audioLanguage);
-    await prefs.setDouble('yingji.player.cache-seconds', _cacheSeconds);
-    await prefs.setString('yingji.player.aspect', _aspect);
-    await prefs.setBool('yingji.segment.auto-skip', _autoSkipSegments);
-    await prefs.setDouble(
-      'yingji.segment.skip-delay-seconds',
-      _autoSkipDelaySeconds,
-    );
-    await prefs.setBool('yingji.segment.source-server', _segmentServerSource);
-    await prefs.setBool(
-      'yingji.segment.source-theintrodb',
-      _segmentIntroDbSource,
-    );
-    await prefs.setDouble('yingji.player.seek-seconds', _seekSeconds);
-    await prefs.setDouble('yingji.player.volume-step', _volumeStep);
-    await prefs.setBool('yingji.player.preload-next', _preloadNextEpisode);
-    await prefs.setDouble(
-      'yingji.player.preload-lead-minutes',
-      _preloadLeadMinutes,
-    );
-    await prefs.setBool('yingji.system.close-to-tray', _closeToTray);
-    await prefs.setString('yingji.player.shortcuts', jsonEncode(_shortcuts));
-    await prefs.setString('yingji.tmdb.api-key', _tmdbApiKey.text.trim());
-    await prefs.setString('yingji.trakt.client-id', _traktClientId.text.trim());
-    await prefs.setString(
-      'yingji.trakt.client-secret',
-      _traktClientSecret.text.trim(),
-    );
-    await prefs.setString('yingji.trakt.access-token', _traktToken.text.trim());
-    await prefs.setBool('yingji.danmaku.enabled', _danmakuEnabled);
-    await prefs.remove('yingji.danmaku.name');
-    await prefs.setString('yingji.danmaku.url', danmakuApis.firstOrNull ?? '');
-    await prefs.setStringList('yingji.danmaku.apis', danmakuApis);
-    await prefs.setStringList(
-      'yingji.danmaku.api-names',
-      List.generate(
+    return <String, Object>{
+      'yingji.player.hardware': _hardware,
+      'yingji.player.hdr': _hdr,
+      'yingji.player.downmix': _downmix,
+      'yingji.player.night': _night,
+      'yingji.player.voice-enhance': _voiceEnhance,
+      'yingji.player.resume-prompt': _resumePrompt,
+      'yingji.home.continue-watching': _homeContinueWatching,
+      'yingji.home.show-icon': _homeShowIcon,
+      'yingji.home.auto-carousel': _homeAutoCarousel,
+      'yingji.home.show-dots': _homeShowCarouselDots,
+      'yingji.home.carousel-seconds': _homeCarouselSeconds,
+      'yingji.home.carousel-source': _homeCarouselSource,
+      'yingji.home.carousel-effect': _homeCarouselEffect,
+      'yingji.appearance.theme': _appearanceTheme,
+      'yingji.appearance.icon': _appearanceIcon,
+      'yingji.appearance.font': _appearanceFont,
+      'yingji.appearance.glass-opacity': _appearanceGlassOpacity,
+      'yingji.appearance.glass-blur': _appearanceGlassBlur,
+      'yingji.appearance.card-depth': _appearanceCardDepth,
+      'yingji.player.speed': _defaultSpeed,
+      'yingji.player.audio-delay': _audioDelay,
+      'yingji.player.subtitle-delay': _subtitleDelay,
+      'yingji.player.subtitle-priority-enabled': _preferChineseSubtitle,
+      'yingji.player.subtitle-language': _subtitleLanguage,
+      'yingji.player.audio-priority-enabled': _preferAudioTrack,
+      'yingji.player.audio-language': _audioLanguage,
+      'yingji.player.cache-seconds': _cacheSeconds,
+      'yingji.player.aspect': _aspect,
+      'yingji.segment.auto-skip': _autoSkipSegments,
+      'yingji.segment.skip-delay-seconds': _autoSkipDelaySeconds,
+      'yingji.segment.source-server': _segmentServerSource,
+      'yingji.segment.source-theintrodb': _segmentIntroDbSource,
+      'yingji.player.seek-seconds': _seekSeconds,
+      'yingji.player.volume-step': _volumeStep,
+      'yingji.player.preload-next': _preloadNextEpisode,
+      'yingji.player.preload-lead-minutes': _preloadLeadMinutes,
+      'yingji.system.close-to-tray': _closeToTray,
+      'yingji.player.shortcuts': jsonEncode(_shortcuts),
+      'yingji.tmdb.api-key': _tmdbApiKey.text.trim(),
+      'yingji.trakt.client-id': _traktClientId.text.trim(),
+      'yingji.trakt.client-secret': _traktClientSecret.text.trim(),
+      'yingji.trakt.access-token': _traktToken.text.trim(),
+      'yingji.danmaku.enabled': _danmakuEnabled,
+      'yingji.danmaku.url': danmakuApis.firstOrNull ?? '',
+      'yingji.danmaku.apis': danmakuApis,
+      'yingji.danmaku.api-names': List.generate(
         danmakuApis.length,
         (index) => index < _danmakuApiNameControllers.length
             ? _danmakuApiNameControllers[index].text.trim()
             : '',
       ),
+      'yingji.danmaku.token': _danmakuToken.text.trim(),
+    };
+  }
+
+  bool _sameSettingValue(Object? previous, Object current) {
+    if (previous is List && current is List) {
+      if (previous.length != current.length) return false;
+      for (var index = 0; index < current.length; index++) {
+        if (previous[index] != current[index]) return false;
+      }
+      return true;
+    }
+    return previous == current;
+  }
+
+  Future<bool> _writeSetting(
+    SharedPreferences prefs,
+    String key,
+    Object value,
+  ) {
+    if (value is bool) return prefs.setBool(key, value);
+    if (value is double) return prefs.setDouble(key, value);
+    if (value is String) return prefs.setString(key, value);
+    if (value is List<String>) return prefs.setStringList(key, value);
+    throw ArgumentError.value(value, key, 'Unsupported setting value');
+  }
+
+  Future<void> _save({bool feedback = false}) {
+    final pending = _saveQueue.then(
+      (_) => _saveChangedSettings(feedback: feedback),
     );
-    await prefs.setString('yingji.danmaku.token', _danmakuToken.text.trim());
+    _saveQueue = pending.catchError((_) {});
+    return pending;
+  }
+
+  Future<void> _saveChangedSettings({required bool feedback}) async {
+    final values = _settingsSnapshot();
+    final changed = Map<String, Object>.fromEntries(
+      values.entries.where(
+        (entry) =>
+            !_sameSettingValue(_persistedSettings[entry.key], entry.value),
+      ),
+    );
+    final changesDanmaku = changed.keys.any(
+      (key) => key.startsWith('yingji.danmaku.'),
+    );
+    final danmakuApis = values['yingji.danmaku.apis']! as List<String>;
+    if (changesDanmaku && _danmakuEnabled && danmakuApis.isEmpty) {
+      if (mounted) setState(() => _savedMessage = '请填写弹幕 API 地址，或关闭弹幕');
+      return;
+    }
+    if (changesDanmaku) {
+      for (final api in danmakuApis) {
+        final candidate = api.replaceAllMapped(
+          RegExp(r'\{(?:tmdbId|title|season|episode|url)\}'),
+          (_) => 'test',
+        );
+        final uri = Uri.tryParse(candidate);
+        if (uri == null || !['http', 'https'].contains(uri.scheme)) {
+          if (mounted) setState(() => _savedMessage = '弹幕 API 地址无效');
+          return;
+        }
+      }
+    }
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.containsKey('yingji.danmaku.name')) {
+      await prefs.remove('yingji.danmaku.name');
+    }
+    for (final entry in changed.entries) {
+      if (await _writeSetting(prefs, entry.key, entry.value)) {
+        _persistedSettings = {
+          ..._persistedSettings,
+          entry.key: entry.value is List<String>
+              ? List<String>.of(entry.value as List<String>)
+              : entry.value,
+        };
+      }
+    }
+    if (changed.containsKey('yingji.home.carousel-effect')) {
+      yingjiBackdropEffect.value = _homeCarouselEffect;
+    }
     if (feedback && mounted) setState(() => _savedMessage = '已保存');
   }
 
@@ -8546,9 +8588,11 @@ class _SettingsPageState extends State<SettingsPage> {
                                     setState(
                                       () => _appearanceGlassOpacity = value,
                                     );
-                                    _applyAppearance();
                                   },
-                                  onChangeEnd: (_) => _save(),
+                                  onChangeEnd: (_) {
+                                    _applyAppearance();
+                                    _save();
+                                  },
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
@@ -8572,9 +8616,11 @@ class _SettingsPageState extends State<SettingsPage> {
                                     setState(
                                       () => _appearanceGlassBlur = value,
                                     );
-                                    _applyAppearance();
                                   },
-                                  onChangeEnd: (_) => _save(),
+                                  onChangeEnd: (_) {
+                                    _applyAppearance();
+                                    _save();
+                                  },
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
@@ -8599,9 +8645,11 @@ class _SettingsPageState extends State<SettingsPage> {
                                     setState(
                                       () => _appearanceCardDepth = value,
                                     );
-                                    _applyAppearance();
                                   },
-                                  onChangeEnd: (_) => _save(),
+                                  onChangeEnd: (_) {
+                                    _applyAppearance();
+                                    _save();
+                                  },
                                 ),
                               ],
                             ),

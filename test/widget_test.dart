@@ -95,6 +95,36 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+  testWidgets('changing one setting writes only that preference', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    tester.view.physicalSize = const Size(1440, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: SettingsPage())),
+    );
+    await tester.pumpAndSettle();
+
+    final settingRow = find
+        .ancestor(of: find.text('显示首页图标'), matching: find.byType(Row))
+        .first;
+    final toggle = find.descendant(
+      of: settingRow,
+      matching: find.byType(Switch),
+    );
+    expect(toggle, findsOneWidget);
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('yingji.home.show-icon'), isFalse);
+    expect(prefs.containsKey('yingji.player.hardware'), isFalse);
+    expect(prefs.containsKey('yingji.appearance.theme'), isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
   testWidgets('discover shelves can be shown and persist their layout', (
     tester,
   ) async {
