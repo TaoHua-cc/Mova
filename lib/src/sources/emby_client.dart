@@ -105,9 +105,10 @@ class MediaTrack {
 }
 
 class MediaChapter {
-  const MediaChapter({required this.title, required this.start});
+  const MediaChapter({required this.title, required this.start, this.end});
   final String title;
   final Duration start;
+  final Duration? end;
 }
 
 class EmbySession {
@@ -133,6 +134,49 @@ class EmbyLibraryStats {
 class EmbyClient {
   EmbyClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
+
+  /// Jellyfin 10.10+ native media segments. Older Jellyfin and Emby servers
+  /// return 404, which is an expected capability miss rather than an error.
+  Future<List<MediaChapter>> mediaSegments(
+    EmbySession session,
+    String itemId,
+  ) async {
+    if (itemId.isEmpty) return const [];
+    final response = await _client
+        .get(
+          session.source.endpoint
+              .resolve('MediaSegments/$itemId')
+              .replace(queryParameters: {'api_key': session.token}),
+          headers: {
+            'Accept': 'application/json',
+            'X-Emby-Token': session.token,
+          },
+        )
+        .timeout(const Duration(seconds: 6));
+    if (response.statusCode == 404) return const [];
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_message(response.statusCode, '服务器分段读取失败'));
+    }
+    final root = jsonDecode(response.body);
+    final rows = root is List
+        ? root
+        : root is Map && root['Items'] is List
+        ? root['Items'] as List
+        : const [];
+    return rows
+        .whereType<Map>()
+        .map((row) {
+          final start = (row['StartTicks'] as num?)?.toInt() ?? 0;
+          final end = (row['EndTicks'] as num?)?.toInt();
+          return MediaChapter(
+            title: '${row['Type'] ?? 'Unknown'}',
+            start: Duration(microseconds: start ~/ 10),
+            end: end == null ? null : Duration(microseconds: end ~/ 10),
+          );
+        })
+        .where((segment) => segment.start >= Duration.zero)
+        .toList(growable: false);
+  }
 
   /// Selects the first line that accepts this saved login, not merely the
   /// first reverse proxy that answers a public health request.

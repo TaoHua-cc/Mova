@@ -278,6 +278,9 @@ class _PlayerPageState extends State<PlayerPage> {
   double _autoSkipDelaySeconds = 5;
   bool _segmentServerSource = true;
   bool _segmentIntroDbSource = true;
+  bool _segmentTheIntroDbSource = true;
+  bool _segmentAniSkipSource = true;
+  bool _segmentChaptersDbSource = true;
   double _seekSeconds = 10;
   double _volumeStep = 5;
   Map<String, String> _shortcuts = Map.of(_defaultShortcuts);
@@ -775,34 +778,124 @@ class _PlayerPageState extends State<PlayerPage> {
       _segmentServerSource =
           prefs.getBool('yingji.segment.source-server') ?? true;
       _segmentIntroDbSource =
+          prefs.getBool('yingji.segment.source-introdb') ?? true;
+      _segmentTheIntroDbSource =
           prefs.getBool('yingji.segment.source-theintrodb') ?? true;
+      _segmentAniSkipSource =
+          prefs.getBool('yingji.segment.source-aniskip') ?? true;
+      _segmentChaptersDbSource =
+          prefs.getBool('yingji.segment.source-chaptersdb') ?? true;
     });
   }
 
   Future<void> _loadSegmentData() async {
     final episode = _activeEpisode;
-    final local = _segmentServerSource
+    var local = _segmentServerSource
         ? _segmentsFromChapters(episode.chapters)
         : const <PlaybackSegment>[];
-    var fetched = const <PlaybackSegment>[];
-    String? message;
-    if (_segmentIntroDbSource && episode.tmdbId != null) {
-      final client = SegmentClient();
+    final fetched = <PlaybackSegment>[];
+    final failures = <String>[];
+    if (_segmentServerSource && episode.serverItemId != null) {
       try {
-        fetched = await client.theIntroDb(
-          tmdbId: episode.tmdbId!,
-          season: episode.seasonNumber,
-          episode: episode.episodeNumber,
-          duration: _player.state.duration,
-        );
+        final store = await SourceStore.create();
+        final source = store
+            .load()
+            .where((value) => value.id == episode.sourceId)
+            .firstOrNull;
+        final token = source == null ? null : store.tokenFor(source);
+        if (source != null &&
+            source.kind != SourceKind.webdav &&
+            token != null &&
+            token.isNotEmpty) {
+          final server = EmbyClient();
+          try {
+            final native = await server.mediaSegments(
+              EmbySession(source: source, token: token),
+              episode.serverItemId!,
+            );
+            if (native.isNotEmpty) {
+              local = [
+                ..._segmentsFromChapters(native, provider: '服务器原生分段'),
+                ...local,
+              ];
+            }
+          } finally {
+            server.dispose();
+          }
+        }
       } catch (_) {
-        message = 'TheIntroDB 暂无可用数据';
-      } finally {
-        client.dispose();
+        failures.add('服务器分段');
       }
     }
+    final client = SegmentClient();
+    try {
+      final tmdbId = episode.tmdbId;
+      if (tmdbId != null) {
+        SegmentIdentifiers? ids;
+        if (_segmentIntroDbSource ||
+            _segmentAniSkipSource ||
+            _segmentChaptersDbSource) {
+          try {
+            ids = await client.identifiers(
+              tmdbId: tmdbId,
+              movie: episode.seasonNumber == null,
+            );
+          } catch (_) {
+            failures.add('外部标识');
+          }
+        }
+        final requests = <Future<List<PlaybackSegment>>>[
+          if (_segmentIntroDbSource &&
+              ids?.imdbId != null &&
+              episode.seasonNumber != null &&
+              episode.episodeNumber != null)
+            client.introDb(
+              imdbId: ids!.imdbId!,
+              season: episode.seasonNumber!,
+              episode: episode.episodeNumber!,
+            ),
+          if (_segmentTheIntroDbSource)
+            client.theIntroDb(
+              tmdbId: tmdbId,
+              season: episode.seasonNumber,
+              episode: episode.episodeNumber,
+              duration: _player.state.duration,
+            ),
+          if (_segmentAniSkipSource &&
+              ids?.malId != null &&
+              episode.episodeNumber != null)
+            client.aniSkip(
+              malId: ids!.malId!,
+              episode: episode.episodeNumber!,
+              duration: _player.state.duration,
+            ),
+          if (_segmentChaptersDbSource &&
+              (ids?.imdbId != null || ids?.tvdbId != null))
+            client.chaptersDb(
+              imdbId: ids?.imdbId,
+              season: episode.seasonNumber,
+              episode: episode.episodeNumber,
+            ),
+        ];
+        final results = await Future.wait(
+          requests.map((request) async {
+            try {
+              return await request;
+            } catch (_) {
+              failures.add('公共来源');
+              return const <PlaybackSegment>[];
+            }
+          }),
+        );
+        for (final result in results) {
+          fetched.addAll(result);
+        }
+      }
+    } finally {
+      client.dispose();
+    }
     if (!mounted) return;
-    final segments = [...local, ...fetched];
+    final segments = _dedupeSegments([...local, ...fetched]);
     final intro = segments
         .where((item) => item.type == PlaybackSegmentType.intro)
         .firstOrNull;
@@ -811,27 +904,67 @@ class _PlayerPageState extends State<PlayerPage> {
         .firstOrNull;
     setState(() {
       _segments = segments;
-      _segmentMessage = message ?? (segments.isEmpty ? '当前数据源未提供片头片尾信息' : null);
+      _segmentMessage = segments.isEmpty
+          ? failures.isEmpty
+                ? '当前数据源未提供片头片尾信息'
+                : '部分来源暂时不可用，且未找到片头片尾信息'
+          : failures.isEmpty
+          ? null
+          : '已使用可用来源，部分来源暂时不可用';
       _introEnd ??= intro?.end;
       _outroStart ??= credits?.start;
     });
   }
 
-  List<PlaybackSegment> _segmentsFromChapters(List<MediaChapter> chapters) {
+  List<PlaybackSegment> _dedupeSegments(List<PlaybackSegment> values) {
+    final result = <PlaybackSegment>[];
+    for (final value in values) {
+      final duplicate = result.any(
+        (existing) =>
+            existing.type == value.type &&
+            (existing.start - value.start).abs() < const Duration(seconds: 2),
+      );
+      if (!duplicate) result.add(value);
+    }
+    return result;
+  }
+
+  List<PlaybackSegment> _segmentsFromChapters(
+    List<MediaChapter> chapters, {
+    String provider = '服务器章节',
+  }) {
     final results = <PlaybackSegment>[];
     for (var index = 0; index < chapters.length; index++) {
       final chapter = chapters[index];
       final name = chapter.title.toLowerCase();
-      final next = index + 1 < chapters.length
-          ? chapters[index + 1].start
-          : null;
+      final next =
+          chapter.end ??
+          (index + 1 < chapters.length ? chapters[index + 1].start : null);
       if (name.contains('intro') || name.contains('片头')) {
         results.add(
           PlaybackSegment(
             type: PlaybackSegmentType.intro,
             start: chapter.start,
             end: next,
-            provider: '服务器章节',
+            provider: provider,
+          ),
+        );
+      } else if (name.contains('recap') || name.contains('前情')) {
+        results.add(
+          PlaybackSegment(
+            type: PlaybackSegmentType.recap,
+            start: chapter.start,
+            end: next,
+            provider: provider,
+          ),
+        );
+      } else if (name.contains('preview') || name.contains('预告')) {
+        results.add(
+          PlaybackSegment(
+            type: PlaybackSegmentType.preview,
+            start: chapter.start,
+            end: next,
+            provider: provider,
           ),
         );
       } else if (name.contains('credit') ||
@@ -842,7 +975,7 @@ class _PlayerPageState extends State<PlayerPage> {
             type: PlaybackSegmentType.credits,
             start: chapter.start,
             end: next,
-            provider: '服务器章节',
+            provider: provider,
           ),
         );
       }

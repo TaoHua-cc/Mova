@@ -7650,6 +7650,9 @@ class _SettingsPageState extends State<SettingsPage> {
   double _autoSkipDelaySeconds = 5;
   bool _segmentServerSource = true;
   bool _segmentIntroDbSource = true;
+  bool _segmentTheIntroDbSource = true;
+  bool _segmentAniSkipSource = true;
+  bool _segmentChaptersDbSource = true;
   double _seekSeconds = 10;
   double _volumeStep = 5;
   bool _preloadNextEpisode = true;
@@ -7767,7 +7770,13 @@ class _SettingsPageState extends State<SettingsPage> {
         _segmentServerSource =
             prefs.getBool('yingji.segment.source-server') ?? true;
         _segmentIntroDbSource =
+            prefs.getBool('yingji.segment.source-introdb') ?? true;
+        _segmentTheIntroDbSource =
             prefs.getBool('yingji.segment.source-theintrodb') ?? true;
+        _segmentAniSkipSource =
+            prefs.getBool('yingji.segment.source-aniskip') ?? true;
+        _segmentChaptersDbSource =
+            prefs.getBool('yingji.segment.source-chaptersdb') ?? true;
         _seekSeconds = prefs.getDouble('yingji.player.seek-seconds') ?? 10;
         _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
         _preloadNextEpisode =
@@ -7869,7 +7878,10 @@ class _SettingsPageState extends State<SettingsPage> {
       'yingji.segment.auto-skip': _autoSkipSegments,
       'yingji.segment.skip-delay-seconds': _autoSkipDelaySeconds,
       'yingji.segment.source-server': _segmentServerSource,
-      'yingji.segment.source-theintrodb': _segmentIntroDbSource,
+      'yingji.segment.source-introdb': _segmentIntroDbSource,
+      'yingji.segment.source-theintrodb': _segmentTheIntroDbSource,
+      'yingji.segment.source-aniskip': _segmentAniSkipSource,
+      'yingji.segment.source-chaptersdb': _segmentChaptersDbSource,
       'yingji.player.seek-seconds': _seekSeconds,
       'yingji.player.volume-step': _volumeStep,
       'yingji.player.preload-next': _preloadNextEpisode,
@@ -9100,8 +9112,8 @@ class _SettingsPageState extends State<SettingsPage> {
                                   ),
                                 ],
                                 _ToggleRow(
-                                  title: '服务器章节',
-                                  detail: '从 Emby / Jellyfin 媒体章节读取片头片尾',
+                                  title: '服务器原生分段',
+                                  detail: '优先读取 Emby / Jellyfin 当前文件的媒体章节',
                                   value: _segmentServerSource,
                                   onChanged: (value) {
                                     setState(
@@ -9111,12 +9123,45 @@ class _SettingsPageState extends State<SettingsPage> {
                                   },
                                 ),
                                 _ToggleRow(
-                                  title: 'TheIntroDB',
-                                  detail: '按 TMDB、季和集匹配公共片头片尾数据',
+                                  title: 'IntroDB',
+                                  detail: '按 IMDb、季和集读取片头、前情与片尾',
                                   value: _segmentIntroDbSource,
                                   onChanged: (value) {
                                     setState(
                                       () => _segmentIntroDbSource = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: 'TheIntroDB',
+                                  detail: '按 TMDB、季和集匹配公共片头片尾数据',
+                                  value: _segmentTheIntroDbSource,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _segmentTheIntroDbSource = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: 'AniSkip',
+                                  detail: '动画专用；仅在 TMDB 能唯一映射到 MAL 时读取',
+                                  value: _segmentAniSkipSource,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _segmentAniSkipSource = value,
+                                    );
+                                    _save();
+                                  },
+                                ),
+                                _ToggleRow(
+                                  title: 'ChaptersDB',
+                                  detail: '使用评分最高的公共章节作为备用分段',
+                                  value: _segmentChaptersDbSource,
+                                  onChanged: (value) {
+                                    setState(
+                                      () => _segmentChaptersDbSource = value,
                                     );
                                     _save();
                                   },
