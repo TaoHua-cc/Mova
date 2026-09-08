@@ -7651,7 +7651,6 @@ class _SettingsPageState extends State<SettingsPage> {
   double _volumeStep = 5;
   bool _preloadNextEpisode = true;
   double _preloadLeadMinutes = 5;
-  bool _closeToTray = true;
   Map<String, String> _shortcuts = Map.of(_defaultPlayerShortcuts);
   int _metadataCacheCount = 0;
   int _imageCacheBytes = 0;
@@ -7777,7 +7776,6 @@ class _SettingsPageState extends State<SettingsPage> {
             prefs.getBool('yingji.player.preload-next') ?? true;
         _preloadLeadMinutes =
             prefs.getDouble('yingji.player.preload-lead-minutes') ?? 5;
-        _closeToTray = prefs.getBool('yingji.system.close-to-tray') ?? true;
         final shortcutJson = prefs.getString('yingji.player.shortcuts');
         final shortcutData = shortcutJson == null
             ? null
@@ -7880,7 +7878,6 @@ class _SettingsPageState extends State<SettingsPage> {
       'yingji.player.volume-step': _volumeStep,
       'yingji.player.preload-next': _preloadNextEpisode,
       'yingji.player.preload-lead-minutes': _preloadLeadMinutes,
-      'yingji.system.close-to-tray': _closeToTray,
       'yingji.player.shortcuts': jsonEncode(_shortcuts),
       'yingji.tmdb.api-key': _tmdbApiKey.text.trim(),
       'yingji.trakt.client-id': _traktClientId.text.trim(),
@@ -9356,16 +9353,6 @@ class _SettingsPageState extends State<SettingsPage> {
                                   '播放器快捷键会立即保存；同一个按键不能绑定两个操作。',
                                   style: TextStyle(color: Color(0xFFABB1BE)),
                                 ),
-                                _ToggleRow(
-                                  title: '关闭窗口时最小化到托盘',
-                                  detail: '从托盘菜单可重新显示 Mova；选择“退出”才结束进程',
-                                  value: _closeToTray,
-                                  onChanged: (value) {
-                                    setState(() => _closeToTray = value);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 10),
                                 for (final entry in _shortcutNames.entries) ...[
                                   _ShortcutRecorder(
                                     label: entry.value,

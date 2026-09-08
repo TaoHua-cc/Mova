@@ -21,9 +21,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#AppName}
-; The app intentionally intercepts WM_CLOSE when close-to-tray is enabled.
-; We close the old process explicitly in PrepareToInstall instead of waiting
-; for Restart Manager, which would otherwise wait on the hidden tray instance.
+; Close a running copy before replacing application files during an upgrade.
 CloseApplications=no
 RestartApplications=no
 
