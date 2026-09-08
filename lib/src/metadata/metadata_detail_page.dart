@@ -48,13 +48,6 @@ String _dateLabel(DateTime? date) => date == null
     ? ''
     : '${date.year}年${date.month.toString().padLeft(2, '0')}月${date.day.toString().padLeft(2, '0')}日';
 
-String _episodeDurationSummary(int? totalMinutes, double progress) {
-  if (totalMinutes == null || totalMinutes <= 0) return '时长暂缺';
-  final watched = (totalMinutes * progress.clamp(0, 1)).round();
-  final remaining = math.max(0, totalMinutes - watched);
-  return '总时长 $totalMinutes 分钟 · 已播放 $watched 分钟 · 剩余 $remaining 分钟';
-}
-
 String _minuteClock(int minutes) =>
     '${minutes ~/ 60 > 0 ? '${minutes ~/ 60}:' : ''}${(minutes % 60).toString().padLeft(2, '0')}:00';
 
@@ -2299,10 +2292,9 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
     ],
   );
 
-  Future<void> _showAllEpisodes() => showModalBottomSheet<void>(
+  Future<void> _showAllEpisodes() => showDialog<void>(
     context: context,
-    backgroundColor: Colors.transparent,
-    barrierColor: Colors.black54,
+    barrierColor: Colors.black.withValues(alpha: .72),
     builder: (context) {
       final playedCount = widget.resources.where((episode) {
         final key = _episodeKey(episode.seasonNumber, episode.episodeNumber);
@@ -2318,203 +2310,408 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
             0;
         return progress > 0 && progress < .92;
       }).length;
-      return SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
-          child: GlassPanel(
-            radius: 22,
-            padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 650),
+      final unplayedCount =
+          widget.resources.length - playedCount - watchingCount;
+      return YingjiPinnedDialog(
+        maxWidth: 1180,
+        maxHeight: 820,
+        insetPadding: const EdgeInsets.all(24),
+        header: Row(
+          children: [
+            Container(
+              width: 46,
+              height: 46,
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: .1),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: const Icon(YingjiIcons.rectangle_stack, size: 22),
+            ),
+            const SizedBox(width: 14),
+            const Expanded(
               child: Column(
-                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  ListTile(
-                    leading: const Icon(YingjiIcons.rectangle_stack),
-                    title: const Text(
-                      '全部剧集',
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    subtitle: Text(
-                      '${widget.resources.length} 集 · 已播放 $playedCount · 观看中 $watchingCount · 未播放 ${widget.resources.length - playedCount - watchingCount}',
-                    ),
-                    trailing: SizedBox(
-                      width: 150,
-                      child: LinearProgressIndicator(
-                        value: widget.resources.isEmpty
-                            ? 0
-                            : playedCount / widget.resources.length,
-                        minHeight: 5,
-                        borderRadius: BorderRadius.circular(9),
-                        backgroundColor: Colors.white.withValues(alpha: .12),
-                        color: Colors.white,
-                      ),
-                    ),
+                  Text(
+                    '全部剧集',
+                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900),
                   ),
-                  const Divider(height: 1),
-                  const SizedBox(height: 8),
-                  Flexible(
-                    child: ListView.separated(
-                      itemCount: widget.resources.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 8),
-                      itemBuilder: (_, index) {
-                        final episode = widget.resources[index];
-                        final metadata =
-                            widget.metadata[_episodeKey(
-                              episode.seasonNumber,
-                              episode.episodeNumber,
-                            )];
-                        final title = _episodeTitle(
-                          episode,
-                          metadata,
-                          index + 1,
-                        );
-                        final image = _episodeImage(episode, metadata);
-                        final published =
-                            episode.premiereDate ?? metadata?.airDate;
-                        final runtime =
-                            episode.runtime?.inMinutes ?? metadata?.runtime;
-                        final selected =
-                            episode.seasonNumber ==
-                                widget.selected?.seasonNumber &&
-                            episode.episodeNumber ==
-                                widget.selected?.episodeNumber;
-                        final progress =
-                            widget.episodeProgress[_episodeKey(
-                              episode.seasonNumber,
-                              episode.episodeNumber,
-                            )] ??
-                            0;
-                        final completed =
-                            widget.completedResourceIds.contains(episode.id) ||
-                            progress >= .92;
-                        return InkWell(
-                          onTap: () {
-                            Navigator.pop(context);
-                            widget.onSelect(episode);
-                          },
-                          borderRadius: BorderRadius.circular(14),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 180),
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: selected
-                                  ? Colors.white.withValues(alpha: .12)
-                                  : YingjiGlass.chrome(strength: .48),
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(
-                                color: selected
-                                    ? Colors.white
-                                    : YingjiGlass.line(),
-                                width: selected ? 2.2 : 1,
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(10),
-                                  child: SizedBox(
-                                    width: 128,
-                                    height: 72,
-                                    child: image == null
-                                        ? const _EpisodeArtworkFallback()
-                                        : CachedNetworkImage(
-                                            imageUrl: image.toString(),
-                                            fit: BoxFit.cover,
-                                            errorWidget: (_, _, _) =>
-                                                const _EpisodeArtworkFallback(),
-                                          ),
-                                  ),
-                                ),
-                                const SizedBox(width: 13),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        '第 ${episode.episodeNumber ?? index + 1} 集 · $title',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontWeight: FontWeight.w800,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        [
-                                          if (_dateLabel(published).isNotEmpty)
-                                            _dateLabel(published),
-                                          _episodeDurationSummary(
-                                            runtime,
-                                            progress,
-                                          ),
-                                        ].join(' · '),
-                                        style: const TextStyle(
-                                          color: YingjiColors.muted,
-                                          fontSize: 12,
-                                        ),
-                                      ),
-                                      if (progress > 0) ...[
-                                        const SizedBox(height: 7),
-                                        LinearProgressIndicator(
-                                          value: progress.clamp(0, 1),
-                                          minHeight: 3,
-                                          borderRadius: BorderRadius.circular(
-                                            8,
-                                          ),
-                                          backgroundColor: Colors.white
-                                              .withValues(alpha: .10),
-                                          color: Colors.white,
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 10),
-                                Column(
-                                  children: [
-                                    Icon(
-                                      completed
-                                          ? YingjiIcons.checkmark_circle_fill
-                                          : progress > 0
-                                          ? YingjiIcons.play_circle_fill
-                                          : YingjiIcons.circle,
-                                      color: completed || selected
-                                          ? Colors.white
-                                          : YingjiColors.muted,
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      completed
-                                          ? '已播放'
-                                          : progress > 0
-                                          ? '${(progress * 100).round()}%'
-                                          : '未播放',
-                                      style: const TextStyle(
-                                        fontSize: 10,
-                                        color: YingjiColors.muted,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
+                  SizedBox(height: 3),
+                  Text(
+                    '选择剧集继续播放，右键可更新观看状态',
+                    style: TextStyle(color: YingjiColors.muted, fontSize: 12),
                   ),
                 ],
               ),
             ),
-          ),
+            _EpisodeStat(label: '总集数', value: widget.resources.length),
+            const SizedBox(width: 8),
+            _EpisodeStat(label: '已播放', value: playedCount),
+            const SizedBox(width: 8),
+            _EpisodeStat(label: '观看中', value: watchingCount),
+            const SizedBox(width: 8),
+            _EpisodeStat(label: '未播放', value: unplayedCount),
+            const SizedBox(width: 14),
+            YingjiMotionIconButton(
+              icon: YingjiIcons.xmark,
+              tooltip: '关闭',
+              size: 38,
+              onPressed: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+        body: Column(
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(99),
+                    child: LinearProgressIndicator(
+                      value: widget.resources.isEmpty
+                          ? 0
+                          : playedCount / widget.resources.length,
+                      minHeight: 5,
+                      backgroundColor: Colors.white.withValues(alpha: .1),
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  widget.resources.isEmpty
+                      ? '0%'
+                      : '${(playedCount / widget.resources.length * 100).round()}%',
+                  style: const TextStyle(
+                    color: YingjiColors.muted,
+                    fontWeight: FontWeight.w700,
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final columns = constraints.maxWidth >= 960
+                    ? 3
+                    : constraints.maxWidth >= 620
+                    ? 2
+                    : 1;
+                return GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: widget.resources.length,
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    mainAxisSpacing: 14,
+                    crossAxisSpacing: 14,
+                    childAspectRatio: columns == 1 ? 2.25 : 1.2,
+                  ),
+                  itemBuilder: (_, index) {
+                    final episode = widget.resources[index];
+                    final metadata =
+                        widget.metadata[_episodeKey(
+                          episode.seasonNumber,
+                          episode.episodeNumber,
+                        )];
+                    final title = _episodeTitle(episode, metadata, index + 1);
+                    final image = _episodeImage(episode, metadata);
+                    final published = episode.premiereDate ?? metadata?.airDate;
+                    final runtime =
+                        episode.runtime?.inMinutes ?? metadata?.runtime;
+                    final selected =
+                        episode.seasonNumber == widget.selected?.seasonNumber &&
+                        episode.episodeNumber == widget.selected?.episodeNumber;
+                    final progress =
+                        widget.episodeProgress[_episodeKey(
+                          episode.seasonNumber,
+                          episode.episodeNumber,
+                        )] ??
+                        0;
+                    final completed =
+                        widget.completedResourceIds.contains(episode.id) ||
+                        progress >= .92;
+                    return _AllEpisodeCard(
+                      episode: episode,
+                      index: index,
+                      title: title,
+                      image: image,
+                      published: published,
+                      runtime: runtime,
+                      progress: progress,
+                      completed: completed,
+                      selected: selected,
+                      overview: episode.overview?.trim().isNotEmpty == true
+                          ? episode.overview!
+                          : metadata?.overview,
+                      onTap: () {
+                        Navigator.pop(context);
+                        widget.onSelect(episode);
+                      },
+                      onSecondaryTapUp: (details) => _showMarkMenu(
+                        context,
+                        episode,
+                        completed,
+                        details.globalPosition,
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ],
         ),
       );
     },
+  );
+}
+
+class _EpisodeStat extends StatelessWidget {
+  const _EpisodeStat({required this.label, required this.value});
+  final String label;
+  final int value;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+    decoration: BoxDecoration(
+      color: YingjiGlass.chrome(strength: .72),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Text.rich(
+      TextSpan(
+        text: '$value ',
+        style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13),
+        children: [
+          TextSpan(
+            text: label,
+            style: const TextStyle(
+              color: YingjiColors.muted,
+              fontWeight: FontWeight.w600,
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _AllEpisodeCard extends StatelessWidget {
+  const _AllEpisodeCard({
+    required this.episode,
+    required this.index,
+    required this.title,
+    required this.image,
+    required this.published,
+    required this.runtime,
+    required this.progress,
+    required this.completed,
+    required this.selected,
+    required this.overview,
+    required this.onTap,
+    required this.onSecondaryTapUp,
+  });
+
+  final MediaItem episode;
+  final int index;
+  final String title;
+  final Uri? image;
+  final DateTime? published;
+  final int? runtime;
+  final double progress;
+  final bool completed;
+  final bool selected;
+  final String? overview;
+  final VoidCallback onTap;
+  final GestureTapUpCallback onSecondaryTapUp;
+
+  @override
+  Widget build(BuildContext context) => YingjiMotionSurface(
+    selected: selected,
+    borderRadius: 16,
+    child: Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        onSecondaryTapUp: onSecondaryTapUp,
+        borderRadius: BorderRadius.circular(16),
+        child: Ink(
+          decoration: BoxDecoration(
+            color: selected
+                ? YingjiGlass.surface(strength: 1.18)
+                : YingjiGlass.chrome(strength: .66),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: ClipRRect(
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(16),
+                  ),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      image == null
+                          ? const _EpisodeArtworkFallback()
+                          : CachedNetworkImage(
+                              imageUrl: image.toString(),
+                              fit: BoxFit.cover,
+                              errorWidget: (_, _, _) =>
+                                  const _EpisodeArtworkFallback(),
+                            ),
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [Colors.transparent, Color(0xB8000000)],
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 12,
+                        top: 12,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 9,
+                            vertical: 5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: .62),
+                            borderRadius: BorderRadius.circular(9),
+                          ),
+                          child: Text(
+                            'S${episode.seasonNumber ?? 1} · E${episode.episodeNumber ?? index + 1}',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        right: 12,
+                        top: 12,
+                        child: Icon(
+                          completed
+                              ? YingjiIcons.checkmark_circle_fill
+                              : progress > 0
+                              ? YingjiIcons.play_circle_fill
+                              : YingjiIcons.circle,
+                          size: 21,
+                          color: completed || progress > 0
+                              ? Colors.white
+                              : Colors.white54,
+                        ),
+                      ),
+                      if (progress > 0 && !completed)
+                        Positioned(
+                          left: 12,
+                          right: 12,
+                          bottom: 10,
+                          child: Column(
+                            children: [
+                              if (runtime != null)
+                                Row(
+                                  children: [
+                                    Text(
+                                      _minuteClock(
+                                        (runtime! * progress).round(),
+                                      ),
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    Text(
+                                      _minuteClock(
+                                        (runtime! * (1 - progress)).round(),
+                                      ),
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              const SizedBox(height: 4),
+                              LinearProgressIndicator(
+                                value: progress.clamp(0, 1),
+                                minHeight: 3,
+                                borderRadius: BorderRadius.circular(99),
+                                backgroundColor: Colors.white24,
+                                color: Colors.white,
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(13, 11, 13, 13),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '第 ${episode.episodeNumber ?? index + 1} 集 · $title',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      [
+                        if (_dateLabel(published).isNotEmpty)
+                          _dateLabel(published),
+                        if (runtime != null) '$runtime 分钟',
+                        completed
+                            ? '已播放'
+                            : progress > 0
+                            ? '${(progress * 100).round()}%'
+                            : '未播放',
+                      ].join(' · '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: YingjiColors.muted,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (overview?.trim().isNotEmpty == true) ...[
+                      const SizedBox(height: 6),
+                      YingjiSynopsisTooltip(
+                        message: overview!,
+                        child: Text(
+                          overview!,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xFFD5D8DF),
+                            fontSize: 11,
+                            height: 1.3,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
   );
 }
 
