@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
@@ -12,7 +11,6 @@ import 'package:flutter/rendering.dart'
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
-import 'package:image/image.dart' as image_lib;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,7 +20,6 @@ import 'app_route_observer.dart';
 import 'brand.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
-import 'images/icon_background.dart';
 import 'metadata/metadata_detail_page.dart';
 import 'metadata/tmdb_client.dart';
 import 'metadata/ratings.dart';
@@ -33,6 +30,7 @@ import 'player/subtitle_preference.dart';
 import 'player/player_page.dart';
 import 'sources/emby_client.dart';
 import 'sources/media_source.dart';
+import 'sources/server_mark.dart';
 import 'sources/source_store.dart';
 import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
@@ -6504,7 +6502,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
     header: Row(
       children: [
         if (widget.existing != null) ...[
-          _ServerMark(source: widget.existing!, size: 42),
+          ServerMark(source: widget.existing!, size: 42),
           const SizedBox(width: 12),
         ],
         Expanded(
@@ -9822,7 +9820,7 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
                             width: widget.compact ? 128 : 178,
                             height: widget.compact ? 42 : 64,
                             child: platformLogo != null
-                                ? _BackgroundFreeNetworkIcon(
+                                ? BackgroundFreeNetworkIcon(
                                     url: platformLogo.toString(),
                                     alignment: Alignment.centerLeft,
                                     fallback: _PlatformName(
@@ -10896,13 +10894,51 @@ class _ContinueTile extends StatelessWidget {
   );
 }
 
-class _WatchProgressOriginBadge extends StatelessWidget {
+class _WatchProgressOriginBadge extends StatefulWidget {
   const _WatchProgressOriginBadge({required this.state});
 
   final WatchState state;
 
   @override
+  State<_WatchProgressOriginBadge> createState() =>
+      _WatchProgressOriginBadgeState();
+}
+
+class _WatchProgressOriginBadgeState extends State<_WatchProgressOriginBadge> {
+  late Future<(MediaSource, String?)?> _server;
+
+  @override
+  void initState() {
+    super.initState();
+    _server = _loadServer();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WatchProgressOriginBadge oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.state.sourceId != widget.state.sourceId ||
+        oldWidget.state.progressOrigin != widget.state.progressOrigin) {
+      _server = _loadServer();
+    }
+  }
+
+  Future<(MediaSource, String?)?> _loadServer() async {
+    if (widget.state.progressOrigin != 'server' ||
+        widget.state.sourceId == null) {
+      return null;
+    }
+    final store = await SourceStore.create();
+    for (final source in store.load()) {
+      if (source.id == widget.state.sourceId) {
+        return (source, store.tokenFor(source));
+      }
+    }
+    return null;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final state = widget.state;
     final (icon, label) = switch (state.progressOrigin) {
       'server' => (
         YingjiIcons.server,
@@ -10931,7 +10967,18 @@ class _WatchProgressOriginBadge extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 13, color: Colors.white),
+          if (state.progressOrigin == 'server')
+            FutureBuilder<(MediaSource, String?)?>(
+              future: _server,
+              builder: (context, snapshot) {
+                final server = snapshot.data;
+                return server == null
+                    ? Icon(icon, size: 13, color: Colors.white)
+                    : ServerMark(source: server.$1, token: server.$2, size: 16);
+              },
+            )
+          else
+            Icon(icon, size: 13, color: Colors.white),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
@@ -11866,7 +11913,7 @@ class _SourceCardState extends State<_SourceCard> {
                 InkWell(
                   onTap: widget.onPickIcon,
                   borderRadius: BorderRadius.circular(16),
-                  child: _ServerMark(
+                  child: ServerMark(
                     source: widget.source,
                     token: widget.iconToken,
                     size: 54,
@@ -12247,7 +12294,7 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
             children: [
               Row(
                 children: [
-                  _ServerMark(
+                  ServerMark(
                     source: widget.source,
                     token: widget.token,
                     size: 48,
@@ -12463,155 +12510,6 @@ class _ServerIconDialogState extends State<_ServerIconDialog> {
         ),
       ),
     );
-  }
-}
-
-class _ServerMark extends StatelessWidget {
-  const _ServerMark({required this.source, this.token, this.size = 42});
-  final MediaSource source;
-  final String? token;
-  final double size;
-
-  @override
-  Widget build(BuildContext context) {
-    final webdav = source.kind == SourceKind.webdav;
-    final jellyfin = source.kind == SourceKind.jellyfin;
-    final colors = webdav
-        ? const [Color(0xFF4B88C7), Color(0xFF23456B)]
-        : jellyfin
-        ? const [Color(0xFF9B5DE5), Color(0xFF3157C8)]
-        : const [Color(0xFF58D568), Color(0xFF18853A)];
-    final customIcon = Uri.tryParse(source.iconUrl ?? '');
-    final hasImage = customIcon != null && customIcon.hasScheme;
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        gradient: hasImage
-            ? null
-            : LinearGradient(
-                colors: colors,
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-        borderRadius: BorderRadius.circular(size * .29),
-        boxShadow: hasImage
-            ? null
-            : const [
-                BoxShadow(
-                  color: Color(0x4D000000),
-                  blurRadius: 16,
-                  offset: Offset(0, 8),
-                ),
-              ],
-      ),
-      child: hasImage
-          ? ClipRRect(
-              borderRadius: BorderRadius.circular(size * .29),
-              child: source.customIcon
-                  ? _BackgroundFreeNetworkIcon(
-                      url: customIcon.toString(),
-                      fallback: _defaultMark(webdav, colors),
-                    )
-                  : Image.network(
-                      customIcon.toString(),
-                      headers:
-                          customIcon.host == source.endpoint.host &&
-                              token != null &&
-                              token!.isNotEmpty
-                          ? {'X-Emby-Token': token!}
-                          : null,
-                      fit: BoxFit.contain,
-                      errorBuilder: (_, _, _) => _defaultMark(webdav, colors),
-                    ),
-            )
-          : _defaultMark(webdav, colors),
-    );
-  }
-
-  Widget _defaultMark(bool webdav, List<Color> colors) => webdav
-      ? Icon(YingjiIcons.cloud_fill, color: Colors.white, size: size * .46)
-      : Center(
-          child: Transform.rotate(
-            angle: math.pi / 4,
-            child: Container(
-              width: size * .44,
-              height: size * .44,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: .94),
-                borderRadius: BorderRadius.circular(size * .08),
-              ),
-              child: Transform.rotate(
-                angle: -math.pi / 4,
-                child: Icon(
-                  YingjiIcons.play_fill,
-                  color: colors.last,
-                  size: size * .24,
-                ),
-              ),
-            ),
-          ),
-        );
-}
-
-final Map<String, Future<Uint8List?>> _backgroundFreeIconCache = {};
-
-class _BackgroundFreeNetworkIcon extends StatelessWidget {
-  const _BackgroundFreeNetworkIcon({
-    required this.url,
-    required this.fallback,
-    this.alignment = Alignment.center,
-  });
-
-  final String url;
-  final Widget fallback;
-  final AlignmentGeometry alignment;
-
-  @override
-  Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
-    future: _backgroundFreeIconCache.putIfAbsent(
-      url,
-      () => _loadBackgroundFreeIcon(url),
-    ),
-    builder: (context, snapshot) {
-      final bytes = snapshot.data;
-      if (bytes == null) {
-        return snapshot.connectionState == ConnectionState.done
-            ? fallback
-            : const SizedBox.shrink();
-      }
-      return Image.memory(
-        bytes,
-        fit: BoxFit.contain,
-        alignment: alignment,
-        gaplessPlayback: true,
-      );
-    },
-  );
-}
-
-Future<Uint8List?> _loadBackgroundFreeIcon(String value) async {
-  final uri = Uri.tryParse(value);
-  if (uri == null || !uri.hasScheme) return null;
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
-  try {
-    final response = await (await client.getUrl(uri)).close();
-    if (response.statusCode < 200 || response.statusCode >= 300) return null;
-    final output = BytesBuilder(copy: false);
-    await for (final chunk in response) {
-      output.add(chunk);
-    }
-    final decoded = image_lib.decodeImage(output.takeBytes());
-    if (decoded == null) return null;
-    final rgba = decoded.numChannels == 4
-        ? decoded
-        : decoded.convert(numChannels: 4);
-    removeFlatIconBackground(rgba);
-    return Uint8List.fromList(image_lib.encodePng(rgba));
-  } catch (_) {
-    return null;
-  } finally {
-    client.close(force: true);
   }
 }
 

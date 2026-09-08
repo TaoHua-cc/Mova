@@ -6,6 +6,7 @@ import '../metadata/metadata_detail_page.dart';
 import '../metadata/tmdb_client.dart';
 import 'emby_client.dart';
 import 'media_source.dart';
+import 'server_mark.dart';
 import 'source_store.dart';
 
 class EmbyLibraryPage extends StatefulWidget {
@@ -19,6 +20,8 @@ class EmbyLibraryPage extends StatefulWidget {
 class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
   String? _parentId;
   String _title = '完整媒体库';
+  String? _token;
+  MediaSource? _resolvedSource;
   late Future<List<MediaItem>> _items;
 
   @override
@@ -33,6 +36,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
     var source = saved.isEmpty ? widget.source : saved.first;
     final token = store.tokenFor(source);
     if (token == null || token.isEmpty) throw Exception('未找到服务器登录令牌');
+    _token = token;
     final client = EmbyClient();
     try {
       final resolved = await client.resolveSession(
@@ -58,6 +62,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
         customIcon: source.customIcon,
       );
       await store.upsert(source, token);
+      _resolvedSource = source;
       return await client.browse(
         EmbySession(source: source, token: token),
         parentId: _parentId,
@@ -174,7 +179,11 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
                   ),
                   child: Row(
                     children: [
-                      const Icon(YingjiIcons.server, size: 22),
+                      ServerMark(
+                        source: _resolvedSource ?? widget.source,
+                        token: _token,
+                        size: 30,
+                      ),
                       const SizedBox(width: 12),
                       Expanded(
                         child: Column(

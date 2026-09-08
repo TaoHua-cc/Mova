@@ -15,6 +15,7 @@ import '../player/player_page.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
+import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
 import '../sources/webdav_client.dart';
 import '../history/watchlist_store.dart';
@@ -992,6 +993,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             ].where((value) => value.isNotEmpty).join(' · '),
             sourceId: candidate.source.id,
             serverItemId: candidate.id,
+            source: candidate.source,
           ),
         )
         .toList(growable: false);
@@ -2933,7 +2935,11 @@ class _TrackResourceSummary extends StatelessWidget {
     ),
     child: Row(
       children: [
-        _ResourceServerMark(source: resource.source),
+        ServerMark(
+          source: resource.source,
+          token: resource.headers['X-Emby-Token'],
+          size: 34,
+        ),
         const SizedBox(width: 10),
         Expanded(
           child: Text(
@@ -3438,7 +3444,11 @@ class _ResourceCard extends StatelessWidget {
                       ),
                       const SizedBox(width: 7),
                     ],
-                    _ResourceServerMark(source: resource.source),
+                    ServerMark(
+                      source: resource.source,
+                      token: resource.headers['X-Emby-Token'],
+                      size: 34,
+                    ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
@@ -3616,7 +3626,11 @@ class _ResourcePickerCard extends StatelessWidget {
         ),
         child: Row(
           children: [
-            _ResourceServerMark(source: resource.source),
+            ServerMark(
+              source: resource.source,
+              token: resource.headers['X-Emby-Token'],
+              size: 34,
+            ),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
@@ -3660,52 +3674,6 @@ String _resourcePickerSummary(MediaItem resource) => [
   if (resource.size != null)
     '${(resource.size! / 1073741824).toStringAsFixed(2)} GB',
 ].join(' · ');
-
-class _ResourceServerMark extends StatelessWidget {
-  const _ResourceServerMark({required this.source});
-  final MediaSource source;
-
-  @override
-  Widget build(BuildContext context) {
-    final webdav = source.kind == SourceKind.webdav;
-    final colors = webdav
-        ? const [Color(0xFF4B88C7), Color(0xFF23456B)]
-        : source.kind == SourceKind.jellyfin
-        ? const [Color(0xFF9B5DE5), Color(0xFF3157C8)]
-        : const [Color(0xFF58D568), Color(0xFF18853A)];
-    return Container(
-      width: 34,
-      height: 34,
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: colors),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: webdav
-          ? const Icon(YingjiIcons.cloud_fill, size: 17)
-          : Center(
-              child: Transform.rotate(
-                angle: .785398,
-                child: Container(
-                  width: 15,
-                  height: 15,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(3),
-                  ),
-                  child: Transform.rotate(
-                    angle: -.785398,
-                    child: Icon(
-                      YingjiIcons.play_fill,
-                      size: 9,
-                      color: colors.last,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-    );
-  }
-}
 
 class _ResourceBadge extends StatelessWidget {
   const _ResourceBadge(this.text);

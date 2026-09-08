@@ -18,6 +18,7 @@ import 'subtitle_preference.dart';
 import 'segment_client.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
+import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
 import '../tracking/trakt_client.dart';
 
@@ -65,6 +66,7 @@ class PlayerResourceOption {
     this.headers = const {},
     this.sourceId,
     this.serverItemId,
+    this.source,
   });
 
   final String url;
@@ -72,6 +74,7 @@ class PlayerResourceOption {
   final Map<String, String> headers;
   final String? sourceId;
   final String? serverItemId;
+  final MediaSource? source;
 }
 
 class PlayerEpisode {
@@ -2348,7 +2351,38 @@ class _PlayerPageState extends State<PlayerPage> {
       padding: EdgeInsets.zero,
       child: ListTile(
         selected: selected,
-        leading: Icon(icon, color: color, size: 20),
+        leading: SizedBox(
+          width: 48,
+          height: 36,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              if (resource.source != null)
+                ServerMark(
+                  source: resource.source!,
+                  token: resource.headers['X-Emby-Token'],
+                  size: 34,
+                )
+              else
+                Positioned.fill(child: Icon(icon, color: color, size: 20)),
+              if (resource.source != null && index < 3)
+                Positioned(
+                  right: 0,
+                  bottom: -1,
+                  child: Container(
+                    width: 21,
+                    height: 21,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF20242C),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    child: Icon(icon, color: color, size: 12),
+                  ),
+                ),
+            ],
+          ),
+        ),
         title: Text(
           resource.label,
           maxLines: 2,
