@@ -1953,8 +1953,9 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
     BuildContext context,
     MediaItem resource,
     bool completed,
-    Offset position,
-  ) async {
+    Offset position, {
+    ValueChanged<bool>? onChoice,
+  }) async {
     final choice = await showGeneralDialog<String>(
       context: context,
       barrierDismissible: true,
@@ -2002,7 +2003,9 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
       },
     );
     if (!mounted || choice == null) return;
-    await widget.onMarkPlayed(resource, choice == 'played');
+    final markedPlayed = choice == 'played';
+    onChoice?.call(markedPlayed);
+    await widget.onMarkPlayed(resource, markedPlayed);
   }
 
   @override
@@ -2292,179 +2295,216 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
     ],
   );
 
-  Future<void> _showAllEpisodes() => showDialog<void>(
-    context: context,
-    barrierColor: Colors.black.withValues(alpha: .72),
-    builder: (context) {
-      final playedCount = widget.resources.where((episode) {
-        final key = _episodeKey(episode.seasonNumber, episode.episodeNumber);
-        return widget.completedResourceIds.contains(episode.id) ||
-            (widget.episodeProgress[key] ?? 0) >= .92;
-      }).length;
-      final watchingCount = widget.resources.where((episode) {
-        final progress =
-            widget.episodeProgress[_episodeKey(
+  Future<void> _showAllEpisodes() {
+    final completedIds = Set<String>.of(widget.completedResourceIds);
+    final episodeProgress = Map<String, double>.of(widget.episodeProgress);
+    return showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: .72),
+      builder: (context) => StatefulBuilder(
+        builder: (context, updateDialog) {
+          final playedCount = widget.resources.where((episode) {
+            final key = _episodeKey(
               episode.seasonNumber,
               episode.episodeNumber,
-            )] ??
-            0;
-        return progress > 0 && progress < .92;
-      }).length;
-      final unplayedCount =
-          widget.resources.length - playedCount - watchingCount;
-      return YingjiPinnedDialog(
-        maxWidth: 1180,
-        maxHeight: 820,
-        insetPadding: const EdgeInsets.all(24),
-        header: Row(
-          children: [
-            Container(
-              width: 46,
-              height: 46,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: .1),
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: const Icon(YingjiIcons.rectangle_stack, size: 22),
-            ),
-            const SizedBox(width: 14),
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '全部剧集',
-                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900),
-                  ),
-                  SizedBox(height: 3),
-                  Text(
-                    '选择剧集继续播放，右键可更新观看状态',
-                    style: TextStyle(color: YingjiColors.muted, fontSize: 12),
-                  ),
-                ],
-              ),
-            ),
-            _EpisodeStat(label: '总集数', value: widget.resources.length),
-            const SizedBox(width: 8),
-            _EpisodeStat(label: '已播放', value: playedCount),
-            const SizedBox(width: 8),
-            _EpisodeStat(label: '观看中', value: watchingCount),
-            const SizedBox(width: 8),
-            _EpisodeStat(label: '未播放', value: unplayedCount),
-            const SizedBox(width: 14),
-            YingjiMotionIconButton(
-              icon: YingjiIcons.xmark,
-              tooltip: '关闭',
-              size: 38,
-              onPressed: () => Navigator.pop(context),
-            ),
-          ],
-        ),
-        body: Column(
-          children: [
-            Row(
+            );
+            return completedIds.contains(episode.id) ||
+                (episodeProgress[key] ?? 0) >= .92;
+          }).length;
+          final watchingCount = widget.resources.where((episode) {
+            final progress =
+                episodeProgress[_episodeKey(
+                  episode.seasonNumber,
+                  episode.episodeNumber,
+                )] ??
+                0;
+            return progress > 0 && progress < .92;
+          }).length;
+          final unplayedCount =
+              widget.resources.length - playedCount - watchingCount;
+          return YingjiPinnedDialog(
+            maxWidth: 1180,
+            maxHeight: 820,
+            insetPadding: const EdgeInsets.all(24),
+            header: Row(
               children: [
-                Expanded(
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(99),
-                    child: LinearProgressIndicator(
-                      value: widget.resources.isEmpty
-                          ? 0
-                          : playedCount / widget.resources.length,
-                      minHeight: 5,
-                      backgroundColor: Colors.white.withValues(alpha: .1),
-                      color: Colors.white,
-                    ),
+                Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: .1),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Icon(YingjiIcons.rectangle_stack, size: 22),
+                ),
+                const SizedBox(width: 14),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '全部剧集',
+                        style: TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      SizedBox(height: 3),
+                      Text(
+                        '选择剧集继续播放，右键可更新观看状态',
+                        style: TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(width: 12),
-                Text(
-                  widget.resources.isEmpty
-                      ? '0%'
-                      : '${(playedCount / widget.resources.length * 100).round()}%',
-                  style: const TextStyle(
-                    color: YingjiColors.muted,
-                    fontWeight: FontWeight.w700,
-                    fontFeatures: [FontFeature.tabularFigures()],
-                  ),
+                _EpisodeStat(label: '总集数', value: widget.resources.length),
+                const SizedBox(width: 8),
+                _EpisodeStat(label: '已播放', value: playedCount),
+                const SizedBox(width: 8),
+                _EpisodeStat(label: '观看中', value: watchingCount),
+                const SizedBox(width: 8),
+                _EpisodeStat(label: '未播放', value: unplayedCount),
+                const SizedBox(width: 14),
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.xmark,
+                  tooltip: '关闭',
+                  size: 38,
+                  onPressed: () => Navigator.pop(context),
                 ),
               ],
             ),
-            const SizedBox(height: 18),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final columns = constraints.maxWidth >= 960
-                    ? 3
-                    : constraints.maxWidth >= 620
-                    ? 2
-                    : 1;
-                return GridView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: widget.resources.length,
-                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: columns,
-                    mainAxisSpacing: 14,
-                    crossAxisSpacing: 14,
-                    childAspectRatio: columns == 1 ? 2.25 : 1.2,
-                  ),
-                  itemBuilder: (_, index) {
-                    final episode = widget.resources[index];
-                    final metadata =
-                        widget.metadata[_episodeKey(
-                          episode.seasonNumber,
-                          episode.episodeNumber,
-                        )];
-                    final title = _episodeTitle(episode, metadata, index + 1);
-                    final image = _episodeImage(episode, metadata);
-                    final published = episode.premiereDate ?? metadata?.airDate;
-                    final runtime =
-                        episode.runtime?.inMinutes ?? metadata?.runtime;
-                    final selected =
-                        episode.seasonNumber == widget.selected?.seasonNumber &&
-                        episode.episodeNumber == widget.selected?.episodeNumber;
-                    final progress =
-                        widget.episodeProgress[_episodeKey(
-                          episode.seasonNumber,
-                          episode.episodeNumber,
-                        )] ??
-                        0;
-                    final completed =
-                        widget.completedResourceIds.contains(episode.id) ||
-                        progress >= .92;
-                    return _AllEpisodeCard(
-                      episode: episode,
-                      index: index,
-                      title: title,
-                      image: image,
-                      published: published,
-                      runtime: runtime,
-                      progress: progress,
-                      completed: completed,
-                      selected: selected,
-                      overview: episode.overview?.trim().isNotEmpty == true
-                          ? episode.overview!
-                          : metadata?.overview,
-                      onTap: () {
-                        Navigator.pop(context);
-                        widget.onSelect(episode);
-                      },
-                      onSecondaryTapUp: (details) => _showMarkMenu(
-                        context,
-                        episode,
-                        completed,
-                        details.globalPosition,
+            body: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(99),
+                        child: LinearProgressIndicator(
+                          value: widget.resources.isEmpty
+                              ? 0
+                              : playedCount / widget.resources.length,
+                          minHeight: 5,
+                          backgroundColor: Colors.white.withValues(alpha: .1),
+                          color: Colors.white,
+                        ),
                       ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      widget.resources.isEmpty
+                          ? '0%'
+                          : '${(playedCount / widget.resources.length * 100).round()}%',
+                      style: const TextStyle(
+                        color: YingjiColors.muted,
+                        fontWeight: FontWeight.w700,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final columns = constraints.maxWidth >= 960
+                        ? 3
+                        : constraints.maxWidth >= 620
+                        ? 2
+                        : 1;
+                    return GridView.builder(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: widget.resources.length,
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: columns,
+                        mainAxisSpacing: 14,
+                        crossAxisSpacing: 14,
+                        childAspectRatio: columns == 1 ? 2.25 : 1.2,
+                      ),
+                      itemBuilder: (_, index) {
+                        final episode = widget.resources[index];
+                        final metadata =
+                            widget.metadata[_episodeKey(
+                              episode.seasonNumber,
+                              episode.episodeNumber,
+                            )];
+                        final title = _episodeTitle(
+                          episode,
+                          metadata,
+                          index + 1,
+                        );
+                        final image = _episodeImage(episode, metadata);
+                        final published =
+                            episode.premiereDate ?? metadata?.airDate;
+                        final runtime =
+                            episode.runtime?.inMinutes ?? metadata?.runtime;
+                        final selected =
+                            episode.seasonNumber ==
+                                widget.selected?.seasonNumber &&
+                            episode.episodeNumber ==
+                                widget.selected?.episodeNumber;
+                        final progress =
+                            episodeProgress[_episodeKey(
+                              episode.seasonNumber,
+                              episode.episodeNumber,
+                            )] ??
+                            0;
+                        final completed =
+                            completedIds.contains(episode.id) ||
+                            progress >= .92;
+                        return _AllEpisodeCard(
+                          episode: episode,
+                          index: index,
+                          title: title,
+                          image: image,
+                          published: published,
+                          runtime: runtime,
+                          progress: progress,
+                          completed: completed,
+                          selected: selected,
+                          overview: episode.overview?.trim().isNotEmpty == true
+                              ? episode.overview!
+                              : metadata?.overview,
+                          onTap: () {
+                            Navigator.pop(context);
+                            widget.onSelect(episode);
+                          },
+                          onSecondaryTapUp: (details) => _showMarkMenu(
+                            context,
+                            episode,
+                            completed,
+                            details.globalPosition,
+                            onChoice: (marked) {
+                              updateDialog(() {
+                                final key = _episodeKey(
+                                  episode.seasonNumber,
+                                  episode.episodeNumber,
+                                );
+                                if (marked) {
+                                  completedIds.add(episode.id);
+                                  episodeProgress[key] = 1;
+                                } else {
+                                  completedIds.remove(episode.id);
+                                  episodeProgress[key] = 0;
+                                }
+                              });
+                            },
+                          ),
+                        );
+                      },
                     );
                   },
-                );
-              },
+                ),
+              ],
             ),
-          ],
-        ),
-      );
-    },
-  );
+          );
+        },
+      ),
+    );
+  }
 }
 
 class _EpisodeStat extends StatelessWidget {
