@@ -41,7 +41,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
       source = resolved.source;
       final identity = await client.serverIdentity(source, token: token);
       final endpoints = <Uri>{
-        ...source.endpoints,
+        identity.endpoint,
         ...identity.discoveredEndpoints,
       };
       source = MediaSource(

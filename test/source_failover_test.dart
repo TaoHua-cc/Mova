@@ -35,6 +35,7 @@ void main() {
           endpoint: Uri.parse('https://offline.example/'),
           alternateEndpoints: [Uri.parse('https://online.example/emby/')],
         ),
+        token: 'token',
       );
 
       expect(result.name, 'Living room');
@@ -48,6 +49,51 @@ void main() {
         result.discoveredEndpoints,
         contains(Uri.parse('https://media.example/emby/')),
       );
+      client.dispose();
+    },
+  );
+
+  test(
+    'server discovery rejects unreachable and foreign published lines',
+    () async {
+      final client = EmbyClient(
+        client: MockClient((request) async {
+          if (request.url.host == 'origin.example') {
+            return http.Response(
+              jsonEncode({
+                'ServerName': 'Home',
+                'Id': 'server-1',
+                'LocalAddress': 'http://192.168.1.8:8096',
+                'WanAddress': 'https://foreign.example/',
+              }),
+              200,
+            );
+          }
+          if (request.url.host == 'foreign.example') {
+            return http.Response(jsonEncode({'Id': 'server-2'}), 200);
+          }
+          if (request.url.host == 'valid.example') {
+            return http.Response(jsonEncode({'Id': 'server-1'}), 200);
+          }
+          throw http.ClientException('unreachable', request.url);
+        }),
+      );
+
+      final result = await client.serverIdentity(
+        MediaSource(
+          id: 'source-1',
+          name: 'Home',
+          kind: SourceKind.jellyfin,
+          endpoint: Uri.parse('https://origin.example/'),
+          alternateEndpoints: [
+            Uri.parse('https://valid.example/'),
+            Uri.parse('https://stale.example/'),
+          ],
+        ),
+        token: 'token',
+      );
+
+      expect(result.discoveredEndpoints, [Uri.parse('https://valid.example/')]);
       client.dispose();
     },
   );

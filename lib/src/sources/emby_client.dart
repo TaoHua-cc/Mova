@@ -264,16 +264,36 @@ class EmbyClient {
           final name = '${data['ServerName'] ?? data['Name'] ?? source.name}'
               .trim();
           final id = '${data['Id'] ?? source.serverId ?? source.id}'.trim();
-          final discovered = <Uri>[];
+          final published = source.endpoints
+              .map(_base)
+              .where((candidate) => candidate != base)
+              .toSet()
+              .toList();
           for (final value in [data['LocalAddress'], data['WanAddress']]) {
             final candidate = Uri.tryParse('${value ?? ''}'.trim());
             if (candidate != null &&
                 ['http', 'https'].contains(candidate.scheme) &&
                 candidate.host.isNotEmpty) {
               final normalized = _base(candidate);
-              if (!discovered.contains(normalized)) discovered.add(normalized);
+              if (normalized != base && !published.contains(normalized)) {
+                published.add(normalized);
+              }
             }
           }
+          final discovered = token == null || token.isEmpty
+              ? const <Uri>[]
+              : (await Future.wait(
+                  published.map(
+                    (candidate) async =>
+                        await _isSameServer(
+                          candidate,
+                          token: token,
+                          serverId: id,
+                        )
+                        ? candidate
+                        : null,
+                  ),
+                )).whereType<Uri>().toList(growable: false);
           return (
             name: name.isEmpty ? source.name : name,
             id: id.isEmpty ? source.id : id,
@@ -291,6 +311,28 @@ class EmbyClient {
           ? lastError.toString().replaceFirst('Exception: ', '')
           : '所有服务器线路均无法连接',
     );
+  }
+
+  Future<bool> _isSameServer(
+    Uri endpoint, {
+    required String token,
+    required String serverId,
+  }) async {
+    try {
+      final response = await _client
+          .get(
+            endpoint
+                .resolve('System/Info')
+                .replace(queryParameters: {'api_key': token}),
+            headers: {'Accept': 'application/json', 'X-Emby-Token': token},
+          )
+          .timeout(const Duration(seconds: 4));
+      if (response.statusCode < 200 || response.statusCode >= 300) return false;
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return '${data['Id'] ?? ''}'.trim() == serverId;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<EmbySession> authenticate({

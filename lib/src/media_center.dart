@@ -5727,7 +5727,7 @@ class _SourceHubState extends State<_SourceHub> {
                 token: token,
               );
               final endpoints = <Uri>{
-                ...source.endpoints,
+                identity.endpoint,
                 ...identity.discoveredEndpoints,
               };
               if (identity.name != source.name ||
@@ -6010,10 +6010,9 @@ class _SourceHubState extends State<_SourceHub> {
             endpoint: identity.endpoint,
             userId: resolved.source.userId,
             serverId: identity.id,
-            alternateEndpoints: <Uri>{
-              ...source.endpoints,
-              ...identity.discoveredEndpoints,
-            }.where((value) => value != identity.endpoint).toList(),
+            alternateEndpoints: <Uri>{...identity.discoveredEndpoints}
+                .where((value) => value != identity.endpoint)
+                .toList(),
             iconUrl: source.iconUrl,
             customIcon: source.customIcon,
           );
@@ -6364,8 +6363,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
             token: token,
           );
           final available = <Uri>{
-            endpoint,
-            ...alternates,
+            identity.endpoint,
             ...identity.discoveredEndpoints,
           };
           verified = await client.resolveSession(
@@ -6388,8 +6386,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
           client.dispose();
         }
         final allEndpoints = <Uri>{
-          endpoint,
-          ...alternates,
+          identity.endpoint,
           ...identity.discoveredEndpoints,
         };
         await store.upsert(
@@ -6444,8 +6441,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
             token: session.token,
           );
           final allEndpoints = <Uri>{
-            endpoint,
-            ...alternates,
+            identity.endpoint,
             ...identity.discoveredEndpoints,
           };
           final verified = await client.resolveSession(
