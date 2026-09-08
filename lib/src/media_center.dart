@@ -7259,7 +7259,11 @@ class _CalendarPageState extends State<_CalendarPage> {
                 child: ListView.separated(
                   controller: _calendarRail,
                   scrollDirection: Axis.horizontal,
-                  clipBehavior: Clip.none,
+                  // Date cards must stay within the rail. Allowing the list to
+                  // paint outside its viewport lets the final date overlap the
+                  // next-arrow control at the far right.
+                  clipBehavior: Clip.hardEdge,
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
                   itemCount: dates.length,
                   separatorBuilder: (_, _) => const SizedBox(width: 9),
                   itemBuilder: (context, index) {
