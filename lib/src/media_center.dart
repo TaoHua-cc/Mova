@@ -934,14 +934,31 @@ class _CinematicHomeState extends State<_CinematicHome>
         return LayoutBuilder(
           builder: (context, constraints) {
             final compact = constraints.maxHeight < 760;
+            // The hero intentionally exposes only the same items represented by
+            // the carousel dots. More fetched titles stay available to future
+            // refreshes, but cannot appear through left/right navigation.
+            final carouselItemCount = items.length > 8 ? 8 : items.length;
             // A continuation tile contains a 16:9 image plus two metadata
             // lines. The old shelf was shorter than that content, so its
             // metadata leaked into the cinematic canvas and appeared covered.
             final continueHeight = compact ? 244.0 : 268.0;
+            final carouselDotsBottom = _showContinue
+                ? continueHeight + 136
+                : 44.0;
+            // The dot row is also the visual boundary for the hero. Keeping
+            // every hero gesture above it leaves the continue shelf and lower
+            // canvas free for their own interactions.
+            final heroInteractionHeight = math
+                .max(0, constraints.maxHeight - carouselDotsBottom)
+                .toDouble();
             return Stack(
               fit: StackFit.expand,
               children: [
-                Positioned.fill(
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  right: 0,
+                  height: heroInteractionHeight,
                   child: GestureDetector(
                     behavior: HitTestBehavior.translucent,
                     onTap: () => _openHeroDetails(context, selected),
@@ -950,21 +967,21 @@ class _CinematicHomeState extends State<_CinematicHome>
                 Positioned(
                   left: 0,
                   top: 0,
-                  bottom: 0,
+                  height: heroInteractionHeight,
                   width: 84,
                   child: GestureDetector(
                     behavior: HitTestBehavior.translucent,
-                    onTap: () => _moveHero(-1, items.length),
+                    onTap: () => _moveHero(-1, carouselItemCount),
                   ),
                 ),
                 Positioned(
                   right: 0,
                   top: 0,
-                  bottom: 0,
+                  height: heroInteractionHeight,
                   width: 84,
                   child: GestureDetector(
                     behavior: HitTestBehavior.translucent,
-                    onTap: () => _moveHero(1, items.length),
+                    onTap: () => _moveHero(1, carouselItemCount),
                   ),
                 ),
                 Positioned(
@@ -1076,7 +1093,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                     child: ValueListenableBuilder<double>(
                       valueListenable: _heroProgress,
                       builder: (context, progress, _) => _HeroProgressDots(
-                        length: items.length.clamp(1, 8),
+                        length: carouselItemCount.clamp(1, 8),
                         active: _hero,
                         progress: progress,
                         onChanged: (value) {
