@@ -588,13 +588,15 @@ class _FloatingHomeRailState extends State<_FloatingHomeRail> {
 class _FloatingHomeDragRegion extends StatelessWidget {
   const _FloatingHomeDragRegion();
 
+  // 不能用 const：WindowHost.dragArea 是方法调用，在桌面端返回 DragToMoveArea，
+  // 移动端直接返回 child（DragToMoveArea 在移动端会触发未注册插件）。
   @override
-  Widget build(BuildContext context) => const Positioned(
+  Widget build(BuildContext context) => Positioned(
     top: 0,
     left: 0,
     right: 0,
     height: 72,
-    child: WindowHost.dragArea(child: SizedBox.expand()),
+    child: WindowHost.dragArea(child: const SizedBox.expand()),
   );
 }
 

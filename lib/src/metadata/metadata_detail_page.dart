@@ -1380,7 +1380,9 @@ class _DetailTopBar extends StatelessWidget {
         const SizedBox(width: 14),
         // 桌面端才需要窗口拖拽区
         if (WindowHost.isDesktop)
-          Expanded(child: DragToMoveArea(child: const SizedBox.expand())),
+          Expanded(
+            child: WindowHost.dragArea(child: const SizedBox.expand()),
+          ),
         _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
         if (WindowHost.isDesktop) ...[
           const SizedBox(width: 8),
