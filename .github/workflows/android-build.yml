@@ -16,6 +16,8 @@ jobs:
     name: Build APK (split-per-abi)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -47,14 +49,30 @@ jobs:
       - name: Ensure gradlew executable
         run: chmod +x android/gradlew
 
+      - name: Show toolchain
+        run: |
+          flutter doctor -v || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || echo "(no platforms dir)"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || echo "(no ndk dir)"
+
       - name: Build APK
         # 未配置 key.properties 时自动回退到 debug 签名，CI 无需密钥
-        run: flutter build apk --split-per-abi --release
+        run: |
+          set -o pipefail
+          flutter build apk --split-per-abi --release 2>&1 | tee build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect APK info
-        run: |
-          echo "=== 产物清单 ==="
-          ls -lh build/app/outputs/flutter-apk/*.apk
+        run: ls -lh build/app/outputs/flutter-apk/*.apk
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
@@ -63,6 +81,23 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      # 调试用：GitHub 的日志接口对匿名请求需要管理员权限，
+      # 失败时把日志推到 ci-logs 分支，便于在仓库外读取。稳定后可移除。
+      - name: Publish build log to ci-logs branch
+        if: failure()
+        run: |
+          {
+            echo "run: ${{ github.run_number }} / ${{ github.sha }}"
+            echo "--- build.log (tail 300) ---"
+            tail -n 300 build.log
+          } > ci-build-log.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B ci-logs
+          git add -f ci-build-log.txt
+          git commit -m "ci: build log for run ${{ github.run_number }}"
+          git push -f origin ci-logs
 
   release:
     name: Attach APK to Release
