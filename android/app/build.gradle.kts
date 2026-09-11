@@ -17,7 +17,9 @@ if (keystorePropertiesFile.exists()) {
 android {
     namespace = "com.taohua.mova"
     compileSdk = 36
-    ndkVersion = "27.0.12077973"
+    // 需取所有依赖中的最高版本：media_kit 的 jni 插件要求 28.2.13676358，
+    // 低于该值会构建失败（NDK 向后兼容，取最高即可）。
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
