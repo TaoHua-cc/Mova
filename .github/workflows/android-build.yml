@@ -89,6 +89,10 @@ jobs:
         run: |
           {
             echo "run: ${{ github.run_number }} / ${{ github.sha }}"
+            echo "--- 实际产出的 apk/aab ---"
+            find build -name "*.apk" -o -name "*.aab" 2>/dev/null | head -30
+            echo "--- build/app/outputs 目录树 ---"
+            find build/app/outputs -maxdepth 4 2>/dev/null | head -60
             echo "--- build.log (tail 300) ---"
             tail -n 300 build.log
           } > ci-build-log.txt
