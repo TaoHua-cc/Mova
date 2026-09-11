@@ -33,8 +33,8 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        // 只保留真机需要的 ABI（配合下面的 splits）
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        // ABI 白名单，需与下方 splits.abi.include 保持一致
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
 
     signingConfigs {

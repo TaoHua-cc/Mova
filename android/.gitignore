@@ -1,10 +1,11 @@
-gradle-wrapper.jar
+# 注意：gradle-wrapper.jar / gradlew / gradlew.bat 必须入库，
+# 否则 CI 与其他开发机无法执行 flutter build（wrapper 是构建入口）。
 /.gradle
 /captures/
-/gradlew
-/gradlew.bat
 /local.properties
 GeneratedPluginRegistrant.java
+
+# 签名配置与密钥严禁入库
 key.properties
 **/*.keystore
 **/*.jks
