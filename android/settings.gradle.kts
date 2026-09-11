@@ -19,7 +19,8 @@ plugins {
     // AGP 下限由 Flutter 强制校验（>= 8.11.1）。
     // 停留在 8.x：AGP 9+ 只读取新 DSL，会导致 Flutter Gradle 插件应用失败。
     id("com.android.application") version "8.13.2" apply false
-    id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+    // Kotlin 下限由 Flutter 强制校验（>= 2.2.20）
+    id("org.jetbrains.kotlin.android") version "2.2.21" apply false
 }
 
 include(":app")
