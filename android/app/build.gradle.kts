@@ -33,8 +33,9 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-        // ABI 白名单，需与下方 splits.abi.include 保持一致
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        // 不要在这里设 ndk.abiFilters：与下面的 splits.abi 同时存在会直接报错
+        // "Conflicting configuration ... in ndk abiFilters cannot be present
+        //  when splits abi filters are set"。ABI 白名单统一由 splits 控制。
     }
 
     signingConfigs {
