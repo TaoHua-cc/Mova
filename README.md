@@ -1,5 +1,7 @@
 # Mova
 
+[![Android Build](https://github.com/TaoHua-cc/Mova/actions/workflows/android-build.yml/badge.svg)](https://github.com/TaoHua-cc/Mova/actions/workflows/android-build.yml)
+
 <p align="center">
   <img src="app/assets/mova-logo.png" alt="Mova" width="128" />
 </p>

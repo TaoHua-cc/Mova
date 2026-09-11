@@ -82,29 +82,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 调试用：GitHub 的日志接口对匿名请求需要管理员权限，
-      # 失败时把日志推到 ci-logs 分支，便于在仓库外读取。稳定后可移除。
-      - name: Publish build log to ci-logs branch
-        if: failure()
-        run: |
-          {
-            echo "run: ${{ github.run_number }} / ${{ github.sha }}"
-            echo "--- 全仓库 apk/aab（排除 .git） ---"
-            find . -path ./.git -prune -o \( -name "*.apk" -o -name "*.aab" \) -print 2>/dev/null | head -40
-            echo "--- build/app/outputs 目录树 ---"
-            find build/app/outputs -maxdepth 4 2>/dev/null | head -60
-            echo "--- android/app/build 目录树（前 60） ---"
-            find android/app/build -maxdepth 5 2>/dev/null | head -60
-            echo "--- build.log (tail 300) ---"
-            tail -n 300 build.log
-          } > ci-build-log.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B ci-logs
-          git add -f ci-build-log.txt
-          git commit -m "ci: build log for run ${{ github.run_number }}"
-          git push -f origin ci-logs
-
   release:
     name: Attach APK to Release
     needs: build
