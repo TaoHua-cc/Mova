@@ -2,6 +2,7 @@
 # 否则 CI 与其他开发机无法执行 flutter build（wrapper 是构建入口）。
 /.gradle
 /captures/
+/build/
 /local.properties
 GeneratedPluginRegistrant.java
 
