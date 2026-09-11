@@ -1,0 +1,5 @@
+# ⚠️ 本文件不入库。复制为 key.properties 后填入真实值。
+storeFile=../mova-signing.jks
+storePassword=mova2026
+keyAlias=mova
+keyPassword=mova2026

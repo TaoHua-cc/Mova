@@ -8,7 +8,7 @@ import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:window_manager/window_manager.dart';
+import '../platform/window_host.dart';
 
 import '../brand.dart';
 import '../player/player_page.dart';
@@ -1378,30 +1378,28 @@ class _DetailTopBar extends StatelessWidget {
           size: 44,
         ),
         const SizedBox(width: 14),
-        Expanded(child: DragToMoveArea(child: const SizedBox.expand())),
+        // 桌面端才需要窗口拖拽区
+        if (WindowHost.isDesktop)
+          Expanded(child: DragToMoveArea(child: const SizedBox.expand())),
         _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
-        const SizedBox(width: 8),
-        _DetailRailButton(
-          icon: YingjiIcons.minus,
-          onPressed: windowManager.minimize,
-        ),
-        const SizedBox(width: 8),
-        _DetailRailButton(
-          icon: YingjiIcons.square,
-          onPressed: () async {
-            if (await windowManager.isMaximized()) {
-              await windowManager.unmaximize();
-            } else {
-              await windowManager.maximize();
-            }
-          },
-        ),
-        const SizedBox(width: 8),
-        _DetailRailButton(
-          icon: YingjiIcons.xmark,
-          onPressed: windowManager.close,
-        ),
-        const SizedBox(width: 14),
+        if (WindowHost.isDesktop) ...[
+          const SizedBox(width: 8),
+          _DetailRailButton(
+            icon: YingjiIcons.minus,
+            onPressed: WindowHost.minimize,
+          ),
+          const SizedBox(width: 8),
+          _DetailRailButton(
+            icon: YingjiIcons.square,
+            onPressed: WindowHost.toggleMaximize,
+          ),
+          const SizedBox(width: 8),
+          _DetailRailButton(
+            icon: YingjiIcons.xmark,
+            onPressed: WindowHost.close,
+          ),
+          const SizedBox(width: 14),
+        ],
       ],
     ),
   );

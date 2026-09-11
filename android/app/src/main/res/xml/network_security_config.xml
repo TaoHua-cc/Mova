@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ✅ 修复 3：替代全局 android:usesCleartextTraffic="true"
+  原则：默认禁用明文，仅对确实需要 HTTP 的域名放行。
+  · 官方元数据/图片服务：强制 HTTPS
+  · 局域网 NAS / WebDAV / Emby / Jellyfin：放行 192.168.* / 10.* / 172.16-31.*
+  · 自建 Worker（yingji-metadata.gctykxy.workers.dev）：走 HTTPS
+  新增数据源时，在此追加 domain 条目即可，不要回退到全局开关。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+            <certificates src="user"/>
+        </trust-anchors>
+    </base-config>
+
+    <!-- 局域网设备：NAS / WebDAV / Emby / Jellyfin 自建服务常为 http -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.0.0</domain>
+        <domain includeSubdomains="true">192.168.0.0</domain>
+        <domain includeSubdomains="true">172.16.0.0</domain>
+    </domain-config>
+
+    <!-- 若确有第三方片源需要明文，在此逐条添加，并注明来源 -->
+    <!--
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">example-source.com</domain>
+    </domain-config>
+    -->
+</network-security-config>

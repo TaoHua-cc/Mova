@@ -14,7 +14,7 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:window_manager/window_manager.dart';
+import 'platform/window_host.dart';
 
 import 'app_route_observer.dart';
 import 'brand.dart';
@@ -594,7 +594,7 @@ class _FloatingHomeDragRegion extends StatelessWidget {
     left: 0,
     right: 0,
     height: 72,
-    child: DragToMoveArea(child: SizedBox.expand()),
+    child: WindowHost.dragArea(child: SizedBox.expand()),
   );
 }
 
@@ -684,31 +684,27 @@ class _FloatingHomeTopBar extends StatelessWidget {
           tooltip: '搜索',
           onPressed: onSearch,
         ),
-        const SizedBox(width: 8),
-        _CircleAction(
-          icon: YingjiIcons.minus,
-          tooltip: '最小化',
-          onPressed: windowManager.minimize,
-        ),
-        const SizedBox(width: 8),
-        _CircleAction(
-          icon: YingjiIcons.square,
-          tooltip: '最大化',
-          onPressed: () async {
-            if (await windowManager.isMaximized()) {
-              await windowManager.unmaximize();
-            } else {
-              await windowManager.maximize();
-            }
-          },
-        ),
-        const SizedBox(width: 8),
-        _CircleAction(
-          icon: YingjiIcons.xmark,
-          tooltip: '关闭',
-          onPressed: windowManager.close,
-        ),
-        const SizedBox(width: 4),
+        if (WindowHost.isDesktop) ...[
+          const SizedBox(width: 8),
+          _CircleAction(
+            icon: YingjiIcons.minus,
+            tooltip: '最小化',
+            onPressed: WindowHost.minimize,
+          ),
+          const SizedBox(width: 8),
+          _CircleAction(
+            icon: YingjiIcons.square,
+            tooltip: '最大化',
+            onPressed: WindowHost.toggleMaximize,
+          ),
+          const SizedBox(width: 8),
+          _CircleAction(
+            icon: YingjiIcons.xmark,
+            tooltip: '关闭',
+            onPressed: WindowHost.close,
+          ),
+          const SizedBox(width: 4),
+        ],
       ],
     ),
   );

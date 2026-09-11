@@ -6,7 +6,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
-import 'package:window_manager/window_manager.dart';
+import 'platform/window_host.dart';
 
 /// Turns discrete Windows wheel ticks into one interruptible, eased movement.
 /// The controller remains authoritative, so scrollbars and programmatic
@@ -895,7 +895,7 @@ class YingjiPageChrome extends StatelessWidget {
           const SizedBox(width: 12),
         ],
         Expanded(
-          child: DragToMoveArea(
+          child: WindowHost.dragArea(
             child: Align(
               alignment: Alignment.centerLeft,
               child: title == null
@@ -947,46 +947,45 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
 
   Future<void> _toggleMaximize() async {
     if (widget.fullscreen) {
-      final active = await windowManager.isFullScreen();
-      await windowManager.setFullScreen(!active);
-      if (mounted) setState(() => _maximized = !active);
+      final active = await WindowHost.toggleFullScreen();
+      if (mounted) setState(() => _maximized = active);
       return;
     }
-    final maximized = await windowManager.isMaximized();
-    if (maximized) {
-      await windowManager.unmaximize();
-    } else {
-      await windowManager.maximize();
-    }
-    if (mounted) setState(() => _maximized = !maximized);
+    await WindowHost.toggleMaximize();
+    final maximized = await WindowHost.isMaximized();
+    if (mounted) setState(() => _maximized = maximized);
   }
 
   @override
-  Widget build(BuildContext context) => Row(
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      YingjiMotionIconButton(
-        icon: YingjiIcons.minus,
-        tooltip: '最小化',
-        size: widget.size,
-        onPressed: windowManager.minimize,
-      ),
-      const SizedBox(width: 7),
-      YingjiMotionIconButton(
-        icon: _maximized ? YingjiIcons.rectangle_stack : YingjiIcons.square,
-        tooltip: widget.fullscreen
-            ? (_maximized ? '退出全屏' : '全屏')
-            : (_maximized ? '还原' : '最大化'),
-        size: widget.size,
-        onPressed: _toggleMaximize,
-      ),
-      const SizedBox(width: 7),
-      YingjiMotionIconButton(
-        icon: YingjiIcons.xmark,
-        tooltip: '关闭',
-        size: widget.size,
-        onPressed: widget.onClose ?? windowManager.close,
-      ),
-    ],
-  );
+  Widget build(BuildContext context) {
+    // 移动端没有窗口控制概念，整组按钮不渲染
+    if (!WindowHost.isDesktop) return const SizedBox.shrink();
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        YingjiMotionIconButton(
+          icon: YingjiIcons.minus,
+          tooltip: '最小化',
+          size: widget.size,
+          onPressed: WindowHost.minimize,
+        ),
+        const SizedBox(width: 7),
+        YingjiMotionIconButton(
+          icon: _maximized ? YingjiIcons.rectangle_stack : YingjiIcons.square,
+          tooltip: widget.fullscreen
+              ? (_maximized ? '退出全屏' : '全屏')
+              : (_maximized ? '还原' : '最大化'),
+          size: widget.size,
+          onPressed: _toggleMaximize,
+        ),
+        const SizedBox(width: 7),
+        YingjiMotionIconButton(
+          icon: YingjiIcons.xmark,
+          tooltip: '关闭',
+          size: widget.size,
+          onPressed: widget.onClose ?? WindowHost.close,
+        ),
+      ],
+    );
+  }
 }

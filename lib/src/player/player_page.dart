@@ -9,7 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:window_manager/window_manager.dart';
+import '../platform/window_host.dart';
 
 import '../brand.dart';
 import '../history/watch_state_store.dart';
@@ -318,6 +318,8 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   void initState() {
     super.initState();
+    // 移动端：保持常亮 + 沉浸式 + 允许横屏（桌面端无操作）
+    unawaited(WindowHost.enterMediaSession());
     _activeEpisodeIndex = widget.episodes.indexWhere(
       (episode) => episode.url == widget.url,
     );
@@ -1361,6 +1363,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
+    unawaited(WindowHost.exitMediaSession());
     _subtitleSubscription?.cancel();
     _danmakuRequest++;
     unawaited(_syncProgress(syncTrakt: true, ending: true));
@@ -1599,9 +1603,7 @@ class _PlayerPageState extends State<PlayerPage> {
           _adjustVolume(-_volumeStep),
       SingleActivator(_shortcutKey(_shortcuts['mute']!)): _toggleMute,
       SingleActivator(_shortcutKey(_shortcuts['fullscreen']!)): () async {
-        await windowManager.setFullScreen(
-          !(await windowManager.isFullScreen()),
-        );
+        await WindowHost.toggleFullScreen();
       },
     },
     child: Focus(
@@ -1710,7 +1712,7 @@ class _PlayerPageState extends State<PlayerPage> {
                   right: 210,
                   top: 0,
                   height: 64,
-                  child: DragToMoveArea(child: SizedBox.expand()),
+                  child: WindowHost.dragArea(child: SizedBox.expand()),
                 ),
               ],
             ),

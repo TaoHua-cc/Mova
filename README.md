@@ -4,7 +4,7 @@
   <img src="app/assets/mova-logo.png" alt="Mova" width="128" />
 </p>
 
-Mova 是一款面向 Windows 的沉浸式私人影音客户端。它把 TMDB 中文影视资料、Emby / Jellyfin / WebDAV 媒体来源、Trakt 观看记录与 libmpv 播放器整合到统一的海报背景界面中。
+Mova 是一款沉浸式私人影音客户端，同时支持 **Windows** 与 **Android**。它把 TMDB 中文影视资料、Emby / Jellyfin / WebDAV 媒体来源、Trakt 观看记录与 libmpv 播放器整合到统一的海报背景界面中。
 
 ## 主要体验
 
@@ -29,15 +29,49 @@ Mova 是一款面向 Windows 的沉浸式私人影音客户端。它把 TMDB 中
 
 ## 下载与安装
 
-请从 [GitHub Releases](https://github.com/TaoHua-cc/yingji/releases) 下载最新的 Windows x64 安装程序。
+请从 [GitHub Releases](https://github.com/TaoHua-cc/Mova/releases) 下载最新版本。
 
-安装包会部署 Mova、Flutter Windows 运行组件和 libmpv 播放依赖。服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
+- **Windows**：下载 x64 安装程序，部署 Mova、Flutter Windows 运行组件和 libmpv 播放依赖。
+- **Android**：下载对应架构的 APK（推荐 `arm64-v8a`，适用于绝大多数现代手机）。
+
+服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
 
 ## 系统要求
 
-- Windows 10 或 Windows 11（64 位）
-- 支持 D3D11 的显卡驱动
+- **Windows**：Windows 10 或 Windows 11（64 位），支持 D3D11 的显卡驱动
+- **Android**：Android 7.0（API 24）及以上，arm64-v8a / armeabi-v7a / x86_64
 - 访问 TMDB、Trakt 或个人媒体服务器所需的网络连接
+
+## 构建
+
+```bash
+# 桌面端（Windows）
+flutter build windows --release
+
+# 安卓：按 ABI 拆分，避免打出上百 MB 的单一大包
+flutter build apk --split-per-abi --release
+# 产物：build/app/outputs/flutter-apk/app-{arm64-v8a,armeabi-v7a,x86_64}-release.apk
+
+# Play 商店
+flutter build appbundle --release
+```
+
+安卓签名：复制 `android/key.properties.example` 为 `android/key.properties` 并填入真实口令。
+密钥文件**不入库**，请自行妥善保管——丢失后无法为已发布的包名推送更新。
+
+## 平台差异
+
+桌面端与移动端共用同一套业务代码，差异集中在 `lib/src/platform/window_host.dart`：
+
+| 能力 | 桌面端 | Android |
+|---|---|---|
+| 窗口控制（最小化/最大化/关闭/拖拽） | `window_manager` | 不渲染相关按钮 |
+| 全屏 | 窗口全屏 | 系统沉浸式（隐藏状态栏/导航栏） |
+| 播放时屏幕常亮 | 系统电源管理 | `wakelock_plus` |
+| 凭据存储 | Windows DPAPI 加密 | 本地存储 |
+
+> 注意：安卓上直接调用 `windowManager.*` 会抛 `MissingPluginException`，
+> 所有窗口相关操作必须经由 `WindowHost`。
 
 ## 隐私与授权
 
