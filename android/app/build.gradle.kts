@@ -67,16 +67,11 @@ android {
         }
     }
 
-    // ✅ 修复 2：按 ABI 拆分，彻底解决 137MB 虚胖
-    // 构建命令：flutter build apk --split-per-abi --release
-    splits {
-        abi {
-            isEnable = true
-            reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
-            isUniversalApk = false
-        }
-    }
+    // ⚠️ 不要在这里配置 splits { abi { ... } }：
+    // `flutter build apk --split-per-abi` 自带按 ABI 拆分机制，
+    // 手写 splits 会与其冲突，导致 APK 产出到错误目录，
+    // Flutter 找不到产物而报 "Gradle build failed to produce an .apk file"。
+    // 需要 universal 包时用 `flutter build apk`（不带 --split-per-abi）。
 
     packaging {
         // 避免多个 .so 打包冲突（media_kit 常见）
