@@ -7811,6 +7811,8 @@ class _SettingsPageState extends State<SettingsPage> {
   String? _traktMessage;
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
+  /// 横向胶囊的 key（按需生成），用来把高亮的那一项滚回可视区。
+  final _settingsChipKeys = <GlobalKey>[];
   Map<String, Object> _persistedSettings = const {};
   Future<void> _saveQueue = Future<void>.value();
 
@@ -7837,6 +7839,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _settingsScroll.addListener(_syncActiveSetting);
+    _activeSetting.addListener(_revealActiveSettingChip);
     _load();
   }
 
@@ -8340,6 +8343,13 @@ class _SettingsPageState extends State<SettingsPage> {
           .offset;
       if (offset <= position) active = index;
     }
+    // 滑到底时最后一节可能永远到不了顶部（它后面没有足够内容可滚），
+    // 不补这一条的话末尾那一节永远高亮不上。
+    final metrics = _settingsScroll.position;
+    if (metrics.maxScrollExtent > 0 &&
+        _settingsScroll.offset >= metrics.maxScrollExtent - 4) {
+      active = _settingKeys.length - 1;
+    }
     if (active != _activeSetting.value) _activeSetting.value = active;
   }
 
@@ -8370,6 +8380,30 @@ class _SettingsPageState extends State<SettingsPage> {
         _syncActiveSetting();
       }
     }
+  }
+
+  GlobalKey _settingChipKey(int index) {
+    while (_settingsChipKeys.length <= index) {
+      _settingsChipKeys.add(GlobalKey());
+    }
+    return _settingsChipKeys[index];
+  }
+
+  /// 横向胶囊一次只放得下前几项，高亮项常常落在可视区外（尤其是靠后的
+  /// 分栏）。每次选中变化都把它带回到胶囊条中间。
+  void _revealActiveSettingChip() {
+    final index = _activeSetting.value;
+    if (index >= _settingsChipKeys.length) return;
+    final context = _settingsChipKeys[index].currentContext;
+    if (context == null) return;
+    final render = context.findRenderObject();
+    if (render == null || !render.attached) return;
+    Scrollable.ensureVisible(
+      context,
+      alignment: 0.5,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   @override
@@ -9860,6 +9894,7 @@ class _SettingsPageState extends State<SettingsPage> {
         itemCount: labels.length,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemBuilder: (context, index) => TextButton(
+          key: _settingChipKey(index),
           onPressed: () => _jumpToSetting(index, keys[index]),
           style: TextButton.styleFrom(
             foregroundColor: active == index
