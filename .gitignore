@@ -36,3 +36,11 @@ dist-new*/
 /verify-asar.cjs
 /verify-console.cjs
 /v9-console-handoff/
+
+# --- 签名材料：绝不入库 ---
+# 这是发布包的更新凭证，泄露等于别人可以伪造你的更新包。
+key.properties
+/android/key.properties
+/android/mova-signing.jks
+*.jks
+*.keystore

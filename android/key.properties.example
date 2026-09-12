@@ -1,5 +1,13 @@
-# ⚠️ 本文件不入库。复制为 key.properties 后填入真实值。
+# 复制本文件为 android/key.properties 后填入真实值。
+# key.properties 与 *.jks 都已被 .gitignore 忽略 —— 绝不要提交到仓库。
+#
+# 路径说明：storeFile 相对 android/app/ 解析，
+# 所以 ../mova-signing.jks 指的是 android/mova-signing.jks。
+#
+# CI 发版时由 release.yml 自动生成这个文件（从 GitHub Secrets 还原密钥），
+# 无需人工维护。
+
 storeFile=../mova-signing.jks
-storePassword=mova2026
+storePassword=你的密钥库口令
 keyAlias=mova
-keyPassword=mova2026
+keyPassword=你的密钥口令

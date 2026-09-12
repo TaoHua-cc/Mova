@@ -1,0 +1,239 @@
+name: Release
+
+# 打 tag（v3.1.81 这种）时自动构建双端安装包并发布到 GitHub Releases，
+# 其他人就能在 Releases 页面直接下载更新。
+# 也可以在 Actions 页面手动触发：填 tag 则发布，留空则只构建不发布。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '版本 tag（如 v3.1.81）；留空则只构建、不发布'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      publish: ${{ steps.r.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version from tag / pubspec
+        id: r
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          pub=$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' pubspec.yaml | head -1)
+          if [ "$EVENT" = "push" ]; then
+            tag="$REF_NAME"; publish=true
+          elif [ -n "${IN_TAG:-}" ]; then
+            tag="$IN_TAG"; publish=true
+          else
+            tag="v$pub"; publish=false
+          fi
+          version="${tag#v}"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$tag  version=$version  publish=$publish  pubspec=$pub"
+          if [ "$version" != "$pub" ]; then
+            echo "::warning::pubspec.yaml 版本为 $pub，与 tag $version 不一致，安装包以 tag 为准"
+          fi
+
+  windows:
+    name: Build Windows
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Package installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe 未找到' }
+          & $iscc "/DAppVersion=$env:VERSION" 'installer\Mova.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 打包失败: $LASTEXITCODE" }
+
+      - name: Package portable archive
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          Compress-Archive -Path 'build\windows\x64\runner\Release\*' `
+            -DestinationPath "Mova-$env:VERSION-Windows-x64-Portable.zip" -Force
+          Get-ChildItem -Path dist-installer\*.exe, "Mova-$env:VERSION-Windows-x64-Portable.zip" |
+            Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mova-windows
+          path: |
+            dist-installer/*.exe
+            Mova-*-Windows-x64-Portable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    name: Build Android
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signing: ${{ steps.sign.outputs.signing }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Restore release keystore
+        id: sign
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KS_B64:-}" ]; then
+            echo "signing=debug" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，本次以 debug 签名出包：新用户可正常安装，但已装 release 签名旧版的用户无法覆盖更新。"
+            exit 0
+          fi
+          echo "$KS_B64" | base64 -d > android/mova-signing.jks
+          # 写绝对路径：Gradle 里的 file() 相对 android/app/ 解析，绝对路径最不容易踩坑
+          {
+            echo "storeFile=$GITHUB_WORKSPACE/android/mova-signing.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=${KEY_ALIAS:-mova}"
+            echo "keyPassword=$KEY_PASS"
+          } > android/key.properties
+          echo "signing=release" >> "$GITHUB_OUTPUT"
+          echo "已写入 release 签名配置（alias=${KEY_ALIAS:-mova}）"
+
+      - name: Ensure gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build split APKs
+        run: flutter build apk --split-per-abi --release
+
+      - name: Rename APKs with version and ABI
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd build/app/outputs/flutter-apk
+          for f in app-*-release.apk; do
+            abi="${f#app-}"
+            abi="${abi%-release.apk}"
+            mv "$f" "Mova-${VERSION}-android-${abi}.apk"
+          done
+          ls -lh
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mova-android
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: [meta, windows, android]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh dist
+
+      - name: Write summary
+        run: |
+          {
+            echo "### Release ${{ needs.meta.outputs.tag }}"
+            echo ""
+            echo "- Windows: 安装程序 + 免安装包"
+            echo "- Android: 三个 ABI 的 APK（签名方式：${{ needs.android.outputs.signing }}）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: Mova ${{ needs.meta.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            **Windows**
+            - `Mova-${{ needs.meta.outputs.version }}-Windows-x64-Setup.exe` — 安装程序（推荐）
+            - `Mova-${{ needs.meta.outputs.version }}-Windows-x64-Portable.zip` — 免安装，解压即用
+
+            **Android**
+            - `Mova-${{ needs.meta.outputs.version }}-android-arm64-v8a.apk` — 绝大多数现代手机（推荐）
+            - `Mova-${{ needs.meta.outputs.version }}-android-armeabi-v7a.apk` — 较老的 32 位设备
+            - `Mova-${{ needs.meta.outputs.version }}-android-x86_64.apk` — 模拟器 / x86 平板
+
+            安卓安装包与历史版本使用同一签名，可直接覆盖更新，观看记录与配置不会丢失。

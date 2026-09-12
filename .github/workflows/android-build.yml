@@ -16,8 +16,6 @@ jobs:
     name: Build APK (split-per-abi)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout
@@ -82,22 +80,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  release:
-    name: Attach APK to Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+# 说明：本工作流只负责「推送即验证」。
+# 发版（打 tag 后自动构建双端产物并挂到 GitHub Releases）由 release.yml 统一负责。
 
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: mova-android-apk-${{ github.sha }}
-          path: apk
-
-      - name: Publish to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: apk/*.apk

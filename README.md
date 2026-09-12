@@ -1,6 +1,8 @@
 # Mova
 
 [![Android Build](https://github.com/TaoHua-cc/Mova/actions/workflows/android-build.yml/badge.svg)](https://github.com/TaoHua-cc/Mova/actions/workflows/android-build.yml)
+[![Windows Build](https://github.com/TaoHua-cc/Mova/actions/workflows/windows-build.yml/badge.svg)](https://github.com/TaoHua-cc/Mova/actions/workflows/windows-build.yml)
+[![Release](https://github.com/TaoHua-cc/Mova/actions/workflows/release.yml/badge.svg)](https://github.com/TaoHua-cc/Mova/actions/workflows/release.yml)
 
 <p align="center">
   <img src="app/assets/mova-logo.png" alt="Mova" width="128" />
@@ -33,8 +35,16 @@ Mova 是一款沉浸式私人影音客户端，同时支持 **Windows** 与 **An
 
 请从 [GitHub Releases](https://github.com/TaoHua-cc/Mova/releases) 下载最新版本。
 
-- **Windows**：下载 x64 安装程序，部署 Mova、Flutter Windows 运行组件和 libmpv 播放依赖。
-- **Android**：下载对应架构的 APK（推荐 `arm64-v8a`，适用于绝大多数现代手机）。
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows | `Mova-<版本>-Windows-x64-Setup.exe` | 安装程序，推荐 |
+| Windows | `Mova-<版本>-Windows-x64-Portable.zip` | 免安装，解压即用 |
+| Android | `Mova-<版本>-android-arm64-v8a.apk` | 绝大多数现代手机，推荐 |
+| Android | `Mova-<版本>-android-armeabi-v7a.apk` | 较老的 32 位设备 |
+| Android | `Mova-<版本>-android-x86_64.apk` | 模拟器 / x86 平板 |
+
+安装包均由 CI 从对应 tag 的源码构建，**同一平台的包使用固定签名**，
+可以直接覆盖安装升级，观看记录与配置不会丢失。
 
 服务器密码、访问令牌、个人 TMDB Key 与同步凭据只保存在本机。
 
@@ -54,12 +64,25 @@ flutter build windows --release
 flutter build apk --split-per-abi --release
 # 产物：build/app/outputs/flutter-apk/app-{arm64-v8a,armeabi-v7a,x86_64}-release.apk
 
+# Windows 安装器（需先装 Inno Setup 6）
+ISCC.exe /DAppVersion=3.1.81 installer\Mova.iss
+
 # Play 商店
 flutter build appbundle --release
 ```
 
 安卓签名：复制 `android/key.properties.example` 为 `android/key.properties` 并填入真实口令。
 密钥文件**不入库**，请自行妥善保管——丢失后无法为已发布的包名推送更新。
+
+## 开发与发布
+
+界面与逻辑写在共享的 `lib/` 目录，`windows/` 与 `android/` 只承载平台专属配置。
+
+改动流程：**先改要改的那一端 → CI 编译验证 → 在真机/桌面上验证行为 → 同步打包另一端 → 打 tag 发版。**
+
+推送 `v*` 格式的 tag 会自动构建 Windows 与 Android 双端安装包并发布到 GitHub Releases。
+
+完整流程、版本号约定与签名 Secrets 配置见 [RELEASE.md](RELEASE.md)。
 
 ## 平台差异
 

@@ -1,0 +1,86 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        # 与安卓工作流一致：只有 error 中断构建，历史告警不阻断。
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)' |
+                Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $v) { throw 'pubspec.yaml 中未找到 version' }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "package version: $v"
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Package installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe 未找到' }
+          # 版本号由 CI 注入，避免每次发版都要改 Mova.iss
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" 'installer\Mova.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 打包失败: $LASTEXITCODE" }
+
+      - name: Package portable archive
+        shell: pwsh
+        run: |
+          $out = "Mova-${{ steps.ver.outputs.version }}-Windows-x64-Portable.zip"
+          Compress-Archive -Path 'build\windows\x64\runner\Release\*' -DestinationPath $out -Force
+          Get-ChildItem $out, dist-installer\*.exe | Select-Object Name, Length
+
+      - name: List artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem dist-installer | Format-Table Name, Length
+
+      - name: Upload installer and portable archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: mova-windows-${{ github.sha }}
+          path: |
+            dist-installer/*.exe
+            Mova-*-Windows-x64-Portable.zip
+          if-no-files-found: error
+          retention-days: 30
