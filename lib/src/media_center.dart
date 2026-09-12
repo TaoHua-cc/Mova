@@ -18,6 +18,7 @@ import 'platform/window_host.dart';
 
 import 'app_route_observer.dart';
 import 'brand.dart';
+import 'motion.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
 import 'metadata/metadata_detail_page.dart';
@@ -7749,6 +7750,9 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   final _settingsScroll = ScrollController();
+  /// 胶囊条自己的控制器。高亮变化时只许动这一条：用 Scrollable.ensureVisible
+  /// 会顺着祖先一路滚上去，把外层页面也带得跳一下。
+  final _chipScroll = ScrollController();
   final _homeKey = GlobalKey();
   final _appearanceKey = GlobalKey();
   final _playerKey = GlobalKey();
@@ -8349,8 +8353,11 @@ class _SettingsPageState extends State<SettingsPage> {
     // 滑到底时最后一节可能永远到不了顶部（它后面没有足够内容可滚），
     // 不补这一条的话末尾那一节永远高亮不上。
     final metrics = _settingsScroll.position;
-    if (metrics.maxScrollExtent > 0 &&
-        _settingsScroll.offset >= metrics.maxScrollExtent - 4) {
+    // 两端各认死一节：滑到顶就是第一节，滑到底就是最后一节。少了这两条，
+    // 边界附近会因为「最后一节永远到不了顶部」而在两节之间反复跳。
+    if (_settingsScroll.offset <= metrics.minScrollExtent + 4) {
+      active = 0;
+    } else if (_settingsScroll.offset >= metrics.maxScrollExtent - 4) {
       active = _settingKeys.length - 1;
     }
     if (active != _activeSetting.value) _activeSetting.value = active;
@@ -8395,12 +8402,18 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 横向胶囊一次只放得下前几项，高亮项常常落在可视区外（尤其是靠后的
   /// 分栏）。每次选中变化都把它带回到胶囊条中间。
   void _revealActiveSettingChip() {
-    // 上下滑动时高亮会在相邻两节之间反复横跳，如果每次都把胶囊条滚到
-    // 正中，整排胶囊就会跟着左右抽搐。两道闸：①等高亮稳定一小会儿再动；
-    // ②目标胶囊本来就完整可见时干脆不动。
+    // 三道闸，缺一道都会「跳」：
+    // ① 等高亮稳定一小会儿再动 —— 滑动时高亮会在相邻两节之间反复横跳；
+    // ② 目标胶囊本来就完整可见就完全不动 —— 只在它真的被挤出可视区时才滚；
+    // ③ 只滚「刚好够看见」的距离 —— 不再强行把它挪到正中间，那样每换一节
+    //    整排胶囊都要位移一次，观感就是抽搐。
+    //
+    // 而且只能用 _chipScroll 自己滚：Scrollable.ensureVisible 会顺着祖先
+    // 一路滚上去，外层页面也跟着跳。
     _chipRevealTimer?.cancel();
-    _chipRevealTimer = Timer(const Duration(milliseconds: 180), () {
+    _chipRevealTimer = Timer(const Duration(milliseconds: 220), () {
       _chipRevealTimer = null;
+      if (!_chipScroll.hasClients) return;
       final index = _activeSetting.value;
       if (index >= _settingsChipKeys.length) return;
       final context = _settingsChipKeys[index].currentContext;
@@ -8408,22 +8421,33 @@ class _SettingsPageState extends State<SettingsPage> {
       final render = context.findRenderObject();
       if (render == null || !render.attached) return;
       final viewport = RenderAbstractViewport.maybeOf(render);
-      final scrollable = Scrollable.maybeOf(context);
-      if (viewport != null &&
-          scrollable != null &&
-          scrollable.position.hasPixels) {
-        final current = scrollable.position.pixels;
-        // alignment 0 = 把目标顶边对齐到可视区起点，1 = 把目标底边对齐到
-        // 终点。两者同时成立说明目标已经完整落在可视区里，不用再滚。
-        final toStart = viewport.getOffsetToReveal(render, 0).offset;
-        final toEnd = viewport.getOffsetToReveal(render, 1).offset;
-        if (toStart >= current - 8 && toEnd <= current + 8) return;
+      if (viewport == null) return;
+      final position = _chipScroll.position;
+      final current = position.pixels;
+      // alignment 0 = 把目标顶边对齐到可视区起点，1 = 把目标底边对齐到终点。
+      // toStart < current 说明它已经从左侧被挤出去，toEnd > current 说明从
+      // 右侧被挤出去；两者都不成立 = 完整可见。
+      const margin = 24.0;
+      final toStart = viewport.getOffsetToReveal(render, 0).offset;
+      final toEnd = viewport.getOffsetToReveal(render, 1).offset;
+      double? target;
+      if (toStart < current) {
+        target = toStart - margin;
+      } else if (toEnd > current) {
+        target = toEnd + margin;
       }
-      Scrollable.ensureVisible(
-        context,
-        alignment: 0.5,
-        duration: const Duration(milliseconds: 260),
-        curve: Curves.easeOutCubic,
+      if (target == null) return;
+      final clamped = target.clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((clamped - current).abs() < 6) return;
+      unawaited(
+        _chipScroll.animateTo(
+          clamped,
+          duration: MovaMotion.standard,
+          curve: MovaMotion.standardEase,
+        ),
       );
     });
   }
@@ -8431,6 +8455,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void dispose() {
     _chipRevealTimer?.cancel();
+    _chipScroll.dispose();
     _settingsScroll.dispose();
     _activeSetting.dispose();
     _tmdbApiKey.dispose();
@@ -9854,30 +9879,34 @@ class _SettingsPageState extends State<SettingsPage> {
                               for (var i = 0; i < labels.length; i++)
                                 Padding(
                                   padding: const EdgeInsets.only(bottom: 6),
-                                  child: TextButton(
-                                    onPressed: () => _jumpToSetting(i, keys[i]),
-                                    style: TextButton.styleFrom(
-                                      alignment: Alignment.centerLeft,
-                                      foregroundColor: active == i
-                                          ? const Color(0xFF111216)
-                                          : const Color(0xFFB8BDC8),
-                                      backgroundColor: active == i
-                                          ? const Color(0xFFF1F1F2)
-                                          : Colors.transparent,
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 14,
-                                        vertical: 12,
+                                  child: MovaPress(
+                                    scale: .97,
+                                    visualOnly: true,
+                                    child: TextButton(
+                                      onPressed: () => _jumpToSetting(i, keys[i]),
+                                      style: TextButton.styleFrom(
+                                        alignment: Alignment.centerLeft,
+                                        foregroundColor: active == i
+                                            ? const Color(0xFF111216)
+                                            : const Color(0xFFB8BDC8),
+                                        backgroundColor: active == i
+                                            ? const Color(0xFFF1F1F2)
+                                            : Colors.transparent,
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 14,
+                                          vertical: 12,
+                                        ),
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(12),
+                                        ),
                                       ),
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(12),
+                                      child: Row(
+                                        children: [
+                                          Icon(labels[i].$2, size: 18),
+                                          const SizedBox(width: 11),
+                                          Text(labels[i].$1),
+                                        ],
                                       ),
-                                    ),
-                                    child: Row(
-                                      children: [
-                                        Icon(labels[i].$2, size: 18),
-                                        const SizedBox(width: 11),
-                                        Text(labels[i].$1),
-                                      ],
                                     ),
                                   ),
                                 ),
@@ -9922,6 +9951,9 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 窄屏下的分栏切换：横向滚动的胶囊按钮。
   ///
   /// 桌面版把分栏做成 220px 的左侧竖排导航，手机上那个宽度会把正文挤没。
+  ///
+  /// 选中态只换颜色、不换字重：字重一变胶囊就变宽，右边所有胶囊都会跟着
+  /// 左右挪一下 —— 这才是上下滑动时「跳动」的主因之一。
   Widget _settingsSectionChips(
     List<(String, IconData)> labels,
     List<GlobalKey> keys,
@@ -9930,35 +9962,55 @@ class _SettingsPageState extends State<SettingsPage> {
     child: ValueListenableBuilder<int>(
       valueListenable: _activeSetting,
       builder: (context, active, _) => ListView.separated(
+        controller: _chipScroll,
         scrollDirection: Axis.horizontal,
         itemCount: labels.length,
         separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, index) => TextButton(
-          key: _settingChipKey(index),
-          onPressed: () => _jumpToSetting(index, keys[index]),
-          style: TextButton.styleFrom(
-            foregroundColor: active == index
-                ? const Color(0xFF111216)
-                : const Color(0xFFB8BDC8),
-            backgroundColor: active == index
-                ? const Color(0xFFF1F1F2)
-                : Colors.transparent,
-            padding: const EdgeInsets.symmetric(horizontal: 14),
-            minimumSize: const Size(0, 38),
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(19),
+        itemBuilder: (context, index) {
+          final selected = active == index;
+          return MovaPress(
+            key: _settingChipKey(index),
+            onTap: () => _jumpToSetting(index, keys[index]),
+            behavior: HitTestBehavior.opaque,
+            scale: .94,
+            hoverScale: 1.03,
+            semanticLabel: labels[index].$1,
+            child: AnimatedContainer(
+              duration: MovaMotion.quick,
+              curve: MovaMotion.standardEase,
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: BoxDecoration(
+                color: selected ? const Color(0xFFF1F1F2) : Colors.transparent,
+                borderRadius: BorderRadius.circular(19),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    labels[index].$2,
+                    size: 16,
+                    color: selected
+                        ? const Color(0xFF111216)
+                        : const Color(0xFFB8BDC8),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    labels[index].$1,
+                    style: TextStyle(
+                      fontSize: 13,
+                      height: 1,
+                      fontWeight: FontWeight.w600,
+                      color: selected
+                          ? const Color(0xFF111216)
+                          : const Color(0xFFB8BDC8),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(labels[index].$2, size: 16),
-              const SizedBox(width: 8),
-              Text(labels[index].$1),
-            ],
-          ),
-        ),
+          );
+        },
       ),
     ),
   );

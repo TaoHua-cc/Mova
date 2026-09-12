@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
 import 'platform/window_host.dart';
+import 'motion.dart';
 
 /// 桌面端把滚轮交给 [YingjiSmoothWheel] 接管，移动端保留原生触摸滚动。
 ///
@@ -818,7 +819,10 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
         }),
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTapDown: (_) => setState(() => _pressed = true),
+          onTapDown: (_) {
+            MovaMotion.tap();
+            setState(() => _pressed = true);
+          },
           onTapUp: (_) => setState(() => _pressed = false),
           onTapCancel: () => setState(() => _pressed = false),
           onTap: widget.onPressed,
@@ -827,12 +831,14 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
             label: widget.tooltip,
             selected: widget.selected,
             child: AnimatedScale(
-              scale: _pressed ? .94 : (active ? 1.018 : 1),
-              duration: const Duration(milliseconds: 110),
-              curve: Curves.easeOutCubic,
+              scale: _pressed
+                  ? MovaMotion.pressScaleIcon
+                  : (active ? MovaMotion.hoverScale : 1),
+              duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
+              curve: _pressed ? MovaMotion.press : MovaMotion.spring,
               child: AnimatedContainer(
-                duration: const Duration(milliseconds: 180),
-                curve: Curves.easeOutCubic,
+                duration: MovaMotion.quick,
+                curve: MovaMotion.standardEase,
                 width: widget.size,
                 height: widget.size,
                 decoration: BoxDecoration(

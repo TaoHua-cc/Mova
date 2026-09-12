@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
 
 import '../brand.dart';
+import '../motion.dart';
 import '../history/watch_state_store.dart';
 import 'danmaku_client.dart';
 import 'subtitle_preference.dart';
@@ -340,6 +341,11 @@ class _PlayerPageState extends State<PlayerPage> {
   IconData _gestureIcon = Icons.brightness_6;
   /// 手势指示器的进度，0..1。
   double _gestureProgress = 0;
+  /// 手势指示器的副文案（快进快退的偏移量）；为空时不显示。
+  String _gestureCaption = '';
+  /// 指示器当前该不该显示。手势结束只置 false 让它按统一规范淡出，
+  /// 数值保留到淡出结束，免得最后一帧跳回默认值。
+  bool _gestureVisible = false;
   /// 水平拖动的累计位移，用来换算快进快退的秒数。
   double _seekDragPixels = 0;
   /// 水平拖动开始时的播放位置。
@@ -540,7 +546,9 @@ class _PlayerPageState extends State<PlayerPage> {
     _seekDragAnchor = _player.state.position;
     _seekPreview = _seekDragAnchor;
     _gestureLabel = _time(_seekDragAnchor);
+    _gestureCaption = '';
     _gestureProgress = _progressFor(_seekDragAnchor);
+    _gestureVisible = true;
     // 拖动期间不要自动隐藏控件，否则指示器会跟着一起消失。
     _controlsTimer?.cancel();
     setState(() {});
@@ -562,8 +570,8 @@ class _PlayerPageState extends State<PlayerPage> {
     _gestureIcon = _seekDragPixels >= 0
         ? Icons.fast_forward
         : Icons.fast_rewind;
-    _gestureLabel =
-        '${_time(target)}  ${_offsetLabel(target - _seekDragAnchor)}';
+    _gestureLabel = _time(target);
+    _gestureCaption = _offsetLabel(target - _seekDragAnchor);
     _gestureProgress = _progressFor(target, span);
     setState(() {});
   }
@@ -591,7 +599,9 @@ class _PlayerPageState extends State<PlayerPage> {
     if (isLeft && !_brightnessKnown) unawaited(_loadScreenBrightness());
     _valueDragAnchor = isLeft ? _brightness * 100 : _volume;
     _gestureLabel = '${_valueDragAnchor.round()}%';
+    _gestureCaption = '';
     _gestureProgress = (_valueDragAnchor / 100).clamp(0.0, 1.0);
+    _gestureVisible = true;
     _controlsTimer?.cancel();
     setState(() {});
   }
@@ -642,7 +652,9 @@ class _PlayerPageState extends State<PlayerPage> {
   void _endGesture() {
     if (!mounted) return;
     setState(() {
-      _gestureKind = null;
+      // 保留 _gestureKind 和数值：指示器要按统一规范淡出，直接清空会让它
+      // 在消失的那一帧突然变成默认文案。
+      _gestureVisible = false;
       _seekPreview = null;
       _seekDragPixels = 0;
       _valueDragPixels = 0;
@@ -1324,53 +1336,68 @@ class _PlayerPageState extends State<PlayerPage> {
     }
   }
 
-  Widget _segmentPrompt() => Positioned(
+  Widget _segmentPrompt() => AnimatedPositioned(
     right: 28,
     bottom: _showControls ? 170 : 32,
-    child: GlassPanel(
-      radius: 16,
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            _skipKind == 'intro'
-                ? '片头 · 跳转至 ${_time(_introEnd!)}'
-                : '片尾 · ${_activeEpisodeIndex < widget.episodes.length - 1 ? '播放下一集' : '跳转至结尾'}',
-            style: const TextStyle(fontWeight: FontWeight.w700),
-          ),
-          if (_autoSkipSegments) ...[
-            const SizedBox(height: 6),
+    duration: MovaMotion.standard,
+    curve: MovaMotion.standardEase,
+    child: MovaAppear(
+      beginScale: .94,
+      slide: .06,
+      duration: MovaMotion.standard,
+      child: GlassPanel(
+        radius: 16,
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
             Text(
-              '${((10 - _skipTicks) / 2).ceil().clamp(0, 5)} 秒后自动跳过',
-              style: const TextStyle(fontSize: 12, color: YingjiColors.muted),
+              _skipKind == 'intro'
+                  ? '片头 · 跳转至 ${_time(_introEnd!)}'
+                  : '片尾 · ${_activeEpisodeIndex < widget.episodes.length - 1 ? '播放下一集' : '跳转至结尾'}',
+              style: const TextStyle(fontWeight: FontWeight.w700),
             ),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: 224,
-              child: LinearProgressIndicator(
-                value: (_skipTicks / 10).clamp(0, 1),
+            if (_autoSkipSegments) ...[
+              const SizedBox(height: 6),
+              Text(
+                '${((10 - _skipTicks) / 2).ceil().clamp(0, 5)} 秒后自动跳过',
+                style: const TextStyle(fontSize: 12, color: YingjiColors.muted),
               ),
-            ),
-          ],
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextButton.icon(
-                onPressed: _performSegmentSkip,
-                icon: const Icon(YingjiIcons.chevron_right, size: 16),
-                label: const Text('立即跳过'),
-              ),
-              TextButton(
-                onPressed: () => setState(() {
-                  if (_skipKind != null) _skipDismissed.add(_skipKind!);
-                }),
-                child: const Text('本次不跳过'),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: 224,
+                child: LinearProgressIndicator(
+                  value: (_skipTicks / 10).clamp(0, 1),
+                ),
               ),
             ],
-          ),
-        ],
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                MovaPress(
+                  scale: .94,
+                  visualOnly: true,
+                  child: TextButton.icon(
+                    onPressed: _performSegmentSkip,
+                    icon: const Icon(YingjiIcons.chevron_right, size: 16),
+                    label: const Text('立即跳过'),
+                  ),
+                ),
+                MovaPress(
+                  scale: .94,
+                  visualOnly: true,
+                  child: TextButton(
+                    onPressed: () => setState(() {
+                      if (_skipKind != null) _skipDismissed.add(_skipKind!);
+                    }),
+                    child: const Text('本次不跳过'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     ),
   );
@@ -1987,7 +2014,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     !_settingsOpen)
                   _segmentPrompt(),
                 if (_settingsOpen) _consolePanel(context),
-                if (_gestureKind != null) _gestureIndicator(),
+                _gestureIndicator(),
                 _pauseResumePrompt(),
                 // Keep a dedicated caption strip above the custom overlay so
                 // controls cannot swallow window-drag gestures. It avoids
@@ -2259,49 +2286,29 @@ class _PlayerPageState extends State<PlayerPage> {
     ),
   );
 
-  /// 手势回显：快进快退显示目标时间，亮度 / 音量显示百分比。
+  /// 手势回显：亮度 / 音量用 Apple 那种竖条 HUD，快进快退用横条胶囊。
   ///
-  /// 手机上这层压在画面正中时，调音量/亮度会正好挡住人物和字幕，所以整体
-  /// 缩小、并抬到画面上方（水平仍居中）。
+  /// 手机上这层不能压在画面正中：调音量/亮度时会正好挡住人物和字幕，所以
+  /// 抬到画面上方（水平仍居中）。
   ///
   /// 整层 IgnorePointer，避免它自己抢走后续的拖动事件。
+  ///
+  /// 出现 / 消失走 [MovaAppear]，和全软件其它浮层同一套时长与曲线。
   Widget _gestureIndicator() => IgnorePointer(
-    child: Align(
-      alignment: const Alignment(0, -0.45),
-      child: GlassPanel(
-        radius: 16,
-        padding: const EdgeInsets.fromLTRB(14, 10, 14, 9),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(_gestureIcon, size: 20, color: Colors.white),
-            const SizedBox(height: 6),
-            Text(
-              _gestureLabel,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-            const SizedBox(height: 7),
-            SizedBox(
-              width: 92,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(999),
-                child: LinearProgressIndicator(
-                  value: _gestureProgress,
-                  minHeight: 4,
-                  backgroundColor: Colors.white24,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    YingjiColors.focus,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
+    child: MovaAppear(
+      visible: _gestureVisible,
+      animateOnMount: false,
+      beginScale: .88,
+      duration: MovaMotion.hudIn,
+      child: Align(
+        alignment: const Alignment(0, -.42),
+        child: _gestureKind == _GestureKind.seek
+            ? MovaHudPill(
+                icon: _gestureIcon,
+                label: _gestureLabel,
+                caption: _gestureCaption.isEmpty ? null : _gestureCaption,
+              )
+            : MovaHud(icon: _gestureIcon, value: _gestureProgress),
       ),
     ),
   );
@@ -2321,27 +2328,35 @@ class _PlayerPageState extends State<PlayerPage> {
         return const SizedBox.shrink();
       }
       return Center(
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () {
-            _revealControls();
-            unawaited(_player.play());
-          },
-          child: Container(
-            width: 78,
-            height: 78,
-            decoration: BoxDecoration(
-              color: const Color(0x8A000000),
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: const Color(0x66FFFFFF),
-                width: 1.4,
+        child: MovaAppear(
+          beginScale: .8,
+          duration: MovaMotion.emphasis,
+          child: MovaPress(
+            onTap: () {
+              _revealControls();
+              unawaited(_player.play());
+            },
+            behavior: HitTestBehavior.opaque,
+            scale: MovaMotion.pressScaleIcon,
+            hoverScale: 1.06,
+            pressedOpacity: .82,
+            semanticLabel: '继续播放',
+            child: Container(
+              width: 78,
+              height: 78,
+              decoration: BoxDecoration(
+                color: const Color(0x8A000000),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: const Color(0x66FFFFFF),
+                  width: 1.4,
+                ),
               ),
-            ),
-            child: const Icon(
-              YingjiIcons.play_fill,
-              color: Colors.white,
-              size: 34,
+              child: const Icon(
+                YingjiIcons.play_fill,
+                color: Colors.white,
+                size: 34,
+              ),
             ),
           ),
         ),

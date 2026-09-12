@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'app_route_observer.dart';
 import 'brand.dart';
 import 'media_center.dart';
+import 'motion.dart';
 
 class YingjiApp extends StatelessWidget {
   const YingjiApp({super.key});
@@ -43,10 +44,23 @@ class YingjiApp extends StatelessWidget {
         fontFamily: YingjiFonts.family,
         fontFamilyFallback: [...YingjiFonts.fallback, 'Segoe UI'],
         visualDensity: VisualDensity.compact,
+        // 全平台同一个转场：新页面从右侧滑入并淡入，底下的页面往左让一点。
+        pageTransitionsTheme: const PageTransitionsTheme(
+          builders: <TargetPlatform, PageTransitionsBuilder>{
+            TargetPlatform.android: MovaPageTransitionsBuilder(),
+            TargetPlatform.iOS: MovaPageTransitionsBuilder(),
+            TargetPlatform.fuchsia: MovaPageTransitionsBuilder(),
+            TargetPlatform.linux: MovaPageTransitionsBuilder(),
+            TargetPlatform.macOS: MovaPageTransitionsBuilder(),
+            TargetPlatform.windows: MovaPageTransitionsBuilder(),
+          },
+        ),
         hoverColor: Colors.white.withValues(alpha: .09),
         focusColor: Colors.white.withValues(alpha: .13),
-        splashColor: Colors.white.withValues(alpha: .16),
-        highlightColor: Colors.white.withValues(alpha: .11),
+        // Apple 那套没有墨迹扩散：按下反馈统一交给 MovaPress /
+        // YingjiMotionIconButton 的缩放回弹，Material 水波纹关掉。
+        splashColor: Colors.transparent,
+        highlightColor: Colors.transparent,
         textTheme:
             const TextTheme(
               displayLarge: TextStyle(
