@@ -143,7 +143,9 @@ class _MovaPressState extends State<MovaPress> {
     final target = !interactive
         ? 1.0
         : (_pressed ? widget.scale : (_hovered ? widget.hoverScale : 1.0));
-    final opacity = !interactive ? 1.0 : (_pressed ? widget.pressedOpacity : 1);
+    final opacity = !interactive
+        ? 1.0
+        : (_pressed ? widget.pressedOpacity : 1.0);
     return Semantics(
       button: widget.onTap != null,
       label: widget.semanticLabel,
@@ -434,6 +436,56 @@ class MovaHudPill extends StatelessWidget {
       ),
     ),
   );
+}
+
+/// 统一的轻提示。
+///
+/// 仍然走 SnackBar 的通道（这样不会钻到页面叠层底下、多条也会自动排队），
+/// 但外观、时长、圆角由这里定：底部浮起的深色胶囊，可选一个引导图标。
+abstract final class MovaToast {
+  MovaToast._();
+
+  static void show(
+    BuildContext context, {
+    required String message,
+    IconData? icon,
+    Duration duration = const Duration(milliseconds: 2200),
+    SnackBarAction? action,
+  }) {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 17, color: Colors.white.withValues(alpha: .9)),
+              const SizedBox(width: 10),
+            ],
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  height: 1.4,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+        duration: duration,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        backgroundColor: const Color(0xF21A1C22),
+        action: action,
+      ),
+    );
+  }
 }
 
 /// 统一的页面转场：新页面从右侧滑入并淡入，底下的页面跟着往左让一点。

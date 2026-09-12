@@ -658,11 +658,11 @@ class _YingjiMotionSurfaceState extends State<YingjiMotionSurface> {
           onPointerCancel: (_) => setState(() => _pressed = false),
           child: AnimatedScale(
             scale: _pressed ? .975 : (active ? 1.012 : 1),
-            duration: const Duration(milliseconds: 120),
-            curve: Curves.easeOutCubic,
+            duration: MovaMotion.tapDown,
+            curve: MovaMotion.standardEase,
             child: AnimatedContainer(
-              duration: const Duration(milliseconds: 180),
-              curve: Curves.easeOutCubic,
+              duration: MovaMotion.quick,
+              curve: MovaMotion.standardEase,
               foregroundDecoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(widget.borderRadius),
                 border: Border.all(
