@@ -398,6 +398,8 @@ class _HomeFeedPageState extends State<_HomeFeedPage> {
               controller: _scroll,
               child: ListView(
                 controller: _scroll,
+                // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
+                physics: yingjiWheelPhysics,
                 padding: EdgeInsets.zero,
                 children: [
                   SizedBox(
@@ -5412,6 +5414,8 @@ class _SearchPageState extends State<_SearchPage> {
     controller: _pageScroll,
     child: ListView(
       controller: _pageScroll,
+      // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
+      physics: yingjiWheelPhysics,
       padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
       children: [
         const Text(

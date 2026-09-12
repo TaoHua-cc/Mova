@@ -1,5 +1,6 @@
 // ignore_for_file: constant_identifier_names
 
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
@@ -8,38 +9,159 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
 import 'platform/window_host.dart';
 
-/// Turns discrete Windows wheel ticks into one interruptible, eased movement.
-/// The controller remains authoritative, so scrollbars and programmatic
-/// centering stay synchronized.
-class YingjiSmoothWheel extends StatelessWidget {
+/// 桌面端把滚轮交给 [YingjiSmoothWheel] 接管，移动端保留原生触摸滚动。
+///
+/// 这是 [YingjiSmoothWheel] 能生效的前提：内层滚动视图若保留了可滚动的
+/// physics，它的 `Scrollable` 会先一步消费掉滚轮事件，平滑动画永远不会触发。
+ScrollPhysics? get yingjiWheelPhysics =>
+    WindowHost.isDesktop ? const NeverScrollableScrollPhysics() : null;
+
+/// 把鼠标滚轮的离散刻度，换成一段连续、可被下一次滚动接续的平滑位移。
+///
+/// 落点由滚轮增量累加得出，每一帧再用与帧率无关的指数收敛去追赶它：快速连续
+/// 滚动会合成一次滑行，而不是一格一格地跳；松手后速度自然衰减到静止，不会在
+/// 每个刻度末尾停顿。`controller` 始终是唯一真相，因此滚动条与程序化定位都不
+/// 受影响。
+///
+/// 仅在桌面端生效——移动端保留系统原生的触摸滚动，避免与手指拖拽打架。
+class YingjiSmoothWheel extends StatefulWidget {
   const YingjiSmoothWheel({
     super.key,
     required this.controller,
     required this.child,
+    this.stepScale = 1.18,
+    this.settlePerFrame = .78,
   });
 
   final ScrollController controller;
   final Widget child;
 
+  /// 一个滚轮刻度折算成的滚动像素倍数。
+  final double stepScale;
+
+  /// 每个 60fps 帧之后仍未走完的距离比例；越小越跟手、滑行尾巴越短。
+  final double settlePerFrame;
+
+  @override
+  State<YingjiSmoothWheel> createState() => _YingjiSmoothWheelState();
+}
+
+class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
+  /// 滚轮累加出来的落点。
+  double _goal = 0;
+
+  /// 已经写入 controller 的位置。
+  double _shown = 0;
+
+  /// 上一次由本组件写入的像素值，用来识别外部滚动介入。
+  double _written = double.nan;
+
+  Duration _lastFrame = Duration.zero;
+
+  /// 排队中的帧回调；非 null 表示滑行还没结束。这里逐帧调度而不是用 Ticker，
+  /// 是为了让 keep-alive 的页面在销毁时不会留下仍被引用的 ticker。
+  int? _frame;
+
+  @override
+  void dispose() {
+    _settle();
+    super.dispose();
+  }
+
+  /// 结束滑行：撤掉排队中的帧，并让下一次滚轮重新对齐到真实位置。
+  void _settle() {
+    final pending = _frame;
+    if (pending != null) {
+      WidgetsBinding.instance.cancelFrameCallbackWithId(pending);
+      _frame = null;
+    }
+    _lastFrame = Duration.zero;
+    _written = double.nan;
+  }
+
+  void _scheduleFrame() {
+    _frame = WidgetsBinding.instance.scheduleFrameCallback(_onFrame);
+  }
+
+  ScrollPosition? get _position =>
+      widget.controller.hasClients ? widget.controller.position : null;
+
+  void _handleWheel(PointerScrollEvent event) {
+    // 移动端不接管：内层 Scrollable 会照常处理，这里再动一次就重复滚了。
+    if (!WindowHost.isDesktop) return;
+    final position = _position;
+    if (position == null) return;
+    // 横向占优（触控板横滑 / Shift+滚轮）交给内层的横向列表。
+    if (event.scrollDelta.dy.abs() <= event.scrollDelta.dx.abs()) return;
+
+    final pixels = position.pixels;
+    if (_frame == null || (pixels - _written).abs() > 1) {
+      // 上一段滑行已经停稳，或外部（拖拽、程序化定位）动过位置：重新对齐再起步。
+      _shown = pixels;
+      _goal = pixels;
+    }
+    _goal = (_goal + event.scrollDelta.dy * widget.stepScale).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    if (_frame == null) {
+      _lastFrame = Duration.zero;
+      _scheduleFrame();
+    }
+    // 同一次事件若还嵌着别的可滚动视图，别让它再消费一遍。
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {});
+  }
+
+  void _onFrame(Duration elapsed) {
+    // 这一帧已经兑现，重新排队前先清空标记。
+    _frame = null;
+    if (!mounted) return;
+    final position = _position;
+    if (position == null) {
+      _settle();
+      return;
+    }
+    // 拖拽或程序化滚动正在进行：让路，并把落点对齐到真实位置，下一帧再看。
+    if ((position.pixels - _written).abs() > 1) {
+      _shown = position.pixels;
+      _goal = position.pixels;
+      _written = position.pixels;
+      _lastFrame = elapsed;
+      _scheduleFrame();
+      return;
+    }
+
+    final seconds = _lastFrame == Duration.zero
+        ? 1 / 60
+        : (elapsed - _lastFrame).inMicroseconds / 1e6;
+    _lastFrame = elapsed;
+    // 掉帧时钳住步长，避免一帧跨过太远。
+    final step = seconds.clamp(1 / 240, 1 / 24);
+    // 与帧率无关的指数收敛：60fps 下每帧保留 settlePerFrame。
+    final keep = math.pow(widget.settlePerFrame, step * 60).toDouble();
+    _shown += (_goal - _shown) * (1 - keep);
+
+    // 剩余距离够小就直接落到位，省掉肉眼看不到的尾巴。
+    if ((_goal - _shown).abs() < .35) {
+      _commit(position, _goal);
+      _settle();
+      return;
+    }
+    _commit(position, _shown);
+    _scheduleFrame();
+  }
+
+  void _commit(ScrollPosition position, double value) {
+    _written = value;
+    position.jumpTo(value);
+  }
+
   @override
   Widget build(BuildContext context) => Listener(
     onPointerSignal: (signal) {
-      if (signal is! PointerScrollEvent || !controller.hasClients) return;
-      GestureBinding.instance.pointerSignalResolver.register(signal, (event) {
-        final wheel = event as PointerScrollEvent;
-        final position = controller.position;
-        final target = (controller.offset + wheel.scrollDelta.dy * 1.18).clamp(
-          position.minScrollExtent,
-          position.maxScrollExtent,
-        );
-        controller.animateTo(
-          target,
-          duration: const Duration(milliseconds: 190),
-          curve: Curves.easeOutCubic,
-        );
-      });
+      if (signal is PointerScrollEvent) _handleWheel(signal);
     },
-    child: child,
+    child: widget.child,
   );
 }
 

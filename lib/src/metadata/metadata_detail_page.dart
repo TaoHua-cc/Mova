@@ -1049,9 +1049,13 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                               scrollCacheExtent: const ScrollCacheExtent.pixels(
                                 900,
                               ),
-                              physics: const BouncingScrollPhysics(
-                                parent: AlwaysScrollableScrollPhysics(),
-                              ),
+                              // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel
+                              // 平滑驱动；移动端保持原有的回弹手感。
+                              physics:
+                                  yingjiWheelPhysics ??
+                                  const BouncingScrollPhysics(
+                                    parent: AlwaysScrollableScrollPhysics(),
+                                  ),
                               padding: const EdgeInsets.fromLTRB(
                                 34,
                                 10,
