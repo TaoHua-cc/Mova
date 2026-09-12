@@ -209,6 +209,44 @@ final yingjiHomeFocusTick = ValueNotifier<int>(0);
 /// 改由这个值驱动，以保留合并前“滚下去背景变糊”的观感。
 final yingjiHomeScrollDepth = ValueNotifier<double>(0);
 
+/// 贯穿全部页面的统一栅格。
+///
+/// 浮动导航固定在左边 16、宽 54，正文必须让开这一段；桌面和手机屏宽差得远，
+/// 所以两侧内缩分成两档。**任何页面都不应该再自己算左边距**——之前详情页
+/// （侧栏 88 + 内缩 34 = 122）和设置页（壳层 96 + 内缩 26 = 122）各算了一遍，
+/// 结果和首页、搜索页的 96 对不齐，搜索按钮也被挤在返回键旁边。
+abstract final class YingjiLayout {
+  /// 浮动导航条的左边距与宽度。
+  static const double railLeft = 16;
+  static const double railWidth = 54;
+
+  /// 设置页窄于这个宽度就从「左栏 + 正文」改成单栏。
+  static const double twoColumnMinWidth = 900;
+
+  /// 正文区统一内缩：所有内层页面（首页内的发现内容、搜索、服务器、片单、
+  /// 追剧、设置）共用同一个值。
+  static EdgeInsets get pageInset => WindowHost.isDesktop
+      ? const EdgeInsets.only(left: 96, top: 96, right: 40)
+      : const EdgeInsets.only(left: 78, top: 84, right: 18);
+
+  /// 正文区左锚点。
+  static double get pageLeft => WindowHost.isDesktop ? 96 : 78;
+
+  /// 正文区右锚点。
+  static double get pageRight => WindowHost.isDesktop ? 40 : 18;
+
+  /// 详情页左侧导航栏宽度（详情页是独立路由，自带侧栏，宽度要算进锚点里）。
+  static double get detailSidebarWidth => WindowHost.isDesktop ? 88 : 64;
+
+  /// 详情页侧栏自身的横向内边距，两种宽度下都保证按钮槽位是 44。
+  static EdgeInsets get detailSidebarPadding => WindowHost.isDesktop
+      ? const EdgeInsets.fromLTRB(18, 18, 14, 18)
+      : const EdgeInsets.fromLTRB(10, 18, 10, 18);
+
+  /// 详情页正文与顶部栏在侧栏之外还要补的内缩，补完正好等于 [pageLeft]。
+  static double get detailLeadingInset => pageLeft - detailSidebarWidth;
+}
+
 class YingjiBackdrop extends StatelessWidget {
   const YingjiBackdrop({super.key, this.overlay, this.blur = 0});
   final Widget? overlay;

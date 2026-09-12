@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../network/network_http_client.dart';
+import '../version.dart';
 
 Map<String, double> _parseRatingsMap(dynamic value) {
   final map = value as Map<dynamic, dynamic>?;
@@ -844,7 +845,7 @@ class TmdbClient {
                 uri,
                 headers: const {
                   'Accept': 'application/json',
-                  'User-Agent': 'Mova/3.1.65 (Windows; Flutter)',
+                  'User-Agent': 'Mova/$movaVersion ($movaPlatform; Flutter)',
                 },
               )
               .timeout(const Duration(seconds: 12));
@@ -887,7 +888,7 @@ class TmdbClient {
             uri,
             headers: const {
               'Accept': 'application/json',
-              'User-Agent': 'Mova/3.1.65 (Windows; Flutter)',
+              'User-Agent': 'Mova/$movaVersion ($movaPlatform; Flutter)',
             },
           )
           .timeout(const Duration(seconds: 12));

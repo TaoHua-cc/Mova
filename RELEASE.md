@@ -19,17 +19,20 @@ Windows 与 Android 共用同一套业务源码（`lib/`），所以绝大多数
 
 ## 版本号约定
 
-版本号有**两个地方**要同步，另有**一个 tag**：
+版本号有**三个地方**要同步，另有**一个 tag**：
 
 | 位置 | 作用 | 示例 |
 |---|---|---|
-| `pubspec.yaml` 的 `version:` | 前后段分别是 版本名 和 build 号 | `3.1.80+87` |
-| `installer/Mova.iss` 的 `AppVersion` | Windows 安装器显示版本；CI 会覆盖它 | `3.1.80` |
-| Git tag | 触发发版流水线 | `v3.1.80` |
+| `pubspec.yaml` 的 `version:` | 前后段分别是 版本名 和 build 号 | `3.1.83+90` |
+| `installer/Mova.iss` 的 `AppVersion` | Windows 安装器显示版本；CI 会覆盖它 | `3.1.83` |
+| `lib/src/version.dart` 的 `movaVersion` | 「关于 Mova」面板显示、HTTP 请求头声明 | `3.1.83` |
+| Git tag | 触发发版流水线 | `v3.1.83` |
 
 - `+` 后面的 build 号就是安卓 `versionCode`，**每次发版必须递增**，否则手机不接受覆盖更新
 - tag 必须带 `v` 前缀，格式 `vX.Y.Z`
 - CI 以 **tag 为准**；若 pubspec 与 tag 不一致会给出警告
+- `movaVersion` **不要在别处再硬编码**：源里只留这一处，两个发版脚本都会自动改写它。
+  （这条规则是因为「关于」面板曾经停在 `3.1.65`，比实际发布版本落后了十几个版本。）
 
 ## 日常改动（不发布）
 

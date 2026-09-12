@@ -71,11 +71,27 @@ if (Test-Path $iss) {
   Write-Host "installer/Mova.iss: $Version"
 }
 
-# ---- 3. commit ----
-Invoke-Git @('add', 'pubspec.yaml', 'installer/Mova.iss')
+# ---- 3. lib/src/version.dart: the version the UI and UA strings report ----
+# The About panel and the HTTP user agents read movaVersion from here, so it has
+# to move with the release or it silently goes stale (it once sat at 3.1.65 for
+# eighteen releases).
+$verDart = Join-Path $root 'lib\src\version.dart'
+if (-not (Test-Path $verDart)) {
+  throw 'lib/src/version.dart is missing; movaVersion is read from it'
+}
+$verText = [System.IO.File]::ReadAllText($verDart)
+$verNew = [regex]::Replace($verText, "(?m)^const String movaVersion = '\d+\.\d+\.\d+';", "const String movaVersion = '$Version';")
+if ($verNew -eq $verText) {
+  throw 'lib/src/version.dart has no movable "const String movaVersion = X.Y.Z;" line'
+}
+Write-Utf8NoBom $verDart $verNew
+Write-Host "lib/src/version.dart: movaVersion -> $Version"
+
+# ---- 4. commit ----
+Invoke-Git @('add', 'pubspec.yaml', 'installer/Mova.iss', 'lib/src/version.dart')
 Invoke-Git @('commit', '-m', "release: Mova $Version")
 
-# ---- 4. tag ----
+# ---- 5. tag ----
 Invoke-Git @('tag', "v$Version")
 Write-Host "tagged v$Version"
 
@@ -84,7 +100,7 @@ if ($SkipPush) {
   exit 0
 }
 
-# ---- 5. push branch then tag (tag push triggers the release workflow) ----
+# ---- 6. push branch then tag (tag push triggers the release workflow) ----
 Invoke-Git @('push', 'origin', 'main')
 Invoke-Git @('push', 'origin', "v$Version")
 

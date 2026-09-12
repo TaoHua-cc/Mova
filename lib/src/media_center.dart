@@ -35,6 +35,7 @@ import 'sources/source_store.dart';
 import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
+import 'version.dart';
 
 const _defaultPlayerShortcuts = <String, String>{
   'playPause': 'Space',
@@ -288,7 +289,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
             final page = _pageFor(section);
             if (section == _CenterSection.home) return page;
             return Padding(
-              padding: const EdgeInsets.only(left: 96, top: 96, right: 40),
+              padding: YingjiLayout.pageInset,
               child: page,
             );
           },
@@ -406,10 +407,10 @@ class _HomeFeedPageState extends State<_HomeFeedPage> {
                     height: canvasHeight,
                     child: const _CinematicHome(),
                   ),
-                  const Padding(
+                  Padding(
                     // 与原独立“发现”页在壳层中收到的边距保持一致
-                    padding: EdgeInsets.only(left: 96, top: 96, right: 40),
-                    child: _DiscoverPage(embedded: true),
+                    padding: YingjiLayout.pageInset,
+                    child: const _DiscoverPage(embedded: true),
                   ),
                 ],
               ),
@@ -3240,7 +3241,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
             return const Center(child: CircularProgressIndicator());
           }
           return ListView.builder(
-            padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+            padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
             // 内嵌在首页时自身不滚动：整页高度由外层列表丈量，滚动也交给外层。
             shrinkWrap: widget.embedded,
             physics: widget.embedded
@@ -4553,7 +4554,12 @@ class _RankingPageState extends State<_RankingPage> {
                       scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
                       slivers: [
                         SliverPadding(
-                          padding: const EdgeInsets.fromLTRB(74, 32, 64, 24),
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            32,
+                            YingjiLayout.pageRight,
+                            24,
+                          ),
                           sliver: SliverToBoxAdapter(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -4610,7 +4616,12 @@ class _RankingPageState extends State<_RankingPage> {
                           ),
                         ),
                         SliverPadding(
-                          padding: const EdgeInsets.fromLTRB(74, 0, 64, 56),
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            0,
+                            YingjiLayout.pageRight,
+                            56,
+                          ),
                           sliver: SliverGrid(
                             gridDelegate:
                                 const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -5033,7 +5044,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                     scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
                     slivers: [
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(74, 32, 64, 24),
+                        padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            32,
+                            YingjiLayout.pageRight,
+                            24,
+                          ),
                         sliver: SliverToBoxAdapter(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -5134,7 +5150,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                         ),
                       ),
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(74, 0, 64, 56),
+                        padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            0,
+                            YingjiLayout.pageRight,
+                            56,
+                          ),
                         sliver: SliverGrid(
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -5416,7 +5437,7 @@ class _SearchPageState extends State<_SearchPage> {
       controller: _pageScroll,
       // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
       physics: yingjiWheelPhysics,
-      padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
       children: [
         const Text(
           '搜索',
@@ -6188,7 +6209,7 @@ class _SourceHubState extends State<_SourceHub> {
 
   @override
   Widget build(BuildContext context) => ListView(
-    padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+    padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
     children: [
       Row(
         children: [
@@ -7009,7 +7030,7 @@ class _PlaylistsPageState extends State<_PlaylistsPage> {
 
   @override
   Widget build(BuildContext context) => ListView(
-    padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+    padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
     children: [
       Row(
         children: [
@@ -7323,7 +7344,7 @@ class _CalendarPageState extends State<_CalendarPage> {
     final dates = _scheduleDates();
     final now = DateTime.now();
     return ListView(
-      padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
       children: [
         Row(
           crossAxisAlignment: CrossAxisAlignment.end,
@@ -8244,9 +8265,15 @@ class _SettingsPageState extends State<SettingsPage> {
     final client = TraktClient();
     try {
       final device = await client.requestDeviceCode(clientId);
-      await Process.run('cmd', ['/c', 'start', '', device.verificationUrl]);
+      // 桌面走 cmd /c start，安卓走宿主的 Intent.ACTION_VIEW；打不开时把地址
+      // 原样显示出来，让用户自己复制。
+      final opened = await WindowHost.openUrl(device.verificationUrl);
       if (mounted) {
-        setState(() => _traktMessage = '浏览器已打开，请输入代码 ${device.userCode} 完成授权');
+        setState(
+          () => _traktMessage = opened
+              ? '浏览器已打开，请输入代码 ${device.userCode} 完成授权'
+              : '请手动打开 ${device.verificationUrl}，输入代码 ${device.userCode} 完成授权',
+        );
       }
       final token = await client.pollDeviceCode(
         clientId: clientId,
@@ -8366,14 +8393,15 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
-    const labels = <(String, IconData)>[
+    final labels = <(String, IconData)>[
       ('首页', YingjiIcons.house),
       ('外观', YingjiIcons.paintbrush),
       ('播放器', YingjiIcons.play),
       ('播放行为', YingjiIcons.gauge),
       ('网络与同步', YingjiIcons.wifi),
       ('字幕与弹幕', YingjiIcons.captions_bubble),
-      ('快捷键与系统', YingjiIcons.gear_alt),
+      // 手机上没有键盘，这一栏就是手势说明。
+      (WindowHost.isDesktop ? '快捷键与系统' : '手势与系统', YingjiIcons.gear_alt),
       ('缓存与数据', YingjiIcons.archivebox),
       ('关于 Mova', YingjiIcons.info_circle),
     ];
@@ -8388,1243 +8416,1477 @@ class _SettingsPageState extends State<SettingsPage> {
       _maintenanceKey,
       _aboutKey,
     ];
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(26, 4, 44, 30),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(
-            sigmaX: YingjiGlass.blur + 4,
-            sigmaY: YingjiGlass.blur + 4,
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          '设置',
+          style: TextStyle(
+            fontSize: 48,
+            height: 1,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -1.2,
           ),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: YingjiGlass.surface(strength: 1.08),
-              border: Border.all(color: YingjiGlass.line()),
-            ),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SizedBox(
-                  width: 220,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 40, 18, 24),
-                    child: ValueListenableBuilder<int>(
-                      valueListenable: _activeSetting,
-                      builder: (context, active, _) => Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          for (var i = 0; i < labels.length; i++)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 6),
-                              child: TextButton(
-                                onPressed: () => _jumpToSetting(i, keys[i]),
-                                style: TextButton.styleFrom(
-                                  alignment: Alignment.centerLeft,
-                                  foregroundColor: active == i
-                                      ? const Color(0xFF111216)
-                                      : const Color(0xFFB8BDC8),
-                                  backgroundColor: active == i
-                                      ? const Color(0xFFF1F1F2)
-                                      : Colors.transparent,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 14,
-                                    vertical: 12,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                child: Row(
-                                  children: [
-                                    Icon(labels[i].$2, size: 18),
-                                    const SizedBox(width: 11),
-                                    Text(labels[i].$1),
-                                  ],
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
+        ),
+        const SizedBox(height: 28),
+        _FrostSurface(
+          key: _homeKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '首页',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '控制首页海报轮播、浮动导航和继续观看内容。保存后返回首页即可生效。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              _ToggleRow(
+                title: '显示继续观看',
+                detail: '在首页海报下方显示本机播放进度',
+                value: _homeContinueWatching,
+                onChanged: (value) {
+                  setState(
+                    () => _homeContinueWatching = value,
+                  );
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '显示首页图标',
+                detail: '在左侧浮动导航中保留首页按钮',
+                value: _homeShowIcon,
+                onChanged: (value) {
+                  setState(() => _homeShowIcon = value);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '自动轮播海报',
+                detail: '关闭后保留当前海报，可用轮播点手动切换',
+                value: _homeAutoCarousel,
+                onChanged: (value) {
+                  setState(() => _homeAutoCarousel = value);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '显示轮播点',
+                detail: '在海报右下方显示当前轮播进度',
+                value: _homeShowCarouselDots,
+                onChanged: (value) {
+                  setState(
+                    () => _homeShowCarouselDots = value,
+                  );
+                  _save();
+                },
+              ),
+              const SizedBox(height: 8),
+              YingjiGlassChoiceField<String>(
+                label: '首页轮播来源',
+                helper: '决定海报轮播使用哪组真实 TMDB 数据',
+                value: _homeCarouselSource,
+                items: const [
+                  'trending',
+                  'popular-movies',
+                  'popular-shows',
+                  'top-rated',
+                ],
+                labelBuilder: (value) => switch (value) {
+                  'trending' => 'TMDB · 本周趋势',
+                  'popular-movies' => 'TMDB · 热门电影',
+                  'popular-shows' => 'TMDB · 热门剧集',
+                  _ => 'TMDB · 高分电影',
+                },
+                onChanged: (value) {
+                  setState(() => _homeCarouselSource = value);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 12),
+              YingjiGlassDropdownField<String>(
+                initialValue: _homeCarouselEffect,
+                decoration: const InputDecoration(
+                  labelText: '海报轮播效果',
+                  helperText: '切换海报时使用的过渡动画',
+                ),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'blur-dissolve',
+                    child: Text('模糊溶解（推荐）'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'slide-fade',
+                    child: Text('上浮渐变'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'fade',
+                    child: Text('淡入式'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'zoom-fade',
+                    child: Text('缩放淡入'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'slide-horizontal',
+                    child: Text('横向滑入'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'instant',
+                    child: Text('即时切换'),
+                  ),
+                ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _homeCarouselEffect = value);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 14),
+              Text(
+                '海报停留时间  ${_homeCarouselSeconds.round()} 秒',
+              ),
+              Slider(
+                value: _homeCarouselSeconds,
+                min: 3,
+                max: 15,
+                divisions: 12,
+                label: '${_homeCarouselSeconds.round()} 秒',
+                onChanged: (value) => setState(
+                  () => _homeCarouselSeconds = value,
+                ),
+                onChangeEnd: (_) => _save(),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _appearanceKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '外观',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '调整整体明暗、圆润图标与全局玻璃材质；改动会即时应用到每个悬浮卡片。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 8),
+              YingjiGlassDropdownField<String>(
+                initialValue: _appearanceTheme,
+                decoration: InputDecoration(
+                  labelText: '颜色模式',
+                  helperText: WindowHost.isDesktop
+                      ? '系统模式会跟随 Windows 的浅色/深色设置'
+                      : '系统模式会跟随 Android 系统的浅色/深色设置',
+                ),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'dark',
+                    child: Text('深色模式'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'light',
+                    child: Text('浅色模式'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'system',
+                    child: Text('跟随系统'),
+                  ),
+                ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _appearanceTheme = value);
+                  _applyAppearance();
+                  _save();
+                },
+              ),
+              const SizedBox(height: 14),
+              YingjiGlassDropdownField<String>(
+                initialValue: _appearanceFont,
+                decoration: InputDecoration(
+                  labelText: '全局字体',
+                  helperText: WindowHost.isDesktop
+                      ? '字体会即时应用到标题、正文、榜单与播放器控件；等线 / 雅黑是 Windows 自带字体'
+                      : '字体会即时应用到标题、正文、榜单与播放器控件；两项内置字体已随安装包提供',
+                ),
+                items: [
+                  const DropdownMenuItem(
+                    value: 'round',
+                    child: Text('Mova 圆润无衬线（内置）'),
+                  ),
+                  const DropdownMenuItem(
+                    value: 'wenkai',
+                    child: Text('Mova 温润文楷（内置）'),
+                  ),
+                  // 等线 / 微软雅黑来自 Windows 系统，安卓上
+                  // 没有对应字族，列出来只会静默回退到内置
+                  // 字体，所以移动端不显示这两项。
+                  if (WindowHost.isDesktop) ...[
+                    const DropdownMenuItem(
+                      value: 'dengxian',
+                      child: Text('方圆 UI · 等线（Windows）'),
                     ),
+                    const DropdownMenuItem(
+                      value: 'yahei',
+                      child: Text('微软雅黑 UI（Windows）'),
+                    ),
+                  ],
+                ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _appearanceFont = value);
+                  _applyAppearance();
+                  _save();
+                },
+              ),
+              const SizedBox(height: 14),
+              Text(
+                '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                '左端完全透明，右端完全玻璃化；所有图标与卡片同步使用。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              Slider(
+                value: _appearanceGlassOpacity,
+                min: 0,
+                max: 1,
+                divisions: 20,
+                label:
+                    '${(_appearanceGlassOpacity * 100).round()}%',
+                onChanged: (value) {
+                  setState(
+                    () => _appearanceGlassOpacity = value,
+                  );
+                },
+                onChangeEnd: (_) {
+                  _applyAppearance();
+                  _save();
+                },
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '背景模糊  ${_appearanceGlassBlur.round()} px',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                '左端完全无模糊，右端为完整毛玻璃；可单独与透明度组合。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              Slider(
+                value: _appearanceGlassBlur,
+                min: 0,
+                max: 40,
+                divisions: 15,
+                label: '${_appearanceGlassBlur.round()} px',
+                onChanged: (value) {
+                  setState(
+                    () => _appearanceGlassBlur = value,
+                  );
+                },
+                onChangeEnd: (_) {
+                  _applyAppearance();
+                  _save();
+                },
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                '左端更明亮通透，右端更深邃；不会改变海报背景本身。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              Slider(
+                value: _appearanceCardDepth,
+                min: 0,
+                max: 1,
+                divisions: 20,
+                label:
+                    '${(_appearanceCardDepth * 100).round()}%',
+                onChanged: (value) {
+                  setState(
+                    () => _appearanceCardDepth = value,
+                  );
+                },
+                onChangeEnd: (_) {
+                  _applyAppearance();
+                  _save();
+                },
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _playerKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '播放器',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                WindowHost.isDesktop
+                    ? '内置 libmpv；这些偏好会在播放时下发给内核。'
+                    : '内置 libmpv，视频解码走 Android 的 MediaCodec 硬解；这些偏好会在播放时下发给内核。',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                ),
+              ),
+              _ToggleRow(
+                title: '硬件解码',
+                detail: WindowHost.isDesktop
+                    ? '优先 D3D11VA，由显卡直接解码'
+                    : '优先 MediaCodec 硬解，省电、发热更低',
+                value: _hardware,
+                onChanged: (v) {
+                  setState(() => _hardware = v);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: 'HDR 输出',
+                detail: WindowHost.isDesktop
+                    ? '匹配 Windows HDR 状态'
+                    : '匹配屏幕 HDR 状态（HDR10 / HLG）',
+                value: _hdr,
+                onChanged: (v) {
+                  setState(() => _hdr = v);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '立体声下混',
+                detail: WindowHost.isDesktop
+                    ? '多声道输出转换为立体声'
+                    : '多声道下混为立体声，适配手机扬声器与耳机',
+                value: _downmix,
+                onChanged: (v) {
+                  setState(() => _downmix = v);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '夜间模式',
+                detail: '压缩动态范围，深夜观影不刺耳',
+                value: _night,
+                onChanged: (v) {
+                  setState(() => _night = v);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '人声增强',
+                detail: '抬高对白频段，台词更清晰',
+                value: _voiceEnhance,
+                onChanged: (v) {
+                  setState(() => _voiceEnhance = v);
+                  _save();
+                },
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _behaviorKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '播放行为与默认值',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '这些值会作为每次打开播放器时的初始状态，也可在播放控制台临时调整。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              // 触屏手势是移动端独有的操作方式：桌面上它们
+              // 根本没有注册（鼠标拖拽会误触亮度和音量），
+              // 所以这段说明只在移动端显示。
+              if (!WindowHost.isDesktop) ...[
+                const SizedBox(height: 16),
+                const Text(
+                  '触屏手势',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
-                const VerticalDivider(width: 1, color: Color(0x22FFFFFF)),
-                Expanded(
-                  child: ScrollConfiguration(
-                    behavior: ScrollConfiguration.of(context)
-                        .copyWith(scrollbars: false),
-                    child: SingleChildScrollView(
-                      controller: _settingsScroll,
-                      padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          const Text(
-                            '设置',
-                            style: TextStyle(
-                              fontSize: 48,
-                              height: 1,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: -1.2,
+                const SizedBox(height: 2),
+                const Text(
+                  '下面这些手势在画面区域生效，和控制台里的按钮等价。',
+                  style: TextStyle(
+                    color: Color(0xFFABB1BE),
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                const _GestureHintRow(
+                  icon: YingjiIcons.play_circle,
+                  title: '单击画面',
+                  detail: '呼出或收起播放控件；控件约 1 秒后自动隐藏',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.pause_fill,
+                  title: '双击画面',
+                  detail:
+                      '播放 / 暂停。判断窗口是 280 毫秒，单击不会被推迟等待，点一下立刻出控件',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.goforward_10,
+                  title: '左右滑动',
+                  detail:
+                      '快进 / 快退：横向滑满一屏约 90 秒，滑动过程中画面中央显示目标时间与 ±偏移，松手才真正跳转',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.sparkles,
+                  title: '左半屏上下滑动',
+                  detail:
+                      '调节屏幕亮度：纵向滑满一屏约 100%，中央显示百分比。只改本应用窗口的亮度，退出播放器后自动还原，不动系统设置',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.speaker_2_fill,
+                  title: '右半屏上下滑动',
+                  detail:
+                      '调节音量：纵向滑满一屏约 100%，中央显示百分比；滑到底自动静音，往上滑恢复',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.scissors,
+                  title: '左右半屏怎么分',
+                  detail:
+                      '按手指按下的横坐标判断，不是按滑到哪儿；上下方向也只认纵向拖动，斜着滑按主方向走',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.rectangle_stack,
+                  title: '手势与控件的关系',
+                  detail:
+                      '整个画面都是手势区，控件浮在上面时手势依然可用；只有直接按在按钮或滑条上才交给控件',
+                ),
+                const SizedBox(height: 16),
+              ],
+              _ToggleRow(
+                title: '继续播放提示',
+                detail: '打开已观看媒体时显示上次进度',
+                value: _resumePrompt,
+                onChanged: (v) {
+                  setState(() => _resumePrompt = v);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 6),
+              YingjiGlassDropdownField<String>(
+                initialValue: _aspect,
+                decoration: const InputDecoration(
+                  labelText: '默认画面比例',
+                ),
+                items: const ['自动', '16:9', '4:3', '21:9']
+                    .map(
+                      (value) => DropdownMenuItem(
+                        value: value,
+                        child: Text(value),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _aspect = value);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 14),
+              Text(
+                '默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x',
+              ),
+              Slider(
+                value: _defaultSpeed,
+                min: .5,
+                max: 2,
+                divisions: 30,
+                label: '${_defaultSpeed.toStringAsFixed(2)}x',
+                onChanged: (value) =>
+                    setState(() => _defaultSpeed = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('预读缓存  ${_cacheSeconds.round()} 秒'),
+              Slider(
+                value: _cacheSeconds,
+                min: 5,
+                max: 120,
+                divisions: 23,
+                label: '${_cacheSeconds.round()} 秒',
+                onChanged: (value) =>
+                    setState(() => _cacheSeconds = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              _ToggleRow(
+                title: '预加载下一集',
+                detail: '播放接近片尾时预热下一集，减少连续播放等待',
+                value: _preloadNextEpisode,
+                onChanged: (value) {
+                  setState(() => _preloadNextEpisode = value);
+                  _save();
+                },
+              ),
+              if (_preloadNextEpisode) ...[
+                Text(
+                  '距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载',
+                ),
+                Slider(
+                  value: _preloadLeadMinutes,
+                  min: 1,
+                  max: 15,
+                  divisions: 14,
+                  label: '${_preloadLeadMinutes.round()} 分钟',
+                  onChanged: (value) => setState(
+                    () => _preloadLeadMinutes = value,
+                  ),
+                  onChangeEnd: (_) => _save(),
+                ),
+              ],
+              Text('快进 / 快退按键步长  ${_seekSeconds.round()} 秒'),
+              Text(
+                WindowHost.isDesktop
+                    ? '播放器左右方向键每次跳转的时间；长片可调大，短片建议保持 10 秒。'
+                    : '外接键盘 / 遥控器左右键每次跳转的时间。触屏左右滑动是独立手势，不受这一项影响（见上方手势说明）。',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                  fontSize: 12,
+                ),
+              ),
+              Slider(
+                value: _seekSeconds,
+                min: 5,
+                max: 60,
+                divisions: 11,
+                label: '${_seekSeconds.round()} 秒',
+                onChanged: (value) =>
+                    setState(() => _seekSeconds = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('音量按键步长  ${_volumeStep.round()}%'),
+              Text(
+                WindowHost.isDesktop
+                    ? '键盘上下方向键按一次增减的音量。'
+                    : '外接键盘 / 遥控器按一次增减的音量；触屏右半屏上下滑动是按满屏 100% 调节的。',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                  fontSize: 12,
+                ),
+              ),
+              Slider(
+                value: _volumeStep,
+                min: 1,
+                max: 20,
+                divisions: 19,
+                label: '${_volumeStep.round()}%',
+                onChanged: (value) =>
+                    setState(() => _volumeStep = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text(
+                '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
+              ),
+              Slider(
+                value: _audioDelay,
+                min: -3,
+                max: 3,
+                divisions: 120,
+                label: '${(_audioDelay * 1000).round()} ms',
+                onChanged: (value) =>
+                    setState(() => _audioDelay = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text(
+                '默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
+              ),
+              Slider(
+                value: _subtitleDelay,
+                min: -3,
+                max: 3,
+                divisions: 120,
+                label:
+                    '${(_subtitleDelay * 1000).round()} ms',
+                onChanged: (value) =>
+                    setState(() => _subtitleDelay = value),
+                onChangeEnd: (_) => _save(),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _networkKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '网络与同步',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'TMDB 默认通过 Mova 托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _tmdbApiKey,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'TMDB API Key（可选）',
+                  hintText: '留空使用 Mova 托管网关',
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _tmdbTesting
+                        ? null
+                        : _testTmdb,
+                    icon: _tmdbTesting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
                             ),
+                          )
+                        : const Icon(
+                            YingjiIcons.wifi,
+                            size: 16,
                           ),
-                          const SizedBox(height: 28),
-                          _FrostSurface(
-                            key: _homeKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '首页',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '控制首页海报轮播、浮动导航和继续观看内容。保存后返回首页即可生效。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                _ToggleRow(
-                                  title: '显示继续观看',
-                                  detail: '在首页海报下方显示本机播放进度',
-                                  value: _homeContinueWatching,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _homeContinueWatching = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '显示首页图标',
-                                  detail: '在左侧浮动导航中保留首页按钮',
-                                  value: _homeShowIcon,
-                                  onChanged: (value) {
-                                    setState(() => _homeShowIcon = value);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '自动轮播海报',
-                                  detail: '关闭后保留当前海报，可用轮播点手动切换',
-                                  value: _homeAutoCarousel,
-                                  onChanged: (value) {
-                                    setState(() => _homeAutoCarousel = value);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '显示轮播点',
-                                  detail: '在海报右下方显示当前轮播进度',
-                                  value: _homeShowCarouselDots,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _homeShowCarouselDots = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 8),
-                                YingjiGlassChoiceField<String>(
-                                  label: '首页轮播来源',
-                                  helper: '决定海报轮播使用哪组真实 TMDB 数据',
-                                  value: _homeCarouselSource,
-                                  items: const [
-                                    'trending',
-                                    'popular-movies',
-                                    'popular-shows',
-                                    'top-rated',
-                                  ],
-                                  labelBuilder: (value) => switch (value) {
-                                    'trending' => 'TMDB · 本周趋势',
-                                    'popular-movies' => 'TMDB · 热门电影',
-                                    'popular-shows' => 'TMDB · 热门剧集',
-                                    _ => 'TMDB · 高分电影',
-                                  },
-                                  onChanged: (value) {
-                                    setState(() => _homeCarouselSource = value);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 12),
-                                YingjiGlassDropdownField<String>(
-                                  initialValue: _homeCarouselEffect,
-                                  decoration: const InputDecoration(
-                                    labelText: '海报轮播效果',
-                                    helperText: '切换海报时使用的过渡动画',
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: 'blur-dissolve',
-                                      child: Text('模糊溶解（推荐）'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'slide-fade',
-                                      child: Text('上浮渐变'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'fade',
-                                      child: Text('淡入式'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'zoom-fade',
-                                      child: Text('缩放淡入'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'slide-horizontal',
-                                      child: Text('横向滑入'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'instant',
-                                      child: Text('即时切换'),
-                                    ),
-                                  ],
-                                  onChanged: (value) {
-                                    if (value == null) return;
-                                    setState(() => _homeCarouselEffect = value);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 14),
-                                Text(
-                                  '海报停留时间  ${_homeCarouselSeconds.round()} 秒',
-                                ),
-                                Slider(
-                                  value: _homeCarouselSeconds,
-                                  min: 3,
-                                  max: 15,
-                                  divisions: 12,
-                                  label: '${_homeCarouselSeconds.round()} 秒',
-                                  onChanged: (value) => setState(
-                                    () => _homeCarouselSeconds = value,
-                                  ),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _appearanceKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '外观',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '调整整体明暗、圆润图标与全局玻璃材质；改动会即时应用到每个悬浮卡片。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                const SizedBox(height: 8),
-                                YingjiGlassDropdownField<String>(
-                                  initialValue: _appearanceTheme,
-                                  decoration: const InputDecoration(
-                                    labelText: '颜色模式',
-                                    helperText: '系统模式会跟随 Windows 的浅色/深色设置',
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: 'dark',
-                                      child: Text('深色模式'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'light',
-                                      child: Text('浅色模式'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'system',
-                                      child: Text('跟随系统'),
-                                    ),
-                                  ],
-                                  onChanged: (value) {
-                                    if (value == null) return;
-                                    setState(() => _appearanceTheme = value);
-                                    _applyAppearance();
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 14),
-                                YingjiGlassDropdownField<String>(
-                                  initialValue: _appearanceFont,
-                                  decoration: const InputDecoration(
-                                    labelText: '全局字体',
-                                    helperText: '字体会即时应用到标题、正文、榜单与播放器控件',
-                                  ),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: 'round',
-                                      child: Text('Mova 圆润无衬线（内置）'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'wenkai',
-                                      child: Text('Mova 温润文楷（内置）'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'dengxian',
-                                      child: Text('方圆 UI · 等线（Windows）'),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: 'yahei',
-                                      child: Text('微软雅黑 UI（Windows）'),
-                                    ),
-                                  ],
-                                  onChanged: (value) {
-                                    if (value == null) return;
-                                    setState(() => _appearanceFont = value);
-                                    _applyAppearance();
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 14),
-                                Text(
-                                  '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                const Text(
-                                  '左端完全透明，右端完全玻璃化；所有图标与卡片同步使用。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                Slider(
-                                  value: _appearanceGlassOpacity,
-                                  min: 0,
-                                  max: 1,
-                                  divisions: 20,
-                                  label:
-                                      '${(_appearanceGlassOpacity * 100).round()}%',
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _appearanceGlassOpacity = value,
-                                    );
-                                  },
-                                  onChangeEnd: (_) {
-                                    _applyAppearance();
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '背景模糊  ${_appearanceGlassBlur.round()} px',
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                const Text(
-                                  '左端完全无模糊，右端为完整毛玻璃；可单独与透明度组合。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                Slider(
-                                  value: _appearanceGlassBlur,
-                                  min: 0,
-                                  max: 40,
-                                  divisions: 15,
-                                  label: '${_appearanceGlassBlur.round()} px',
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _appearanceGlassBlur = value,
-                                    );
-                                  },
-                                  onChangeEnd: (_) {
-                                    _applyAppearance();
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                const Text(
-                                  '左端更明亮通透，右端更深邃；不会改变海报背景本身。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                Slider(
-                                  value: _appearanceCardDepth,
-                                  min: 0,
-                                  max: 1,
-                                  divisions: 20,
-                                  label:
-                                      '${(_appearanceCardDepth * 100).round()}%',
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _appearanceCardDepth = value,
-                                    );
-                                  },
-                                  onChangeEnd: (_) {
-                                    _applyAppearance();
-                                    _save();
-                                  },
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _playerKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '播放器',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '内置 libmpv；这些偏好会在播放时下发给内核。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                _ToggleRow(
-                                  title: '硬件解码',
-                                  detail: '优先 D3D11VA',
-                                  value: _hardware,
-                                  onChanged: (v) {
-                                    setState(() => _hardware = v);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: 'HDR 输出',
-                                  detail: '匹配 Windows HDR 状态',
-                                  value: _hdr,
-                                  onChanged: (v) {
-                                    setState(() => _hdr = v);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '立体声下混',
-                                  detail: '多声道输出转换为立体声',
-                                  value: _downmix,
-                                  onChanged: (v) {
-                                    setState(() => _downmix = v);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '夜间模式',
-                                  detail: '压缩动态范围',
-                                  value: _night,
-                                  onChanged: (v) {
-                                    setState(() => _night = v);
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: '人声增强',
-                                  detail: '提升对白清晰度',
-                                  value: _voiceEnhance,
-                                  onChanged: (v) {
-                                    setState(() => _voiceEnhance = v);
-                                    _save();
-                                  },
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _behaviorKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '播放行为与默认值',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '这些值会作为每次打开播放器时的初始状态，也可在播放控制台临时调整。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                _ToggleRow(
-                                  title: '继续播放提示',
-                                  detail: '打开已观看媒体时显示上次进度',
-                                  value: _resumePrompt,
-                                  onChanged: (v) {
-                                    setState(() => _resumePrompt = v);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 6),
-                                YingjiGlassDropdownField<String>(
-                                  initialValue: _aspect,
-                                  decoration: const InputDecoration(
-                                    labelText: '默认画面比例',
-                                  ),
-                                  items: const ['自动', '16:9', '4:3', '21:9']
-                                      .map(
-                                        (value) => DropdownMenuItem(
-                                          value: value,
-                                          child: Text(value),
-                                        ),
-                                      )
-                                      .toList(),
-                                  onChanged: (value) {
-                                    if (value == null) return;
-                                    setState(() => _aspect = value);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 14),
-                                Text(
-                                  '默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x',
-                                ),
-                                Slider(
-                                  value: _defaultSpeed,
-                                  min: .5,
-                                  max: 2,
-                                  divisions: 30,
-                                  label: '${_defaultSpeed.toStringAsFixed(2)}x',
-                                  onChanged: (value) =>
-                                      setState(() => _defaultSpeed = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                                Text('预读缓存  ${_cacheSeconds.round()} 秒'),
-                                Slider(
-                                  value: _cacheSeconds,
-                                  min: 5,
-                                  max: 120,
-                                  divisions: 23,
-                                  label: '${_cacheSeconds.round()} 秒',
-                                  onChanged: (value) =>
-                                      setState(() => _cacheSeconds = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                                _ToggleRow(
-                                  title: '预加载下一集',
-                                  detail: '播放接近片尾时预热下一集，减少连续播放等待',
-                                  value: _preloadNextEpisode,
-                                  onChanged: (value) {
-                                    setState(() => _preloadNextEpisode = value);
-                                    _save();
-                                  },
-                                ),
-                                if (_preloadNextEpisode) ...[
-                                  Text(
-                                    '距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载',
-                                  ),
-                                  Slider(
-                                    value: _preloadLeadMinutes,
-                                    min: 1,
-                                    max: 15,
-                                    divisions: 14,
-                                    label: '${_preloadLeadMinutes.round()} 分钟',
-                                    onChanged: (value) => setState(
-                                      () => _preloadLeadMinutes = value,
-                                    ),
-                                    onChangeEnd: (_) => _save(),
-                                  ),
-                                ],
-                                Text('快进 / 快退  ${_seekSeconds.round()} 秒'),
-                                const Text(
-                                  '播放器左右方向键每次跳转的时间；长片可调大，短片建议保持 10 秒。',
-                                  style: TextStyle(
-                                    color: Color(0xFFABB1BE),
-                                    fontSize: 12,
-                                  ),
-                                ),
-                                Slider(
-                                  value: _seekSeconds,
-                                  min: 5,
-                                  max: 60,
-                                  divisions: 11,
-                                  label: '${_seekSeconds.round()} 秒',
-                                  onChanged: (value) =>
-                                      setState(() => _seekSeconds = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                                Text('音量按键步长  ${_volumeStep.round()}%'),
-                                Slider(
-                                  value: _volumeStep,
-                                  min: 1,
-                                  max: 20,
-                                  divisions: 19,
-                                  label: '${_volumeStep.round()}%',
-                                  onChanged: (value) =>
-                                      setState(() => _volumeStep = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                                Text(
-                                  '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
-                                ),
-                                Slider(
-                                  value: _audioDelay,
-                                  min: -3,
-                                  max: 3,
-                                  divisions: 120,
-                                  label: '${(_audioDelay * 1000).round()} ms',
-                                  onChanged: (value) =>
-                                      setState(() => _audioDelay = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                                Text(
-                                  '默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
-                                ),
-                                Slider(
-                                  value: _subtitleDelay,
-                                  min: -3,
-                                  max: 3,
-                                  divisions: 120,
-                                  label:
-                                      '${(_subtitleDelay * 1000).round()} ms',
-                                  onChanged: (value) =>
-                                      setState(() => _subtitleDelay = value),
-                                  onChangeEnd: (_) => _save(),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _networkKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '网络与同步',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  'TMDB 默认通过 Mova 托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                const SizedBox(height: 14),
-                                TextField(
-                                  controller: _tmdbApiKey,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'TMDB API Key（可选）',
-                                    hintText: '留空使用 Mova 托管网关',
-                                  ),
-                                ),
-                                const SizedBox(height: 14),
-                                Row(
-                                  children: [
-                                    FilledButton.tonalIcon(
-                                      onPressed: _tmdbTesting
-                                          ? null
-                                          : _testTmdb,
-                                      icon: _tmdbTesting
-                                          ? const SizedBox(
-                                              width: 16,
-                                              height: 16,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                              ),
-                                            )
-                                          : const Icon(
-                                              YingjiIcons.wifi,
-                                              size: 16,
-                                            ),
-                                      label: const Text('测试 TMDB 网络'),
-                                    ),
-                                    if (_tmdbMessage != null) ...[
-                                      const SizedBox(width: 12),
-                                      Expanded(
-                                        child: Text(
-                                          _tmdbMessage!,
-                                          style: const TextStyle(
-                                            color: Color(0xFFABB1BE),
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                                const SizedBox(height: 14),
-                                TextField(
-                                  controller: _traktClientId,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Trakt Client ID',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _traktToken,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Trakt Access Token',
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _traktClientSecret,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Trakt Client Secret（设备授权需要）',
-                                  ),
-                                ),
-                                const SizedBox(height: 12),
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.end,
-                                  children: [
-                                    FilledButton.tonal(
-                                      onPressed: _traktAuthorizing
-                                          ? null
-                                          : _authorizeTrakt,
-                                      child: Text(
-                                        _traktAuthorizing
-                                            ? '等待授权…'
-                                            : '浏览器授权 Trakt',
-                                      ),
-                                    ),
-                                    const SizedBox(width: 10),
-                                    FilledButton(
-                                      onPressed: _save,
-                                      child: Text(_savedMessage ?? '保存设置'),
-                                    ),
-                                  ],
-                                ),
-                                if (_traktMessage != null) ...[
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    _traktMessage!,
-                                    style: const TextStyle(
-                                      color: Color(0xFFABB1BE),
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _danmakuKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '音轨、字幕与片头片尾',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '按语言智能选择音轨和字幕，并统一管理自动跳过的数据来源。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                _ToggleRow(
-                                  title: '启用首选音轨',
-                                  detail: '存在匹配语言时自动选择；手动选择仍然优先',
-                                  value: _preferAudioTrack,
-                                  onChanged: (value) {
-                                    setState(() => _preferAudioTrack = value);
-                                    _save();
-                                  },
-                                ),
-                                YingjiGlassChoiceField<String>(
-                                  label: '首选音轨语言',
-                                  value: _audioLanguage,
-                                  items: audioLanguages.keys.toList(),
-                                  labelBuilder: (v) => audioLanguages[v] ?? v,
-                                  onChanged: (v) {
-                                    setState(() => _audioLanguage = v);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 16),
-                                SwitchListTile.adaptive(
-                                  contentPadding: EdgeInsets.zero,
-                                  secondary: const Icon(
-                                    YingjiIcons.captions_bubble,
-                                  ),
-                                  title: const Text('启用字幕语言优先'),
-                                  subtitle: const Text(
-                                    '按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。',
-                                  ),
-                                  value: _preferChineseSubtitle,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _preferChineseSubtitle = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 24),
-                                YingjiGlassChoiceField<String>(
-                                  label: '首选字幕语言',
-                                  value: _subtitleLanguage,
-                                  items: subtitleLanguages.keys.toList(),
-                                  labelBuilder: (v) =>
-                                      subtitleLanguages[v] ?? v,
-                                  onChanged: (v) {
-                                    setState(() => _subtitleLanguage = v);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 24),
-                                const Divider(color: Color(0x22FFFFFF)),
-                                const SizedBox(height: 12),
-                                const Text(
-                                  '自动跳过',
-                                  style: TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                _ToggleRow(
-                                  title: '自动跳过片头片尾',
-                                  detail: '播放器仍会先显示跳转提示，可手动取消',
-                                  value: _autoSkipSegments,
-                                  onChanged: (value) {
-                                    setState(() => _autoSkipSegments = value);
-                                    _save();
-                                  },
-                                ),
-                                if (_autoSkipSegments) ...[
-                                  Text(
-                                    '跳转提示停留  ${_autoSkipDelaySeconds.round()} 秒',
-                                  ),
-                                  Slider(
-                                    value: _autoSkipDelaySeconds,
-                                    min: 1,
-                                    max: 10,
-                                    divisions: 9,
-                                    label: '${_autoSkipDelaySeconds.round()} 秒',
-                                    onChanged: (value) => setState(
-                                      () => _autoSkipDelaySeconds = value,
-                                    ),
-                                    onChangeEnd: (_) => _save(),
-                                  ),
-                                ],
-                                _ToggleRow(
-                                  title: '服务器原生分段',
-                                  detail: '优先读取 Emby / Jellyfin 当前文件的媒体章节',
-                                  value: _segmentServerSource,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _segmentServerSource = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: 'IntroDB',
-                                  detail: '按 IMDb、季和集读取片头、前情与片尾',
-                                  value: _segmentIntroDbSource,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _segmentIntroDbSource = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: 'TheIntroDB',
-                                  detail: '按 TMDB、季和集匹配公共片头片尾数据',
-                                  value: _segmentTheIntroDbSource,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _segmentTheIntroDbSource = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: 'AniSkip',
-                                  detail: '动画专用；仅在 TMDB 能唯一映射到 MAL 时读取',
-                                  value: _segmentAniSkipSource,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _segmentAniSkipSource = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                _ToggleRow(
-                                  title: 'ChaptersDB',
-                                  detail: '使用评分最高的公共章节作为备用分段',
-                                  value: _segmentChaptersDbSource,
-                                  onChanged: (value) {
-                                    setState(
-                                      () => _segmentChaptersDbSource = value,
-                                    );
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 16),
-                                const Divider(color: Color(0x22FFFFFF)),
-                                const SizedBox(height: 16),
-                                const Text(
-                                  '弹幕服务',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '播放时并行请求下方 API，自动使用最先返回有效结果的线路。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                _ToggleRow(
-                                  title: '启用弹幕',
-                                  detail: _danmakuEnabled
-                                      ? '播放时读取下方 API'
-                                      : '当前关闭',
-                                  value: _danmakuEnabled,
-                                  onChanged: (value) {
-                                    setState(() => _danmakuEnabled = value);
-                                    _save();
-                                  },
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '弹幕 API',
-                                  style: TextStyle(fontWeight: FontWeight.w800),
-                                ),
-                                const SizedBox(height: 4),
-                                const Text(
-                                  '每个地址独立保存。播放时并行测速，使用最先返回实际弹幕的服务。',
-                                  style: TextStyle(
-                                    color: Color(0xFFABB1BE),
-                                    fontSize: 12,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                for (
-                                  var index = 0;
-                                  index < _danmakuApiControllers.length;
-                                  index++
-                                ) ...[
-                                  Row(
-                                    children: [
-                                      SizedBox(
-                                        width: 118,
-                                        child: TextField(
-                                          controller:
-                                              _danmakuApiNameControllers[index],
-                                          decoration: InputDecoration(
-                                            labelText: '名称',
-                                            hintText: '弹幕 ${index + 1}',
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: TextField(
-                                          controller:
-                                              _danmakuApiControllers[index],
-                                          keyboardType: TextInputType.url,
-                                          decoration: InputDecoration(
-                                            labelText: 'API ${index + 1}',
-                                            hintText: 'https://example.com/api',
-                                            prefixIcon: const Icon(
-                                              YingjiIcons.link,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      YingjiMotionIconButton(
-                                        icon: YingjiIcons.checkmark_seal,
-                                        tooltip:
-                                            '测试 ${_danmakuApiNameControllers[index].text.trim().isEmpty ? '弹幕 API ${index + 1}' : _danmakuApiNameControllers[index].text.trim()}',
-                                        size: 38,
-                                        onPressed: _danmakuTesting
-                                            ? () {}
-                                            : () {
-                                                unawaited(
-                                                  _testDanmaku(
-                                                    _danmakuApiControllers[index]
-                                                        .text
-                                                        .trim(),
-                                                  ),
-                                                );
-                                              },
-                                      ),
-                                      if (_danmakuApiControllers.length >
-                                          1) ...[
-                                        const SizedBox(width: 8),
-                                        YingjiMotionIconButton(
-                                          icon: YingjiIcons.trash,
-                                          tooltip: '移除 API ${index + 1}',
-                                          size: 38,
-                                          onPressed: () => setState(() {
-                                            _danmakuApiControllers
-                                                .removeAt(index)
-                                                .dispose();
-                                            _danmakuApiNameControllers
-                                                .removeAt(index)
-                                                .dispose();
-                                          }),
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                  const SizedBox(height: 8),
-                                ],
-                                Align(
-                                  alignment: Alignment.centerLeft,
-                                  child: YingjiMotionIconButton(
-                                    icon: YingjiIcons.plus,
-                                    tooltip: '添加弹幕 API',
-                                    size: 38,
-                                    onPressed: () => setState(() {
-                                      _danmakuApiControllers.add(
-                                        TextEditingController(),
-                                      );
-                                      _danmakuApiNameControllers.add(
-                                        TextEditingController(
-                                          text:
-                                              '弹幕 ${_danmakuApiControllers.length}',
-                                        ),
-                                      );
-                                    }),
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                TextField(
-                                  controller: _danmakuToken,
-                                  obscureText: true,
-                                  decoration: const InputDecoration(
-                                    labelText: 'API Token（可选）',
-                                    hintText: '以 Bearer Token 方式发送',
-                                  ),
-                                ),
-                                const SizedBox(height: 12),
-                                Row(
-                                  children: [
-                                    FilledButton.tonalIcon(
-                                      onPressed: _danmakuTesting
-                                          ? null
-                                          : _testDanmaku,
-                                      icon: _danmakuTesting
-                                          ? const SizedBox(
-                                              width: 16,
-                                              height: 16,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                              ),
-                                            )
-                                          : const Icon(
-                                              YingjiIcons.checkmark_seal,
-                                              size: 16,
-                                            ),
-                                      label: const Text('测试弹幕 API'),
-                                    ),
-                                    if (_danmakuMessage != null) ...[
-                                      const SizedBox(width: 12),
-                                      Expanded(
-                                        child: Text(
-                                          _danmakuMessage!,
-                                          style: const TextStyle(
-                                            color: Color(0xFFABB1BE),
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _systemKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '快捷键与系统',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '播放器快捷键会立即保存；同一个按键不能绑定两个操作。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                for (final entry in _shortcutNames.entries) ...[
-                                  _ShortcutRecorder(
-                                    label: entry.value,
-                                    value: _shortcuts[entry.key]!,
-                                    onChanged: (value) =>
-                                        _changeShortcut(entry.key, value),
-                                  ),
-                                  const SizedBox(height: 10),
-                                ],
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _maintenanceKey,
-                            borderRadius: 22,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '缓存与数据',
-                                  style: TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                const Text(
-                                  '分别管理元数据、海报剧照与观看记录；清理不会修改服务器媒体。',
-                                  style: TextStyle(color: Color(0xFFABB1BE)),
-                                ),
-                                const SizedBox(height: 14),
-                                Wrap(
-                                  spacing: 10,
-                                  runSpacing: 8,
-                                  children: [
-                                    _CacheStat(
-                                      label: '元数据',
-                                      value: '$_metadataCacheCount 项',
-                                    ),
-                                    _CacheStat(
-                                      label: '照片与其他临时缓存',
-                                      value: _imageCacheLabel,
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 14),
-                                Wrap(
-                                  spacing: 10,
-                                  runSpacing: 10,
-                                  children: [
-                                    FilledButton.tonalIcon(
-                                      onPressed: _clearTmdbCache,
-                                      icon: const Icon(
-                                        YingjiIcons.trash,
-                                        size: 16,
-                                      ),
-                                      label: const Text('清理 TMDB 缓存'),
-                                    ),
-                                    FilledButton.tonalIcon(
-                                      onPressed: _clearImageCache,
-                                      icon: const Icon(
-                                        YingjiIcons.film,
-                                        size: 16,
-                                      ),
-                                      label: const Text('清理照片缓存'),
-                                    ),
-                                    FilledButton.tonalIcon(
-                                      onPressed: _clearWatchHistory,
-                                      icon: const Icon(
-                                        YingjiIcons.clock,
-                                        size: 16,
-                                      ),
-                                      label: const Text('清空观看记录'),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 14),
-                                Text(
-                                  _savedMessage ?? '本机缓存与观看记录',
-                                  style: const TextStyle(
-                                    color: Color(0xFFABB1BE),
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 18),
-                          _FrostSurface(
-                            key: _aboutKey,
-                            borderRadius: 22,
-                            child: Row(
-                              children: [
-                                const YingjiMark(size: 72),
-                                const SizedBox(width: 22),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      const Text(
-                                        'Mova',
-                                        style: TextStyle(
-                                          fontSize: 30,
-                                          fontWeight: FontWeight.w800,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 6),
-                                      const Text(
-                                        '私人媒体中心',
-                                        style: TextStyle(
-                                          color: YingjiColors.muted,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 12),
-                                      const Text(
-                                        '版本 3.1.65 · Windows · Flutter + libmpv',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: YingjiColors.muted,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      const Text('连接你的媒体，延续每一次观看。'),
-                                    ],
-                                  ),
-                                ),
-                                YingjiMotionIconButton(
-                                  icon: YingjiIcons.info_circle,
-                                  tooltip: '关于与许可',
-                                  onPressed: () => showAboutDialog(
-                                    context: context,
-                                    applicationName: 'Mova',
-                                    applicationIcon: const YingjiMark(size: 56),
-                                    applicationVersion: '3.1.65',
-                                    applicationLegalese: '私人媒体中心 · 内置 libmpv',
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
+                    label: const Text('测试 TMDB 网络'),
+                  ),
+                  if (_tmdbMessage != null) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _tmdbMessage!,
+                        style: const TextStyle(
+                          color: Color(0xFFABB1BE),
+                        ),
                       ),
                     ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _traktClientId,
+                decoration: const InputDecoration(
+                  labelText: 'Trakt Client ID',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _traktToken,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Trakt Access Token',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _traktClientSecret,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Trakt Client Secret（设备授权需要）',
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  FilledButton.tonal(
+                    onPressed: _traktAuthorizing
+                        ? null
+                        : _authorizeTrakt,
+                    child: Text(
+                      _traktAuthorizing
+                          ? '等待授权…'
+                          : '浏览器授权 Trakt',
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  FilledButton(
+                    onPressed: _save,
+                    child: Text(_savedMessage ?? '保存设置'),
+                  ),
+                ],
+              ),
+              if (_traktMessage != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  _traktMessage!,
+                  style: const TextStyle(
+                    color: Color(0xFFABB1BE),
                   ),
                 ),
               ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _danmakuKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '音轨、字幕与片头片尾',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '按语言智能选择音轨和字幕，并统一管理自动跳过的数据来源。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              _ToggleRow(
+                title: '启用首选音轨',
+                detail: '存在匹配语言时自动选择；手动选择仍然优先',
+                value: _preferAudioTrack,
+                onChanged: (value) {
+                  setState(() => _preferAudioTrack = value);
+                  _save();
+                },
+              ),
+              YingjiGlassChoiceField<String>(
+                label: '首选音轨语言',
+                value: _audioLanguage,
+                items: audioLanguages.keys.toList(),
+                labelBuilder: (v) => audioLanguages[v] ?? v,
+                onChanged: (v) {
+                  setState(() => _audioLanguage = v);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 16),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                secondary: const Icon(
+                  YingjiIcons.captions_bubble,
+                ),
+                title: const Text('启用字幕语言优先'),
+                subtitle: const Text(
+                  '按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。',
+                ),
+                value: _preferChineseSubtitle,
+                onChanged: (value) {
+                  setState(
+                    () => _preferChineseSubtitle = value,
+                  );
+                  _save();
+                },
+              ),
+              const SizedBox(height: 24),
+              YingjiGlassChoiceField<String>(
+                label: '首选字幕语言',
+                value: _subtitleLanguage,
+                items: subtitleLanguages.keys.toList(),
+                labelBuilder: (v) =>
+                    subtitleLanguages[v] ?? v,
+                onChanged: (v) {
+                  setState(() => _subtitleLanguage = v);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 24),
+              const Divider(color: Color(0x22FFFFFF)),
+              const SizedBox(height: 12),
+              const Text(
+                '自动跳过',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              _ToggleRow(
+                title: '自动跳过片头片尾',
+                detail: '播放器仍会先显示跳转提示，可手动取消',
+                value: _autoSkipSegments,
+                onChanged: (value) {
+                  setState(() => _autoSkipSegments = value);
+                  _save();
+                },
+              ),
+              if (_autoSkipSegments) ...[
+                Text(
+                  '跳转提示停留  ${_autoSkipDelaySeconds.round()} 秒',
+                ),
+                Slider(
+                  value: _autoSkipDelaySeconds,
+                  min: 1,
+                  max: 10,
+                  divisions: 9,
+                  label: '${_autoSkipDelaySeconds.round()} 秒',
+                  onChanged: (value) => setState(
+                    () => _autoSkipDelaySeconds = value,
+                  ),
+                  onChangeEnd: (_) => _save(),
+                ),
+              ],
+              _ToggleRow(
+                title: '服务器原生分段',
+                detail: '优先读取 Emby / Jellyfin 当前文件的媒体章节',
+                value: _segmentServerSource,
+                onChanged: (value) {
+                  setState(
+                    () => _segmentServerSource = value,
+                  );
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: 'IntroDB',
+                detail: '按 IMDb、季和集读取片头、前情与片尾',
+                value: _segmentIntroDbSource,
+                onChanged: (value) {
+                  setState(
+                    () => _segmentIntroDbSource = value,
+                  );
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: 'TheIntroDB',
+                detail: '按 TMDB、季和集匹配公共片头片尾数据',
+                value: _segmentTheIntroDbSource,
+                onChanged: (value) {
+                  setState(
+                    () => _segmentTheIntroDbSource = value,
+                  );
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: 'AniSkip',
+                detail: '动画专用；仅在 TMDB 能唯一映射到 MAL 时读取',
+                value: _segmentAniSkipSource,
+                onChanged: (value) {
+                  setState(
+                    () => _segmentAniSkipSource = value,
+                  );
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: 'ChaptersDB',
+                detail: '使用评分最高的公共章节作为备用分段',
+                value: _segmentChaptersDbSource,
+                onChanged: (value) {
+                  setState(
+                    () => _segmentChaptersDbSource = value,
+                  );
+                  _save();
+                },
+              ),
+              const SizedBox(height: 16),
+              const Divider(color: Color(0x22FFFFFF)),
+              const SizedBox(height: 16),
+              const Text(
+                '弹幕服务',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '播放时并行请求下方 API，自动使用最先返回有效结果的线路。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              _ToggleRow(
+                title: '启用弹幕',
+                detail: _danmakuEnabled
+                    ? '播放时读取下方 API'
+                    : '当前关闭',
+                value: _danmakuEnabled,
+                onChanged: (value) {
+                  setState(() => _danmakuEnabled = value);
+                  _save();
+                },
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '弹幕 API',
+                style: TextStyle(fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                '每个地址独立保存。播放时并行测速，使用最先返回实际弹幕的服务。',
+                style: TextStyle(
+                  color: Color(0xFFABB1BE),
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 8),
+              for (
+                var index = 0;
+                index < _danmakuApiControllers.length;
+                index++
+              ) ...[
+                Row(
+                  children: [
+                    SizedBox(
+                      width: 118,
+                      child: TextField(
+                        controller:
+                            _danmakuApiNameControllers[index],
+                        decoration: InputDecoration(
+                          labelText: '名称',
+                          hintText: '弹幕 ${index + 1}',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller:
+                            _danmakuApiControllers[index],
+                        keyboardType: TextInputType.url,
+                        decoration: InputDecoration(
+                          labelText: 'API ${index + 1}',
+                          hintText: 'https://example.com/api',
+                          prefixIcon: const Icon(
+                            YingjiIcons.link,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    YingjiMotionIconButton(
+                      icon: YingjiIcons.checkmark_seal,
+                      tooltip:
+                          '测试 ${_danmakuApiNameControllers[index].text.trim().isEmpty ? '弹幕 API ${index + 1}' : _danmakuApiNameControllers[index].text.trim()}',
+                      size: 38,
+                      onPressed: _danmakuTesting
+                          ? () {}
+                          : () {
+                              unawaited(
+                                _testDanmaku(
+                                  _danmakuApiControllers[index]
+                                      .text
+                                      .trim(),
+                                ),
+                              );
+                            },
+                    ),
+                    if (_danmakuApiControllers.length >
+                        1) ...[
+                      const SizedBox(width: 8),
+                      YingjiMotionIconButton(
+                        icon: YingjiIcons.trash,
+                        tooltip: '移除 API ${index + 1}',
+                        size: 38,
+                        onPressed: () => setState(() {
+                          _danmakuApiControllers
+                              .removeAt(index)
+                              .dispose();
+                          _danmakuApiNameControllers
+                              .removeAt(index)
+                              .dispose();
+                        }),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 8),
+              ],
+              Align(
+                alignment: Alignment.centerLeft,
+                child: YingjiMotionIconButton(
+                  icon: YingjiIcons.plus,
+                  tooltip: '添加弹幕 API',
+                  size: 38,
+                  onPressed: () => setState(() {
+                    _danmakuApiControllers.add(
+                      TextEditingController(),
+                    );
+                    _danmakuApiNameControllers.add(
+                      TextEditingController(
+                        text:
+                            '弹幕 ${_danmakuApiControllers.length}',
+                      ),
+                    );
+                  }),
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _danmakuToken,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'API Token（可选）',
+                  hintText: '以 Bearer Token 方式发送',
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _danmakuTesting
+                        ? null
+                        : _testDanmaku,
+                    icon: _danmakuTesting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(
+                            YingjiIcons.checkmark_seal,
+                            size: 16,
+                          ),
+                    label: const Text('测试弹幕 API'),
+                  ),
+                  if (_danmakuMessage != null) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _danmakuMessage!,
+                        style: const TextStyle(
+                          color: Color(0xFFABB1BE),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _systemKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                WindowHost.isDesktop ? '快捷键与系统' : '手势与系统',
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                WindowHost.isDesktop
+                    ? '播放器快捷键会立即保存；同一个按键不能绑定两个操作。'
+                    : '手机上没有键盘，播放器的全部操作都由画面手势完成。下面是完整对照。',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                ),
+              ),
+              if (WindowHost.isDesktop) ...[
+                for (final entry in _shortcutNames.entries) ...[
+                  _ShortcutRecorder(
+                    label: entry.value,
+                    value: _shortcuts[entry.key]!,
+                    onChanged: (value) =>
+                        _changeShortcut(entry.key, value),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ] else ...[
+                const SizedBox(height: 6),
+                const _GestureHintRow(
+                  icon: YingjiIcons.play_circle,
+                  title: '呼出 / 收起控件',
+                  detail: '单击画面任意位置',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.pause_fill,
+                  title: '播放 / 暂停',
+                  detail: '双击画面任意位置',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.goforward_10,
+                  title: '快进 / 快退',
+                  detail: '在画面上左右拖动，横向满屏约 90 秒',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.sparkles,
+                  title: '调节亮度',
+                  detail: '在左半屏上下拖动，纵向满屏约 100%',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.speaker_2_fill,
+                  title: '调节音量',
+                  detail: '在右半屏上下拖动，纵向满屏约 100%',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.rectangle_stack,
+                  title: '换集 / 换资源',
+                  detail: '底部控件条右侧的「更多」与「全集列表」',
+                ),
+                const _GestureHintRow(
+                  icon: YingjiIcons.chevron_left,
+                  title: '返回详情页',
+                  detail: '左上角返回按钮，或系统返回手势',
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  '系统返回手势与手势导航由 Android 接管，Mova 不会覆盖。',
+                  style: TextStyle(
+                    color: Color(0xFFABB1BE),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _maintenanceKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '缓存与数据',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '分别管理元数据、海报剧照与观看记录；清理不会修改服务器媒体。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  _CacheStat(
+                    label: '元数据',
+                    value: '$_metadataCacheCount 项',
+                  ),
+                  _CacheStat(
+                    label: '照片与其他临时缓存',
+                    value: _imageCacheLabel,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _clearTmdbCache,
+                    icon: const Icon(
+                      YingjiIcons.trash,
+                      size: 16,
+                    ),
+                    label: const Text('清理 TMDB 缓存'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _clearImageCache,
+                    icon: const Icon(
+                      YingjiIcons.film,
+                      size: 16,
+                    ),
+                    label: const Text('清理照片缓存'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _clearWatchHistory,
+                    icon: const Icon(
+                      YingjiIcons.clock,
+                      size: 16,
+                    ),
+                    label: const Text('清空观看记录'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Text(
+                WindowHost.isDesktop
+                    ? '缓存与观看记录保存在本机用户目录；清理不会影响服务器上的媒体文件。'
+                    : '缓存与观看记录保存在应用私有目录；卸载应用会一并清除，重装后需要重新连接服务器。',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _savedMessage ?? '本机缓存与观看记录',
+                style: const TextStyle(
+                  color: Color(0xFFABB1BE),
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _aboutKey,
+          borderRadius: 22,
+          child: Row(
+            children: [
+              const YingjiMark(size: 72),
+              const SizedBox(width: 22),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment:
+                      CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Mova',
+                      style: TextStyle(
+                        fontSize: 30,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      '私人媒体中心',
+                      style: TextStyle(
+                        color: YingjiColors.muted,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      '版本 $movaVersion · $movaPlatform · Flutter + libmpv',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: YingjiColors.muted,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      WindowHost.isDesktop
+                          ? '连接你的媒体，延续每一次观看。'
+                          : '连接你的媒体，延续每一次观看。播放时用画面手势操作：单击呼出控件、双击播放暂停、左右滑动快进快退、左半屏调亮度、右半屏调音量。',
+                    ),
+                  ],
+                ),
+              ),
+              YingjiMotionIconButton(
+                icon: YingjiIcons.info_circle,
+                tooltip: '关于与许可',
+                onPressed: () => showAboutDialog(
+                  context: context,
+                  applicationName: 'Mova',
+                  applicationIcon: const YingjiMark(size: 56),
+                  applicationVersion: movaVersion,
+                  applicationLegalese: '私人媒体中心 · 内置 libmpv',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 手机上（或桌面上把窗口拖窄）没有 220px 的余地给左栏：那套两栏面板
+        // 会把正文挤到只剩几十像素。窄屏改成「横向分栏胶囊 + 单栏正文」，
+        // 宽屏保留原来的左栏面板。
+        if (constraints.maxWidth < YingjiLayout.twoColumnMinWidth) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _settingsSectionChips(labels, keys),
+                const SizedBox(height: 14),
+                Expanded(child: _settingsScrollView(context, content)),
+              ],
             ),
+          );
+        }
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 30),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(
+                sigmaX: YingjiGlass.blur + 4,
+                sigmaY: YingjiGlass.blur + 4,
+              ),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: YingjiGlass.surface(strength: 1.08),
+                  border: Border.all(color: YingjiGlass.line()),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 220,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 40, 18, 24),
+                        child: ValueListenableBuilder<int>(
+                          valueListenable: _activeSetting,
+                          builder: (context, active, _) => Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              for (var i = 0; i < labels.length; i++)
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 6),
+                                  child: TextButton(
+                                    onPressed: () => _jumpToSetting(i, keys[i]),
+                                    style: TextButton.styleFrom(
+                                      alignment: Alignment.centerLeft,
+                                      foregroundColor: active == i
+                                          ? const Color(0xFF111216)
+                                          : const Color(0xFFB8BDC8),
+                                      backgroundColor: active == i
+                                          ? const Color(0xFFF1F1F2)
+                                          : Colors.transparent,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 14,
+                                        vertical: 12,
+                                      ),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Icon(labels[i].$2, size: 18),
+                                        const SizedBox(width: 11),
+                                        Text(labels[i].$1),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const VerticalDivider(width: 1, color: Color(0x22FFFFFF)),
+                    Expanded(
+                      child: _settingsScrollView(
+                        context,
+                        content,
+                        padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 设置正文的滚动容器。窄屏不给额外内缩（壳层已经让开了导航条），宽屏才需要
+  /// 面板内部的留白。
+  Widget _settingsScrollView(
+    BuildContext context,
+    Widget child, {
+    EdgeInsets padding = EdgeInsets.zero,
+  }) => ScrollConfiguration(
+    behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+    child: SingleChildScrollView(
+      controller: _settingsScroll,
+      padding: padding,
+      child: child,
+    ),
+  );
+
+  /// 窄屏下的分栏切换：横向滚动的胶囊按钮。
+  ///
+  /// 桌面版把分栏做成 220px 的左侧竖排导航，手机上那个宽度会把正文挤没。
+  Widget _settingsSectionChips(
+    List<(String, IconData)> labels,
+    List<GlobalKey> keys,
+  ) => SizedBox(
+    height: 38,
+    child: ValueListenableBuilder<int>(
+      valueListenable: _activeSetting,
+      builder: (context, active, _) => ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: labels.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) => TextButton(
+          onPressed: () => _jumpToSetting(index, keys[index]),
+          style: TextButton.styleFrom(
+            foregroundColor: active == index
+                ? const Color(0xFF111216)
+                : const Color(0xFFB8BDC8),
+            backgroundColor: active == index
+                ? const Color(0xFFF1F1F2)
+                : YingjiGlass.chrome(strength: .58),
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            minimumSize: const Size(0, 38),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(19),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(labels[index].$2, size: 16),
+              const SizedBox(width: 8),
+              Text(labels[index].$1),
+            ],
           ),
         ),
       ),
-    );
-  }
+    ),
+  );
 }
 
 class _PosterStrip extends StatefulWidget {
@@ -10767,7 +11029,12 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                       ),
                       slivers: [
                         const SliverPadding(
-                          padding: EdgeInsets.fromLTRB(74, 30, 64, 18),
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            30,
+                            YingjiLayout.pageRight,
+                            18,
+                          ),
                           sliver: SliverToBoxAdapter(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -10801,7 +11068,12 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                           )
                         else
                           SliverPadding(
-                            padding: const EdgeInsets.fromLTRB(74, 0, 64, 64),
+                            padding: EdgeInsets.fromLTRB(
+                              YingjiLayout.pageLeft,
+                              0,
+                              YingjiLayout.pageRight,
+                              64,
+                            ),
                             sliver: SliverGrid(
                               gridDelegate:
                                   const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -12815,6 +13087,62 @@ class _CacheStat extends StatelessWidget {
         const SizedBox(width: 10),
         Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
       ],
+    ),
+  );
+}
+
+/// 设置页里的一条手势说明：图标 + 动作 + 触发方式。
+///
+/// 和 [_ToggleRow] 的区别是没有开关——手势是固定的操作方式，不是可选设置。
+/// 写在这里是为了让安卓用户不用猜「是单击还是双击」「哪半屏调什么」。
+class _GestureHintRow extends StatelessWidget {
+  const _GestureHintRow({
+    required this.icon,
+    required this.title,
+    required this.detail,
+  });
+
+  final IconData icon;
+  final String title;
+  final String detail;
+
+  @override
+  Widget build(BuildContext context) => DecoratedBox(
+    decoration: const BoxDecoration(
+      border: Border(bottom: BorderSide(color: YingjiColors.line)),
+    ),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Icon(icon, size: 18, color: YingjiColors.muted),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    color: YingjiColors.muted,
+                    fontSize: 12,
+                    height: 1.45,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     ),
   );
 }

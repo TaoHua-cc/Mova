@@ -1056,10 +1056,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                                   const BouncingScrollPhysics(
                                     parent: AlwaysScrollableScrollPhysics(),
                                   ),
-                              padding: const EdgeInsets.fromLTRB(
-                                34,
+                              padding: EdgeInsets.fromLTRB(
+                                YingjiLayout.detailLeadingInset,
                                 10,
-                                44,
+                                YingjiLayout.pageRight,
                                 80,
                               ),
                               children: [
@@ -1312,9 +1312,10 @@ class _DetailSidebar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-    width: 88,
+    // 宽度与内边距都取自统一栅格，侧栏按钮槽位和正文锚点一起移动。
+    width: YingjiLayout.detailSidebarWidth,
     child: Padding(
-      padding: const EdgeInsets.fromLTRB(18, 18, 14, 18),
+      padding: YingjiLayout.detailSidebarPadding,
       child: Column(
         children: [
           const YingjiMark(size: 42),
@@ -1370,23 +1371,33 @@ class _DetailTopBar extends StatelessWidget {
   final VoidCallback onSearch;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 82,
-    child: Row(
-      children: [
-        YingjiMotionIconButton(
-          icon: YingjiIcons.chevron_left,
-          tooltip: '返回',
-          onPressed: onBack,
-          size: 44,
-        ),
-        const SizedBox(width: 14),
-        // 桌面端才需要窗口拖拽区
-        if (WindowHost.isDesktop)
-          Expanded(
-            child: WindowHost.dragArea(child: const SizedBox.expand()),
+  Widget build(BuildContext context) => Padding(
+    // 左边距补上侧栏宽度正好等于 YingjiLayout.pageLeft，与正文、与其它页面
+    // 对齐；右侧与首页顶部栏一致，搜索按钮因此固定在屏幕最右。
+    padding: EdgeInsets.only(
+      left: YingjiLayout.detailLeadingInset,
+      right: WindowHost.isDesktop ? 0 : 14,
+    ),
+    child: SizedBox(
+      height: 82,
+      child: Row(
+        children: [
+          YingjiMotionIconButton(
+            icon: YingjiIcons.chevron_left,
+            tooltip: '返回',
+            onPressed: onBack,
+            size: 44,
           ),
-        _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
+          const SizedBox(width: 14),
+          // 用剩余宽度把搜索按钮推到最右。桌面端顺带当成窗口拖拽区；移动端
+          // 没有窗口可拖，用普通占位——旧实现只在桌面端插这一段，安卓上
+          // 搜索按钮就贴到了返回键右边。
+          Expanded(
+            child: WindowHost.isDesktop
+                ? WindowHost.dragArea(child: const SizedBox.expand())
+                : const SizedBox.expand(),
+          ),
+          _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
         if (WindowHost.isDesktop) ...[
           const SizedBox(width: 8),
           _DetailRailButton(
@@ -1405,7 +1416,8 @@ class _DetailTopBar extends StatelessWidget {
           ),
           const SizedBox(width: 14),
         ],
-      ],
+        ],
+      ),
     ),
   );
 }

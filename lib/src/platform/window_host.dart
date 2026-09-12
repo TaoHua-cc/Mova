@@ -1,4 +1,4 @@
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, Process, ProcessException;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -107,8 +107,35 @@ class WindowHost {
   static Widget dragArea({required Widget child}) =>
       isDesktop ? DragToMoveArea(child: child) : child;
 
-  /// 安卓宿主暴露的屏幕通道（见 MainActivity.kt）。
-  static const MethodChannel _screenChannel = MethodChannel('mova/screen');
+  /// 安卓宿主暴露的平台通道（见 MainActivity.kt）：屏幕亮度 + 打开外部链接。
+  static const MethodChannel _platformChannel = MethodChannel('mova/platform');
+
+  /// 用系统默认浏览器打开外部链接。
+  ///
+  /// 桌面端走 `cmd /c start`；移动端交给宿主的 `Intent.ACTION_VIEW`——旧实现
+  /// 在 Android 上直接跑 `Process.run('cmd', ...)`，会抛异常，Trakt 设备授权
+  /// 按钮点了没有任何反应。返回是否成功发起。
+  static Future<bool> openUrl(String url) async {
+    if (url.isEmpty) return false;
+    if (isDesktop) {
+      try {
+        await Process.run('cmd', ['/c', 'start', '', url]);
+        return true;
+      } on ProcessException {
+        return false;
+      }
+    }
+    try {
+      final opened = await _platformChannel.invokeMethod<bool>('openUrl', {
+        'url': url,
+      });
+      return opened ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
 
   /// 当前屏幕亮度，取值 0..1。
   ///
@@ -117,7 +144,7 @@ class WindowHost {
   static Future<double?> get screenBrightness async {
     if (isDesktop) return null;
     try {
-      final value = await _screenChannel.invokeMethod<double>('getBrightness');
+      final value = await _platformChannel.invokeMethod<double>('getBrightness');
       return value?.clamp(0.0, 1.0);
     } on PlatformException {
       return null;
@@ -133,7 +160,7 @@ class WindowHost {
   static Future<void> setScreenBrightness(double value) async {
     if (isDesktop) return;
     try {
-      await _screenChannel.invokeMethod<void>('setBrightness', {
+      await _platformChannel.invokeMethod<void>('setBrightness', {
         'value': value.clamp(0.0, 1.0),
       });
     } on PlatformException {
@@ -147,7 +174,7 @@ class WindowHost {
   static Future<void> resetScreenBrightness() async {
     if (isDesktop) return;
     try {
-      await _screenChannel.invokeMethod<void>('resetBrightness');
+      await _platformChannel.invokeMethod<void>('resetBrightness');
     } on PlatformException {
       // 忽略。
     } on MissingPluginException {

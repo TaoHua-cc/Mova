@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../version.dart';
 import 'media_source.dart';
 
 class MediaItem {
@@ -349,7 +350,11 @@ class EmbyClient {
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'X-Emby-Authorization': 'MediaBrowser Client="Mova", Device="Windows", DeviceId="mova-windows", Version="3.1.65"',
+            'X-Emby-Authorization':
+                'MediaBrowser Client="Mova", '
+                    'Device="$movaPlatform", '
+                    'DeviceId="mova-${movaPlatform.toLowerCase()}", '
+                    'Version="$movaVersion"',
           },
           body: jsonEncode({'Username': username, 'Pw': password}),
         )
