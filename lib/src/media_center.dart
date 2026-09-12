@@ -8967,11 +8967,11 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               const SizedBox(height: 8),
               const Text(
-                '上下箭头调整播放器右下角按钮的顺序，右侧开关决定它是否出现。',
+                '长按左侧手柄拖动调整顺序，右侧开关决定它是否出现。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
               ),
               const SizedBox(height: 12),
-              ..._playerToolOrderTiles(),
+              _playerToolOrderList(),
               const SizedBox(height: 10),
               MovaPress(
                 onTap: _resetPlayerToolOrder,
@@ -10054,75 +10054,86 @@ class _SettingsPageState extends State<SettingsPage> {
   ///
   /// 用上下箭头而不是长按拖拽：设置页本身在滚动，内嵌 ReorderableListView
   /// 会和外层抢手势，手机上尤其容易拖不动。
-  List<Widget> _playerToolOrderTiles() {
-    final tiles = <Widget>[];
-    for (var index = 0; index < _playerToolOrder.length; index++) {
-      final id = _playerToolOrder[index];
-      final enabled = !_playerToolHidden.contains(id);
-      tiles.add(
-        Padding(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: AnimatedContainer(
-            duration: MovaMotion.quick,
-            curve: MovaMotion.standardEase,
-            decoration: BoxDecoration(
-              color: enabled
-                  ? YingjiGlass.surface(strength: .92)
-                  : YingjiGlass.surface(strength: .42),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: YingjiGlass.line(strength: 1.25)),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 4, 6, 4),
-              child: Row(
-                children: [
-                  Icon(
-                    YingjiPlayerTools.iconOf(id),
-                    size: 17,
-                    color: enabled ? Colors.white : const Color(0xFF7C818D),
+  /// 改为按住左侧手柄拖动排序：用 ReorderableListView 但 shrinkWrap +
+  /// NeverScrollableScrollPhysics，列表本身不滚动，不会和设置页外层滚动抢手势。
+  Widget _playerToolOrderList() => ReorderableListView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        padding: EdgeInsets.zero,
+        buildDefaultDragHandles: false,
+        onReorder: _reorderPlayerTool,
+        itemCount: _playerToolOrder.length,
+        itemBuilder: (context, index) {
+          final id = _playerToolOrder[index];
+          final enabled = !_playerToolHidden.contains(id);
+          return _playerToolTile(
+            key: Key(id),
+            index: index,
+            id: id,
+            enabled: enabled,
+          );
+        },
+      );
+
+  Widget _playerToolTile({
+    required Key key,
+    required int index,
+    required String id,
+    required bool enabled,
+  }) =>
+      Padding(
+        key: key,
+        padding: const EdgeInsets.only(bottom: 8),
+        child: AnimatedContainer(
+          duration: MovaMotion.quick,
+          curve: MovaMotion.standardEase,
+          decoration: BoxDecoration(
+            color: enabled
+                ? YingjiGlass.surface(strength: .92)
+                : YingjiGlass.surface(strength: .42),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: YingjiGlass.line(strength: 1.25)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 4, 6, 4),
+            child: Row(
+              children: [
+                ReorderableDragStartListener(
+                  index: index,
+                  child: Icon(
+                    Icons.drag_handle,
+                    size: 22,
+                    color: enabled ? Colors.white70 : const Color(0xFF7C818D),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      id,
-                      style: TextStyle(
-                        fontSize: 13.5,
-                        fontWeight: FontWeight.w700,
-                        color: enabled
-                            ? Colors.white
-                            : const Color(0xFF7C818D),
-                      ),
+                ),
+                const SizedBox(width: 6),
+                Icon(
+                  YingjiPlayerTools.iconOf(id),
+                  size: 17,
+                  color: enabled ? Colors.white : const Color(0xFF7C818D),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    id,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w700,
+                      color: enabled
+                          ? Colors.white
+                          : const Color(0xFF7C818D),
                     ),
                   ),
-                  YingjiMotionIconButton(
-                    tooltip: '上移',
-                    icon: YingjiIcons.chevron_up,
-                    size: 34,
-                    onPressed: index == 0
-                        ? () {}
-                        : () => _movePlayerTool(index, -1),
-                  ),
-                  YingjiMotionIconButton(
-                    tooltip: '下移',
-                    icon: YingjiIcons.chevron_down,
-                    size: 34,
-                    onPressed: index == _playerToolOrder.length - 1
-                        ? () {}
-                        : () => _movePlayerTool(index, 1),
-                  ),
-                  Switch(
-                    value: enabled,
-                    onChanged: (value) => _togglePlayerTool(id, value),
-                  ),
-                ],
-              ),
+                ),
+                Switch(
+                  value: enabled,
+                  onChanged: (value) => _togglePlayerTool(id, value),
+                ),
+              ],
             ),
           ),
         ),
       );
-    }
-    return tiles;
-  }
 
   /// 把保存的顺序补全 / 去重：丢掉已不存在的入口，新加入口补到末尾。
   List<String> _sanitizePlayerToolOrder(List<String>? saved) {
@@ -10138,10 +10149,11 @@ class _SettingsPageState extends State<SettingsPage> {
     return order;
   }
 
-  void _movePlayerTool(int index, int delta) {
+  void _reorderPlayerTool(int oldIndex, int newIndex) {
     setState(() {
-      final moved = _playerToolOrder.removeAt(index);
-      _playerToolOrder.insert(index + delta, moved);
+      if (oldIndex < newIndex) newIndex -= 1;
+      final moved = _playerToolOrder.removeAt(oldIndex);
+      _playerToolOrder.insert(newIndex, moved);
     });
     _save();
   }
