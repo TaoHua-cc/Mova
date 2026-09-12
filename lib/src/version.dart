@@ -5,7 +5,7 @@ import 'dart:io' show Platform;
 /// 与 `pubspec.yaml` 里的 `version:` 前缀保持同步，发版脚本（`scripts/cut-release.ps1`
 /// 与 `tools/cut_release_api.py`）会同时改写这两处。**不要在别处再硬编码版本字符串**
 /// ——「关于 Mova」面板就曾长期停在 3.1.65，比实际发布版本落后了十几个版本。
-const String movaVersion = '3.1.84';
+const String movaVersion = '3.1.85';
 
 /// 当前运行平台名。
 ///
