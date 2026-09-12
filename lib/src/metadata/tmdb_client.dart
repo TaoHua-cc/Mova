@@ -843,7 +843,7 @@ class TmdbClient {
           final response = await _client
               .get(
                 uri,
-                headers: const {
+                headers: {
                   'Accept': 'application/json',
                   'User-Agent': 'Mova/$movaVersion ($movaPlatform; Flutter)',
                 },
@@ -886,7 +886,7 @@ class TmdbClient {
       final response = await _client
           .get(
             uri,
-            headers: const {
+            headers: {
               'Accept': 'application/json',
               'User-Agent': 'Mova/$movaVersion ($movaPlatform; Flutter)',
             },

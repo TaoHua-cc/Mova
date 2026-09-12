@@ -11028,7 +11028,7 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                         parent: AlwaysScrollableScrollPhysics(),
                       ),
                       slivers: [
-                        const SliverPadding(
+                        SliverPadding(
                           padding: EdgeInsets.fromLTRB(
                             YingjiLayout.pageLeft,
                             30,
