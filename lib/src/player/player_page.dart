@@ -157,6 +157,42 @@ class PlayerEpisode {
   );
 }
 
+/// 播放器正在处理的手势类型。
+enum _GestureKind {
+  /// 水平滑动：快进 / 快退。
+  seek,
+
+  /// 左半屏纵向滑动：调屏幕亮度。
+  brightness,
+
+  /// 右半屏纵向滑动：调音量。
+  volume,
+}
+
+/// 右侧工具按钮的声明式描述。
+///
+/// 平铺出来的按钮和溢出进「更多」菜单里的条目都由这份列表生成，
+/// 避免两处各写一份导致新增入口时漏改。
+class _PlayerTool {
+  const _PlayerTool(this.tab, this.icon);
+
+  /// 控制台面板的标签，同时用作工具提示和菜单文案。
+  final String tab;
+  final IconData icon;
+}
+
+/// 控制台工具入口，顺序即平铺顺序。
+const _playerTools = <_PlayerTool>[
+  _PlayerTool('声音', YingjiIcons.speaker_2_fill),
+  _PlayerTool('字幕', YingjiIcons.captions_bubble),
+  _PlayerTool('弹幕', YingjiIcons.danmaku),
+  _PlayerTool('画面', YingjiIcons.film),
+  _PlayerTool('播放', YingjiIcons.play_circle),
+  _PlayerTool('章节', YingjiIcons.bookmark),
+  _PlayerTool('片头片尾', YingjiIcons.scissors),
+  _PlayerTool('资源', YingjiIcons.server),
+];
+
 class PlayerPage extends StatefulWidget {
   const PlayerPage({
     super.key,
@@ -293,6 +329,32 @@ class _PlayerPageState extends State<PlayerPage> {
   Timer? _segmentTimer;
   bool _segmentActionPending = false;
 
+  // ── 触摸手势状态（仅移动端注册拖动，见 build）────────────────────
+  /// 进行中的手势类型；null 表示当前没有手势。
+  _GestureKind? _gestureKind;
+  /// 画面中央手势指示器的主文案（时间点 / 百分比）。
+  String _gestureLabel = '';
+  /// 手势指示器的图标。
+  IconData _gestureIcon = Icons.brightness_6;
+  /// 手势指示器的进度，0..1。
+  double _gestureProgress = 0;
+  /// 水平拖动的累计位移，用来换算快进快退的秒数。
+  double _seekDragPixels = 0;
+  /// 水平拖动开始时的播放位置。
+  Duration _seekDragAnchor = Duration.zero;
+  /// 水平拖动过程中的预览落点，松手时 seek 到它。
+  Duration? _seekPreview;
+  /// 垂直拖动开始时的基准值（亮度或音量的百分比）。
+  double _valueDragAnchor = 0;
+  /// 垂直拖动的累计位移。
+  double _valueDragPixels = 0;
+  /// 屏幕亮度 0..1，由宿主窗口提供。
+  double _brightness = .5;
+  /// 是否已从宿主读到过真实亮度，读到之前不写回宿主。
+  bool _brightnessKnown = false;
+  /// 上一次单击的时间，用于自实现的双击判定。
+  DateTime? _lastTapAt;
+
   PlayerEpisode get _baseEpisode => widget.episodes.isEmpty
       ? PlayerEpisode(
           url: widget.url,
@@ -320,6 +382,8 @@ class _PlayerPageState extends State<PlayerPage> {
     super.initState();
     // 移动端：保持常亮 + 沉浸式 + 允许横屏（桌面端无操作）
     unawaited(WindowHost.enterMediaSession());
+    // 预读一次亮度，这样左半屏第一次上下滑动是从真实基准开始，不会跳变。
+    unawaited(_loadScreenBrightness());
     _activeEpisodeIndex = widget.episodes.indexWhere(
       (episode) => episode.url == widget.url,
     );
@@ -414,6 +478,193 @@ class _PlayerPageState extends State<PlayerPage> {
         setState(() => _showControls = false);
       }
     });
+  }
+
+  /// 读取宿主窗口亮度；读不到就保持默认值，不写回宿主。
+  Future<void> _loadScreenBrightness() async {
+    final value = await WindowHost.screenBrightness;
+    if (!mounted || value == null) return;
+    setState(() {
+      _brightness = value;
+      _brightnessKnown = true;
+    });
+  }
+
+  // ── 单击 / 双击 ───────────────────────────────────────────────────
+  //
+  // 单击呼出或收起控件，双击播放 / 暂停。
+  //
+  // 这里刻意不注册 GestureDetector.onDoubleTap：只要存在双击识别器，Flutter
+  // 就会把单击回调推迟到双击超时（约 300ms）之后才派发，单击呼出控件会明显
+  // 发滞。改为自己维护 280ms 的双击窗口，单击零延迟响应。
+  void _handleTap() {
+    final now = DateTime.now();
+    final previous = _lastTapAt;
+    final isDoubleTap =
+        previous != null &&
+        now.difference(previous) < const Duration(milliseconds: 280);
+    _lastTapAt = isDoubleTap ? null : now;
+    if (isDoubleTap) {
+      unawaited(_togglePlayback());
+    } else {
+      _toggleControls();
+    }
+  }
+
+  /// 单击：控件可见就收起，不可见就呼出；控制台面板开着时先收面板。
+  void _toggleControls() {
+    if (!mounted) return;
+    if (_settingsOpen) {
+      setState(() => _settingsOpen = false);
+      return;
+    }
+    if (_showControls) {
+      _controlsTimer?.cancel();
+      setState(() => _showControls = false);
+    } else {
+      _revealControls();
+    }
+  }
+
+  // ── 水平滑动：快进 / 快退 ─────────────────────────────────────────
+
+  void _onSeekDragStart(DragStartDetails details) {
+    _gestureKind = _GestureKind.seek;
+    _gestureIcon = Icons.fast_forward;
+    _seekDragPixels = 0;
+    _seekDragAnchor = _player.state.position;
+    _seekPreview = _seekDragAnchor;
+    _gestureLabel = _time(_seekDragAnchor);
+    _gestureProgress = _progressFor(_seekDragAnchor);
+    // 拖动期间不要自动隐藏控件，否则指示器会跟着一起消失。
+    _controlsTimer?.cancel();
+    setState(() {});
+  }
+
+  void _onSeekDragUpdate(DragUpdateDetails details) {
+    final width = context.size?.width ?? 0;
+    if (width <= 0) return;
+    _seekDragPixels += details.delta.dx;
+    // 横向划过整屏 ≈ 90 秒；超过片长会被 clamp 到结尾。
+    final span = _player.state.duration;
+    final target = _clampPosition(
+      _seekDragAnchor +
+          Duration(milliseconds: (_seekDragPixels / width * 90000).round()),
+      span,
+    );
+    _seekPreview = target;
+    // 指示器箭头跟着方向走，向左拖就是快退。
+    _gestureIcon = _seekDragPixels >= 0
+        ? Icons.fast_forward
+        : Icons.fast_rewind;
+    _gestureLabel =
+        '${_time(target)}  ${_offsetLabel(target - _seekDragAnchor)}';
+    _gestureProgress = _progressFor(target, span);
+    setState(() {});
+  }
+
+  void _onSeekDragEnd(DragEndDetails details) {
+    final target = _seekPreview;
+    _endGesture();
+    if (target != null) unawaited(_player.seek(target));
+    _revealControls();
+  }
+
+  // ── 垂直滑动：左半屏调亮度，右半屏调音量 ──────────────────────────
+
+  void _onValueDragStart(DragStartDetails details) {
+    final width = context.size?.width ?? MediaQuery.sizeOf(context).width;
+    // 以按下的位置决定调节对象，和主流移动播放器一致。
+    final isLeft = width <= 0 || details.localPosition.dx < width / 2;
+    _gestureKind = isLeft ? _GestureKind.brightness : _GestureKind.volume;
+    _gestureIcon = isLeft
+        ? Icons.brightness_6
+        : (_muted ? YingjiIcons.speaker_slash : Icons.volume_up);
+    _valueDragPixels = 0;
+    // 亮度在 initState 里读过一次；若那次失败（宿主通道未就绪等），
+    // 这里补一次，避免基准值停在默认的 50%。
+    if (isLeft && !_brightnessKnown) unawaited(_loadScreenBrightness());
+    _valueDragAnchor = isLeft ? _brightness * 100 : _volume;
+    _gestureLabel = '${_valueDragAnchor.round()}%';
+    _gestureProgress = (_valueDragAnchor / 100).clamp(0.0, 1.0);
+    _controlsTimer?.cancel();
+    setState(() {});
+  }
+
+  void _onValueDragUpdate(DragUpdateDetails details) {
+    final height = context.size?.height ?? 0;
+    final kind = _gestureKind;
+    if (height <= 0 ||
+        (kind != _GestureKind.brightness && kind != _GestureKind.volume)) {
+      return;
+    }
+    _valueDragPixels += details.delta.dy;
+    // 向上滑（dy 为负）是调大；纵向滑满一屏约等于 100%。
+    final next = (_valueDragAnchor - _valueDragPixels / height * 100).clamp(
+      0.0,
+      100.0,
+    );
+    if (kind == _GestureKind.brightness) {
+      _brightness = next / 100;
+      _brightnessKnown = true;
+      unawaited(WindowHost.setScreenBrightness(_brightness));
+    } else {
+      // 拖动过程中直接改播放器音量并刷新界面，不落盘：一次滑动会触发几十次
+      // 回调，逐次写 SharedPreferences 没有必要，松手时再存一次即可。
+      _volume = next;
+      _muted = next <= 0;
+      if (next > 0) _lastAudibleVolume = next;
+      unawaited(_player.setVolume(next));
+      _gestureIcon = next <= 0 ? YingjiIcons.speaker_slash : Icons.volume_up;
+    }
+    _gestureLabel = '${next.round()}%';
+    _gestureProgress = next / 100;
+    setState(() {});
+  }
+
+  void _onValueDragEnd(DragEndDetails details) {
+    if (_gestureKind == _GestureKind.volume) unawaited(_persistVolume());
+    _endGesture();
+    _revealControls();
+  }
+
+  /// 手势结束后把音量落盘，下次进入播放器沿用。
+  Future<void> _persistVolume() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('yingji.player.volume', _volume);
+  }
+
+  void _endGesture() {
+    if (!mounted) return;
+    setState(() {
+      _gestureKind = null;
+      _seekPreview = null;
+      _seekDragPixels = 0;
+      _valueDragPixels = 0;
+    });
+  }
+
+  /// 把位置限制在 [0, span] 内；span 未知（直播或时长未就绪）时只挡负数。
+  Duration _clampPosition(Duration value, Duration span) {
+    if (value < Duration.zero) return Duration.zero;
+    if (span > Duration.zero && value > span) return span;
+    return value;
+  }
+
+  /// 位置在总时长里的占比；时长未知时返回中点。
+  double _progressFor(Duration value, [Duration? span]) {
+    final total = (span ?? _player.state.duration).inMilliseconds;
+    if (total <= 0) return .5;
+    return (value.inMilliseconds / total).clamp(0.0, 1.0);
+  }
+
+  /// 「+0:30」形式的相对偏移文案。
+  String _offsetLabel(Duration delta) {
+    final sign = delta.isNegative ? '-' : '+';
+    final seconds = delta.inSeconds.abs();
+    final minutes = seconds ~/ 60;
+    final rest = (seconds % 60).toString().padLeft(2, '0');
+    return minutes > 0 ? '$sign$minutes:$rest' : '$sign${seconds}s';
   }
 
   void _toggleSettings() {
@@ -1618,22 +1869,38 @@ class _PlayerPageState extends State<PlayerPage> {
               _scheduleControlsHide(delay: const Duration(milliseconds: 250)),
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onTap: _togglePlayback,
+            // 单击呼出控件、双击播放 / 暂停，见 _handleTap。
+            onTap: _handleTap,
+            // 拖动调参只在移动端注册：桌面端用鼠标拖拽会误触亮度和音量，
+            // 而桌面本来就有方向键、滚轮和控件按钮可用。
+            onHorizontalDragStart: WindowHost.isDesktop
+                ? null
+                : _onSeekDragStart,
+            onHorizontalDragUpdate: WindowHost.isDesktop
+                ? null
+                : _onSeekDragUpdate,
+            onHorizontalDragEnd: WindowHost.isDesktop ? null : _onSeekDragEnd,
+            onVerticalDragStart: WindowHost.isDesktop
+                ? null
+                : _onValueDragStart,
+            onVerticalDragUpdate: WindowHost.isDesktop
+                ? null
+                : _onValueDragUpdate,
+            onVerticalDragEnd: WindowHost.isDesktop ? null : _onValueDragEnd,
             child: Stack(
               fit: StackFit.expand,
               children: [
-                // media_kit ships its own Material controls by default. They
-                // must be disabled because this page owns the single custom
-                // control layer below; otherwise collapsed mode leaves a
-                // second native bar behind it.
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _togglePlayback,
-                  child: Video(
-                    controller: _controller,
-                    fit: BoxFit.contain,
-                    controls: NoVideoControls,
-                  ),
+                // 视频层不再自带手势：整屏手势（单击、双击、左右滑动快进
+                // 快退、左半屏调亮度、右半屏调音量）统一由外层
+                // GestureDetector 处理。内层再挂一个 TapGestureRecognizer
+                // 会先赢得手势竞技场，把外层的手势全部吃掉。
+                //
+                // media_kit 自带的原生控制条也必须关掉，否则折叠模式下
+                // 会多出一条原生控制栏。
+                Video(
+                  controller: _controller,
+                  fit: BoxFit.contain,
+                  controls: NoVideoControls,
                 ),
                 if (_danmakuComments.isNotEmpty)
                   Positioned.fill(
@@ -1704,6 +1971,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     !_settingsOpen)
                   _segmentPrompt(),
                 if (_settingsOpen) _consolePanel(context),
+                if (_gestureKind != null) _gestureIndicator(),
                 // Keep a dedicated caption strip above the custom overlay so
                 // controls cannot swallow window-drag gestures. It avoids
                 // the left title/back button and right window buttons.
@@ -1959,51 +2227,7 @@ class _PlayerPageState extends State<PlayerPage> {
                         Expanded(
                           child: Align(
                             alignment: Alignment.centerRight,
-                            child: GlassPanel(
-                              radius: 28,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 8,
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  YingjiMotionIconButton(
-                                    tooltip: _muted ? '恢复声音' : '静音',
-                                    onPressed: _toggleMute,
-                                    icon: _muted
-                                        ? YingjiIcons.speaker_slash
-                                        : YingjiIcons.speaker_2_fill,
-                                    selected: _muted,
-                                    size: 40,
-                                  ),
-                                  SizedBox(
-                                    width: 116,
-                                    height: 40,
-                                    child: Slider(
-                                      value: _volume,
-                                      min: 0,
-                                      max: 100,
-                                      onChanged: _setVolume,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  ..._playerToolButtons(),
-                                  if (widget.episodes.isNotEmpty) ...[
-                                    const SizedBox(width: 8),
-                                    YingjiMotionIconButton(
-                                      icon: YingjiIcons.rectangle_stack,
-                                      tooltip: '全集列表',
-                                      selected:
-                                          _settingsOpen && _consoleTab == '全集',
-                                      size: 40,
-                                      onPressed: _showEpisodeList,
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
+                            child: _rightControlsBar(),
                           ),
                         ),
                       ],
@@ -2014,6 +2238,49 @@ class _PlayerPageState extends State<PlayerPage> {
             },
           ),
         ],
+      ),
+    ),
+  );
+
+  /// 画面中央的手势回显：快进快退显示目标时间，亮度 / 音量显示百分比。
+  ///
+  /// 整层 IgnorePointer，避免它自己抢走后续的拖动事件。
+  Widget _gestureIndicator() => IgnorePointer(
+    child: Center(
+      child: GlassPanel(
+        radius: 22,
+        padding: const EdgeInsets.fromLTRB(24, 18, 24, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(_gestureIcon, size: 30, color: Colors.white),
+            const SizedBox(height: 10),
+            Text(
+              _gestureLabel,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: 170,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: LinearProgressIndicator(
+                  value: _gestureProgress,
+                  minHeight: 5,
+                  backgroundColor: Colors.white24,
+                  valueColor: const AlwaysStoppedAnimation<Color>(
+                    YingjiColors.focus,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     ),
   );
@@ -2495,50 +2762,143 @@ class _PlayerPageState extends State<PlayerPage> {
     ),
   );
 
-  List<Widget> _playerToolButtons() {
-    const tabs = <String>['声音', '字幕', '弹幕', '画面', '播放', '章节', '片头片尾', '资源'];
-    const icons = <IconData>[
-      YingjiIcons.speaker_2_fill,
-      YingjiIcons.captions_bubble,
-      YingjiIcons.danmaku,
-      YingjiIcons.film,
-      YingjiIcons.play_circle,
-      YingjiIcons.bookmark,
-      YingjiIcons.scissors,
-      YingjiIcons.server,
-    ];
-    return [
-      for (var i = 0; i < tabs.length; i++) ...[
-        if (tabs[i] == '播放')
-          _quickChoice<double>(
-            icon: YingjiIcons.gauge,
-            label: '播放速度',
-            value: _speed,
-            values: const [.5, .75, 1, 1.25, 1.5, 2],
-            labelBuilder: (v) => '${v}x',
-            onChanged: _setPlaybackSpeed,
-          )
-        else if (tabs[i] == '画面')
-          _quickChoice<String>(
-            icon: YingjiIcons.fullscreen,
-            label: '画面比例',
-            value: _aspect,
-            values: const ['自动', '16:9', '4:3', '21:9'],
-            labelBuilder: (v) => v,
-            onChanged: _setAspect,
-          )
-        else
-          YingjiMotionIconButton(
-            icon: icons[i],
-            tooltip: tabs[i],
-            selected: _settingsOpen && _consoleTab == tabs[i],
-            size: 40,
-            onPressed: () => _openConsoleTab(tabs[i]),
-          ),
-        if (i != tabs.length - 1) const SizedBox(width: 5),
-      ],
-    ];
-  }
+  /// 右下角控件条。
+  ///
+  /// 横向空间不够时把工具按钮依次折叠进末尾的「更多」菜单：先尽量平铺，
+  /// 位置不足时把最后一个位置让给「更多」，其余入口收进菜单。桌面端窗口
+  /// 通常够宽会全部平铺，手机横屏才会折叠——否则 Row 会直接溢出。
+  Widget _rightControlsBar() => LayoutBuilder(
+    builder: (context, constraints) {
+      const double gap = 4;
+      const double button = 40;
+      final available = constraints.maxWidth;
+      final hasEpisodes = widget.episodes.isNotEmpty;
+      // 窄屏收窄音量滑条，把空间让给工具按钮。
+      final sliderWidth = available < 420
+          ? 56.0
+          : available < 560
+          ? 80.0
+          : 116.0;
+      final fixed =
+          28 + // 面板左右 padding
+          (button + gap) + // 静音
+          (sliderWidth + gap) + // 音量滑条
+          (hasEpisodes ? button + gap : 0); // 全集列表
+      // 不折叠时能平铺下的工具按钮个数：n 个按钮占 n*(button+gap) - gap。
+      final fit = ((available - fixed + gap) / (button + gap)).floor();
+      final overflowing = fit < _playerTools.length;
+      // 折叠时末尾要让出一个「更多」按钮的位置。
+      final visible = overflowing
+          ? math.max(0, fit - 1)
+          : _playerTools.length;
+      final hidden = _playerTools.sublist(visible);
+      return GlassPanel(
+        radius: 28,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            YingjiMotionIconButton(
+              tooltip: _muted ? '恢复声音' : '静音',
+              onPressed: _toggleMute,
+              icon: _muted
+                  ? YingjiIcons.speaker_slash
+                  : YingjiIcons.speaker_2_fill,
+              selected: _muted,
+              size: 40,
+            ),
+            const SizedBox(width: gap),
+            SizedBox(
+              width: sliderWidth,
+              height: button,
+              child: Slider(
+                value: _volume,
+                min: 0,
+                max: 100,
+                onChanged: _setVolume,
+              ),
+            ),
+            const SizedBox(width: gap),
+            for (final tool in _playerTools.take(visible)) ...[
+              _playerToolControl(tool),
+              const SizedBox(width: gap),
+            ],
+            if (hasEpisodes) ...[
+              YingjiMotionIconButton(
+                icon: YingjiIcons.rectangle_stack,
+                tooltip: '全集列表',
+                selected: _settingsOpen && _consoleTab == '全集',
+                size: 40,
+                onPressed: _showEpisodeList,
+              ),
+              const SizedBox(width: gap),
+            ],
+            if (hidden.isNotEmpty) _overflowToolsMenu(hidden),
+          ],
+        ),
+      );
+    },
+  );
+
+  /// 把工具描述渲染成控件。带取值的两个入口（播放速度、画面比例）平铺时是
+  /// 下拉快选，其余是打开控制台对应标签的图标按钮。
+  Widget _playerToolControl(_PlayerTool tool) => switch (tool.tab) {
+    '播放' => _quickChoice<double>(
+      icon: YingjiIcons.gauge,
+      label: '播放速度',
+      value: _speed,
+      values: const [.5, .75, 1, 1.25, 1.5, 2],
+      labelBuilder: (v) => '${v}x',
+      onChanged: _setPlaybackSpeed,
+    ),
+    '画面' => _quickChoice<String>(
+      icon: YingjiIcons.fullscreen,
+      label: '画面比例',
+      value: _aspect,
+      values: const ['自动', '16:9', '4:3', '21:9'],
+      labelBuilder: (v) => v,
+      onChanged: _setAspect,
+    ),
+    _ => YingjiMotionIconButton(
+      icon: tool.icon,
+      tooltip: tool.tab,
+      selected: _settingsOpen && _consoleTab == tool.tab,
+      size: 40,
+      onPressed: () => _openConsoleTab(tool.tab),
+    ),
+  };
+
+  /// 放不下的工具入口折叠成一个「更多」按钮，点开列在菜单里。
+  Widget _overflowToolsMenu(List<_PlayerTool> hidden) => YingjiGlassMenu(
+    borderRadius: 999,
+    onOpen: () {
+      _quickMenuOpen = true;
+      _controlsTimer?.cancel();
+    },
+    onClose: () {
+      _quickMenuOpen = false;
+      _scheduleControlsHide();
+    },
+    entries: [
+      for (final tool in hidden)
+        MenuItemButton(
+          leadingIcon: Icon(tool.icon, size: 16),
+          onPressed: () => _openConsoleTab(tool.tab),
+          child: Text(tool.tab),
+        ),
+    ],
+    child: Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: YingjiGlass.chrome(),
+        shape: BoxShape.circle,
+        border: Border.all(color: YingjiGlass.line()),
+      ),
+      child: const Icon(YingjiIcons.ellipsis, size: 18),
+    ),
+  );
 
   Widget _quickChoice<T>({
     required IconData icon,

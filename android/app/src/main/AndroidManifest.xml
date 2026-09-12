@@ -28,10 +28,15 @@
         android:isGame="false"
         android:supportsRtl="true">
 
+        <!-- launchMode 必须是 singleTask，不能用 singleTop：
+             singleTop 只在 Activity 恰好位于栈顶时复用，从桌面图标或「最近
+             任务」再次启动时会把 MainActivity 压到新任务栈里，于是出现多个
+             Mova 实例（多个后台、重复的播放会话）。singleTask 保证全系统只有
+             一个实例，再次启动走 onNewIntent 复用现有任务栈。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|colorMode"
             android:hardwareAccelerated="true"
