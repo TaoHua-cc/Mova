@@ -27,6 +27,29 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
+# Run git, always echo its output, hard-fail on non-zero exit.
+# Without capturing output a failure looks like a silent hang.
+function Invoke-Git([string[]]$GitArgs) {
+  $out = & git @GitArgs 2>&1
+  $code = $LASTEXITCODE
+  $text = ($out | Out-String).Trim()
+  if ($text) { Write-Host "  git $($GitArgs[0]): $text" }
+  if ($code -ne 0) { throw "git $($GitArgs -join ' ') failed (exit $code): $text" }
+}
+
+# ---- 0. preflight ----
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+  throw 'git not found in PATH'
+}
+& git rev-parse --is-inside-work-tree *> $null
+if ($LASTEXITCODE -ne 0) { throw "$root is not a git working tree" }
+if (-not (& git config user.email)) {
+  throw 'git user.email is not configured (git config --global user.email ...); commit would fail'
+}
+if (& git tag -l "v$Version") {
+  throw "tag v$Version already exists"
+}
+
 # ---- 1. pubspec.yaml: bump version name, increment build number ----
 $pubspec = Join-Path $root 'pubspec.yaml'
 $text = [System.IO.File]::ReadAllText($pubspec)
@@ -49,14 +72,11 @@ if (Test-Path $iss) {
 }
 
 # ---- 3. commit ----
-git add pubspec.yaml installer/Mova.iss
-if ($LASTEXITCODE -ne 0) { throw 'git add failed' }
-git commit -m "release: Mova $Version"
-if ($LASTEXITCODE -ne 0) { throw 'git commit failed (nothing to commit?)' }
+Invoke-Git @('add', 'pubspec.yaml', 'installer/Mova.iss')
+Invoke-Git @('commit', '-m', "release: Mova $Version")
 
 # ---- 4. tag ----
-git tag "v$Version"
-if ($LASTEXITCODE -ne 0) { throw "git tag v$Version failed (tag already exists?)" }
+Invoke-Git @('tag', "v$Version")
 Write-Host "tagged v$Version"
 
 if ($SkipPush) {
@@ -65,9 +85,7 @@ if ($SkipPush) {
 }
 
 # ---- 5. push branch then tag (tag push triggers the release workflow) ----
-git push origin main
-if ($LASTEXITCODE -ne 0) { throw 'git push origin main failed' }
-git push origin "v$Version"
-if ($LASTEXITCODE -ne 0) { throw "git push origin v$Version failed" }
+Invoke-Git @('push', 'origin', 'main')
+Invoke-Git @('push', 'origin', "v$Version")
 
 Write-Host "Done. Watch Actions: the Release workflow will publish v$Version to GitHub Releases."
