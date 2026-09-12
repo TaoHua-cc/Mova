@@ -81,6 +81,12 @@ final yingjiSectionRequest = ValueNotifier<String?>(null);
 /// (their resume rails may have changed while the user was elsewhere).
 final yingjiHomeFocusTick = ValueNotifier<int>(0);
 
+/// 首页画布内部的滚动深度：0 = 停在首屏，1 = 已滚过一屏（进入“发现”栏目）。
+///
+/// 首页与“发现”合并后，背景模糊不再由壳层翻页驱动（首页页码恒为 0），
+/// 改由这个值驱动，以保留合并前“滚下去背景变糊”的观感。
+final yingjiHomeScrollDepth = ValueNotifier<double>(0);
+
 class YingjiBackdrop extends StatelessWidget {
   const YingjiBackdrop({super.key, this.overlay, this.blur = 0});
   final Widget? overlay;

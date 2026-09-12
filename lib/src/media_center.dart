@@ -360,12 +360,26 @@ class _HomeFeedPageState extends State<_HomeFeedPage> {
     final position = _scroll.position;
     final more = position.maxScrollExtent - position.pixels > 24;
     if (more != _hasMoreBelow) setState(() => _hasMoreBelow = more);
+
+    // 壳层背景的模糊强度由这里驱动：合并前它由“翻到发现那一页”触发，
+    // 现在发现栏目就在首页内部，所以改用滚过一屏的比例还原同样的观感。
+    // 量化成 1/24 步进，避免滚动过程中每帧重建模糊层。
+    final viewport = position.viewportDimension;
+    final raw = viewport <= 0
+        ? 0.0
+        : (position.pixels / viewport).clamp(0.0, 1.0);
+    final depth = (raw * 24).roundToDouble() / 24;
+    if (depth != yingjiHomeScrollDepth.value) {
+      yingjiHomeScrollDepth.value = depth;
+    }
   }
 
   @override
   void dispose() {
     _scroll.removeListener(_handleScroll);
     _scroll.dispose();
+    // 首页销毁时复位，避免下次进入直接停在模糊态。
+    yingjiHomeScrollDepth.value = 0;
     super.dispose();
   }
 
@@ -486,13 +500,19 @@ class _ContinuousShellBackdrop extends StatelessWidget {
     builder: (context, imageUrl, _) => ValueListenableBuilder<String>(
       valueListenable: yingjiBackdropEffect,
       builder: (context, effect, _) => AnimatedBuilder(
-        animation: controller,
+        animation: Listenable.merge([controller, yingjiHomeScrollDepth]),
         builder: (context, _) {
           final rawPage = controller.hasClients
               ? (controller.page ?? controller.initialPage.toDouble())
               : controller.initialPage.toDouble();
           final page = rawPage.clamp(0.0, 6.0);
-          final depth = Curves.easeOutCubic.transform(page.clamp(0.0, 1.0));
+          // 首页与“发现”合并后，首页内部可滚动、页码恒为 0，翻页不再是它变糊的
+          // 触发点。首屏→发现栏目的滚动距离由 yingjiHomeScrollDepth 提供；离开
+          // 首页时仍沿用原来的翻页曲线，两者取大者，保证切换不闪。
+          final depth = math.max(
+            yingjiHomeScrollDepth.value,
+            Curves.easeOutCubic.transform(page.clamp(0.0, 1.0)),
+          );
           final deepening = ((page - 1) / 5).clamp(0.0, 1.0);
           final darkness = .08 + .42 * depth + .12 * deepening;
           return RepaintBoundary(
