@@ -240,6 +240,8 @@ class _PlayerPageState extends State<PlayerPage> {
   late final FocusNode _focusNode;
   late int _activeEpisodeIndex;
   bool _showControls = true;
+  /// 是否真正播过（用来决定暂停时是否显示中央播放钮）。
+  bool _hasPlayed = false;
   double _volume = 100;
   double _lastAudibleVolume = 100;
   bool _muted = false;
@@ -433,6 +435,9 @@ class _PlayerPageState extends State<PlayerPage> {
     _playingSubscription = _player.stream.playing.listen((playing) {
       if (!mounted || _switchingEpisode) return;
       if (playing) {
+        // 至少真正播过一次，之后暂停才在画面中央显示「继续播放」；
+        // 否则开片缓冲阶段也会顶着一个大播放键。
+        _hasPlayed = true;
         // Playback actually started (or resumed): announce the session to the
         // server right away instead of waiting for the 30s progress timer, so
         // the row gets a truthful LastPlayedDate even for short sessions.
@@ -1480,8 +1485,17 @@ class _PlayerPageState extends State<PlayerPage> {
     return completer.future;
   }
 
+  /// 硬解码后端名按平台给：桌面 D3D11VA，安卓 MediaCodec。
+  ///
+  /// 之前这里无条件写 d3d11va —— 那是 Windows 专用的，安卓上 mpv 不认
+  /// 这个值会退回软解，等于「优先硬解」这个开关在手机上一直是失效的。
+  String _hwdecValue(bool enabled) {
+    if (!enabled) return 'no';
+    return WindowHost.isDesktop ? 'd3d11va' : 'mediacodec-copy';
+  }
+
   Future<void> _applyMpvPreferences() async {
-    await _setMpvProperty('hwdec', _hardware ? 'd3d11va' : 'no');
+    await _setMpvProperty('hwdec', _hwdecValue(_hardware));
     await _setMpvProperty('target-colorspace-hint', _hdr ? 'yes' : 'no');
     await _setMpvProperty('audio-channels', _downmix ? 'stereo' : 'auto');
     await _applyAudioFilters();
@@ -1570,7 +1584,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _setVideoPreference({bool? hardware, bool? hdr}) async {
     final prefs = await SharedPreferences.getInstance();
     if (hardware != null) {
-      await _setMpvProperty('hwdec', hardware ? 'd3d11va' : 'no');
+      await _setMpvProperty('hwdec', _hwdecValue(hardware));
       await prefs.setBool('yingji.player.hardware', hardware);
       _hardware = hardware;
     }
@@ -1600,7 +1614,9 @@ class _PlayerPageState extends State<PlayerPage> {
       'Mova 播放诊断',
       '标题: ${_activeEpisode.title}',
       '内核: libmpv / gpu-next',
-      '硬件解码: ${_hardware ? 'D3D11VA' : '关闭'}',
+      '硬件解码: ${_hardware
+          ? (WindowHost.isDesktop ? 'D3D11VA' : 'MediaCodec')
+          : '关闭'}',
       'HDR: ${_hdr ? '自动' : '关闭'}',
       '播放速度: ${_speed.toStringAsFixed(2)}x',
       '状态: ${_error ?? '正常'}',
@@ -1972,6 +1988,7 @@ class _PlayerPageState extends State<PlayerPage> {
                   _segmentPrompt(),
                 if (_settingsOpen) _consolePanel(context),
                 if (_gestureKind != null) _gestureIndicator(),
+                _pauseResumePrompt(),
                 // Keep a dedicated caption strip above the custom overlay so
                 // controls cannot swallow window-drag gestures. It avoids
                 // the left title/back button and right window buttons.
@@ -2242,36 +2259,40 @@ class _PlayerPageState extends State<PlayerPage> {
     ),
   );
 
-  /// 画面中央的手势回显：快进快退显示目标时间，亮度 / 音量显示百分比。
+  /// 手势回显：快进快退显示目标时间，亮度 / 音量显示百分比。
+  ///
+  /// 手机上这层压在画面正中时，调音量/亮度会正好挡住人物和字幕，所以整体
+  /// 缩小、并抬到画面上方（水平仍居中）。
   ///
   /// 整层 IgnorePointer，避免它自己抢走后续的拖动事件。
   Widget _gestureIndicator() => IgnorePointer(
-    child: Center(
+    child: Align(
+      alignment: const Alignment(0, -0.45),
       child: GlassPanel(
-        radius: 22,
-        padding: const EdgeInsets.fromLTRB(24, 18, 24, 16),
+        radius: 16,
+        padding: const EdgeInsets.fromLTRB(14, 10, 14, 9),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(_gestureIcon, size: 30, color: Colors.white),
-            const SizedBox(height: 10),
+            Icon(_gestureIcon, size: 20, color: Colors.white),
+            const SizedBox(height: 6),
             Text(
               _gestureLabel,
               style: const TextStyle(
                 color: Colors.white,
-                fontSize: 17,
+                fontSize: 14,
                 fontWeight: FontWeight.w700,
                 fontFeatures: [FontFeature.tabularFigures()],
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 7),
             SizedBox(
-              width: 170,
+              width: 92,
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(999),
                 child: LinearProgressIndicator(
                   value: _gestureProgress,
-                  minHeight: 5,
+                  minHeight: 4,
                   backgroundColor: Colors.white24,
                   valueColor: const AlwaysStoppedAnimation<Color>(
                     YingjiColors.focus,
@@ -2283,6 +2304,49 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       ),
     ),
+  );
+
+  /// 暂停时在画面正中放一个「继续播放」圆钮。
+  ///
+  /// 手机上控件条一秒后就自动隐藏，暂停后画面上什么都不剩，看着像卡死。
+  /// 这里单独浮一个圆钮，点它直接续播（它是叶子节点，会赢过外层的
+  /// 单击手势，不会退化成“切换控件显示”）。
+  Widget _pauseResumePrompt() => StreamBuilder<bool>(
+    stream: _player.stream.playing,
+    builder: (context, snapshot) {
+      if (!_hasPlayed ||
+          snapshot.data != false ||
+          _error != null ||
+          _settingsOpen) {
+        return const SizedBox.shrink();
+      }
+      return Center(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            _revealControls();
+            unawaited(_player.play());
+          },
+          child: Container(
+            width: 78,
+            height: 78,
+            decoration: BoxDecoration(
+              color: const Color(0x8A000000),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: const Color(0x66FFFFFF),
+                width: 1.4,
+              ),
+            ),
+            child: const Icon(
+              YingjiIcons.play_fill,
+              color: Colors.white,
+              size: 34,
+            ),
+          ),
+        ),
+      );
+    },
   );
 
   String _time(Duration value) =>

@@ -1292,7 +1292,8 @@ class _CinematicHomeState extends State<_CinematicHome>
             );
           },
         );
-      },
+      
+  },
     );
   }
 }
@@ -7813,6 +7814,8 @@ class _SettingsPageState extends State<SettingsPage> {
   int _settingJumpGeneration = 0;
   /// 横向胶囊的 key（按需生成），用来把高亮的那一项滚回可视区。
   final _settingsChipKeys = <GlobalKey>[];
+  /// 高亮稳定一小段时间后才回滚胶囊条（见 _revealActiveSettingChip）。
+  Timer? _chipRevealTimer;
   Map<String, Object> _persistedSettings = const {};
   Future<void> _saveQueue = Future<void>.value();
 
@@ -8392,22 +8395,42 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 横向胶囊一次只放得下前几项，高亮项常常落在可视区外（尤其是靠后的
   /// 分栏）。每次选中变化都把它带回到胶囊条中间。
   void _revealActiveSettingChip() {
-    final index = _activeSetting.value;
-    if (index >= _settingsChipKeys.length) return;
-    final context = _settingsChipKeys[index].currentContext;
-    if (context == null) return;
-    final render = context.findRenderObject();
-    if (render == null || !render.attached) return;
-    Scrollable.ensureVisible(
-      context,
-      alignment: 0.5,
-      duration: const Duration(milliseconds: 260),
-      curve: Curves.easeOutCubic,
-    );
+    // 上下滑动时高亮会在相邻两节之间反复横跳，如果每次都把胶囊条滚到
+    // 正中，整排胶囊就会跟着左右抽搐。两道闸：①等高亮稳定一小会儿再动；
+    // ②目标胶囊本来就完整可见时干脆不动。
+    _chipRevealTimer?.cancel();
+    _chipRevealTimer = Timer(const Duration(milliseconds: 180), () {
+      _chipRevealTimer = null;
+      final index = _activeSetting.value;
+      if (index >= _settingsChipKeys.length) return;
+      final context = _settingsChipKeys[index].currentContext;
+      if (context == null) return;
+      final render = context.findRenderObject();
+      if (render == null || !render.attached) return;
+      final viewport = RenderAbstractViewport.maybeOf(render);
+      final scrollable = Scrollable.maybeOf(context);
+      if (viewport != null &&
+          scrollable != null &&
+          scrollable.position.hasPixels) {
+        final current = scrollable.position.pixels;
+        // alignment 0 = 把目标顶边对齐到可视区起点，1 = 把目标底边对齐到
+        // 终点。两者同时成立说明目标已经完整落在可视区里，不用再滚。
+        final toStart = viewport.getOffsetToReveal(render, 0).offset;
+        final toEnd = viewport.getOffsetToReveal(render, 1).offset;
+        if (toStart >= current - 8 && toEnd <= current + 8) return;
+      }
+      Scrollable.ensureVisible(
+        context,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+      );
+    });
   }
 
   @override
   void dispose() {
+    _chipRevealTimer?.cancel();
     _settingsScroll.dispose();
     _activeSetting.dispose();
     _tmdbApiKey.dispose();
@@ -8450,19 +8473,20 @@ class _SettingsPageState extends State<SettingsPage> {
       _maintenanceKey,
       _aboutKey,
     ];
+    // 「设置」标题不跟着内容滚走：它要一直留在胶囊（窄屏）或分栏面板
+    // （宽屏）上方。放内容里的话滑两屏就只剩一排胶囊孤零零挂在顶上。
+    const title = Text(
+      '设置',
+      style: TextStyle(
+        fontSize: 48,
+        height: 1,
+        fontWeight: FontWeight.w800,
+        letterSpacing: -1.2,
+      ),
+    );
     final content = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text(
-          '设置',
-          style: TextStyle(
-            fontSize: 48,
-            height: 1,
-            fontWeight: FontWeight.w800,
-            letterSpacing: -1.2,
-          ),
-        ),
-        const SizedBox(height: 28),
         _FrostSurface(
           key: _homeKey,
           borderRadius: 22,
@@ -9767,6 +9791,22 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ],
     );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        title,
+        const SizedBox(height: 20),
+        Expanded(child: _settingsBody(labels, keys, content)),
+      ],
+    );
+  }
+
+  /// 分栏主体：窄屏「胶囊 + 单栏」，宽屏「左栏 + 正文」。标题由外层给出。
+  Widget _settingsBody(
+    List<(String, IconData)> labels,
+    List<GlobalKey> keys,
+    Widget content,
+  ) {
     return LayoutBuilder(
       builder: (context, constraints) {
         // 手机上（或桌面上把窗口拖窄）没有 220px 的余地给左栏：那套两栏面板
@@ -9902,7 +9942,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 : const Color(0xFFB8BDC8),
             backgroundColor: active == index
                 ? const Color(0xFFF1F1F2)
-                : YingjiGlass.chrome(strength: .58),
+                : Colors.transparent,
             padding: const EdgeInsets.symmetric(horizontal: 14),
             minimumSize: const Size(0, 38),
             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
