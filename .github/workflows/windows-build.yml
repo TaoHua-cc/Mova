@@ -68,19 +68,22 @@ jobs:
         run: |
           $out = "Mova-${{ steps.ver.outputs.version }}-Windows-x64-Portable.zip"
           Compress-Archive -Path 'build\windows\x64\runner\Release\*' -DestinationPath $out -Force
-          Get-ChildItem $out, dist-installer\*.exe | Select-Object Name, Length
 
-      - name: List artifacts
+      - name: Collect artifacts
+        # 先收进一个目录再上传：多路径模式下 upload-artifact 会把
+        # dist-installer/ 前缀一起带进 artifact，下游 glob 就匹配不到安装包了。
         shell: pwsh
         run: |
-          Get-ChildItem dist-installer | Format-Table Name, Length
+          New-Item -ItemType Directory -Force -Path dist-artifacts | Out-Null
+          Copy-Item 'dist-installer\*.exe' dist-artifacts\
+          Copy-Item "Mova-${{ steps.ver.outputs.version }}-Windows-x64-Portable.zip" dist-artifacts\
+          Get-ChildItem dist-artifacts |
+            Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
 
       - name: Upload installer and portable archive
         uses: actions/upload-artifact@v4
         with:
           name: mova-windows-${{ github.sha }}
-          path: |
-            dist-installer/*.exe
-            Mova-*-Windows-x64-Portable.zip
+          path: dist-artifacts/*
           if-no-files-found: error
           retention-days: 30

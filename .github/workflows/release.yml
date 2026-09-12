@@ -102,16 +102,25 @@ jobs:
         run: |
           Compress-Archive -Path 'build\windows\x64\runner\Release\*' `
             -DestinationPath "Mova-$env:VERSION-Windows-x64-Portable.zip" -Force
-          Get-ChildItem -Path dist-installer\*.exe, "Mova-$env:VERSION-Windows-x64-Portable.zip" |
+
+      - name: Collect release assets
+        # 先收进一个目录再上传：多路径模式下 upload-artifact 会把
+        # dist-installer/ 前缀一起带进 artifact，下游 glob 就匹配不到安装包了。
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-artifacts | Out-Null
+          Copy-Item 'dist-installer\*.exe' dist-artifacts\
+          Copy-Item "Mova-$env:VERSION-Windows-x64-Portable.zip" dist-artifacts\
+          Get-ChildItem dist-artifacts |
             Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mova-windows
-          path: |
-            dist-installer/*.exe
-            Mova-*-Windows-x64-Portable.zip
+          path: dist-artifacts/*
           if-no-files-found: error
           retention-days: 30
 
@@ -205,8 +214,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List assets
-        run: ls -lh dist
+      - name: Flatten assets
+        # 兜底：不管 artifact 内部是什么结构，都展平到一个目录再发布，
+        # 否则 softprops/action-gh-release 会跳过目录、静默漏掉文件。
+        run: |
+          mkdir -p flat
+          find dist -type f -exec cp {} flat/ \;
+          ls -lh flat
 
       - name: Write summary
         run: |
@@ -222,7 +236,7 @@ jobs:
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: Mova ${{ needs.meta.outputs.tag }}
-          files: dist/*
+          files: flat/*
           generate_release_notes: true
           body: |
             ## 下载

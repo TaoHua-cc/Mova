@@ -27,6 +27,7 @@ dist-new*/
 
 # --- Installer & package build artifacts ---
 /dist-installer/
+/dist-artifacts/
 /dist-repack-*/
 /dist-yingji-*/
 *.zip
