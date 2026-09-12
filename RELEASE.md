@@ -109,6 +109,15 @@ powershell -ExecutionPolicy Bypass -File scripts\cut-release.ps1 -Version 3.1.81
 
 配置好后，`release.yml` 会自动还原密钥并给 APK 签名，无需再手工重签名。
 
+流水线会**自己校验签名**：构建后会打印 APK 的证书 DN 与 SHA-256，
+如果配置了 keystore 却仍是 debug 签名，会直接以 `::error::` 失败 ——
+因为这是唯一「构建成功但用户装不上更新」的失败模式。首次配置密钥后可以对照
+keystore 指纹确认：
+
+```bash
+keytool -list -v -keystore mova-signing.jks -storepass <口令> -J-Duser.language=en | grep SHA256
+```
+
 > 安全提醒：密钥库（`.jks`）是发布包的更新凭证。丢了就无法给已安装的用户推送更新；
 > 泄露则别人能伪造你的更新包。请离线备份，且**永远不要提交到仓库**
 > （`.gitignore` 已忽略 `*.jks` / `key.properties`）。
