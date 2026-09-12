@@ -6872,7 +6872,9 @@ class _SourceKindChoice extends StatelessWidget {
       height: 74,
       padding: const EdgeInsets.symmetric(horizontal: 14),
       decoration: BoxDecoration(
-        color: selected ? Colors.white : const Color(0x99101317),
+        color: selected
+            ? YingjiGlass.accent
+            : YingjiGlass.surface(strength: 1.2),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: selected ? Colors.white : Colors.white.withValues(alpha: .1),
@@ -7756,6 +7758,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final _homeKey = GlobalKey();
   final _appearanceKey = GlobalKey();
   final _playerKey = GlobalKey();
+  final _playerToolsKey = GlobalKey();
   final _behaviorKey = GlobalKey();
   final _networkKey = GlobalKey();
   final _danmakuKey = GlobalKey();
@@ -7779,6 +7782,11 @@ class _SettingsPageState extends State<SettingsPage> {
   String _appearanceFont = 'round';
   double _appearanceGlassOpacity = .58, _appearanceGlassBlur = 24;
   double _appearanceCardDepth = .62;
+  String _appearanceGlassTint = 'graphite';
+  List<String> _playerToolOrder = YingjiPlayerTools.all
+      .map((tool) => tool.id)
+      .toList(growable: true);
+  List<String> _playerToolHidden = <String>[];
   double _defaultSpeed = 1,
       _audioDelay = 0,
       _subtitleDelay = 0,
@@ -7891,6 +7899,15 @@ class _SettingsPageState extends State<SettingsPage> {
               0,
               1,
             );
+        _appearanceGlassTint =
+            prefs.getString('yingji.appearance.glass-tint') ?? 'graphite';
+        _playerToolOrder = _sanitizePlayerToolOrder(
+          prefs.getStringList('yingji.player.tool-order'),
+        );
+        _playerToolHidden =
+            (prefs.getStringList('yingji.player.tool-hidden') ?? const [])
+                .where(YingjiPlayerTools.contains)
+                .toList(growable: true);
         _defaultSpeed = prefs.getDouble('yingji.player.speed') ?? 1;
         _audioDelay = prefs.getDouble('yingji.player.audio-delay') ?? 0;
         _subtitleDelay = prefs.getDouble('yingji.player.subtitle-delay') ?? 0;
@@ -8007,6 +8024,9 @@ class _SettingsPageState extends State<SettingsPage> {
       'yingji.appearance.glass-opacity': _appearanceGlassOpacity,
       'yingji.appearance.glass-blur': _appearanceGlassBlur,
       'yingji.appearance.card-depth': _appearanceCardDepth,
+      'yingji.appearance.glass-tint': _appearanceGlassTint,
+      'yingji.player.tool-order': _playerToolOrder,
+      'yingji.player.tool-hidden': _playerToolHidden,
       'yingji.player.speed': _defaultSpeed,
       'yingji.player.audio-delay': _audioDelay,
       'yingji.player.subtitle-delay': _subtitleDelay,
@@ -8137,6 +8157,7 @@ class _SettingsPageState extends State<SettingsPage> {
       glassOpacity: _appearanceGlassOpacity,
       glassBlur: _appearanceGlassBlur,
       cardDepth: _appearanceCardDepth,
+      glassTint: _appearanceGlassTint,
     );
   }
 
@@ -8330,6 +8351,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _homeKey,
     _appearanceKey,
     _playerKey,
+    _playerToolsKey,
     _behaviorKey,
     _networkKey,
     _danmakuKey,
@@ -8479,6 +8501,7 @@ class _SettingsPageState extends State<SettingsPage> {
       ('首页', YingjiIcons.house),
       ('外观', YingjiIcons.paintbrush),
       ('播放器', YingjiIcons.play),
+      ('播放器按钮', YingjiIcons.slider_horizontal_3),
       ('播放行为', YingjiIcons.gauge),
       ('网络与同步', YingjiIcons.wifi),
       ('字幕与弹幕', YingjiIcons.captions_bubble),
@@ -8491,6 +8514,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _homeKey,
       _appearanceKey,
       _playerKey,
+      _playerToolsKey,
       _behaviorKey,
       _networkKey,
       _danmakuKey,
@@ -8823,6 +8847,33 @@ class _SettingsPageState extends State<SettingsPage> {
                   _save();
                 },
               ),
+              const SizedBox(height: 10),
+              const Text(
+                '玻璃色调',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                '决定所有按钮、卡片与播放器浮层的底色；与上面的不透明度、模糊叠加生效。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  for (final tint in YingjiGlassTints.all)
+                    _GlassTintSwatch(
+                      tint: tint,
+                      selected: _appearanceGlassTint == tint.key,
+                      onTap: () {
+                        setState(() => _appearanceGlassTint = tint.key);
+                        _applyAppearance();
+                        _save();
+                      },
+                    ),
+                ],
+              ),
             ],
           ),
         ),
@@ -8899,6 +8950,51 @@ class _SettingsPageState extends State<SettingsPage> {
                   setState(() => _voiceEnhance = v);
                   _save();
                 },
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _playerToolsKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '播放器按钮',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '上下箭头调整播放器右下角按钮的顺序，右侧开关决定它是否出现。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 12),
+              ..._playerToolOrderTiles(),
+              const SizedBox(height: 10),
+              MovaPress(
+                onTap: _resetPlayerToolOrder,
+                scale: .95,
+                semanticLabel: '恢复默认顺序',
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 9,
+                  ),
+                  decoration: BoxDecoration(
+                    color: YingjiGlass.chrome(strength: 1.1),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: YingjiGlass.line(strength: 1.3)),
+                  ),
+                  child: const Text(
+                    '恢复默认顺序',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
               ),
             ],
           ),
@@ -9954,6 +10050,123 @@ class _SettingsPageState extends State<SettingsPage> {
   ///
   /// 选中态只换颜色、不换字重：字重一变胶囊就变宽，右边所有胶囊都会跟着
   /// 左右挪一下 —— 这才是上下滑动时「跳动」的主因之一。
+  /// 播放器按钮的排序 / 显隐列表。
+  ///
+  /// 用上下箭头而不是长按拖拽：设置页本身在滚动，内嵌 ReorderableListView
+  /// 会和外层抢手势，手机上尤其容易拖不动。
+  List<Widget> _playerToolOrderTiles() {
+    final tiles = <Widget>[];
+    for (var index = 0; index < _playerToolOrder.length; index++) {
+      final id = _playerToolOrder[index];
+      final enabled = !_playerToolHidden.contains(id);
+      tiles.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: AnimatedContainer(
+            duration: MovaMotion.quick,
+            curve: MovaMotion.standardEase,
+            decoration: BoxDecoration(
+              color: enabled
+                  ? YingjiGlass.surface(strength: .92)
+                  : YingjiGlass.surface(strength: .42),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: YingjiGlass.line(strength: 1.25)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 6, 4),
+              child: Row(
+                children: [
+                  Icon(
+                    YingjiPlayerTools.iconOf(id),
+                    size: 17,
+                    color: enabled ? Colors.white : const Color(0xFF7C818D),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      id,
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w700,
+                        color: enabled
+                            ? Colors.white
+                            : const Color(0xFF7C818D),
+                      ),
+                    ),
+                  ),
+                  YingjiMotionIconButton(
+                    tooltip: '上移',
+                    icon: YingjiIcons.chevron_up,
+                    size: 34,
+                    onPressed: index == 0
+                        ? () {}
+                        : () => _movePlayerTool(index, -1),
+                  ),
+                  YingjiMotionIconButton(
+                    tooltip: '下移',
+                    icon: YingjiIcons.chevron_down,
+                    size: 34,
+                    onPressed: index == _playerToolOrder.length - 1
+                        ? () {}
+                        : () => _movePlayerTool(index, 1),
+                  ),
+                  Switch(
+                    value: enabled,
+                    onChanged: (value) => _togglePlayerTool(id, value),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return tiles;
+  }
+
+  /// 把保存的顺序补全 / 去重：丢掉已不存在的入口，新加入口补到末尾。
+  List<String> _sanitizePlayerToolOrder(List<String>? saved) {
+    final order = <String>[];
+    for (final id in saved ?? const <String>[]) {
+      if (YingjiPlayerTools.contains(id) && !order.contains(id)) {
+        order.add(id);
+      }
+    }
+    for (final tool in YingjiPlayerTools.all) {
+      if (!order.contains(tool.id)) order.add(tool.id);
+    }
+    return order;
+  }
+
+  void _movePlayerTool(int index, int delta) {
+    setState(() {
+      final moved = _playerToolOrder.removeAt(index);
+      _playerToolOrder.insert(index + delta, moved);
+    });
+    _save();
+  }
+
+  void _togglePlayerTool(String id, bool enabled) {
+    setState(() {
+      if (enabled) {
+        _playerToolHidden.remove(id);
+      } else if (!_playerToolHidden.contains(id)) {
+        _playerToolHidden.add(id);
+      }
+    });
+    _save();
+  }
+
+  void _resetPlayerToolOrder() {
+    setState(() {
+      _playerToolOrder = YingjiPlayerTools.all
+          .map((tool) => tool.id)
+          .toList(growable: true);
+      _playerToolHidden = <String>[];
+    });
+    _save();
+  }
+
   Widget _settingsSectionChips(
     List<(String, IconData)> labels,
     List<GlobalKey> keys,
@@ -9981,7 +10194,7 @@ class _SettingsPageState extends State<SettingsPage> {
               height: 38,
               padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
-                color: selected ? const Color(0xFFF1F1F2) : Colors.transparent,
+                color: selected ? YingjiGlass.accent : Colors.transparent,
                 borderRadius: BorderRadius.circular(19),
               ),
               child: Row(
@@ -12048,6 +12261,64 @@ class _HeroProgressDots extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    ),
+  );
+}
+
+/// 外观设置里的玻璃色调色板。
+class _GlassTintSwatch extends StatelessWidget {
+  const _GlassTintSwatch({
+    required this.tint,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final YingjiGlassTint tint;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => MovaPress(
+    onTap: onTap,
+    scale: .93,
+    semanticLabel: tint.name,
+    child: AnimatedContainer(
+      duration: MovaMotion.quick,
+      curve: MovaMotion.standardEase,
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+      decoration: BoxDecoration(
+        color: selected
+            ? tint.light.withValues(alpha: .92)
+            : YingjiGlass.surface(strength: .8),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: selected ? Colors.white70 : YingjiGlass.line(strength: 1.2),
+          width: selected ? 1.4 : 1,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 16,
+            height: 16,
+            decoration: BoxDecoration(
+              color: Color.lerp(tint.light, tint.deep, .62),
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white.withValues(alpha: .25)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            tint.name,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: selected ? const Color(0xFF12141A) : Colors.white,
+            ),
+          ),
+        ],
       ),
     ),
   );

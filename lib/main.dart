@@ -26,6 +26,18 @@ Future<void> main() async {
       _ => ThemeMode.dark,
     },
     iconStyle: prefs.getString('yingji.appearance.icon') ?? 'play',
+    fontStyle: prefs.getString('yingji.appearance.font') ?? 'round',
+    glassOpacity: (prefs.getDouble('yingji.appearance.glass-opacity') ?? .58)
+        .clamp(0, 1),
+    glassBlur: (prefs.getDouble('yingji.appearance.glass-blur') ?? 24).clamp(
+      0,
+      40,
+    ),
+    cardDepth: (prefs.getDouble('yingji.appearance.card-depth') ?? .62).clamp(
+      0,
+      1,
+    ),
+    glassTint: prefs.getString('yingji.appearance.glass-tint') ?? 'graphite',
   );
   runApp(const YingjiApp());
 }

@@ -172,27 +172,12 @@ enum _GestureKind {
 
 /// 右侧工具按钮的声明式描述。
 ///
-/// 平铺出来的按钮和溢出进「更多」菜单里的条目都由这份列表生成，
-/// 避免两处各写一份导致新增入口时漏改。
-class _PlayerTool {
-  const _PlayerTool(this.tab, this.icon);
+/// 声明放在 `brand.dart`（[YingjiPlayerTools]），因为设置页要拿同一份列表做
+/// 排序和显隐；这里只保留别名，避免两处各写一份导致新增入口时漏改。
+typedef _PlayerTool = YingjiPlayerTool;
 
-  /// 控制台面板的标签，同时用作工具提示和菜单文案。
-  final String tab;
-  final IconData icon;
-}
-
-/// 控制台工具入口，顺序即平铺顺序。
-const _playerTools = <_PlayerTool>[
-  _PlayerTool('声音', YingjiIcons.speaker_2_fill),
-  _PlayerTool('字幕', YingjiIcons.captions_bubble),
-  _PlayerTool('弹幕', YingjiIcons.danmaku),
-  _PlayerTool('画面', YingjiIcons.film),
-  _PlayerTool('播放', YingjiIcons.play_circle),
-  _PlayerTool('章节', YingjiIcons.bookmark),
-  _PlayerTool('片头片尾', YingjiIcons.scissors),
-  _PlayerTool('资源', YingjiIcons.server),
-];
+/// 控制台工具入口，顺序即平铺顺序（实际顺序以设置页保存的为准）。
+const _playerTools = YingjiPlayerTools.all;
 
 class PlayerPage extends StatefulWidget {
   const PlayerPage({
@@ -363,6 +348,26 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 上一次单击的时间，用于自实现的双击判定。
   DateTime? _lastTapAt;
 
+  // ── 右下角工具按钮的顺序与显隐（设置页保存）────────────────────
+  /// 用户排好的顺序；缺省是 [YingjiPlayerTools.all] 的声明顺序。
+  List<String> _toolOrder = YingjiPlayerTools.all
+      .map((tool) => tool.id)
+      .toList(growable: true);
+  /// 被关掉的入口 id。
+  List<String> _toolHidden = <String>[];
+
+  /// 按设置页的顺序和开关过滤后的工具列表。
+  List<_PlayerTool> get _activeTools => _toolOrder
+      .where((id) => !_toolHidden.contains(id))
+      .map(
+        (id) => _playerTools.firstWhere(
+          (tool) => tool.id == id,
+          orElse: () => const YingjiPlayerTool('', YingjiIcons.gear_alt),
+        ),
+      )
+      .where((tool) => tool.id.isNotEmpty)
+      .toList(growable: false);
+
   PlayerEpisode get _baseEpisode => widget.episodes.isEmpty
       ? PlayerEpisode(
           url: widget.url,
@@ -392,6 +397,7 @@ class _PlayerPageState extends State<PlayerPage> {
     unawaited(WindowHost.enterMediaSession());
     // 预读一次亮度，这样左半屏第一次上下滑动是从真实基准开始，不会跳变。
     unawaited(_loadScreenBrightness());
+    unawaited(_loadToolbarPreferences());
     _activeEpisodeIndex = widget.episodes.indexWhere(
       (episode) => episode.url == widget.url,
     );
@@ -641,6 +647,32 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_gestureKind == _GestureKind.volume) unawaited(_persistVolume());
     _endGesture();
     _revealControls();
+  }
+
+  /// 读入设置页保存的工具栏顺序与显隐。
+  ///
+  /// 顺序里可能夹着旧版本留下的、现在已经不存在的入口，先按 [YingjiPlayerTools]
+  /// 过滤一遍，再把新加入口补到末尾 —— 这样升级后不会丢按钮，也不会渲染出空槽。
+  Future<void> _loadToolbarPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedOrder = prefs.getStringList('yingji.player.tool-order');
+    final savedHidden = prefs.getStringList('yingji.player.tool-hidden');
+    if (!mounted) return;
+    setState(() {
+      final order = <String>[];
+      for (final id in savedOrder ?? const <String>[]) {
+        if (YingjiPlayerTools.contains(id) && !order.contains(id)) {
+          order.add(id);
+        }
+      }
+      for (final tool in YingjiPlayerTools.all) {
+        if (!order.contains(tool.id)) order.add(tool.id);
+      }
+      _toolOrder = order;
+      _toolHidden = (savedHidden ?? const <String>[])
+          .where(YingjiPlayerTools.contains)
+          .toList(growable: true);
+    });
   }
 
   /// 手势结束后把音量落盘，下次进入播放器沿用。
@@ -2294,23 +2326,48 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 整层 IgnorePointer，避免它自己抢走后续的拖动事件。
   ///
   /// 出现 / 消失走 [MovaAppear]，和全软件其它浮层同一套时长与曲线。
-  Widget _gestureIndicator() => IgnorePointer(
-    child: MovaAppear(
-      visible: _gestureVisible,
-      animateOnMount: false,
-      beginScale: .88,
-      duration: MovaMotion.hudIn,
-      child: Align(
-        alignment: const Alignment(0, -.42),
-        child: _gestureKind == _GestureKind.seek
-            ? MovaHudPill(
-                icon: _gestureIcon,
-                label: _gestureLabel,
-                caption: _gestureCaption.isEmpty ? null : _gestureCaption,
-              )
-            : MovaHud(icon: _gestureIcon, value: _gestureProgress),
-      ),
-    ),
+  Widget _gestureIndicator() => LayoutBuilder(
+    builder: (context, constraints) {
+      // 之前固定在 Alignment(0, -.42)，手机上正好压在人物脸上。现在按屏高的
+      // 13% 定位（并给顶部标题栏留出至少 76px），横条又薄，基本不挡画面。
+      final height = constraints.maxHeight;
+      final top = (height * .13).clamp(76.0, 200.0);
+      final y = (2 * (top + 19) / (height <= 0 ? 1 : height) - 1).clamp(
+        -1.0,
+        1.0,
+      );
+      final background = YingjiGlass.hud();
+      final border = YingjiGlass.line(strength: 1.8);
+      return IgnorePointer(
+        child: MovaAppear(
+          visible: _gestureVisible,
+          animateOnMount: false,
+          beginScale: .92,
+          duration: MovaMotion.hudIn,
+          child: Align(
+            alignment: Alignment(0, y),
+            child: _gestureKind == _GestureKind.seek
+                ? MovaHud(
+                    icon: _gestureIcon,
+                    label: _gestureLabel,
+                    caption: _gestureCaption.isEmpty ? null : _gestureCaption,
+                    value: _gestureProgress,
+                    width: 292,
+                    background: background,
+                    borderColor: border,
+                  )
+                : MovaHud(
+                    icon: _gestureIcon,
+                    label: _gestureLabel,
+                    value: _gestureProgress,
+                    trackWidth: 104,
+                    background: background,
+                    borderColor: border,
+                  ),
+          ),
+        ),
+      );
+    },
   );
 
   /// 暂停时在画面正中放一个「继续播放」圆钮。
@@ -2345,10 +2402,10 @@ class _PlayerPageState extends State<PlayerPage> {
               width: 78,
               height: 78,
               decoration: BoxDecoration(
-                color: const Color(0x8A000000),
+                color: YingjiGlass.hud(strength: 1.7),
                 shape: BoxShape.circle,
                 border: Border.all(
-                  color: const Color(0x66FFFFFF),
+                  color: YingjiGlass.line(strength: 2.6),
                   width: 1.4,
                 ),
               ),
@@ -2455,9 +2512,9 @@ class _PlayerPageState extends State<PlayerPage> {
         return [
           _consoleGroup('画面', ['画面比例  $_aspect']),
         ];
-      case '播放':
+      case '倍速':
         return [
-          _consoleGroup('播放', ['播放速度  ${_speed.toStringAsFixed(2)}x']),
+          _consoleGroup('倍速', ['播放速度  ${_speed.toStringAsFixed(2)}x']),
         ];
       case '章节':
         return [
@@ -2852,6 +2909,7 @@ class _PlayerPageState extends State<PlayerPage> {
       const double button = 40;
       final available = constraints.maxWidth;
       final hasEpisodes = widget.episodes.isNotEmpty;
+      final tools = _activeTools;
       // 窄屏收窄音量滑条，把空间让给工具按钮。
       final sliderWidth = available < 420
           ? 56.0
@@ -2865,12 +2923,10 @@ class _PlayerPageState extends State<PlayerPage> {
           (hasEpisodes ? button + gap : 0); // 全集列表
       // 不折叠时能平铺下的工具按钮个数：n 个按钮占 n*(button+gap) - gap。
       final fit = ((available - fixed + gap) / (button + gap)).floor();
-      final overflowing = fit < _playerTools.length;
+      final overflowing = fit < tools.length;
       // 折叠时末尾要让出一个「更多」按钮的位置。
-      final visible = overflowing
-          ? math.max(0, fit - 1)
-          : _playerTools.length;
-      final hidden = _playerTools.sublist(visible);
+      final visible = overflowing ? math.max(0, fit - 1) : tools.length;
+      final hidden = tools.sublist(visible);
       return GlassPanel(
         radius: 28,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -2899,7 +2955,7 @@ class _PlayerPageState extends State<PlayerPage> {
               ),
             ),
             const SizedBox(width: gap),
-            for (final tool in _playerTools.take(visible)) ...[
+            for (final tool in tools.take(visible)) ...[
               _playerToolControl(tool),
               const SizedBox(width: gap),
             ],
@@ -2922,14 +2978,16 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 把工具描述渲染成控件。带取值的两个入口（播放速度、画面比例）平铺时是
   /// 下拉快选，其余是打开控制台对应标签的图标按钮。
-  Widget _playerToolControl(_PlayerTool tool) => switch (tool.tab) {
-    '播放' => _quickChoice<double>(
+  Widget _playerToolControl(_PlayerTool tool) => switch (tool.id) {
+    // 倍速不画图标：直接把当前值写在按钮上，一眼能看见，也省一个槽位。
+    '倍速' => _quickChoice<double>(
       icon: YingjiIcons.gauge,
       label: '播放速度',
       value: _speed,
       values: const [.5, .75, 1, 1.25, 1.5, 2],
       labelBuilder: (v) => '${v}x',
       onChanged: _setPlaybackSpeed,
+      display: _speedBadge(),
     ),
     '画面' => _quickChoice<String>(
       icon: YingjiIcons.fullscreen,
@@ -2941,12 +2999,34 @@ class _PlayerPageState extends State<PlayerPage> {
     ),
     _ => YingjiMotionIconButton(
       icon: tool.icon,
-      tooltip: tool.tab,
-      selected: _settingsOpen && _consoleTab == tool.tab,
+      tooltip: tool.id,
+      selected: _settingsOpen && _consoleTab == tool.id,
       size: 40,
-      onPressed: () => _openConsoleTab(tool.tab),
+      onPressed: () => _openConsoleTab(tool.id),
     ),
   };
+
+  /// 倍速按钮的外观：一颗写着「1.0x」的玻璃小胶囊。
+  Widget _speedBadge() => Container(
+    height: 40,
+    padding: const EdgeInsets.symmetric(horizontal: 9),
+    decoration: BoxDecoration(
+      color: YingjiGlass.chrome(strength: 1.15),
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: YingjiGlass.line(strength: 1.4)),
+    ),
+    child: Center(
+      child: Text(
+        '${_speed}x',
+        style: const TextStyle(
+          fontSize: 12.5,
+          fontWeight: FontWeight.w800,
+          height: 1,
+          fontFeatures: [FontFeature.tabularFigures()],
+        ),
+      ),
+    ),
+  );
 
   /// 放不下的工具入口折叠成一个「更多」按钮，点开列在菜单里。
   Widget _overflowToolsMenu(List<_PlayerTool> hidden) => YingjiGlassMenu(
@@ -2963,8 +3043,8 @@ class _PlayerPageState extends State<PlayerPage> {
       for (final tool in hidden)
         MenuItemButton(
           leadingIcon: Icon(tool.icon, size: 16),
-          onPressed: () => _openConsoleTab(tool.tab),
-          child: Text(tool.tab),
+          onPressed: () => _openConsoleTab(tool.id),
+          child: Text(tool.id),
         ),
     ],
     child: Container(
@@ -2986,6 +3066,7 @@ class _PlayerPageState extends State<PlayerPage> {
     required List<T> values,
     required String Function(T) labelBuilder,
     required ValueChanged<T> onChanged,
+    Widget? display,
   }) => Tooltip(
     message: '$label · ${labelBuilder(value)}',
     child: YingjiGlassMenu(
@@ -3008,16 +3089,17 @@ class _PlayerPageState extends State<PlayerPage> {
             child: Text(labelBuilder(item)),
           ),
       ],
-      child: Container(
-        width: 40,
-        height: 40,
-        decoration: BoxDecoration(
-          color: YingjiGlass.chrome(),
-          shape: BoxShape.circle,
-          border: Border.all(color: YingjiGlass.line()),
-        ),
-        child: Icon(icon, size: 18),
-      ),
+      child: display ??
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: YingjiGlass.chrome(strength: 1.1),
+              shape: BoxShape.circle,
+              border: Border.all(color: YingjiGlass.line(strength: 1.3)),
+            ),
+            child: Icon(icon, size: 18),
+          ),
     ),
   );
 
@@ -3221,7 +3303,7 @@ class _StateChip extends StatelessWidget {
       border: Border.all(color: YingjiGlass.line()),
       boxShadow: const [
         BoxShadow(
-          color: Color(0x42000000),
+          color: YingjiGlass.chrome(strength: 1.05),
           blurRadius: 16,
           offset: Offset(0, 8),
         ),

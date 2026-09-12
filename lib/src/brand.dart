@@ -173,6 +173,9 @@ class YingjiAppearance extends ChangeNotifier {
   double glassOpacity = .58;
   double glassBlur = 24;
 
+  /// 玻璃色调预设的 key，见 [YingjiGlassTints]。
+  String glassTint = 'graphite';
+
   /// 0 is a brighter frosted card; 1 is the deepest graphite card.
   double cardDepth = .62;
 
@@ -183,13 +186,15 @@ class YingjiAppearance extends ChangeNotifier {
     double? glassOpacity,
     double? glassBlur,
     double? cardDepth,
-  }) {
+    String? glassTint,
+  } {
     if (themeMode != null) this.themeMode = themeMode;
     if (iconStyle != null) this.iconStyle = iconStyle;
     if (fontStyle != null) this.fontStyle = fontStyle;
     if (glassOpacity != null) this.glassOpacity = glassOpacity.clamp(0, 1);
     if (glassBlur != null) this.glassBlur = glassBlur.clamp(0, 40);
     if (cardDepth != null) this.cardDepth = cardDepth.clamp(0, 1);
+    if (glassTint != null) this.glassTint = glassTint;
     notifyListeners();
   }
 }
@@ -289,29 +294,113 @@ abstract final class YingjiColors {
   static const warmGlass = Color(0xB3262328);
 }
 
+/// 玻璃色调预设。
+///
+/// 每项给一对颜色：「背景卡片颜色」（[YingjiAppearance.cardDepth]）在浅端和
+/// 深端之间插值。也就是说色调和深度是同一块材质的两个维度，合起来决定软件里
+/// 每一个按钮和卡片的底色。
+class YingjiGlassTint {
+  const YingjiGlassTint(this.key, this.name, this.light, this.deep);
+
+  final String key;
+  final String name;
+
+  /// 深度为 0 时的颜色（通透）。
+  final Color light;
+
+  /// 深度为 1 时的颜色（深邃）。
+  final Color deep;
+}
+
+abstract final class YingjiGlassTints {
+  static const all = <YingjiGlassTint>[
+    YingjiGlassTint('graphite', '石墨', Color(0xFF6A7382), Color(0xFF151A22)),
+    YingjiGlassTint('obsidian', '曜黑', Color(0xFF6E6E7A), Color(0xFF0B0B0E)),
+    YingjiGlassTint('indigo', '靛蓝', Color(0xFF6B7FA6), Color(0xFF121B2C)),
+    YingjiGlassTint('pine', '松绿', Color(0xFF6E8B76), Color(0xFF101C17)),
+    YingjiGlassTint('amber', '暖砂', Color(0xFFA08A6E), Color(0xFF1E1811)),
+    YingjiGlassTint('violet', '紫罗兰', Color(0xFF8B78A0), Color(0xFF1A1226)),
+  ];
+
+  static YingjiGlassTint of(String key) {
+    for (final tint in all) {
+      if (tint.key == key) return tint;
+    }
+    return all.first;
+  }
+}
+
+/// 播放器工具栏的入口声明。
+///
+/// 设置页排顺序 / 开关显隐，播放器页按结果渲染 —— 两边共用这一份，免得新增
+/// 入口时漏改一处（之前顺序就只写在播放器页的 const 列表里）。
+class YingjiPlayerTool {
+  const YingjiPlayerTool(this.id, this.icon);
+
+  /// 控制台面板的标签，同时用作工具提示、菜单文案与排序 / 显隐的键。
+  final String id;
+  final IconData icon;
+}
+
+abstract final class YingjiPlayerTools {
+  static const all = <YingjiPlayerTool>[
+    YingjiPlayerTool('声音', YingjiIcons.speaker_2_fill),
+    YingjiPlayerTool('字幕', YingjiIcons.captions_bubble),
+    YingjiPlayerTool('弹幕', YingjiIcons.danmaku),
+    YingjiPlayerTool('画面', YingjiIcons.film),
+    YingjiPlayerTool('倍速', YingjiIcons.gauge),
+    YingjiPlayerTool('章节', YingjiIcons.bookmark),
+    YingjiPlayerTool('片头片尾', YingjiIcons.scissors),
+    YingjiPlayerTool('资源', YingjiIcons.server),
+  ];
+
+  static bool contains(String id) {
+    for (final tool in all) {
+      if (tool.id == id) return true;
+    }
+    return false;
+  }
+
+  static IconData iconOf(String id) {
+    for (final tool in all) {
+      if (tool.id == id) return tool.icon;
+    }
+    return YingjiIcons.slider_horizontal_3;
+  }
+}
+
 /// Centralized glass material.  All floating controls derive their tint,
 /// translucency and blur from the same appearance setting rather than baking
 /// in opaque black fills per page.
 abstract final class YingjiGlass {
-  static Color _tinted(Color light, Color deep) =>
-      Color.lerp(light, deep, yingjiAppearance.cardDepth)!;
-
-  static Color surface({double strength = 1}) {
-    final tint = _tinted(const Color(0xFF596270), const Color(0xFF151A22));
-    return tint.withValues(
-      alpha: (yingjiAppearance.glassOpacity * strength).clamp(0, 1),
-    );
+  /// 当前色调在 [cardDepth] 处插值出的实色。
+  static Color get tint {
+    final preset = YingjiGlassTints.of(yingjiAppearance.glassTint);
+    return Color.lerp(preset.light, preset.deep, yingjiAppearance.cardDepth)!;
   }
 
-  static Color chrome({double strength = .82}) {
-    final tint = _tinted(const Color(0xFF424B58), const Color(0xFF0E131A));
-    return tint.withValues(
-      alpha: (yingjiAppearance.glassOpacity * strength).clamp(0, 1),
-    );
-  }
+  /// 选中态 / 高亮态用的实心色：直接取当前色调的浅端，和悬浮卡片同一色系。
+  static Color get accent => YingjiGlassTints.of(yingjiAppearance.glassTint).light;
+
+  static Color surface({double strength = 1}) => tint.withValues(
+    alpha: (yingjiAppearance.glassOpacity * strength).clamp(0, 1),
+  );
+
+  /// 比卡片再深一档，用在按钮、下拉这类小面积控件上。
+  static Color chrome({double strength = .82}) => Color.lerp(
+    tint,
+    YingjiGlassTints.of(yingjiAppearance.glassTint).deep,
+    .38,
+  )!.withValues(alpha: (yingjiAppearance.glassOpacity * strength).clamp(0, 1));
 
   static Color line({double strength = 1}) => Colors.white.withValues(
     alpha: (yingjiAppearance.glassOpacity * .21 * strength).clamp(0, .28),
+  );
+
+  /// 播放器里的浮层（HUD、暂停圆钮）。跟随玻璃设置，但不透明度有下限：
+  /// 把不透明度拉到 0 时提示也还得看得见。
+  static Color hud({double strength = 1.5}) => tint.withValues(
+    alpha: (yingjiAppearance.glassOpacity * strength).clamp(.55, 1),
   );
 
   static double get blur => yingjiAppearance.glassBlur;

@@ -262,69 +262,115 @@ class _MovaAppearState extends State<MovaAppear> {
   }
 }
 
-/// Apple 风格的竖条 HUD（音量 / 亮度）。
+/// Apple 风格的横条 HUD（亮度 / 音量 / 快进快退）。
 ///
-/// 形态参考 iOS 的音量 HUD：一条竖直的细胶囊，填充从底部往上长，图标压在
-/// 底部。它比「图标 + 横条 + 百分比」那套省掉一半面积，也更不容易挡住画面。
+/// 统一躺成一条 38 高的胶囊：图标 + 进度条 + 数值，横向摆在画面靠上的位置。
+/// 之前是竖条，手机上正好压在人物脸上；横条既薄又靠上，不挡画面也不挡字幕。
+///
+/// 底色由调用方传 [background]（通常是 `YingjiGlass.hud()`），这样外观设置里
+/// 的玻璃色调 / 不透明度 / 模糊会直接作用到它上面。
 class MovaHud extends StatelessWidget {
   const MovaHud({
     super.key,
     required this.icon,
-    required this.value,
-    this.width = 46,
-    this.height = 142,
+    required this.label,
+    this.value,
+    this.caption,
+    this.trackWidth = 96,
+    this.width,
+    this.background = const Color(0xA6121216),
+    this.borderColor = const Color(0x24FFFFFF),
   });
 
   final IconData icon;
 
-  /// 0..1。
-  final double value;
-  final double width;
-  final double height;
+  /// 主数值文案（百分比或时间点）。
+  final String label;
+
+  /// 0..1 的进度；为 null 时不画进度条。
+  final double? value;
+
+  /// 右侧的次要说明（快进快退的偏移量）。
+  final String? caption;
+
+  /// 宽度自适应时的进度条长度；给定 [width] 时进度条改为撑满剩余空间。
+  final double trackWidth;
+
+  /// 给定后整条 HUD 固定宽度，进度条撑满。
+  final double? width;
+  final Color background;
+  final Color borderColor;
 
   @override
   Widget build(BuildContext context) {
-    final radius = width / 2;
+    const radius = 19.0;
+    final value = this.value;
+    Widget track = const SizedBox.shrink();
+    if (value != null) {
+      track = width == null
+          ? _MovaHudTrack(value: value.clamp(0.0, 1.0), width: trackWidth)
+          : Expanded(child: _MovaHudTrack(value: value.clamp(0.0, 1.0)));
+    }
     return ClipRRect(
       borderRadius: BorderRadius.circular(radius),
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
         child: DecoratedBox(
           decoration: BoxDecoration(
-            color: const Color(0xA6121216),
+            color: background,
             borderRadius: BorderRadius.circular(radius),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: .14),
-              width: .8,
-            ),
+            border: Border.all(color: borderColor, width: .8),
             boxShadow: const [
               BoxShadow(
                 color: Color(0x66000000),
-                blurRadius: 30,
-                offset: Offset(0, 12),
+                blurRadius: 26,
+                offset: Offset(0, 10),
               ),
             ],
           ),
           child: SizedBox(
             width: width,
-            height: height,
-            child: Column(
-              children: [
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(0, 14, 0, 8),
-                    child: _MovaHudTrack(value: value.clamp(0.0, 1.0)),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 13),
-                  child: Icon(
+            height: 38,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 13),
+              child: Row(
+                mainAxisSize: width == null
+                    ? MainAxisSize.min
+                    : MainAxisSize.max,
+                children: [
+                  Icon(
                     icon,
-                    size: 17,
-                    color: Colors.white.withValues(alpha: .9),
+                    size: 16,
+                    color: Colors.white.withValues(alpha: .92),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 10),
+                  track,
+                  if (value != null) const SizedBox(width: 11),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      height: 1,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  if (caption != null) ...[
+                    const SizedBox(width: 7),
+                    Text(
+                      caption!,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: .62),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        height: 1,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
         ),
@@ -334,26 +380,27 @@ class MovaHud extends StatelessWidget {
 }
 
 class _MovaHudTrack extends StatelessWidget {
-  const _MovaHudTrack({required this.value});
+  const _MovaHudTrack({required this.value, this.width});
   final double value;
+  final double? width;
 
   @override
-  Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) => ClipRRect(
-      borderRadius: BorderRadius.circular(999),
-      child: SizedBox(
-        width: 8,
-        height: constraints.maxHeight,
-        child: Stack(
+  Widget build(BuildContext context) => ClipRRect(
+    borderRadius: BorderRadius.circular(999),
+    child: SizedBox(
+      width: width,
+      height: 5,
+      child: LayoutBuilder(
+        builder: (context, constraints) => Stack(
           children: [
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
+            ColoredBox(color: Colors.white.withValues(alpha: .2)),
+            Align(
+              alignment: Alignment.centerLeft,
               child: AnimatedContainer(
                 duration: MovaMotion.instant,
                 curve: MovaMotion.standardEase,
-                height: constraints.maxHeight * value,
+                width: constraints.maxWidth * value,
+                height: 5,
                 color: Colors.white.withValues(alpha: .95),
               ),
             ),
@@ -373,11 +420,15 @@ class MovaHudPill extends StatelessWidget {
     required this.icon,
     required this.label,
     this.caption,
+    this.background = const Color(0xA6121216),
+    this.borderColor = const Color(0x24FFFFFF),
   });
 
   final IconData icon;
   final String label;
   final String? caption;
+  final Color background;
+  final Color borderColor;
 
   @override
   Widget build(BuildContext context) => ClipRRect(
@@ -386,12 +437,9 @@ class MovaHudPill extends StatelessWidget {
       filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: const Color(0xA6121216),
+          color: background,
           borderRadius: BorderRadius.circular(17),
-          border: Border.all(
-            color: Colors.white.withValues(alpha: .14),
-            width: .8,
-          ),
+          border: Border.all(color: borderColor, width: .8),
           boxShadow: const [
             BoxShadow(
               color: Color(0x66000000),
