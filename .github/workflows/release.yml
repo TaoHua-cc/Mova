@@ -181,6 +181,28 @@ jobs:
       - name: Build split APKs
         run: flutter build apk --split-per-abi --release
 
+      - name: Verify APK signing
+        # 发版的核心风险就在这一步：签名不对，用户装不上更新，而构建却"成功"。
+        # 所以让流水线自己验，配置了 keystore 却仍是 debug 签名就直接失败。
+        env:
+          SIGNING: ${{ steps.sign.outputs.signing }}
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          echo "apksigner: $APKSIGNER"
+          apk=$(ls build/app/outputs/flutter-apk/app-*-release.apk | head -1)
+          out=$("$APKSIGNER" verify --print-certs "$apk")
+          echo "$out" | grep -E "certificate DN|SHA-256 digest" || true
+          if echo "$out" | grep -q "CN=Android Debug"; then
+            if [ "$SIGNING" = "release" ]; then
+              echo "::error::已配置 keystore，APK 却仍是 debug 签名 —— 已安装旧版的用户会无法覆盖更新"
+              exit 1
+            fi
+            echo "::warning::本次为 debug 签名（仓库未配置 ANDROID_KEYSTORE_BASE64）"
+          else
+            echo "APK 已使用发布签名"
+          fi
+
       - name: Rename APKs with version and ABI
         env:
           VERSION: ${{ needs.meta.outputs.version }}
