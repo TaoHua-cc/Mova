@@ -10216,8 +10216,8 @@ class _SettingsPageState extends State<SettingsPage> {
                     labels[index].$2,
                     size: 16,
                     color: selected
-                        ? const Color(0xFF111216)
-                        : const Color(0xFFB8BDC8),
+                        ? Colors.white
+                        : Theme.of(context).colorScheme.onSurface.withValues(alpha: .66),
                   ),
                   const SizedBox(width: 8),
                   Text(
@@ -10227,8 +10227,8 @@ class _SettingsPageState extends State<SettingsPage> {
                       height: 1,
                       fontWeight: FontWeight.w600,
                       color: selected
-                          ? const Color(0xFF111216)
-                          : const Color(0xFFB8BDC8),
+                          ? Colors.white
+                          : Theme.of(context).colorScheme.onSurface.withValues(alpha: .66),
                     ),
                   ),
                 ],
