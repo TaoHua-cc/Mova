@@ -155,7 +155,6 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   DateTime _lastWheelNavigation = DateTime.fromMillisecondsSinceEpoch(0);
   static const _pageSections = <_CenterSection>[
     _CenterSection.home,
-    _CenterSection.discover,
     _CenterSection.calendar,
     _CenterSection.playlists,
     _CenterSection.sources,
@@ -173,7 +172,8 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     final value = yingjiSectionRequest.value;
     final target = switch (value) {
       'home' => _CenterSection.home,
-      'discover' => _CenterSection.discover,
+      // “发现”已并入首页下半部分，旧入口直接落到首页。
+      'discover' => _CenterSection.home,
       'calendar' => _CenterSection.calendar,
       'playlists' => _CenterSection.playlists,
       'sources' => _CenterSection.sources,
@@ -185,8 +185,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   }
 
   Widget _pageFor(_CenterSection section) => switch (section) {
-    _CenterSection.home => const _CinematicHome(),
-    _CenterSection.discover => const _DiscoverPage(),
+    _CenterSection.home => const _HomeFeedPage(),
     _CenterSection.search => const _SearchPage(),
     _CenterSection.sources => const _SourceHub(),
     _CenterSection.playlists => const _PlaylistsPage(),
@@ -213,9 +212,13 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   }
 
   void _handlePointerSignal(PointerSignalEvent signal) {
-    // Search owns its vertical scroll completely. Wheel input here must never
-    // accumulate into shell-level page navigation.
-    if (_section == _CenterSection.search) return;
+    // Search owns its vertical scroll completely, and the home feed is now a
+    // scrollable page in its own right (home canvas + discover shelves).
+    // Wheel input on either must never accumulate into shell page navigation.
+    if (_section == _CenterSection.search ||
+        _section == _CenterSection.home) {
+      return;
+    }
     if (signal is! PointerScrollEvent ||
         signal.scrollDelta.dy.abs() <= signal.scrollDelta.dx.abs()) {
       return;
@@ -295,11 +298,13 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
         _FloatingHomeTopBar(
           onSearch: () => _selectSection(_CenterSection.search),
         ),
-        Positioned(
-          right: 28,
-          bottom: 30,
-          child: _PageScrollCue(progress: _pageScrollHint),
-        ),
+        // 首页自带绑定真实滚动位置的提示，壳层这个按页切换的提示在首页会失真。
+        if (_section != _CenterSection.home)
+          Positioned(
+            right: 28,
+            bottom: 30,
+            child: _PageScrollCue(progress: _pageScrollHint),
+          ),
       ],
     );
     return Listener(
@@ -324,9 +329,93 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   }
 }
 
+/// 首页与“发现”合并后的单一页面。
+///
+/// 上半部分仍是占满一屏的电影感首页画布（hero 轮播 + 继续观看），继续向下
+/// 滚动即接上原“发现”页的完整内容（栏目标题、栏目编排入口、全部榜单）。
+/// 左侧导航因此不再需要单独的“发现”入口。
+class _HomeFeedPage extends StatefulWidget {
+  const _HomeFeedPage();
+
+  @override
+  State<_HomeFeedPage> createState() => _HomeFeedPageState();
+}
+
+class _HomeFeedPageState extends State<_HomeFeedPage> {
+  final ScrollController _scroll = ScrollController();
+
+  /// 首页画布下方是否还有“发现”内容未看到，用于滚动提示。
+  bool _hasMoreBelow = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_handleScroll);
+    // 首帧之后再测量一次：内容不足一屏时不该显示向下提示。
+    WidgetsBinding.instance.addPostFrameCallback((_) => _handleScroll());
+  }
+
+  void _handleScroll() {
+    if (!mounted || !_scroll.hasClients) return;
+    final position = _scroll.position;
+    final more = position.maxScrollExtent - position.pixels > 24;
+    if (more != _hasMoreBelow) setState(() => _hasMoreBelow = more);
+  }
+
+  @override
+  void dispose() {
+    _scroll.removeListener(_handleScroll);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      // 首页画布内部是 Stack + LayoutBuilder，依赖有界高度；放进滚动列表时
+      // 必须显式给出一屏高度，否则会因无限高度触发布局断言。
+      final canvasHeight = constraints.maxHeight.isFinite
+          ? constraints.maxHeight
+          : MediaQuery.sizeOf(context).height;
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: YingjiSmoothWheel(
+              controller: _scroll,
+              child: ListView(
+                controller: _scroll,
+                padding: EdgeInsets.zero,
+                children: [
+                  SizedBox(
+                    height: canvasHeight,
+                    child: const _CinematicHome(),
+                  ),
+                  const Padding(
+                    // 与原独立“发现”页在壳层中收到的边距保持一致
+                    padding: EdgeInsets.only(left: 96, top: 96, right: 40),
+                    child: _DiscoverPage(embedded: true),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            right: 28,
+            bottom: 30,
+            child: AnimatedOpacity(
+              opacity: _hasMoreBelow ? 1 : 0,
+              duration: const Duration(milliseconds: 220),
+              child: const _PageScrollCue(progress: 1),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
 enum _CenterSection {
   home,
-  discover,
   search,
   sources,
   playlists,
@@ -550,7 +639,6 @@ class _FloatingHomeRailState extends State<_FloatingHomeRail> {
                 const _RailDot(),
                 const SizedBox(height: 10),
                 for (final item in const <(_CenterSection, IconData, String)>[
-                  (_CenterSection.discover, YingjiIcons.square_grid_2x2, '发现'),
                   (_CenterSection.calendar, YingjiIcons.calendar, '追剧'),
                   (_CenterSection.playlists, YingjiIcons.heart, '片单'),
                 ]) ...[
@@ -1456,7 +1544,10 @@ bool _sameWatchStates(List<WatchState> a, List<WatchState> b) {
 }
 
 class _DiscoverPage extends StatefulWidget {
-  const _DiscoverPage();
+  const _DiscoverPage({this.embedded = false});
+
+  /// 为 true 表示被嵌入首页下半部分：自身不再滚动，改由外层列表统一驱动。
+  final bool embedded;
   @override
   State<_DiscoverPage> createState() => _DiscoverPageState();
 }
@@ -3128,6 +3219,11 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           }
           return ListView.builder(
             padding: const EdgeInsets.fromLTRB(0, 8, 4, 56),
+            // 内嵌在首页时自身不滚动：整页高度由外层列表丈量，滚动也交给外层。
+            shrinkWrap: widget.embedded,
+            physics: widget.embedded
+                ? const NeverScrollableScrollPhysics()
+                : null,
             itemCount: visibleSections.isEmpty ? 2 : visibleSections.length + 1,
             itemBuilder: (context, index) {
               if (index == 0) {

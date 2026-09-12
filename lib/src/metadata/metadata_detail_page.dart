@@ -1319,7 +1319,6 @@ class _DetailSidebar extends StatelessWidget {
           for (final item in const <(IconData, String, String)>[
             (YingjiIcons.square_stack_3d_up, 'sources', '服务器'),
             (YingjiIcons.house, 'home', '首页'),
-            (YingjiIcons.square_grid_2x2, 'discover', '发现'),
             (YingjiIcons.calendar, 'calendar', '追剧'),
             (YingjiIcons.heart, 'playlists', '片单'),
           ]) ...[
