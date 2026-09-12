@@ -3301,7 +3301,7 @@ class _StateChip extends StatelessWidget {
       color: YingjiGlass.chrome(strength: .92),
       borderRadius: BorderRadius.circular(999),
       border: Border.all(color: YingjiGlass.line()),
-      boxShadow: const [
+      boxShadow: [
         BoxShadow(
           color: YingjiGlass.chrome(strength: 1.05),
           blurRadius: 16,

@@ -187,7 +187,7 @@ class YingjiAppearance extends ChangeNotifier {
     double? glassBlur,
     double? cardDepth,
     String? glassTint,
-  } {
+  }) {
     if (themeMode != null) this.themeMode = themeMode;
     if (iconStyle != null) this.iconStyle = iconStyle;
     if (fontStyle != null) this.fontStyle = fontStyle;
