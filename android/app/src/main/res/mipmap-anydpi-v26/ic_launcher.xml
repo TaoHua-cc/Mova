@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive launcher icon (Android 8+ / API 26+).
+
+     Before this existed the launcher only had an opaque square: the Mova badge
+     sat on a solid (16,16,20) plate that covered ~59% of the canvas, so
+     launchers shrank the whole square into the system mask and showed the plate
+     behind it -- which reads as "small icon on a black background".
+
+     With an adaptive icon the launcher composites the layers itself: the
+     background is transparent, so only the badge is drawn, and the badge is
+     sized to fill the mask instead of being shrunk into it. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

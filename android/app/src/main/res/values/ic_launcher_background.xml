@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Adaptive icon background: fully transparent, so the home screen shows
+         only the Mova badge with no plate behind it. -->
+    <color name="ic_launcher_background">#00000000</color>
+</resources>
