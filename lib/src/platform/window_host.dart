@@ -73,12 +73,16 @@ class WindowHost {
     return windowManager.isMaximized();
   }
 
+  /// 移动端的全屏是「沉浸式」而不是窗口状态，系统查不到，只能自己记账。
+  /// 播放器右上角的按钮靠它决定画「进入全屏」还是「退出全屏」。
+  static bool _mobileFullScreen = false;
+
   /// 全屏切换。桌面端切窗口全屏；移动端切系统沉浸式。
   /// 返回切换后的全屏状态。
   static Future<bool> toggleFullScreen() async {
     if (!isDesktop) {
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      return true;
+      await setFullScreen(!_mobileFullScreen);
+      return _mobileFullScreen;
     }
     final active = await windowManager.isFullScreen();
     await windowManager.setFullScreen(!active);
@@ -87,6 +91,7 @@ class WindowHost {
 
   static Future<void> setFullScreen(bool value) async {
     if (!isDesktop) {
+      _mobileFullScreen = value;
       await SystemChrome.setEnabledSystemUIMode(
         value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
       );
@@ -96,7 +101,7 @@ class WindowHost {
   }
 
   static Future<bool> isFullScreen() async {
-    if (!isDesktop) return false;
+    if (!isDesktop) return _mobileFullScreen;
     return windowManager.isFullScreen();
   }
 
@@ -107,7 +112,8 @@ class WindowHost {
   static Widget dragArea({required Widget child}) =>
       isDesktop ? DragToMoveArea(child: child) : child;
 
-  /// 安卓宿主暴露的平台通道（见 MainActivity.kt）：屏幕亮度 + 打开外部链接。
+  /// 安卓宿主暴露的平台通道（见 MainActivity.kt）：屏幕亮度、打开外部链接、
+  /// 安装 APK 与网络类型。
   static const MethodChannel _platformChannel = MethodChannel('mova/platform');
 
   /// 用系统默认浏览器打开外部链接。
@@ -186,6 +192,23 @@ class WindowHost {
     }
   }
 
+  /// 当前网络类型：`wifi` / `mobile` / `ethernet` / `other` / `none`。
+  ///
+  /// 只有视频缓存上限需要它 —— 移动数据是计量网络，缓存策略与 WiFi 不同。
+  /// 桌面端不走计量网络，统一按 `ethernet` 处理（也就是「不用省」）。取不到
+  /// 时返回 `other`：调用方把它和 WiFi 归为一类，宁可缓存也别让用户白等。
+  static Future<String> networkType() async {
+    if (isDesktop) return 'ethernet';
+    try {
+      final value = await _platformChannel.invokeMethod<String>('networkType');
+      return value ?? 'other';
+    } on PlatformException {
+      return 'other';
+    } on MissingPluginException {
+      return 'other';
+    }
+  }
+
   /// 桌面端：在文件管理器里打开某个文件所在的目录。移动端无操作。
   ///
   /// 用「打开目录」而不是 `explorer /select,<路径>`：后者要求 `/select,`
@@ -251,6 +274,8 @@ class WindowHost {
   static Future<void> enterMediaSession() async {
     if (isDesktop) return;
     await WakelockPlus.enable();
+    // 进播放器即全屏（沉浸式），和旧行为一致。
+    _mobileFullScreen = true;
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     await SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
@@ -262,6 +287,7 @@ class WindowHost {
   /// 退出播放：关闭常亮、恢复系统栏与竖屏。
   static Future<void> exitMediaSession() async {
     if (isDesktop) return;
+    _mobileFullScreen = false;
     await WakelockPlus.disable();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);

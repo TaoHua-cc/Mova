@@ -21,6 +21,8 @@ import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
+import '../cache/danmaku_cache.dart';
+import '../cache/video_cache.dart';
 import '../tracking/trakt_client.dart';
 
 const _defaultShortcuts = <String, String>{
@@ -283,6 +285,13 @@ class _PlayerPageState extends State<PlayerPage> {
   List<DanmakuComment> _danmakuComments = const [];
   String? _danmakuError;
   DanmakuClient? _danmakuClient;
+  /// 视频缓存与弹幕缓存。拿不到目录时保持 null，播放器按「没有缓存」正常播，
+  /// 只是少一层加速，不会因此打不开。
+  VideoCacheStore? _videoCache;
+  DanmakuCache? _danmakuCache;
+  /// 正在进行的后台视频缓存任务。切集或退出必须打断：否则它既继续占带宽，
+  /// 又会把下一集的地址写进同一个分片文件。
+  VideoCacheDownload? _videoDownload;
   double _speed = 1;
   double _audioDelay = 0;
   double _subtitleDelay = 0;
@@ -345,6 +354,10 @@ class _PlayerPageState extends State<PlayerPage> {
   double _brightness = .5;
   /// 是否已从宿主读到过真实亮度，读到之前不写回宿主。
   bool _brightnessKnown = false;
+
+  /// 移动端当前是否全屏。桌面端没有这个按钮（走窗口控制按钮），恒为 false。
+  bool _mobileFullScreen = false;
+
   /// 上一次单击的时间，用于自实现的双击判定。
   DateTime? _lastTapAt;
 
@@ -395,6 +408,8 @@ class _PlayerPageState extends State<PlayerPage> {
     super.initState();
     // 移动端：保持常亮 + 沉浸式 + 允许横屏（桌面端无操作）
     unawaited(WindowHost.enterMediaSession());
+    // 移动端进播放器就是沉浸式全屏，右上角按钮初始画「退出全屏」。
+    _mobileFullScreen = !WindowHost.isDesktop;
     // 预读一次亮度，这样左半屏第一次上下滑动是从真实基准开始，不会跳变。
     unawaited(_loadScreenBrightness());
     unawaited(_loadToolbarPreferences());
@@ -675,6 +690,12 @@ class _PlayerPageState extends State<PlayerPage> {
     });
   }
 
+  /// 移动端右上角的全屏开关。桌面端不渲染这个按钮。
+  Future<void> _toggleFullScreen() async {
+    final active = await WindowHost.toggleFullScreen();
+    if (mounted) setState(() => _mobileFullScreen = active);
+  }
+
   /// 手势结束后把音量落盘，下次进入播放器沿用。
   Future<void> _persistVolume() async {
     final prefs = await SharedPreferences.getInstance();
@@ -770,6 +791,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _initializePlayer() async {
     _watchStore = await WatchStateStore.create();
+    _videoCache = await VideoCacheStore.tryCreate();
+    _danmakuCache = await DanmakuCache.tryCreate();
     final prefs = await SharedPreferences.getInstance();
     _hardware = prefs.getBool('yingji.player.hardware') ?? true;
     _hdr = prefs.getBool('yingji.player.hdr') ?? true;
@@ -837,7 +860,19 @@ class _PlayerPageState extends State<PlayerPage> {
     _skipDismissed.clear();
     _skipKind = null;
     _skipTicks = 0;
-    await _player.open(Media(episode.url, httpHeaders: episode.headers));
+    _videoDownload?.cancel();
+    _videoDownload = null;
+    final cached = await _videoCache?.cachedFile(episode.url);
+    if (cached != null) {
+      // 命中本机缓存：直接开本地文件。本地文件用不上鉴权头，带了反而可能
+      // 让 mpv 走一次无谓的 HTTP 请求流程。这里传的是**原始绝对路径**而不是
+      // `file://` URI —— 用户目录里可能有中文，`Uri.file` 会转成百分号编码，
+      // mpv 在 Windows 上未必能解回正确的路径。
+      await _player.open(Media(cached.path));
+    } else {
+      await _player.open(Media(episode.url, httpHeaders: episode.headers));
+      unawaited(_cacheCurrentEpisode(episode));
+    }
     if (episode.initialAudioTrack != null) {
       await _setMpvProperty('aid', '${episode.initialAudioTrack! + 1}');
     }
@@ -861,6 +896,25 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     }
     await _player.setVolume(_volume);
+  }
+
+  /// 后台把这一集整份存到本机，下次打开直接播本地文件。
+  ///
+  /// 上限为 0（比如移动数据下默认不缓存）时什么都不做；已经在缓存里的，
+  /// [VideoCacheStore.download] 会立刻返回，不会重复下载一遍。
+  Future<void> _cacheCurrentEpisode(PlayerEpisode episode) async {
+    final store = _videoCache;
+    if (store == null) return;
+    final limit = await VideoCachePolicy.current();
+    if (limit <= 0) return;
+    final job = store.download(
+      url: episode.url,
+      limitBytes: limit,
+      headers: episode.headers,
+      title: episode.title,
+    );
+    _videoDownload = job;
+    await job.done;
   }
 
   /// Waits for the media to become seekable and returns [target] clamped into
@@ -1452,14 +1506,38 @@ class _PlayerPageState extends State<PlayerPage> {
     _openConsoleTab('全集');
   }
 
+  /// 读取弹幕：先用本机缓存铺上，再按需要后台刷新。
+  ///
+  /// 弹幕接口每次播放都要跑一次匹配（有的还要先 match 再取评论），同一集看
+  /// 第二遍时这一步纯属浪费。缓存命中就立刻显示，只有超过
+  /// [DanmakuCache.refreshAfter] 才走网络；网络失败而手里有缓存时继续用缓存
+  /// 且不报错 —— 用户看到的是「弹幕稍旧」，不是「弹幕加载失败」。
   Future<void> _loadDanmaku(String token) async {
     final request = ++_danmakuRequest;
     _activeDanmakuApi = '';
     _danmakuClient?.dispose();
+    final apis = _danmakuApis.isEmpty ? [_danmakuUrl] : _danmakuApis;
+    final cache = _danmakuCache;
+    final cacheKey = DanmakuCache.keyFor(
+      apis: apis,
+      title: _activeEpisode.title,
+      season: _activeEpisode.seasonNumber,
+      episode: _activeEpisode.episodeNumber,
+    );
+    final cached = cache == null ? null : await cache.read(cacheKey);
+    if (cached != null && cached.comments.isNotEmpty) {
+      if (!mounted || request != _danmakuRequest) return;
+      setState(() {
+        _danmakuComments = cached.comments;
+        _matchedDanmakuEpisode =
+            '${cached.matchedEpisode ?? '接口未提供匹配名称'} · 本机缓存';
+        _danmakuError = null;
+      });
+      if (!cached.isStale) return;
+    }
     final clients = <DanmakuClient>[];
     final clientsByApi = <String, DanmakuClient>{};
     try {
-      final apis = _danmakuApis.isEmpty ? [_danmakuUrl] : _danmakuApis;
       final futures = apis
           .map((api) {
             final client = DanmakuClient();
@@ -1478,9 +1556,9 @@ class _PlayerPageState extends State<PlayerPage> {
           })
           .toList(growable: false);
       final comments = await _firstDanmakuResult(futures);
+      final source = clientsByApi[comments.$1];
       if (mounted && request == _danmakuRequest) {
         setState(() {
-          final source = clientsByApi[comments.$1];
           _activeDanmakuApi =
               source?.commentEndpoint?.toString() ?? comments.$1;
           _matchedDanmakuEpisode = source?.matchedEpisode ?? '接口未提供匹配名称';
@@ -1488,7 +1566,13 @@ class _PlayerPageState extends State<PlayerPage> {
           _danmakuError = null;
         });
       }
+      await cache?.write(
+        cacheKey,
+        comments.$2,
+        matchedEpisode: source?.matchedEpisode,
+      );
     } catch (error) {
+      if (cached != null && cached.comments.isNotEmpty) return;
       if (mounted && request == _danmakuRequest) {
         setState(
           () =>
@@ -1692,6 +1776,8 @@ class _PlayerPageState extends State<PlayerPage> {
     // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
     unawaited(WindowHost.exitMediaSession());
     _subtitleSubscription?.cancel();
+    _videoDownload?.cancel();
+    _videoDownload = null;
     _danmakuRequest++;
     unawaited(_syncProgress(syncTrakt: true, ending: true));
     unawaited(_saveWatchState());
@@ -1763,6 +1849,10 @@ class _PlayerPageState extends State<PlayerPage> {
     bool syncTrakt = false,
     bool ending = false,
   }) async {
+    // 「观看记录只保存在本机」时不向媒体服务器与 Trakt 上报任何进度。
+    // 本机记录由 _saveWatchState 照常写入，服务器资源也照常播放；读取
+    // （服务器继续观看、Trakt 已看）同样不受影响 —— 这里只停回写。
+    if (await WatchStateStore.localOnly()) return;
     // Capture the episode and position up-front: the async hops below (source
     // lookup, HTTP) can race an in-page episode switch, and the stop for the
     // *old* item must never target the *new* one.
@@ -2147,7 +2237,20 @@ class _PlayerPageState extends State<PlayerPage> {
                   label: _networkSpeedLabel(),
                   ok: !_player.state.buffering,
                 ),
-                const SizedBox(width: 12),
+                if (!WindowHost.isDesktop) ...[
+                  const SizedBox(width: 10),
+                  YingjiMotionIconButton(
+                    icon: _mobileFullScreen
+                        ? YingjiIcons.fullscreen_exit
+                        : YingjiIcons.fullscreen,
+                    tooltip: _mobileFullScreen ? '退出全屏' : '全屏',
+                    size: 46,
+                    onPressed: _toggleFullScreen,
+                  ),
+                ],
+                // 窗口按钮在移动端整组不渲染，这里也别留空档，
+                // 否则右上角会多出一截无效间距。
+                if (WindowHost.isDesktop) const SizedBox(width: 12),
                 YingjiWindowControls(
                   fullscreen: true,
                   onClose: () => _exitPlayer(context),
@@ -2991,12 +3094,12 @@ class _PlayerPageState extends State<PlayerPage> {
       label: '播放速度',
       value: _speed,
       values: const [.5, .75, 1, 1.25, 1.5, 2],
-      labelBuilder: (v) => '${v}x',
+      labelBuilder: _speedText,
       onChanged: _setPlaybackSpeed,
       display: _speedBadge(),
     ),
     '画面' => _quickChoice<String>(
-      icon: YingjiIcons.fullscreen,
+      icon: YingjiIcons.crop,
       label: '画面比例',
       value: _aspect,
       values: const ['自动', '16:9', '4:3', '21:9'],
@@ -3012,27 +3115,38 @@ class _PlayerPageState extends State<PlayerPage> {
     ),
   };
 
-  /// 倍速按钮的外观：一颗写着「1.0x」的玻璃小胶囊。
+  /// 倍速按钮的外观：和其余工具按钮同规格的 40×40 玻璃圆钮，值写在圆里。
+  ///
+  /// 旧实现是一颗圆角小胶囊：混在一排圆钮里形状、描边粗细都不一致，而且
+  /// 比工具栏常量 button（40）宽，会把 [_rightControlsBar] 能平铺的数量算多，
+  /// 窄屏就溢出。
   Widget _speedBadge() => Container(
+    width: 40,
     height: 40,
-    padding: const EdgeInsets.symmetric(horizontal: 9),
+    alignment: Alignment.center,
     decoration: BoxDecoration(
-      color: YingjiGlass.chrome(strength: 1.15),
-      borderRadius: BorderRadius.circular(14),
-      border: Border.all(color: YingjiGlass.line(strength: 1.4)),
+      color: YingjiGlass.chrome(),
+      shape: BoxShape.circle,
+      border: Border.all(color: YingjiGlass.line(strength: .75)),
     ),
-    child: Center(
-      child: Text(
-        '${_speed}x',
-        style: const TextStyle(
-          fontSize: 12.5,
-          fontWeight: FontWeight.w800,
-          height: 1,
-          fontFeatures: [FontFeature.tabularFigures()],
-        ),
+    child: Text(
+      _speedText(_speed),
+      maxLines: 1,
+      textAlign: TextAlign.center,
+      style: const TextStyle(
+        fontSize: 11.5,
+        fontWeight: FontWeight.w800,
+        height: 1,
+        letterSpacing: -.3,
+        color: Colors.white,
+        fontFeatures: [FontFeature.tabularFigures()],
       ),
     ),
   );
+
+  /// 倍速文案：整数省掉多余的「.0」，40px 的圆钮里才放得下「1.25x」。
+  static String _speedText(double value) =>
+      '${value == value.roundToDouble() ? value.toStringAsFixed(0) : value}x';
 
   /// 放不下的工具入口折叠成一个「更多」按钮，点开列在菜单里。
   Widget _overflowToolsMenu(List<_PlayerTool> hidden) => YingjiGlassMenu(

@@ -132,6 +132,14 @@ class WatchStateStore {
   static Future<WatchStateStore> create() async =>
       WatchStateStore(await SharedPreferences.getInstance());
 
+  /// 「观看记录只保存在本机」开关的存储键。默认关闭时与以前行为一致：把
+  /// 进度同步到媒体服务器与 Trakt；打开后只写本机 —— 服务器资源照常播放，
+  /// 服务器 / Trakt 上已有的记录也照常读取（只停回写，不停读取）。
+  static const localOnlyKey = 'yingji.history.local-only';
+
+  static Future<bool> localOnly() async =>
+      (await SharedPreferences.getInstance()).getBool(localOnlyKey) ?? false;
+
   /// Returns every stored record ordered by most recent watch time first.
   /// Records without a timestamp (written by very old builds) stay at the end
   /// in their stored order instead of arbitrarily jumping above dated ones.

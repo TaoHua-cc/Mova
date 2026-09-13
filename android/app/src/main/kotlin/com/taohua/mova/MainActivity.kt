@@ -1,6 +1,9 @@
 package com.taohua.mova
 
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -62,9 +65,49 @@ class MainActivity : FlutterActivity() {
                     "installApk" -> result.success(
                         installApk(call.argument<String>("path")),
                     )
+                    "networkType" -> result.success(networkType())
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    /**
+     * 当前网络类型，取值 `wifi` / `mobile` / `ethernet` / `other` / `none`。
+     *
+     * 视频缓存上限要按网络分开设置：移动数据是计量网络，默认不该整份缓存。
+     * 查询「当前活动的网络」不需要任何权限，拿不到就返回 `none`——调用方
+     * 会按「不在移动数据下」处理，也就是该缓存还是缓存，不至于因为权限
+     * 问题让用户干等。
+     */
+    @Suppress("DEPRECATION")
+    private fun networkType(): String {
+        return try {
+            val manager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    ?: return "none"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val network = manager.activeNetwork ?: return "none"
+                val caps =
+                    manager.getNetworkCapabilities(network) ?: return "none"
+                when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ->
+                        "ethernet"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ->
+                        "mobile"
+                    else -> "other"
+                }
+            } else {
+                val info = manager.activeNetworkInfo ?: return "none"
+                when (info.type) {
+                    ConnectivityManager.TYPE_WIFI -> "wifi"
+                    ConnectivityManager.TYPE_ETHERNET -> "ethernet"
+                    else -> if (info.subtype > 0) "mobile" else "other"
+                }
+            }
+        } catch (_: Exception) {
+            "none"
+        }
     }
 
     /**

@@ -17,9 +17,29 @@ class WatchlistStore {
       )
       .toList(growable: false);
 
-  Future<void> toggle(TmdbItem item) async {
+  bool contains(int id) => load().any((value) => value.id == id);
+
+  /// 加入待看。同 id 的旧条目先移除，列表里不会出现重复项。
+  Future<void> add(TmdbItem item) async {
     final rows = load().where((value) => value.id != item.id).toList();
-    if (!load().any((value) => value.id == item.id)) rows.insert(0, item);
+    rows.insert(0, item);
+    await _save(rows);
+  }
+
+  /// 移出待看。
+  Future<void> remove(int id) async {
+    await _save(load().where((value) => value.id != id).toList());
+  }
+
+  Future<void> toggle(TmdbItem item) async {
+    if (contains(item.id)) {
+      await remove(item.id);
+    } else {
+      await add(item);
+    }
+  }
+
+  Future<void> _save(List<TmdbItem> rows) async {
     await _prefs.setStringList(
       _key,
       rows.map((value) => jsonEncode(value.toJson())).toList(),

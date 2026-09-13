@@ -18,8 +18,10 @@ import 'platform/window_host.dart';
 
 import 'app_route_observer.dart';
 import 'brand.dart';
+import 'cache/danmaku_cache.dart';
 import 'cache/image_prefetch.dart';
 import 'cache/media_cache.dart';
+import 'cache/video_cache.dart';
 import 'motion.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
@@ -5918,6 +5920,7 @@ class _SourceHubState extends State<_SourceHub>
   String get sectionTopKey => 'sources';
 
   SourceStore? _store;
+  bool _historyLocalOnly = false;
   List<MediaSource> _sources = const [];
   bool _ready = false;
   String? _error;
@@ -5937,6 +5940,17 @@ class _SourceHubState extends State<_SourceHub>
     super.initState();
     initSectionTopListener();
     _load();
+    unawaited(_loadHistoryPreference());
+  }
+
+  /// 观看记录是否只保存在本机。这个开关放在服务器页而不是设置页，因为它
+  /// 决定的是「要不要把下面这些服务器当作进度回写的目标」，和来源列表是
+  /// 同一件事；它自己读写 pref，不进设置页的设置快照。
+  Future<void> _loadHistoryPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getBool(WatchStateStore.localOnlyKey) ?? false;
+    if (!mounted) return;
+    setState(() => _historyLocalOnly = value);
   }
 
   @override
@@ -6467,6 +6481,47 @@ class _SourceHubState extends State<_SourceHub>
                     _switchEndpoint(source, endpoint),
               ),
             ),
+          ),
+        ),
+        const SizedBox(height: 26),
+        _FrostSurface(
+          borderRadius: 22,
+          padding: const EdgeInsets.fromLTRB(18, 15, 14, 15),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '观看记录只保存在本机',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _historyLocalOnly
+                          ? '播放进度与“标记已看”只写本机，不再上报给这些服务器和 Trakt；'
+                              '服务器媒体照常播放，上面的记录也照常读取。'
+                          : '播放进度实时上报给这些服务器，退出播放时同步到 Trakt；'
+                              '换设备可以接着看。',
+                      style: const TextStyle(
+                        color: YingjiColors.muted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 18),
+              Switch.adaptive(
+                value: _historyLocalOnly,
+                onChanged: (value) async {
+                  setState(() => _historyLocalOnly = value);
+                  final prefs = await SharedPreferences.getInstance();
+                  await prefs.setBool(WatchStateStore.localOnlyKey, value);
+                },
+              ),
+            ],
           ),
         ),
       ],
@@ -7328,6 +7383,9 @@ class _CalendarPageState extends State<_CalendarPage>
   final _tmdb = TmdbClient();
   List<TraktEvent> _events = const [];
   Map<String, String> _trackingStatus = const {};
+  /// 待看列表，与详情页 / 片单页共用 yingji.watchlist。日历上的「待看」
+  /// 直接读它，不再自己另存一份状态，两边才不会各说各话。
+  List<TmdbItem> _watchlist = const [];
   String? _traktMessage;
   DateTime _selectedDate = DateTime.now();
   final ScrollController _calendarRail = ScrollController();
@@ -7370,6 +7428,7 @@ class _CalendarPageState extends State<_CalendarPage>
       setState(() {
         _events = cached;
         _trackingStatus = _readTrackingStatus(statusJson);
+        _watchlist = watchlist.load();
         _traktMessage = clientId.isEmpty || token.isEmpty
             ? '未连接 Trakt；已展示本地待看的更新信息。'
             : null;
@@ -7411,18 +7470,24 @@ class _CalendarPageState extends State<_CalendarPage>
     );
     if (mounted) {
       final visibleEvents = events.isEmpty ? cached : events;
-      final selectedHasEvent = visibleEvents.any(
+      // 缓存里留着全部事件（含已弃剧的），只是不显示 —— 取消弃剧立刻回来。
+      final status = _readTrackingStatus(statusJson);
+      final shownEvents = visibleEvents
+          .where((event) => status[event.title] != 'dropped')
+          .toList(growable: false);
+      final selectedHasEvent = shownEvents.any(
         (event) => _sameDate(event.airDate.toLocal(), _selectedDate),
       );
-      final nextEvent = visibleEvents
+      final nextEvent = shownEvents
           .where((event) => !event.airDate.toLocal().isBefore(DateTime.now()))
           .firstOrNull;
       final preferredDate =
           nextEvent?.airDate.toLocal() ??
-          visibleEvents.firstOrNull?.airDate.toLocal();
+          shownEvents.firstOrNull?.airDate.toLocal();
       setState(() {
         _events = visibleEvents;
-        _trackingStatus = _readTrackingStatus(statusJson);
+        _trackingStatus = status;
+        _watchlist = watchlist.load();
         _traktMessage = message;
         if (!selectedHasEvent && preferredDate != null) {
           _selectedDate = preferredDate;
@@ -7540,6 +7605,129 @@ class _CalendarPageState extends State<_CalendarPage>
     if (mounted) setState(() => _trackingStatus = next);
   }
 
+  /// 弃剧 = 这部剧的更新不再进日历。
+  bool _isDropped(String title) => _trackingStatus[title] == 'dropped';
+
+  List<String> get _droppedTitles => _trackingStatus.entries
+      .where((entry) => entry.value == 'dropped')
+      .map((entry) => entry.key)
+      .toList(growable: false);
+
+  /// 「待看」按钮的状态取自待看列表本身（详情页点「加入待看」也是这一份）。
+  /// TMDB 编号优先，编号缺失时退回片名比对。
+  bool _inWatchlist(TraktEvent event) {
+    for (final item in _watchlist) {
+      if (event.tmdbId != null && item.id == event.tmdbId) return true;
+      if (item.title.trim() == event.title.trim()) return true;
+    }
+    return false;
+  }
+
+  Future<void> _toggleWatchlist(TraktEvent event) async {
+    final store = await WatchlistStore.create();
+    final existing = store
+        .load()
+        .where(
+          (item) =>
+              (event.tmdbId != null && item.id == event.tmdbId) ||
+              item.title.trim() == event.title.trim(),
+        )
+        .firstOrNull;
+    if (existing != null) {
+      await store.remove(existing.id);
+    } else {
+      final item = await _watchlistItemFor(event);
+      if (item == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('没找到这部剧的 TMDB 条目，暂时无法加入待看。')),
+          );
+        }
+        return;
+      }
+      await store.add(item);
+    }
+    final rows = store.load();
+    if (mounted) setState(() => _watchlist = rows);
+  }
+
+  /// 把日历条目转成待看列表里的条目。Trakt 来的事件通常自带 TMDB 编号，
+  /// 编号缺失时退回搜索一次 —— 和打开详情页走的是同一条路径。
+  Future<TmdbItem?> _watchlistItemFor(TraktEvent event) async {
+    final id = event.tmdbId;
+    if (id != null && id > 0) {
+      return TmdbItem(
+        id: id,
+        title: event.title,
+        kind: '剧集',
+        posterPath: _posterPathOf(event.posterUrl),
+      );
+    }
+    try {
+      final matches = await _tmdb.search(event.title);
+      return matches.where((item) => item.kind == '剧集').firstOrNull ??
+          matches.firstOrNull;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// TMDB 图片绝对地址 → 待看列表存的相对路径。
+  static String? _posterPathOf(Uri? url) {
+    if (url == null) return null;
+    const marker = '/t/p/';
+    final at = url.path.indexOf(marker);
+    if (at < 0) return null;
+    final rest = url.path.substring(at + marker.length);
+    final slash = rest.indexOf('/');
+    if (slash < 0) return null;
+    final path = rest.substring(slash);
+    return path.isEmpty ? null : path;
+  }
+
+  /// 弃剧后卡片会从日历里消失，恢复入口必须单独留一条，否则点错了找不回来。
+  Widget _droppedBar() => _FrostSurface(
+    borderRadius: 16,
+    padding: const EdgeInsets.fromLTRB(18, 12, 14, 12),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(
+              YingjiIcons.forbidden,
+              size: 16,
+              color: YingjiColors.muted,
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                '已弃剧 ${_droppedTitles.length} 部，不再出现在日历里',
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: YingjiColors.muted,
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: _droppedTitles
+              .map(
+                (title) => _DroppedChip(
+                  title: title,
+                  onRestore: () => _setTrackingStatus(title, 'none'),
+                ),
+              )
+              .toList(growable: false),
+        ),
+      ],
+    ),
+  );
+
   @override
   void dispose() {
     disposeSectionTopListener();
@@ -7554,8 +7742,12 @@ class _CalendarPageState extends State<_CalendarPage>
   Widget build(BuildContext context) {
     // AutomaticKeepAliveClientMixin 要求每次 build 上报存活，否则会被回收。
     super.build(context);
+    // 已弃剧的剧集不进日历，但缓存里还留着，取消弃剧即可立刻恢复。
+    final visibleEvents = _events
+        .where((event) => !_isDropped(event.title))
+        .toList(growable: false);
     final selectedEvents =
-        _events
+        visibleEvents
             .where((event) => _sameDate(event.airDate.toLocal(), _selectedDate))
             .toList()
           ..sort((a, b) => a.airDate.compareTo(b.airDate));
@@ -7620,7 +7812,7 @@ class _CalendarPageState extends State<_CalendarPage>
                   separatorBuilder: (_, _) => const SizedBox(width: 9),
                   itemBuilder: (context, index) {
                     final date = dates[index];
-                    final count = _events
+                    final count = visibleEvents
                         .where(
                           (event) => _sameDate(event.airDate.toLocal(), date),
                         )
@@ -7646,6 +7838,10 @@ class _CalendarPageState extends State<_CalendarPage>
           ],
         ),
         const SizedBox(height: 28),
+        if (_droppedTitles.isNotEmpty) ...[
+          _droppedBar(),
+          const SizedBox(height: 18),
+        ],
         _SectionHeader(
           title: '${_eventTime(_selectedDate)} · ${selectedEvents.length} 项更新',
           subtitle: _events.isEmpty
@@ -7670,10 +7866,14 @@ class _CalendarPageState extends State<_CalendarPage>
                         width: width,
                         child: _TrackingEventCard(
                           event: event,
-                          status: _trackingStatus[event.title] ?? 'none',
+                          inWatchlist: _inWatchlist(event),
+                          dropped: _isDropped(event.title),
                           onOpen: () => _openTrackingDetail(event),
-                          onStatus: (status) =>
-                              _setTrackingStatus(event.title, status),
+                          onToggleWatchlist: () => _toggleWatchlist(event),
+                          onToggleDropped: () => _setTrackingStatus(
+                            event.title,
+                            _isDropped(event.title) ? 'none' : 'dropped',
+                          ),
                         ),
                       ),
                     )
@@ -7851,17 +8051,69 @@ class _CalendarDateRailTile extends StatelessWidget {
   );
 }
 
+/// 已弃剧剧集的恢复入口：一颗带「撤回」图标的玻璃小胶囊。
+class _DroppedChip extends StatelessWidget {
+  const _DroppedChip({required this.title, required this.onRestore});
+
+  final String title;
+  final VoidCallback onRestore;
+
+  @override
+  Widget build(BuildContext context) => Tooltip(
+    message: '恢复追剧',
+    child: InkWell(
+      borderRadius: BorderRadius.circular(999),
+      onTap: onRestore,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: YingjiGlass.chrome(),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: YingjiGlass.line(strength: .75)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 220),
+              child: Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const SizedBox(width: 7),
+            const Icon(YingjiIcons.refresh, size: 14, color: Colors.white70),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
 class _TrackingEventCard extends StatelessWidget {
   const _TrackingEventCard({
     required this.event,
-    required this.status,
+    required this.inWatchlist,
+    required this.dropped,
     required this.onOpen,
-    required this.onStatus,
+    required this.onToggleWatchlist,
+    required this.onToggleDropped,
   });
   final TraktEvent event;
-  final String status;
+
+  /// 是否已在待看列表里 —— 与详情页的「加入待看」共用同一份数据。
+  final bool inWatchlist;
+
+  /// 是否已弃剧（弃剧后这张卡不会再出现在日历里）。
+  final bool dropped;
   final VoidCallback onOpen;
-  final ValueChanged<String> onStatus;
+  final VoidCallback onToggleWatchlist;
+  final VoidCallback onToggleDropped;
 
   @override
   Widget build(BuildContext context) => InkWell(
@@ -7933,22 +8185,18 @@ class _TrackingEventCard extends StatelessWidget {
               children: [
                 YingjiMotionIconButton(
                   icon: YingjiIcons.bookmark,
-                  tooltip: status == 'watchlist' ? '移出待看' : '加入待看',
-                  selected: status == 'watchlist',
+                  tooltip: inWatchlist ? '移出待看' : '加入待看',
+                  selected: inWatchlist,
                   size: 34,
-                  onPressed: () =>
-                      onStatus(status == 'watchlist' ? 'none' : 'watchlist'),
+                  onPressed: onToggleWatchlist,
                 ),
                 const SizedBox(width: 6),
                 YingjiMotionIconButton(
-                  icon: status == 'watched'
-                      ? YingjiIcons.check_mark
-                      : YingjiIcons.xmark,
-                  tooltip: status == 'watched' ? '取消已看' : '标记已看',
-                  selected: status == 'watched',
+                  icon: YingjiIcons.forbidden,
+                  tooltip: dropped ? '取消弃剧' : '弃剧',
+                  selected: dropped,
                   size: 34,
-                  onPressed: () =>
-                      onStatus(status == 'watched' ? 'none' : 'watched'),
+                  onPressed: onToggleDropped,
                 ),
               ],
             ),
@@ -8033,6 +8281,15 @@ class _SettingsPageState extends State<SettingsPage>
   Map<String, String> _shortcuts = Map.of(_defaultPlayerShortcuts);
   int _metadataCacheCount = 0;
   int _imageCacheBytes = 0;
+  int _videoCacheBytes = 0;
+  int _videoCacheCount = 0;
+  int _danmakuCacheBytes = 0;
+  int _danmakuCacheCount = 0;
+  /// 视频缓存上限。桌面只有一档；安卓额外有一档移动数据的（计量网络）。
+  int _videoCacheLimit = WindowHost.isDesktop
+      ? VideoCachePolicy.defaultDesktop
+      : VideoCachePolicy.defaultWifi;
+  int _videoCacheMobileLimit = VideoCachePolicy.defaultMobile;
   /// 本地已知的新版本号（null = 不知道，或者已经是最新）。
   ///
   /// 只用来给按钮配一句说明，真正的判定在 UpdateChecker 里。
@@ -8491,10 +8748,24 @@ class _SettingsPageState extends State<SettingsPage>
         if (entity is File) bytes += await entity.length();
       }
     } catch (_) {}
+    final video = await VideoCacheStore.tryCreate();
+    final danmaku = await DanmakuCache.tryCreate();
+    final videoBytes = video == null ? 0 : await video.usageBytes();
+    final videoCount = video == null ? 0 : await video.count();
+    final danmakuBytes = danmaku == null ? 0 : await danmaku.usageBytes();
+    final danmakuCount = danmaku == null ? 0 : await danmaku.count();
     if (mounted)
       setState(() {
         _metadataCacheCount = metadata;
         _imageCacheBytes = bytes;
+        _videoCacheBytes = videoBytes;
+        _videoCacheCount = videoCount;
+        _danmakuCacheBytes = danmakuBytes;
+        _danmakuCacheCount = danmakuCount;
+        _videoCacheLimit = WindowHost.isDesktop
+            ? VideoCachePolicy.readDesktop(prefs)
+            : VideoCachePolicy.readWifi(prefs);
+        _videoCacheMobileLimit = VideoCachePolicy.readMobile(prefs);
       });
   }
 
@@ -8511,6 +8782,69 @@ class _SettingsPageState extends State<SettingsPage>
     return mb < 1
         ? '${(_imageCacheBytes / 1024).round()} KB'
         : '${mb.toStringAsFixed(1)} MB';
+  }
+
+  String get _videoCacheLabel {
+    final mb = _videoCacheBytes / 1024 / 1024;
+    final size = mb < 1
+        ? '${(_videoCacheBytes / 1024).round()} KB'
+        : mb < 1024
+            ? '${mb.toStringAsFixed(1)} MB'
+            : '${(mb / 1024).toStringAsFixed(2)} GB';
+    return '$_videoCacheCount 份 · $size';
+  }
+
+  String get _danmakuCacheLabel {
+    final kb = _danmakuCacheBytes / 1024;
+    final size = kb < 1024
+        ? '${kb.round()} KB'
+        : '${(kb / 1024).toStringAsFixed(1)} MB';
+    return '$_danmakuCacheCount 集 · $size';
+  }
+
+  Future<void> _clearVideoCache() async {
+    final store = await VideoCacheStore.tryCreate();
+    final removed = store == null ? 0 : await store.clear();
+    await _refreshCacheStats();
+    if (mounted)
+      setState(
+        () => _savedMessage = removed == 0
+            ? '没有可清理的视频缓存'
+            : '已清理 $removed 份视频缓存',
+      );
+  }
+
+  Future<void> _clearDanmakuCache() async {
+    final store = await DanmakuCache.tryCreate();
+    final removed = store == null ? 0 : await store.clear();
+    await _refreshCacheStats();
+    if (mounted)
+      setState(
+        () => _savedMessage = removed == 0
+            ? '没有可清理的弹幕缓存'
+            : '已清理 $removed 集弹幕缓存',
+      );
+  }
+
+  /// 改上限后立即按新上限裁一次，否则「调小」只是账面数字，磁盘上还是老样子。
+  Future<void> _setVideoCacheLimit(int bytes) async {
+    setState(() => _videoCacheLimit = bytes);
+    if (WindowHost.isDesktop) {
+      await VideoCachePolicy.saveDesktop(bytes);
+    } else {
+      await VideoCachePolicy.saveWifi(bytes);
+    }
+    final store = await VideoCacheStore.tryCreate();
+    await store?.prune(bytes);
+    await _refreshCacheStats();
+    if (mounted) setState(() => _savedMessage = '视频缓存上限已更新');
+  }
+
+  Future<void> _setVideoCacheMobileLimit(int bytes) async {
+    setState(() => _videoCacheMobileLimit = bytes);
+    await VideoCachePolicy.saveMobile(bytes);
+    await _refreshCacheStats();
+    if (mounted) setState(() => _savedMessage = '移动数据下的缓存上限已更新');
   }
 
   Future<void> _clearWatchHistory() async {
@@ -10043,7 +10377,7 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 8),
               const Text(
-                '分别管理元数据、海报剧照与观看记录；清理不会修改服务器媒体。',
+                '分别管理元数据、海报剧照、视频与弹幕缓存；清理不会修改服务器媒体。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
               ),
               const SizedBox(height: 14),
@@ -10059,6 +10393,41 @@ class _SettingsPageState extends State<SettingsPage>
                     label: '照片与其他临时缓存',
                     value: _imageCacheLabel,
                   ),
+                  _CacheStat(label: '视频缓存', value: _videoCacheLabel),
+                  _CacheStat(label: '弹幕缓存', value: _danmakuCacheLabel),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Text(
+                WindowHost.isDesktop ? '视频缓存上限' : '视频缓存上限（按网络分别设置）',
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                WindowHost.isDesktop
+                    ? '播放时把整份视频存到本机，下次直接开本地文件；超过上限先删最久没看的。'
+                    : '播放时把整份视频存到本机，下次直接开本地文件；移动数据是计量网络，默认不缓存。',
+                style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  _CacheLimitPicker(
+                    label: WindowHost.isDesktop ? '上限' : '无线局域网',
+                    value: _videoCacheLimit,
+                    onChanged: _setVideoCacheLimit,
+                  ),
+                  if (!WindowHost.isDesktop)
+                    _CacheLimitPicker(
+                      label: '移动数据',
+                      value: _videoCacheMobileLimit,
+                      onChanged: _setVideoCacheMobileLimit,
+                    ),
                 ],
               ),
               const SizedBox(height: 14),
@@ -10083,6 +10452,22 @@ class _SettingsPageState extends State<SettingsPage>
                     label: const Text('清理照片缓存'),
                   ),
                   FilledButton.tonalIcon(
+                    onPressed: _clearVideoCache,
+                    icon: const Icon(
+                      YingjiIcons.film,
+                      size: 16,
+                    ),
+                    label: const Text('清理视频缓存'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _clearDanmakuCache,
+                    icon: const Icon(
+                      YingjiIcons.danmaku,
+                      size: 16,
+                    ),
+                    label: const Text('清理弹幕缓存'),
+                  ),
+                  FilledButton.tonalIcon(
                     onPressed: _clearWatchHistory,
                     icon: const Icon(
                       YingjiIcons.clock,
@@ -10095,8 +10480,8 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 14),
               Text(
                 WindowHost.isDesktop
-                    ? '缓存与观看记录保存在本机用户目录；清理不会影响服务器上的媒体文件。'
-                    : '缓存与观看记录保存在应用私有目录；卸载应用会一并清除，重装后需要重新连接服务器。',
+                    ? '元数据、图片、视频与弹幕缓存保存在本机用户目录；清理不会影响服务器上的媒体文件。'
+                    : '元数据、图片、视频与弹幕缓存保存在应用私有目录；卸载应用会一并清除，重装后需要重新连接服务器。',
                 style: const TextStyle(
                   color: Color(0xFFABB1BE),
                   fontSize: 12,
@@ -13793,6 +14178,65 @@ class _CacheStat extends StatelessWidget {
         ),
         const SizedBox(width: 10),
         Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
+      ],
+    ),
+  );
+}
+
+/// 缓存上限的档位选择器。
+///
+/// 桌面端只出现一次（「上限」）；安卓出现两次——无线局域网和移动数据是两种
+/// 网络，计量网络下是否整份缓存必须能单独决定，所以给两档而不是一档。
+class _CacheLimitPicker extends StatelessWidget {
+  const _CacheLimitPicker({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+    decoration: BoxDecoration(
+      color: YingjiGlass.surface(strength: .72),
+      borderRadius: BorderRadius.circular(13),
+      border: Border.all(color: YingjiGlass.line(strength: 1.35)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(color: YingjiColors.muted, fontSize: 12),
+        ),
+        const SizedBox(width: 10),
+        PopupMenuButton<int>(
+          initialValue: VideoCachePolicy.steps.contains(value) ? value : null,
+          onSelected: onChanged,
+          itemBuilder: (context) => VideoCachePolicy.steps
+              .map(
+                (bytes) => PopupMenuItem<int>(
+                  value: bytes,
+                  child: Text(VideoCachePolicy.label(bytes)),
+                ),
+              )
+              .toList(growable: false),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                VideoCachePolicy.label(value),
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(width: 4),
+              const Icon(YingjiIcons.chevron_down, size: 16),
+            ],
+          ),
+        ),
       ],
     ),
   );

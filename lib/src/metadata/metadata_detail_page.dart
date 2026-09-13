@@ -646,6 +646,21 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         await watchStore.remove(mediaId);
       }
     }
+    if (await WatchStateStore.localOnly()) {
+      // 「观看记录只保存在本机」：本机记录上面已经写好，这里不再回写媒体
+      // 服务器与 Trakt，只如实告诉用户这次标记存在了哪里。
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            completed
+                ? '已标记播放完成 · 仅保存在本机'
+                : '已标记未播放 · 仅保存在本机',
+          ),
+        ),
+      );
+      return;
+    }
     final messages = <String>[];
     try {
       for (final version in versions.where(

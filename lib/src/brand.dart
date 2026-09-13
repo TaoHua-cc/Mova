@@ -504,7 +504,15 @@ abstract final class YingjiIcons {
   static const doc_on_doc = Iconsax.document_copy;
   static const doc_on_clipboard = Iconsax.document_text;
   static const refresh = Iconsax.refresh;
-  static const fullscreen = Iconsax.maximize;
+  /// 进入全屏（四向外的箭头）与退出全屏（四向内的箭头）成对使用。
+  static const fullscreen = Iconsax.maximize_1;
+  static const fullscreen_exit = Iconsax.maximize;
+
+  /// 画面比例用取景框图标，不再借用全屏箭头。
+  static const crop = Iconsax.crop;
+
+  /// 追剧日历的「弃剧」状态。
+  static const forbidden = Iconsax.forbidden;
   static const gobackward_10 = Iconsax.backward_10_seconds;
   static const goforward_10 = Iconsax.forward_10_seconds;
   static const speaker_2_fill = Iconsax.volume_high;
