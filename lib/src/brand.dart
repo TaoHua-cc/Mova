@@ -464,6 +464,7 @@ abstract final class YingjiIcons {
   static const archivebox = Iconsax.archive;
   static const archivebox_fill = Iconsax.archive;
   static const film = Iconsax.video;
+  static const photo = Iconsax.gallery;
   static const cloud_fill = Iconsax.cloud;
   static const cloud = Iconsax.cloud;
   static const gear = Iconsax.setting_2;
@@ -1225,24 +1226,71 @@ class YingjiWindowControls extends StatefulWidget {
   State<YingjiWindowControls> createState() => _YingjiWindowControlsState();
 }
 
-class _YingjiWindowControlsState extends State<YingjiWindowControls> {
+class _YingjiWindowControlsState extends State<YingjiWindowControls>
+    with WidgetsBindingObserver {
   bool _maximized = false;
+  bool _fullScreen = false;
+  bool _syncing = false;
+
+  /// 重新读一遍真实的窗口状态。
+  ///
+  /// 只记住「我点过什么」是不够的：按 Esc 退出全屏、双击标题栏、
+  /// 系统快捷键、把窗口拖到屏幕边缘，都会改变窗口状态但不经过这个按钮。
+  /// 尺寸变化一定会触发 [didChangeMetrics]，在这里补一次同步最稳。
+  Future<void> _sync() async {
+    if (!mounted || !WindowHost.isDesktop || _syncing) return;
+    _syncing = true;
+    try {
+      final maximized = await WindowHost.isMaximized();
+      final fullScreen = await WindowHost.isFullScreen();
+      if (!mounted) return;
+      if (maximized == _maximized && fullScreen == _fullScreen) return;
+      setState(() {
+        _maximized = maximized;
+        _fullScreen = fullScreen;
+      });
+    } finally {
+      _syncing = false;
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _sync();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    _sync();
+  }
 
   Future<void> _toggleMaximize() async {
     if (widget.fullscreen) {
-      final active = await WindowHost.toggleFullScreen();
-      if (mounted) setState(() => _maximized = active);
-      return;
+      await WindowHost.toggleFullScreen();
+    } else {
+      await WindowHost.toggleMaximize();
     }
-    await WindowHost.toggleMaximize();
-    final maximized = await WindowHost.isMaximized();
-    if (mounted) setState(() => _maximized = maximized);
+    await _sync();
   }
 
   @override
   Widget build(BuildContext context) {
     // 移动端没有窗口控制概念，整组按钮不渲染
     if (!WindowHost.isDesktop) return const SizedBox.shrink();
+    // 全屏模式下这个按钮管的是全屏，普通模式管的是最大化。
+    final active = widget.fullscreen ? _fullScreen : _maximized;
+    // 全屏用与移动端一致的四向箭头；标题栏的最大化 / 还原仍是方框。
+    final icon = widget.fullscreen
+        ? (active ? YingjiIcons.fullscreen_exit : YingjiIcons.fullscreen)
+        : (active ? YingjiIcons.rectangle_stack : YingjiIcons.square);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -1254,10 +1302,10 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls> {
         ),
         const SizedBox(width: 7),
         YingjiMotionIconButton(
-          icon: _maximized ? YingjiIcons.rectangle_stack : YingjiIcons.square,
+          icon: icon,
           tooltip: widget.fullscreen
-              ? (_maximized ? '退出全屏' : '全屏')
-              : (_maximized ? '还原' : '最大化'),
+              ? (active ? '退出全屏' : '全屏')
+              : (active ? '还原' : '最大化'),
           size: widget.size,
           onPressed: _toggleMaximize,
         ),

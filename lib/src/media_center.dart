@@ -10417,15 +10417,19 @@ class _SettingsPageState extends State<SettingsPage>
                 spacing: 10,
                 runSpacing: 8,
                 children: [
-                  _CacheLimitPicker(
+                  YingjiGlassChoiceField<int>(
                     label: WindowHost.isDesktop ? '上限' : '无线局域网',
                     value: _videoCacheLimit,
+                    items: VideoCachePolicy.steps,
+                    labelBuilder: VideoCachePolicy.label,
                     onChanged: _setVideoCacheLimit,
                   ),
                   if (!WindowHost.isDesktop)
-                    _CacheLimitPicker(
+                    YingjiGlassChoiceField<int>(
                       label: '移动数据',
                       value: _videoCacheMobileLimit,
+                      items: VideoCachePolicy.steps,
+                      labelBuilder: VideoCachePolicy.label,
                       onChanged: _setVideoCacheMobileLimit,
                     ),
                 ],
@@ -10446,7 +10450,7 @@ class _SettingsPageState extends State<SettingsPage>
                   FilledButton.tonalIcon(
                     onPressed: _clearImageCache,
                     icon: const Icon(
-                      YingjiIcons.film,
+                      YingjiIcons.photo,
                       size: 16,
                     ),
                     label: const Text('清理照片缓存'),
@@ -14183,64 +14187,6 @@ class _CacheStat extends StatelessWidget {
   );
 }
 
-/// 缓存上限的档位选择器。
-///
-/// 桌面端只出现一次（「上限」）；安卓出现两次——无线局域网和移动数据是两种
-/// 网络，计量网络下是否整份缓存必须能单独决定，所以给两档而不是一档。
-class _CacheLimitPicker extends StatelessWidget {
-  const _CacheLimitPicker({
-    required this.label,
-    required this.value,
-    required this.onChanged,
-  });
-
-  final String label;
-  final int value;
-  final ValueChanged<int> onChanged;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-    decoration: BoxDecoration(
-      color: YingjiGlass.surface(strength: .72),
-      borderRadius: BorderRadius.circular(13),
-      border: Border.all(color: YingjiGlass.line(strength: 1.35)),
-    ),
-    child: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(color: YingjiColors.muted, fontSize: 12),
-        ),
-        const SizedBox(width: 10),
-        PopupMenuButton<int>(
-          initialValue: VideoCachePolicy.steps.contains(value) ? value : null,
-          onSelected: onChanged,
-          itemBuilder: (context) => VideoCachePolicy.steps
-              .map(
-                (bytes) => PopupMenuItem<int>(
-                  value: bytes,
-                  child: Text(VideoCachePolicy.label(bytes)),
-                ),
-              )
-              .toList(growable: false),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                VideoCachePolicy.label(value),
-                style: const TextStyle(fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(width: 4),
-              const Icon(YingjiIcons.chevron_down, size: 16),
-            ],
-          ),
-        ),
-      ],
-    ),
-  );
-}
 
 /// 设置页里的一条手势说明：图标 + 动作 + 触发方式。
 ///
