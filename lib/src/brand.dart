@@ -204,6 +204,20 @@ final yingjiBackdropUrl = ValueNotifier<String?>(null);
 final yingjiBackdropEffect = ValueNotifier<String>('blur-dissolve');
 final yingjiSectionRequest = ValueNotifier<String?>(null);
 
+/// 壳层当前展示的分区（'home' / 'calendar' / 'playlists' / 'sources' / ...）。
+///
+/// 分区页带上 keep-alive 之后，切回来不会重建，也就不会重跑 initState。片单页
+/// 的数据来自本地库，详情页里「加入片单」写的正是它 —— 没有这个信号就会一直
+/// 显示旧列表。页面监听它，在被切到时重读一次。
+final yingjiSectionFocus = ValueNotifier<String>('home');
+
+/// 「回到顶部」信号：壳层每响应一次左侧导航点击就 +1。
+///
+/// 这里必须用计数器而不是分区名 —— 重复点击当前分区时
+/// [ValueNotifier] 的值没变，不会发出通知，也就无法回到顶部。
+/// 分区页监听它，并只在 [yingjiSectionFocus] 与自己相符时滚动。
+final yingjiSectionTopTick = ValueNotifier<int>(0);
+
 /// Bumped by the shell every time the home tab becomes the visible page, so
 /// the keep-alive home page re-syncs continue-watching with the media servers
 /// (their resume rails may have changed while the user was elsewhere).

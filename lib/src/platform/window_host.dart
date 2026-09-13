@@ -1,4 +1,4 @@
-import 'dart:io' show Platform, Process, ProcessException;
+import 'dart:io' show File, Platform, Process, ProcessException;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -133,6 +133,70 @@ class WindowHost {
     } on PlatformException {
       return false;
     } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 安卓：是否已被允许「安装未知来源应用」。
+  ///
+  /// Android 8.0 起这是逐应用授权，没授权就调不起安装器。低于 8.0 的系统
+  /// 没有这个开关，宿主直接回 true。
+  static Future<bool> canInstallApk() async {
+    if (isDesktop) return false;
+    try {
+      final allowed = await _platformChannel.invokeMethod<bool>('canInstallApk');
+      return allowed ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 安卓：跳到本应用的「安装未知应用」授权页。返回是否成功跳转。
+  static Future<bool> requestInstallApk() async {
+    if (isDesktop) return false;
+    try {
+      final opened = await _platformChannel.invokeMethod<bool>(
+        'requestInstallApk',
+      );
+      return opened ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 安卓：把下载好的 APK 交给系统安装器。返回是否成功调起。
+  ///
+  /// 这里只管「调起」，安装结果由系统界面负责：用户取消、签名不符、
+  /// 版本号更低都在那边提示，应用不需要也不应该自己判断。
+  static Future<bool> installApk(String path) async {
+    if (isDesktop || path.isEmpty) return false;
+    try {
+      final launched = await _platformChannel.invokeMethod<bool>('installApk', {
+        'path': path,
+      });
+      return launched ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 桌面端：在文件管理器里打开某个文件所在的目录。移动端无操作。
+  ///
+  /// 用「打开目录」而不是 `explorer /select,<路径>`：后者要求 `/select,`
+  /// 后面原样跟着路径，参数里一旦有空格就会被 Dart 加上引号，explorer
+  /// 解析不了。打开目录在各种路径下都稳。
+  static Future<bool> revealInFileManager(String path) async {
+    if (!Platform.isWindows || path.isEmpty) return false;
+    try {
+      await Process.run('explorer.exe', [File(path).parent.path]);
+      return true;
+    } on ProcessException {
       return false;
     }
   }

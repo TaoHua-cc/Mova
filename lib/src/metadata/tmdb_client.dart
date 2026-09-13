@@ -1,11 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../network/network_http_client.dart';
 import '../version.dart';
+
+/// 后台刷新真正改写了元数据缓存时 +1。
+///
+/// 列表页监听它并重新读一次缓存：第一次渲染直接用缓存（瞬时），刷新回来后
+/// 再替换成新内容 —— 这就是「先显示已缓存的内容，然后更新缓存并替换」。
+/// 内容没变时不发信号，避免页面白重建一遍。
+final yingjiMetadataRevision = ValueNotifier<int>(0);
 
 Map<String, double> _parseRatingsMap(dynamic value) {
   final map = value as Map<dynamic, dynamic>?;
@@ -646,7 +654,8 @@ class TmdbClient {
     final data = await _get('/tv/${item.id}', apiKey, {
       'language': 'zh-CN',
       'append_to_response': 'external_ids',
-    }, preferFresh: true);
+      // 播出安排变化慢，但也别每次都打网络：缓存优先，超过 6 小时才后台刷新。
+    }, minRefreshInterval: const Duration(hours: 6));
     final exact = <TmdbUpcomingEpisode>[];
     try {
       final ids = data['external_ids'] as Map<String, dynamic>? ?? const {};
@@ -800,7 +809,7 @@ class TmdbClient {
     String path,
     String apiKey,
     Map<String, String> query, {
-    bool preferFresh = false,
+    Duration minRefreshInterval = const Duration(minutes: 10),
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final effectiveApiKey = apiKey.trim().isNotEmpty
@@ -820,16 +829,30 @@ class TmdbClient {
           'api_key': effectiveApiKey,
         }),
     ];
-    for (final uri in preferFresh ? <Uri>[] : uris) {
-      final cached = prefs.getString(_cacheKey(uri));
+    // 缓存优先：有缓存就立刻返回，网络刷新丢到后台。刷新的节流由
+    // [minRefreshInterval] 控制 —— 这份缓存比间隔还新时连后台请求都不发，
+    // 于是短时间内反复打开同一个页面不会把同一批接口重复打一遍。
+    for (final uri in uris) {
+      final cacheKey = _cacheKey(uri);
+      final cached = prefs.getString(cacheKey);
       if (cached == null || cached.isEmpty) continue;
+      final Map<String, dynamic> data;
       try {
-        final data = jsonDecode(cached) as Map<String, dynamic>;
-        unawaited(_refresh(uri, prefs));
-        return data;
+        data = jsonDecode(cached) as Map<String, dynamic>;
       } catch (_) {
-        // Corrupt entries are replaced by the normal network path below.
+        // 损坏的缓存交给下面的网络路径覆盖，不要在这里中断。
+        continue;
       }
+      final savedAt = DateTime.tryParse(
+        prefs.getString('$cacheKey.savedAt') ?? '',
+      );
+      // 没有时间戳的是升级前写入的旧条目：内容照旧可用，但按已过期处理，
+      // 后台补一次刷新并把时间戳补上。
+      final fresh =
+          savedAt != null &&
+          DateTime.now().difference(savedAt) < minRefreshInterval;
+      if (!fresh) unawaited(_refresh(uri, prefs, cacheKey));
+      return data;
     }
     Object? lastError;
     for (var uriIndex = 0; uriIndex < uris.length; uriIndex++) {
@@ -853,7 +876,7 @@ class TmdbClient {
             throw Exception('TMDB 请求失败（HTTP ${response.statusCode}）');
           }
           final data = jsonDecode(response.body) as Map<String, dynamic>;
-          await prefs.setString(cacheKey, response.body);
+          await _remember(prefs, cacheKey, response.body);
           return data;
         } catch (error) {
           lastError = error;
@@ -881,7 +904,29 @@ class TmdbClient {
     return 'yingji.tmdb.cache.$stableKey';
   }
 
-  Future<void> _refresh(Uri uri, SharedPreferences prefs) async {
+  /// 写入缓存正文并记下时间戳；只有正文真的变了才通知列表页替换内容。
+  ///
+  /// 第一次写入不算「变化」：那一刻页面刚拿到同一份数据，没有需要替换的东西，
+  /// 通知出去只会让列表白重读一遍。
+  Future<void> _remember(
+    SharedPreferences prefs,
+    String cacheKey,
+    String body,
+  ) async {
+    final previous = prefs.getString(cacheKey);
+    await prefs.setString(cacheKey, body);
+    await prefs.setString(
+      '$cacheKey.savedAt',
+      DateTime.now().toIso8601String(),
+    );
+    if (previous != null && previous != body) yingjiMetadataRevision.value++;
+  }
+
+  Future<void> _refresh(
+    Uri uri,
+    SharedPreferences prefs,
+    String cacheKey,
+  ) async {
     try {
       final response = await _client
           .get(
@@ -894,10 +939,10 @@ class TmdbClient {
           .timeout(const Duration(seconds: 12));
       if (response.statusCode >= 200 && response.statusCode < 300) {
         jsonDecode(response.body) as Map<String, dynamic>;
-        await prefs.setString(_cacheKey(uri), response.body);
+        await _remember(prefs, cacheKey, response.body);
       }
     } catch (_) {
-      // Cached content remains usable when a background refresh fails.
+      // 后台刷新失败时缓存内容继续可用。
     }
   }
 

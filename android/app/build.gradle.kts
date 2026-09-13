@@ -82,3 +82,10 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // FileProvider（把缓存里的 APK 以 content:// 交给系统安装器）来自
+    // androidx.core。它本来就会作为 Flutter 嵌入层的传递依赖进来，这里
+    // 显式声明一遍是为了让版本可见、好升级。
+    implementation("androidx.core:core-ktx:1.13.1")
+}

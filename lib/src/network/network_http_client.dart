@@ -11,6 +11,13 @@ http.Client createNetworkHttpClient() {
   return IOClient(client);
 }
 
+/// 暴露同一个代理判定给裸 [HttpClient] 使用。
+///
+/// 更新检查需要「不跟随重定向」的原始客户端（靠 302 的 Location 读版本号），
+/// 而 `IOClient` 不给这个开关，只能自己 new 一个 `HttpClient`——但代理配置
+/// 必须和 API 请求完全一致，否则同一个网络下一边通一边不通。
+String findNetworkProxy(Uri uri) => _findProxy(uri);
+
 /// Makes Flutter's [NetworkImage] use the same Windows proxy path as API calls.
 void configureNetworkHttpOverrides() {
   HttpOverrides.global = _YingjiHttpOverrides();

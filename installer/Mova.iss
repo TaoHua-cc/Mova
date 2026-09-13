@@ -45,6 +45,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "启动{#AppName}"; Flags: nowait postinstall skipifsilent
+; 静默升级（应用内「检查更新」）不会走上面那条 postinstall，装完必须由这里
+; 把新版拉起来，否则用户会以为更新失败了。skipifnotsilent 与上面正好互补。
+Filename: "{app}\{#AppExeName}"; Flags: nowait skipifnotsilent
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;

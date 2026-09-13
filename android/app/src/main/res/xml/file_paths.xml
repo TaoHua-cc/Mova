@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 应用内更新：APK 下载到应用缓存目录的 update/ 子目录。Dart 侧的
+         getTemporaryDirectory() 就是 getCacheDir()，所以这里用 cache-path。
+         不开放别的目录：FileProvider 只该暴露更新包这一个位置。 -->
+    <cache-path name="mova-update" path="update/"/>
+</paths>

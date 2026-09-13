@@ -18,6 +18,8 @@ import 'platform/window_host.dart';
 
 import 'app_route_observer.dart';
 import 'brand.dart';
+import 'cache/image_prefetch.dart';
+import 'cache/media_cache.dart';
 import 'motion.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
@@ -36,6 +38,8 @@ import 'sources/source_store.dart';
 import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
+import 'update/update_checker.dart';
+import 'update/update_flow.dart';
 import 'version.dart';
 
 const _defaultPlayerShortcuts = <String, String>{
@@ -126,6 +130,47 @@ Future<Map<String, String>> _watchProviders(
   return platforms;
 });
 
+/// 左侧导航把某个分区切到前台时，把那一页滚回顶部。
+///
+/// 页面带上 keep-alive 之后切回来不再重建，滚动位置会被保留 —— 但用户点导航
+/// 按钮时期望的是「从这一页的开头看起」。壳层每次响应点击都让
+/// [yingjiSectionTopTick] +1（计数器，重复点当前分区也能通知），分区页监听它
+/// 并只在自己就是当前分区时滚动。
+mixin _SectionTopOnTap<T extends StatefulWidget> on State<T> {
+  Timer? _sectionTopTimer;
+
+  /// 本页用于回到顶部的滚动控制器；没有可滚动视图时返回 null。
+  ScrollController? get sectionTopController;
+
+  /// 本页在 [yingjiSectionFocus] 里的键。
+  String get sectionTopKey;
+
+  void initSectionTopListener() =>
+      yingjiSectionTopTick.addListener(_handleSectionTop);
+
+  void disposeSectionTopListener() {
+    yingjiSectionTopTick.removeListener(_handleSectionTop);
+    _sectionTopTimer?.cancel();
+  }
+
+  void _handleSectionTop() {
+    if (!mounted || yingjiSectionFocus.value != sectionTopKey) return;
+    // 刚切过来时页面可能还没 attach 滚动视图，等一拍再滚。
+    _sectionTopTimer?.cancel();
+    _sectionTopTimer = Timer(const Duration(milliseconds: 16), () {
+      if (!mounted) return;
+      final controller = sectionTopController;
+      if (controller == null || !controller.hasClients) return;
+      if (controller.offset <= 0) return;
+      controller.animateTo(
+        0,
+        duration: const Duration(milliseconds: 320),
+        curve: MovaMotion.standardEase,
+      );
+    });
+  }
+}
+
 // THESIS: Film artwork is the application surface; navigation and tasks float
 // over it instead of living inside a dashboard frame.
 // OWN-WORLD: Near-black cinema canvas, white circular focus states, translucent
@@ -168,6 +213,18 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   void initState() {
     super.initState();
     yingjiSectionRequest.addListener(_handleSectionRequest);
+    unawaited(_checkUpdateOnStart());
+  }
+
+  /// 启动时的版本检查。
+  ///
+  /// 故意延迟一拍：先把首页画出来、再弹更新提示，开局就不会是一层遮罩。
+  /// 提示与否由 [checkMovaUpdate] 决定（本地已知有更新的版本就一定会问，
+  /// 「跳过此版本」的那个版本除外）。
+  Future<void> _checkUpdateOnStart() async {
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    if (!mounted) return;
+    await checkMovaUpdate(context);
   }
 
   void _handleSectionRequest() {
@@ -195,16 +252,39 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     _CenterSection.settings => const SettingsPage(),
   };
 
+  static String _sectionKey(_CenterSection section) => switch (section) {
+    _CenterSection.home => 'home',
+    _CenterSection.search => 'search',
+    _CenterSection.sources => 'sources',
+    _CenterSection.playlists => 'playlists',
+    _CenterSection.calendar => 'calendar',
+    _CenterSection.settings => 'settings',
+  };
+
   void _selectSection(_CenterSection value) {
     final target = _pageSections.indexOf(value);
     if (target < 0) return;
     final previous = _section;
     setState(() => _section = value);
-    _pageController.animateToPage(
-      target,
-      duration: const Duration(milliseconds: 420),
-      curve: const Cubic(.22, 1, .36, 1),
-    );
+    yingjiSectionFocus.value = _sectionKey(value);
+    // 被切到前台的这一页从顶部开始显示（重复点同一个入口也算一次）。
+    yingjiSectionTopTick.value++;
+    final current =
+        _pageController.hasClients && _pageController.page != null
+        ? _pageController.page!.round()
+        : _pageSections.indexOf(previous);
+    if ((target - current).abs() > 1) {
+      // 跨多页滑动会把中间那几页挨个构建 + 绘制一遍（日历要拉数据、片单要读
+      // 本地库，还各带一层玻璃模糊），全屏窗口下就是一段明显卡顿。相邻页
+      // 照旧滑动，跨页直接落位 —— 中间页本来也不会停留。
+      _pageController.jumpToPage(target);
+    } else {
+      _pageController.animateToPage(
+        target,
+        duration: const Duration(milliseconds: 420),
+        curve: const Cubic(.22, 1, .36, 1),
+      );
+    }
     // Re-entering the home tab should re-sync its continue-watching shelf with
     // the servers: playback on other devices may have moved the resume rail
     // while the (keep-alive) home page was off-screen.
@@ -283,8 +363,11 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
           allowImplicitScrolling: true,
           physics: const NeverScrollableScrollPhysics(),
           itemCount: _pageSections.length,
-          onPageChanged: (index) =>
-              setState(() => _section = _pageSections[index]),
+          onPageChanged: (index) {
+            final section = _pageSections[index];
+            setState(() => _section = section);
+            yingjiSectionFocus.value = _sectionKey(section);
+          },
           itemBuilder: (context, index) {
             final section = _pageSections[index];
             final page = _pageFor(section);
@@ -343,8 +426,15 @@ class _HomeFeedPage extends StatefulWidget {
   State<_HomeFeedPage> createState() => _HomeFeedPageState();
 }
 
-class _HomeFeedPageState extends State<_HomeFeedPage> {
+class _HomeFeedPageState extends State<_HomeFeedPage>
+    with _SectionTopOnTap<_HomeFeedPage> {
   final ScrollController _scroll = ScrollController();
+
+  @override
+  ScrollController get sectionTopController => _scroll;
+
+  @override
+  String get sectionTopKey => 'home';
 
   /// 首页画布下方是否还有“发现”内容未看到，用于滚动提示。
   bool _hasMoreBelow = true;
@@ -353,6 +443,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage> {
   void initState() {
     super.initState();
     _scroll.addListener(_handleScroll);
+    initSectionTopListener();
     // 首帧之后再测量一次：内容不足一屏时不该显示向下提示。
     WidgetsBinding.instance.addPostFrameCallback((_) => _handleScroll());
   }
@@ -378,6 +469,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage> {
 
   @override
   void dispose() {
+    disposeSectionTopListener();
     _scroll.removeListener(_handleScroll);
     _scroll.dispose();
     // 首页销毁时复位，避免下次进入直接停在模糊态。
@@ -525,22 +617,26 @@ class _ContinuousShellBackdrop extends StatelessWidget {
               children: [
                 const ColoredBox(color: YingjiColors.canvas),
                 if (imageUrl != null)
-                  AnimatedSwitcher(
-                    duration: effect == 'instant'
-                        ? Duration.zero
-                        : const Duration(milliseconds: 900),
-                    layoutBuilder: (currentChild, previousChildren) => Stack(
-                      fit: StackFit.expand,
-                      children: [...previousChildren, ?currentChild],
-                    ),
-                    transitionBuilder: (child, animation) =>
-                        _transition(effect, child, animation),
-                    child: CachedNetworkImage(
-                      key: ValueKey('clear-$imageUrl'),
-                      imageUrl: imageUrl,
-                      fit: BoxFit.cover,
-                      errorWidget: (_, _, _) =>
-                          const ColoredBox(color: YingjiColors.canvas),
+                  // 隔离成独立图层：翻页 / 滚动时 depth 每帧都在变，只有上面的
+                  // 遮罩需要重画，这张全屏底图不必跟着一起重绘。
+                  RepaintBoundary(
+                    child: AnimatedSwitcher(
+                      duration: effect == 'instant'
+                          ? Duration.zero
+                          : const Duration(milliseconds: 900),
+                      layoutBuilder: (currentChild, previousChildren) => Stack(
+                        fit: StackFit.expand,
+                        children: [...previousChildren, ?currentChild],
+                      ),
+                      transitionBuilder: (child, animation) =>
+                          _transition(effect, child, animation),
+                      child: CachedNetworkImage(
+                        key: ValueKey('clear-$imageUrl'),
+                        imageUrl: imageUrl,
+                        fit: BoxFit.cover,
+                        errorWidget: (_, _, _) =>
+                            const ColoredBox(color: YingjiColors.canvas),
+                      ),
                     ),
                   ),
                 if (imageUrl != null)
@@ -846,6 +942,9 @@ class _CinematicHomeState extends State<_CinematicHome>
   final ScrollController _historyScroll = ScrollController();
   final Map<int, TmdbItem> _heroDetails = <int, TmdbItem>{};
 
+  /// 元数据后台刷新后的重读消抖计时器。
+  Timer? _revisionDebounce;
+
   @override
   void initState() {
     super.initState();
@@ -853,6 +952,9 @@ class _CinematicHomeState extends State<_CinematicHome>
     _loadHomePreferences();
     _loadHistory();
     yingjiHomeFocusTick.addListener(_handleHomeFocus);
+    // 后台把轮播那批元数据刷新回来后换上新内容（FutureBuilder 会保留旧数据，
+    // 所以替换过程不会闪一下空白）。
+    yingjiMetadataRevision.addListener(_handleMetadataRevision);
     _heroTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (!mounted) return;
       final items = _trendingValue;
@@ -892,6 +994,15 @@ class _CinematicHomeState extends State<_CinematicHome>
   /// happened on other devices while this page was off-screen.
   void _handleHomeFocus() => _loadHistory();
 
+  /// 后台刷新可能连着改写好几条缓存，攒到一起只重排一次轮播。
+  void _handleMetadataRevision() {
+    _revisionDebounce?.cancel();
+    _revisionDebounce = Timer(const Duration(milliseconds: 800), () {
+      if (!mounted) return;
+      setState(() => _trending = _loadCarouselItems());
+    });
+  }
+
   List<TmdbItem> _trendingValue = const [];
 
   Future<void> _loadHomePreferences() async {
@@ -920,6 +1031,9 @@ class _CinematicHomeState extends State<_CinematicHome>
       'top-rated' => _tmdb.topRatedMovies(),
       _ => _tmdb.trending(),
     };
+    // 首屏轮播的大图与标题 logo 提前进磁盘缓存：这是最显眼的一屏，
+    // 之后每次打开都应该已经躺在本地。
+    YingjiImageWarmup.items(items, backdrop: true, logo: true, maxItems: 4);
     unawaited(_prefetchHeroDetails(items.take(8).toList(growable: false)));
     return items;
   }
@@ -971,6 +1085,8 @@ class _CinematicHomeState extends State<_CinematicHome>
   @override
   void dispose() {
     yingjiHomeFocusTick.removeListener(_handleHomeFocus);
+    yingjiMetadataRevision.removeListener(_handleMetadataRevision);
+    _revisionDebounce?.cancel();
     yingjiRouteObserver.unsubscribe(this);
     _heroTimer?.cancel();
     _heroProgress.dispose();
@@ -1964,15 +2080,30 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final Set<String> _hiddenSections = {};
   late Future<Map<String, List<TmdbItem>>> _items;
   List<String> _sections = List.of(_defaultSections);
+  /// 元数据后台刷新后的重读消抖计时器。
+  Timer? _revisionDebounce;
 
   @override
   void initState() {
     super.initState();
     _items = _initializeSections();
+    // 后台把某批元数据刷新回来后重读一次缓存，把栏目内容换成新的。
+    yingjiMetadataRevision.addListener(_handleMetadataRevision);
+  }
+
+  /// 每个栏目各自后台刷新，会连着触发好几次；攒到一起只重读一遍。
+  void _handleMetadataRevision() {
+    _revisionDebounce?.cancel();
+    _revisionDebounce = Timer(const Duration(milliseconds: 800), () {
+      if (!mounted) return;
+      setState(() => _items = _loadSections());
+    });
   }
 
   @override
   void dispose() {
+    yingjiMetadataRevision.removeListener(_handleMetadataRevision);
+    _revisionDebounce?.cancel();
     _tmdb.dispose();
     _trakt.dispose();
     _tvMaze.close();
@@ -2803,7 +2934,13 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         }
       }),
     );
-    return Map<String, List<TmdbItem>>.fromEntries(entries);
+    final charts = Map<String, List<TmdbItem>>.fromEntries(entries);
+    // 第一次打开就把所有栏目的海报写进磁盘缓存 —— 之后每次打开都是先命中
+    // 本地图片，再逐栏替换成刚刷新到的内容，不会一屏一屏地边滚边下载。
+    for (final rows in charts.values) {
+      YingjiImageWarmup.items(rows);
+    }
+    return charts;
   }
 
   Future<List<TmdbItem>> _loadSection(
@@ -4515,6 +4652,10 @@ class _RankingPageState extends State<_RankingPage> {
     if (charts['院线热映']?.isEmpty ?? true) {
       charts['院线热映'] = widget.initialItems;
     }
+    // 四个榜单的海报一起预热，切换榜单时不该再等图片。
+    for (final rows in charts.values) {
+      YingjiImageWarmup.items(rows);
+    }
     return charts;
   }
 
@@ -4879,6 +5020,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     _items = List.of(widget.items);
     _platform = _selection?.platform ?? 'all';
     _genre = _selection?.genre ?? 'all';
+    YingjiImageWarmup.items(_items);
     _controller.addListener(_onScroll);
     unawaited(_restoreFilters());
   }
@@ -5290,7 +5432,8 @@ class _SearchPage extends StatefulWidget {
   State<_SearchPage> createState() => _SearchPageState();
 }
 
-class _SearchPageState extends State<_SearchPage> {
+class _SearchPageState extends State<_SearchPage>
+    with _SectionTopOnTap<_SearchPage> {
   static const _recentKey = 'yingji.search.opened';
   final _controller = TextEditingController();
   final _pageScroll = ScrollController();
@@ -5303,8 +5446,15 @@ class _SearchPageState extends State<_SearchPage> {
   String _scope = 'tmdb';
 
   @override
+  ScrollController get sectionTopController => _pageScroll;
+
+  @override
+  String get sectionTopKey => 'search';
+
+  @override
   void initState() {
     super.initState();
+    initSectionTopListener();
     _loadRecentOpened();
   }
 
@@ -5343,6 +5493,7 @@ class _SearchPageState extends State<_SearchPage> {
 
   @override
   void dispose() {
+    disposeSectionTopListener();
     _controller.dispose();
     _pageScroll.dispose();
     _tmdb.dispose();
@@ -5375,6 +5526,11 @@ class _SearchPageState extends State<_SearchPage> {
               : '已连接服务器 · ${serverResults.length} 项结果';
         });
       }
+      // 同一关键词再次搜索多为缓存命中，海报也已经躺在本地。
+      YingjiImageWarmup.items(result);
+      YingjiImageWarmup.urls([
+        for (final media in serverResults) media.imageUrl,
+      ]);
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -5769,7 +5925,20 @@ class _SourceHub extends StatefulWidget {
   State<_SourceHub> createState() => _SourceHubState();
 }
 
-class _SourceHubState extends State<_SourceHub> {
+class _SourceHubState extends State<_SourceHub>
+    with AutomaticKeepAliveClientMixin, _SectionTopOnTap<_SourceHub> {
+  // 服务器页切走后保留：来源列表、统计缓存与滚动位置都不要重来一遍。
+  @override
+  bool get wantKeepAlive => true;
+
+  final _pageScroll = ScrollController();
+
+  @override
+  ScrollController get sectionTopController => _pageScroll;
+
+  @override
+  String get sectionTopKey => 'sources';
+
   SourceStore? _store;
   List<MediaSource> _sources = const [];
   bool _ready = false;
@@ -5788,7 +5957,15 @@ class _SourceHubState extends State<_SourceHub> {
   @override
   void initState() {
     super.initState();
+    initSectionTopListener();
     _load();
+  }
+
+  @override
+  void dispose() {
+    disposeSectionTopListener();
+    _pageScroll.dispose();
+    super.dispose();
   }
 
   /// Local-first: render saved sources from disk immediately, then probe the
@@ -6210,7 +6387,14 @@ class _SourceHubState extends State<_SourceHub> {
   }
 
   @override
-  Widget build(BuildContext context) => ListView(
+  Widget build(BuildContext context) {
+    // AutomaticKeepAliveClientMixin 要求每次 build 上报存活，否则会被回收。
+    super.build(context);
+    return _buildSourceList(context);
+  }
+
+  Widget _buildSourceList(BuildContext context) => ListView(
+    controller: _pageScroll,
     padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
     children: [
       Row(
@@ -6911,13 +7095,41 @@ class _PlaylistsPage extends StatefulWidget {
   State<_PlaylistsPage> createState() => _PlaylistsPageState();
 }
 
-class _PlaylistsPageState extends State<_PlaylistsPage> {
+class _PlaylistsPageState extends State<_PlaylistsPage>
+    with AutomaticKeepAliveClientMixin, _SectionTopOnTap<_PlaylistsPage> {
+  // 片单与想看列表切页后保留，滚动位置不重置。
+  @override
+  bool get wantKeepAlive => true;
+
+  final _pageScroll = ScrollController();
+
+  @override
+  ScrollController get sectionTopController => _pageScroll;
+
+  @override
+  String get sectionTopKey => 'playlists';
+
   List<YingjiPlaylist> _playlists = const [];
   List<TmdbItem> _watchlist = const [];
   @override
   void initState() {
     super.initState();
     _load();
+    initSectionTopListener();
+    // keep-alive 之下切回来不重建，靠壳层的分区信号补一次本地数据。
+    yingjiSectionFocus.addListener(_handleSectionFocus);
+  }
+
+  void _handleSectionFocus() {
+    if (yingjiSectionFocus.value == 'playlists') unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    disposeSectionTopListener();
+    yingjiSectionFocus.removeListener(_handleSectionFocus);
+    _pageScroll.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -7033,7 +7245,14 @@ class _PlaylistsPageState extends State<_PlaylistsPage> {
   }
 
   @override
-  Widget build(BuildContext context) => ListView(
+  Widget build(BuildContext context) {
+    // AutomaticKeepAliveClientMixin 要求每次 build 上报存活，否则会被回收。
+    super.build(context);
+    return _buildPlaylistsList(context);
+  }
+
+  Widget _buildPlaylistsList(BuildContext context) => ListView(
+    controller: _pageScroll,
     padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
     children: [
       Row(
@@ -7121,7 +7340,12 @@ class _CalendarPage extends StatefulWidget {
   State<_CalendarPage> createState() => _CalendarPageState();
 }
 
-class _CalendarPageState extends State<_CalendarPage> {
+class _CalendarPageState extends State<_CalendarPage>
+    with AutomaticKeepAliveClientMixin, _SectionTopOnTap<_CalendarPage> {
+  // 追剧日历的数据与滚动位置切页后保留，不重复拉取。
+  @override
+  bool get wantKeepAlive => true;
+
   final _trakt = TraktClient();
   final _tmdb = TmdbClient();
   List<TraktEvent> _events = const [];
@@ -7129,6 +7353,13 @@ class _CalendarPageState extends State<_CalendarPage> {
   String? _traktMessage;
   DateTime _selectedDate = DateTime.now();
   final ScrollController _calendarRail = ScrollController();
+  final ScrollController _pageScroll = ScrollController();
+
+  @override
+  ScrollController get sectionTopController => _pageScroll;
+
+  @override
+  String get sectionTopKey => 'calendar';
 
   bool _sameDate(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
@@ -7145,6 +7376,7 @@ class _CalendarPageState extends State<_CalendarPage> {
   @override
   void initState() {
     super.initState();
+    initSectionTopListener();
     _load();
   }
 
@@ -7332,7 +7564,9 @@ class _CalendarPageState extends State<_CalendarPage> {
 
   @override
   void dispose() {
+    disposeSectionTopListener();
     _calendarRail.dispose();
+    _pageScroll.dispose();
     _trakt.dispose();
     _tmdb.dispose();
     super.dispose();
@@ -7340,6 +7574,8 @@ class _CalendarPageState extends State<_CalendarPage> {
 
   @override
   Widget build(BuildContext context) {
+    // AutomaticKeepAliveClientMixin 要求每次 build 上报存活，否则会被回收。
+    super.build(context);
     final selectedEvents =
         _events
             .where((event) => _sameDate(event.airDate.toLocal(), _selectedDate))
@@ -7348,6 +7584,7 @@ class _CalendarPageState extends State<_CalendarPage> {
     final dates = _scheduleDates();
     final now = DateTime.now();
     return ListView(
+      controller: _pageScroll,
       padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
       children: [
         Row(
@@ -7750,8 +7987,20 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends State<SettingsPage> {
+class _SettingsPageState extends State<SettingsPage>
+    with AutomaticKeepAliveClientMixin, _SectionTopOnTap<SettingsPage> {
+  // 设置页很长，切走再回来要停在原来的位置，也不要重建整棵子树。
+  @override
+  bool get wantKeepAlive => true;
+
   final _settingsScroll = ScrollController();
+
+  @override
+  ScrollController get sectionTopController => _settingsScroll;
+
+  @override
+  String get sectionTopKey => 'settings';
+
   /// 胶囊条自己的控制器。高亮变化时只许动这一条：用 Scrollable.ensureVisible
   /// 会顺着祖先一路滚上去，把外层页面也带得跳一下。
   final _chipScroll = ScrollController();
@@ -7806,6 +8055,10 @@ class _SettingsPageState extends State<SettingsPage> {
   Map<String, String> _shortcuts = Map.of(_defaultPlayerShortcuts);
   int _metadataCacheCount = 0;
   int _imageCacheBytes = 0;
+  /// 本地已知的新版本号（null = 不知道，或者已经是最新）。
+  ///
+  /// 只用来给按钮配一句说明，真正的判定在 UpdateChecker 里。
+  String? _knownUpdateVersion;
   final _tmdbApiKey = TextEditingController();
   bool _danmakuEnabled = false;
   final _traktClientId = TextEditingController();
@@ -7850,12 +8103,33 @@ class _SettingsPageState extends State<SettingsPage> {
     _save();
   }
 
+  /// 手动检查更新：强制联网查一次，查完把结果同步到按钮旁边的说明。
+  Future<void> _checkForUpdate() async {
+    await checkMovaUpdate(context, manual: true);
+    await _loadKnownUpdate();
+  }
+
+  /// 读本地记着的「最新版本」。不发网络请求 —— 这里只是给界面配一句文案，
+  /// 联网那一步由 UpdateChecker 自己按间隔节流。
+  Future<void> _loadKnownUpdate() async {
+    final release = await UpdateChecker.cached();
+    if (!mounted) return;
+    setState(() {
+      _knownUpdateVersion =
+          release != null && UpdateChecker.isNewer(release)
+          ? release.version
+          : null;
+    });
+  }
+
   @override
   void initState() {
     super.initState();
+    initSectionTopListener();
     _settingsScroll.addListener(_syncActiveSetting);
     _activeSetting.addListener(_revealActiveSettingChip);
     _load();
+    unawaited(_loadKnownUpdate());
   }
 
   Future<void> _load() async {
@@ -8209,11 +8483,13 @@ class _SettingsPageState extends State<SettingsPage> {
     final client = TmdbClient();
     final count = await client.clearCache();
     client.dispose();
+    // 详情页的资源快照属于同一类元数据缓存，一起清掉。
+    final details = await MediaDetailCache.clear();
     if (mounted) {
       setState(
-        () => _savedMessage = count == 0
+        () => _savedMessage = count == 0 && details == 0
             ? '没有可清理的 TMDB 缓存'
-            : '已清理 $count 项 TMDB 缓存',
+            : '已清理 ${count + details} 项 TMDB 与详情缓存',
       );
       unawaited(_refreshCacheStats());
     }
@@ -8221,10 +8497,12 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _refreshCacheStats() async {
     final prefs = await SharedPreferences.getInstance();
-    final metadata = prefs
-        .getKeys()
-        .where((key) => key.startsWith('yingji.tmdb.cache.'))
-        .length;
+    final metadata =
+        prefs
+            .getKeys()
+            .where((key) => key.startsWith('yingji.tmdb.cache.'))
+            .length +
+        await MediaDetailCache.count();
     var bytes = 0;
     try {
       final root = await getTemporaryDirectory();
@@ -8476,6 +8754,9 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    disposeSectionTopListener();
+    _activeSetting.removeListener(_revealActiveSettingChip);
+    _settingsScroll.removeListener(_syncActiveSetting);
     _chipRevealTimer?.cancel();
     _chipScroll.dispose();
     _settingsScroll.dispose();
@@ -8497,6 +8778,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    // AutomaticKeepAliveClientMixin 要求每次 build 上报存活，否则会被回收。
+    super.build(context);
     final labels = <(String, IconData)>[
       ('首页', YingjiIcons.house),
       ('外观', YingjiIcons.paintbrush),
@@ -9791,7 +10074,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 runSpacing: 8,
                 children: [
                   _CacheStat(
-                    label: '元数据',
+                    label: '元数据与详情',
                     value: '$_metadataCacheCount 项',
                   ),
                   _CacheStat(
@@ -9856,56 +10139,92 @@ class _SettingsPageState extends State<SettingsPage> {
         _FrostSurface(
           key: _aboutKey,
           borderRadius: 22,
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const YingjiMark(size: 72),
-              const SizedBox(width: 22),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment:
-                      CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Mova',
-                      style: TextStyle(
-                        fontSize: 30,
-                        fontWeight: FontWeight.w800,
-                      ),
+              Row(
+                children: [
+                  const YingjiMark(size: 72),
+                  const SizedBox(width: 22),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment:
+                          CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Mova',
+                          style: TextStyle(
+                            fontSize: 30,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          '私人媒体中心',
+                          style: TextStyle(
+                            color: YingjiColors.muted,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          '版本 $movaVersion · $movaPlatform · Flutter + libmpv',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: YingjiColors.muted,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          WindowHost.isDesktop
+                              ? '连接你的媒体，延续每一次观看。'
+                              : '连接你的媒体，延续每一次观看。播放时用画面手势操作：单击呼出控件、双击播放暂停、左右滑动快进快退、左半屏调亮度、右半屏调音量。',
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 6),
-                    const Text(
-                      '私人媒体中心',
-                      style: TextStyle(
-                        color: YingjiColors.muted,
-                      ),
+                  ),
+                  YingjiMotionIconButton(
+                    icon: YingjiIcons.info_circle,
+                    tooltip: '关于与许可',
+                    onPressed: () => showAboutDialog(
+                      context: context,
+                      applicationName: 'Mova',
+                      applicationIcon: const YingjiMark(size: 56),
+                      applicationVersion: movaVersion,
+                      applicationLegalese: '私人媒体中心 · 内置 libmpv',
                     ),
-                    const SizedBox(height: 12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Divider(height: 1),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _checkForUpdate,
+                    icon: const Icon(YingjiIcons.cloud, size: 16),
+                    label: const Text('检查更新'),
+                  ),
+                  if (_knownUpdateVersion != null)
                     Text(
-                      '版本 $movaVersion · $movaPlatform · Flutter + libmpv',
+                      '发现新版本 $_knownUpdateVersion',
                       style: const TextStyle(
                         fontSize: 12,
                         color: YingjiColors.muted,
                       ),
+                    )
+                  else
+                    const Text(
+                      '每次打开都会自动检查一次',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: YingjiColors.muted,
+                      ),
                     ),
-                    const SizedBox(height: 8),
-                    Text(
-                      WindowHost.isDesktop
-                          ? '连接你的媒体，延续每一次观看。'
-                          : '连接你的媒体，延续每一次观看。播放时用画面手势操作：单击呼出控件、双击播放暂停、左右滑动快进快退、左半屏调亮度、右半屏调音量。',
-                    ),
-                  ],
-                ),
-              ),
-              YingjiMotionIconButton(
-                icon: YingjiIcons.info_circle,
-                tooltip: '关于与许可',
-                onPressed: () => showAboutDialog(
-                  context: context,
-                  applicationName: 'Mova',
-                  applicationIcon: const YingjiMark(size: 56),
-                  applicationVersion: movaVersion,
-                  applicationLegalese: '私人媒体中心 · 内置 libmpv',
-                ),
+                ],
               ),
             ],
           ),

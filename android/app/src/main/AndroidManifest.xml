@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- 播放时保持唤醒 -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- 应用内更新：下载 APK 后交给系统安装器。Android 8.0 起这只是申请资格，
+         用户还要在设置里为本应用打开「安装未知应用」开关。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <!-- 本地媒体文件访问（Android 13+ 细分权限） -->
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"
         android:minSdkVersion="33"/>
@@ -51,6 +54,19 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!-- 应用内更新：把缓存目录里的 APK 以 content:// 交给系统安装器。
+             直接传 file:// 在 Android 7.0 起会抛 FileUriExposedException。
+             authority 用 ${applicationId} 拼接，debug 包的 .debug 后缀也能对上。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"/>
+        </provider>
 
         <meta-data
             android:name="flutterEmbedding"

@@ -11,6 +11,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
 
 import '../brand.dart';
+import '../cache/image_prefetch.dart';
+import '../cache/media_cache.dart';
 import '../player/player_page.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
@@ -136,7 +138,52 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (mounted) setState(() => _isFavorite = next);
   }
 
-  Future<void> _loadResources() async {
+  /// 用上一次聚合好的资源快照立刻把详情页渲染出来，返回是否真的用上了缓存。
+  ///
+  /// 缓存里存的是「已经按标题匹配过的行」，所以这里不需要再走一遍聚合；
+  /// 但仍然要过两道筛：来源被删掉、或来源地址改过的行不能再拿来播放。
+  Future<bool> _restoreCachedResources() async {
+    if (widget.media != null) return false;
+    final snapshot = await MediaDetailCache.load(widget.item);
+    if (snapshot == null) return false;
+    final store = await SourceStore.create();
+    final endpoints = <String, Uri>{
+      for (final source in store.load()) source.id: source.endpoint,
+    };
+    final rows = snapshot.rows
+        .where((row) {
+          final endpoint = endpoints[row.source.id];
+          return endpoint != null && endpoint == row.source.endpoint;
+        })
+        .toList(growable: false);
+    if (rows.isEmpty) return false;
+    final preferred = await _preferredResource(rows);
+    final history = (await WatchStateStore.create()).load();
+    // Trakt 的已看剧集要联网，先用本机记录把进度渲染出来；真正聚合那一步
+    // （或冷却期内的进度刷新）会再带上 Trakt 重算一次。
+    final derived = _deriveProgress(rows, history, const <String>{});
+    if (!mounted) return false;
+    setState(() {
+      _resources = rows;
+      _seasonPosters = snapshot.seasonPosters;
+      _selectedResource = preferred ?? rows.first;
+      _completedResourceIds = derived.completed;
+      _episodeProgress = derived.progress;
+      _selectedSeason =
+          preferred?.seasonNumber ??
+          rows
+              .map((row) => row.seasonNumber)
+              .whereType<int>()
+              .firstOrNull;
+      _loadingResources = false;
+    });
+    // 剧集名与剧照也立刻补上：TMDB 那侧同样是缓存优先的，不会卡住界面。
+    unawaited(_loadEpisodeMetadata(rows));
+    YingjiImageWarmup.urls([for (final row in rows) row.imageUrl]);
+    return true;
+  }
+
+  Future<void> _loadResources({bool force = false}) async {
     if (widget.media != null) {
       if (mounted) {
         setState(() {
@@ -155,6 +202,16 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         });
       }
       unawaited(_loadEpisodeMetadata([widget.media!]));
+      return;
+    }
+    // 先用上一次聚合好的快照把页面填满，再决定要不要真的去搜服务器。
+    final restored = await _restoreCachedResources();
+    final cooling =
+        restored && await MediaDetailCache.recentlyScanned(widget.item);
+    if (!force && cooling) {
+      // 冷却期内重复打开同一部剧：资源卡片沿用缓存，只把观看进度按本机
+      // 记录重算一遍，不再把每个服务器都重新翻一遍。
+      await _refreshProgressAfterPlayback();
       return;
     }
     try {
@@ -275,9 +332,22 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   .whereType<int>()
                   .firstOrNull;
           _loadingResources = false;
+          _resourceError = null;
         });
       }
       unawaited(_loadEpisodeMetadata(matches));
+      // 存下这次聚合结果：下次打开先渲染它，再按冷却间隔决定要不要重搜。
+      unawaited(
+        MediaDetailCache.save(
+          widget.item,
+          rows: matches,
+          seasonPosters: seasonPosters,
+        ),
+      );
+      unawaited(MediaDetailCache.markScanned(widget.item));
+      YingjiImageWarmup.urls([
+        for (final resource in matches) resource.imageUrl,
+      ]);
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -379,6 +449,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       if (mounted && episodes.isNotEmpty) {
         setState(() => _episodeMetadata = episodes);
       }
+      // 剧照提前写进磁盘缓存，切季/切集时不再逐张现下。
+      YingjiImageWarmup.episodes(episodes.values);
     } catch (_) {
       // Server-provided media details remain usable when TMDB enrichment fails.
     }
@@ -1129,7 +1201,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                                   selected: _selectedResource,
                                   loading: _loadingResources,
                                   error: _resourceError,
-                                  onRetry: _loadResources,
+                                  // 手动重试要绕开冷却间隔，立刻重搜。
+                                  onRetry: () => _loadResources(force: true),
                                   onPicker: (resource) => _showResourcePicker(
                                     source: resource.source,
                                   ),
@@ -1343,11 +1416,13 @@ class _DetailSidebar extends StatelessWidget {
           const YingjiMark(size: 42),
           const SizedBox(height: 18),
           const Spacer(),
+          // 顺序与首页左侧导航完全一致（首页 → 追剧 → 片单 → 服务器），
+          // 同一个入口在不同页面必须落在同一个位置。
           for (final item in const <(IconData, String, String)>[
-            (YingjiIcons.square_stack_3d_up, 'sources', '服务器'),
             (YingjiIcons.house, 'home', '首页'),
             (YingjiIcons.calendar, 'calendar', '追剧'),
             (YingjiIcons.heart, 'playlists', '片单'),
+            (YingjiIcons.rectangle_stack, 'sources', '服务器'),
           ]) ...[
             _DetailRailButton(
               icon: item.$1,
@@ -4020,6 +4095,10 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
         return const _ResourceMessage(message: '未能读取演员、艺术图和相似推荐。');
       }
       final value = snapshot.data ?? const TmdbExtras();
+      // 头像、推荐海报与季封面提前写进磁盘缓存（重复调用只做去重判断）。
+      YingjiImageWarmup.people(value.cast);
+      YingjiImageWarmup.items(value.recommendations);
+      YingjiImageWarmup.seasons(value.seasons);
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -4840,6 +4919,9 @@ class _PersonPageState extends State<_PersonPage> {
                     return const Center(child: CircularProgressIndicator());
                   }
                   final value = snapshot.data!;
+                  // 演员头像与参演作品海报提前进磁盘缓存。
+                  YingjiImageWarmup.people([value.person]);
+                  YingjiImageWarmup.items(value.credits);
                   var rows = value.credits
                       .where((item) => _type == '全部' || item.kind == _type)
                       .toList();
