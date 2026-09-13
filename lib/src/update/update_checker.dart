@@ -405,11 +405,12 @@ abstract final class UpdateChecker {
   /// GitHub 会把它重定向到 `/releases/tag/vX.Y.Z`，版本号就在 Location 里。
   /// 拿不到资产清单也不要紧：[UpdateRelease.asset] 会按命名规则把地址拼出来。
   static Future<UpdateRelease?> _fetchFromRedirect() async {
-    final raw = HttpClient()
-      ..followRedirects = false
-      ..findProxy = findNetworkProxy;
+    final raw = HttpClient()..findProxy = findNetworkProxy;
     try {
       final request = await raw.getUrl(_pageLatest).timeout(_networkTimeout);
+      // 不跟随重定向：版本号就在 302 的 Location 里。这个开关在
+      // `HttpClientRequest` 上，`HttpClient` 本身没有（那边只有 `findProxy`）。
+      request.followRedirects = false;
       final response = await request.close().timeout(_networkTimeout);
       final location = response.headers.value(HttpHeaders.locationHeader) ?? '';
       await response.drain<void>();
