@@ -23,6 +23,7 @@ import 'cache/image_prefetch.dart';
 import 'cache/media_cache.dart';
 import 'cache/video_cache.dart';
 import 'motion.dart';
+import 'network/proxy_routing.dart';
 import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
 import 'metadata/metadata_detail_page.dart';
@@ -1422,7 +1423,7 @@ Future<List<WatchState>> _mergeServerWatchHistory(
       if (source.kind == SourceKind.webdav) continue;
       final token = sources.tokenFor(source);
       if (token == null || token.isEmpty) continue;
-      final client = EmbyClient();
+      final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
       try {
         final session = await client.resolveSession(
           EmbySession(source: source, token: token),
@@ -5548,7 +5549,9 @@ class _SearchPageState extends State<_SearchPage>
             }
           }
         } else {
-          final client = EmbyClient();
+          final client = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(source.id),
+          );
           try {
             final session = await client.resolveSession(
               EmbySession(source: source, token: token),
@@ -6019,7 +6022,9 @@ class _SourceHubState extends State<_SourceHub>
           final source = updated[index];
           if (source.kind == SourceKind.webdav) return;
           final token = store.tokenFor(source);
-          final client = EmbyClient();
+          final client = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(source.id),
+          );
           try {
             if (token == null || token.isEmpty) {
               offline.add(source.id);
@@ -6302,7 +6307,7 @@ class _SourceHubState extends State<_SourceHub>
           client.dispose();
         }
       } else {
-        final client = EmbyClient();
+        final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
         try {
           final resolved = await client.resolveSession(
             EmbySession(source: source, token: token),
@@ -6696,7 +6701,9 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
         if (token == null || token.isEmpty) {
           throw Exception('未找到旧登录凭据，请重新填写用户名和密码');
         }
-        final client = EmbyClient();
+        final client = EmbyClient(
+          proxy: ProxyRouting.serverUsesProxy(existing.id),
+        );
         late final ({
           String name,
           String id,
@@ -8236,6 +8243,7 @@ class _SettingsPageState extends State<SettingsPage>
   final _playerToolsKey = GlobalKey();
   final _behaviorKey = GlobalKey();
   final _networkKey = GlobalKey();
+  final _proxyKey = GlobalKey();
   final _danmakuKey = GlobalKey();
   final _systemKey = GlobalKey();
   final _maintenanceKey = GlobalKey();
@@ -8310,6 +8318,13 @@ class _SettingsPageState extends State<SettingsPage>
   String? _danmakuMessage;
   bool _traktAuthorizing = false;
   String? _traktMessage;
+
+  /// 「代理」页：已添加的服务器列表（用于渲染开关行）。
+  List<MediaSource> _proxySources = const [];
+
+  /// 「代理」页：勾选了「跟随系统代理」的服务器 id 集合（UI 态，与
+  /// ProxyRouting 内存态同步）。
+  Set<String> _proxyServers = const {};
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
   /// 横向胶囊的 key（按需生成），用来把高亮的那一项滚回可视区。
@@ -8502,10 +8517,31 @@ class _SettingsPageState extends State<SettingsPage>
           );
         _danmakuToken.text = prefs.getString('yingji.danmaku.token') ?? '';
       });
+      // 代理页：开关集合已在 main() 里通过 ProxyRouting.load() 灌入内存，
+      // 这里把 UI 态同步过来；服务器列表则异步从 SourceStore 读取。
+      _proxyServers = Set.of(ProxyRouting.proxyServerIds);
+      unawaited(_refreshProxySources());
       _persistedSettings = _settingsSnapshot();
       _applyAppearance();
       unawaited(_refreshCacheStats());
     }
+  }
+
+  /// 读取已添加的媒体服务器，刷新「代理」页的开关列表。
+  Future<void> _refreshProxySources() async {
+    final store = await SourceStore.create();
+    final sources = store.load();
+    if (!mounted) return;
+    setState(() => _proxySources = sources);
+  }
+
+  /// 切换某服务器是否跟随系统代理，立即写盘并同步内存态。
+  Future<void> _setServerProxy(String sourceId, bool enabled) async {
+    await ProxyRouting.setServerProxy(sourceId, enabled);
+    if (!mounted) return;
+    setState(
+      () => _proxyServers = Set.of(ProxyRouting.proxyServerIds),
+    );
   }
 
   Map<String, Object> _settingsSnapshot() {
@@ -8944,6 +8980,7 @@ class _SettingsPageState extends State<SettingsPage>
     _playerToolsKey,
     _behaviorKey,
     _networkKey,
+    _proxyKey,
     _danmakuKey,
     _systemKey,
     _maintenanceKey,
@@ -9099,6 +9136,7 @@ class _SettingsPageState extends State<SettingsPage>
       ('播放器按钮', YingjiIcons.slider_horizontal_3),
       ('播放行为', YingjiIcons.gauge),
       ('网络与同步', YingjiIcons.wifi),
+      ('代理', YingjiIcons.global),
       ('字幕与弹幕', YingjiIcons.captions_bubble),
       // 手机上没有键盘，这一栏就是手势说明。
       (WindowHost.isDesktop ? '快捷键与系统' : '手势与系统', YingjiIcons.gear_alt),
@@ -9112,6 +9150,7 @@ class _SettingsPageState extends State<SettingsPage>
       _playerToolsKey,
       _behaviorKey,
       _networkKey,
+      _proxyKey,
       _danmakuKey,
       _systemKey,
       _maintenanceKey,
@@ -9941,6 +9980,53 @@ class _SettingsPageState extends State<SettingsPage>
                   ),
                 ),
               ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 18),
+        _FrostSurface(
+          key: _proxyKey,
+          borderRadius: 22,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '代理',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '软件本身（TMDB 海报与元数据、应用更新、弹幕）始终跟随系统代理：'
+                '系统开着代理就走，没开走正常网络。下面每个媒体服务器单独控制——'
+                '默认不勾选时，该服务器的浏览、聚合与播放都走正常网络；勾选后则'
+                '跟随系统代理。播放视频流始终直连。',
+                style: TextStyle(
+                  color: Color(0xFFABB1BE),
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 14),
+              if (_proxySources.isEmpty)
+                const Text(
+                  '还没有添加任何媒体服务器。',
+                  style: TextStyle(
+                    color: YingjiColors.muted,
+                    fontSize: 13,
+                  ),
+                )
+              else
+                for (final source in _proxySources) ...[
+                  _ToggleRow(
+                    title: source.name,
+                    detail: '${source.kind.label} · ${source.endpoint.host}',
+                    value: _proxyServers.contains(source.id),
+                    onChanged: (value) =>
+                        _setServerProxy(source.id, value),
+                  ),
+                ],
             ],
           ),
         ),
@@ -12527,7 +12613,9 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
       final token = source == null ? null : store.tokenFor(source);
       if (source != null && token != null && token.isNotEmpty) {
         final session = EmbySession(source: source, token: token);
-        final client = EmbyClient();
+        final client = EmbyClient(
+          proxy: ProxyRouting.serverUsesProxy(source.id),
+        );
         try {
           // Precise path: the stored row references one server item. Fetch it
           // and, when it is an episode, roll up to its parent series — the

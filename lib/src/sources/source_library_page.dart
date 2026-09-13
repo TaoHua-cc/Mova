@@ -4,6 +4,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import '../brand.dart';
 import '../metadata/metadata_detail_page.dart';
 import '../metadata/tmdb_client.dart';
+import '../network/proxy_routing.dart';
 import 'emby_client.dart';
 import 'media_source.dart';
 import 'server_mark.dart';
@@ -37,7 +38,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
     final token = store.tokenFor(source);
     if (token == null || token.isEmpty) throw Exception('未找到服务器登录令牌');
     _token = token;
-    final client = EmbyClient();
+    final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
     try {
       final resolved = await client.resolveSession(
         EmbySession(source: source, token: token),

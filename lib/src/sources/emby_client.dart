@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../network/network_http_client.dart';
 import '../version.dart';
 import 'media_source.dart';
 
@@ -133,7 +134,13 @@ class EmbyLibraryStats {
 }
 
 class EmbyClient {
-  EmbyClient({http.Client? client}) : _client = client ?? http.Client();
+  /// [proxy] 为 true 时，该客户端的所有请求走系统代理（跟随 `_findProxy` 的
+  /// 判定）；否则直连。默认直连——服务器流量默认走正常网络，只有用户在
+  /// 「设置 → 代理」里勾选该服务器后才跟随系统代理。
+  EmbyClient({http.Client? client, bool proxy = false})
+      : _client =
+            client ??
+            (proxy ? createNetworkHttpClient() : http.Client());
   final http.Client _client;
 
   /// Jellyfin 10.10+ native media segments. Older Jellyfin and Emby servers

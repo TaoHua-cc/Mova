@@ -13,6 +13,7 @@ import '../platform/window_host.dart';
 import '../brand.dart';
 import '../cache/image_prefetch.dart';
 import '../cache/media_cache.dart';
+import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
@@ -245,7 +246,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           }
         } else {
           if (token == null || token.isEmpty) continue;
-          final client = EmbyClient();
+          final client = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(source.id),
+          );
           try {
             final session = await client.resolveSession(
               EmbySession(source: source, token: token),
@@ -669,7 +672,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         final store = await SourceStore.create();
         final token = store.tokenFor(version.source);
         if (token != null && token.isNotEmpty) {
-          final client = EmbyClient();
+          final client = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(version.source.id),
+          );
           try {
             await client.setPlayed(
               EmbySession(source: version.source, token: token),

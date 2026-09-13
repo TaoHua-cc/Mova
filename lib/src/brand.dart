@@ -473,6 +473,8 @@ abstract final class YingjiIcons {
   static const paintbrush = Iconsax.brush;
   static const gauge = Iconsax.speedometer;
   static const wifi = Iconsax.wifi;
+  /// 代理设置入口：地球图标，表示「走系统代理」这类网络级开关。
+  static const global = Iconsax.global;
   static const captions_bubble = Iconsax.subtitle;
   static const danmaku = Iconsax.message_text;
   static const bookmark = Iconsax.bookmark;

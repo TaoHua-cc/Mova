@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'src/app.dart';
 import 'src/brand.dart';
 import 'src/network/network_http_client.dart';
+import 'src/network/proxy_routing.dart';
 import 'src/platform/window_host.dart';
 
 Future<void> main() async {
@@ -19,6 +20,7 @@ Future<void> main() async {
     title: 'Mova',
   );
   final prefs = await SharedPreferences.getInstance();
+  await ProxyRouting.load();
   yingjiAppearance.apply(
     themeMode: switch (prefs.getString('yingji.appearance.theme') ?? 'dark') {
       'light' => ThemeMode.light,

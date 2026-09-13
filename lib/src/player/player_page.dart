@@ -14,6 +14,7 @@ import '../platform/window_host.dart';
 import '../brand.dart';
 import '../motion.dart';
 import '../history/watch_state_store.dart';
+import '../network/proxy_routing.dart';
 import 'danmaku_client.dart';
 import 'subtitle_preference.dart';
 import 'segment_client.dart';
@@ -1085,7 +1086,7 @@ class _PlayerPageState extends State<PlayerPage> {
     var position = local?.position ?? episode.initialPosition;
     if (episode.sourceId == null || episode.serverItemId == null)
       return position;
-    final client = EmbyClient();
+    EmbyClient? client;
     try {
       final sources = await SourceStore.create();
       final source = sources
@@ -1095,6 +1096,7 @@ class _PlayerPageState extends State<PlayerPage> {
       if (source == null || source.kind == SourceKind.webdav) return position;
       final token = sources.tokenFor(source);
       if (token == null || token.isEmpty) return position;
+      client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
       final remote = await client
           .itemById(
             EmbySession(source: source, token: token),
@@ -1111,7 +1113,7 @@ class _PlayerPageState extends State<PlayerPage> {
     } catch (_) {
       // Offline switching still resumes the latest saved local position.
     } finally {
-      client.dispose();
+      client?.dispose();
     }
     return position;
   }
@@ -1166,7 +1168,7 @@ class _PlayerPageState extends State<PlayerPage> {
             source.kind != SourceKind.webdav &&
             token != null &&
             token.isNotEmpty) {
-          final server = EmbyClient();
+          final server = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
           try {
             final native = await server.mediaSegments(
               EmbySession(source: source, token: token),
@@ -1877,7 +1879,9 @@ class _PlayerPageState extends State<PlayerPage> {
           if (source.kind != SourceKind.webdav) {
             final token = store.tokenFor(source);
             if (token != null && token.isNotEmpty) {
-              final client = EmbyClient();
+              final client = EmbyClient(
+                proxy: ProxyRouting.serverUsesProxy(source.id),
+              );
               try {
                 final session = EmbySession(source: source, token: token);
                 if (ending) {
