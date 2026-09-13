@@ -559,6 +559,13 @@ class MovaPageTransitionsBuilder extends PageTransitionsBuilder {
       curve: MovaMotion.enter,
       reverseCurve: MovaMotion.exit,
     );
+    // 淡入只跑前 42%，之后 opacity 恒为 1 —— RenderOpacity 此时不再创建离屏层，
+    // 省掉整页逐帧 alpha 合成。否则窗口越大越贵：全屏进详情页卡顿的主因之一。
+    final fade = CurvedAnimation(
+      parent: animation,
+      curve: const Interval(0, .42, curve: Curves.easeOut),
+      reverseCurve: const Interval(0, .42, curve: Curves.easeIn),
+    );
     return SlideTransition(
       position:
           Tween<Offset>(
@@ -566,7 +573,7 @@ class MovaPageTransitionsBuilder extends PageTransitionsBuilder {
             end: Offset.zero,
           ).animate(forward),
       child: FadeTransition(
-        opacity: forward,
+        opacity: fade,
         child: SlideTransition(
           position:
               Tween<Offset>(

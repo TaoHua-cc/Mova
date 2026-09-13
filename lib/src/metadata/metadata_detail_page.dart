@@ -1006,22 +1006,43 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       future: _details,
       builder: (context, snapshot) {
         final item = snapshot.data ?? widget.item;
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            if (item.backdropUrl != null)
-              CachedNetworkImage(
-                imageUrl: item.backdropUrl.toString(),
-                fit: BoxFit.cover,
-                errorWidget: (_, _, _) => const SizedBox.shrink(),
-              ),
-            const DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  center: Alignment.topRight,
-                  radius: 1.15,
-                  colors: [Color(0x553B6A4D), Color(0xE807090D)],
-                ),
+        // 整页隔离成独立图层：页面转场（透明度 / 位移）时可直接复用已光栅化的
+        // 结果，不必每帧重绘全屏背景、阴影与玻璃模糊 —— 窗口越大越省。
+        return RepaintBoundary(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+            RepaintBoundary(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (item.backdropUrl != null)
+                    CachedNetworkImage(
+                      imageUrl: item.backdropUrl.toString(),
+                      fit: BoxFit.cover,
+                      // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成（正好压在进
+                      // 页面的转场上），背景直接显示。
+                      fadeInDuration: Duration.zero,
+                      fadeOutDuration: Duration.zero,
+                      // 全屏窗口下 backdrop 原图可能上千像素：按窗口实际物理宽度
+                      // 解码，省内存也省每帧纹理带宽。
+                      memCacheWidth:
+                          (MediaQuery.sizeOf(context).width *
+                                  MediaQuery.devicePixelRatioOf(context))
+                              .clamp(1.0, 2560.0)
+                              .round(),
+                      errorWidget: (_, _, _) => const SizedBox.shrink(),
+                    ),
+                  const DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: RadialGradient(
+                        center: Alignment.topRight,
+                        radius: 1.15,
+                        colors: [Color(0x553B6A4D), Color(0xE807090D)],
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             SafeArea(
@@ -1137,6 +1158,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               ),
             ),
           ],
+          ),
         );
       },
     ),
@@ -1465,6 +1487,7 @@ class _DetailHeroCopy extends StatelessWidget {
                 ),
               )
             : CachedNetworkImage(
+                fadeInDuration: const Duration(milliseconds: 150),
                 imageUrl: item.logoUrl.toString(),
                 alignment: Alignment.centerLeft,
                 fit: BoxFit.contain,
@@ -1873,6 +1896,7 @@ class _SeasonRailState extends State<_SeasonRail> {
                                     ),
                                   )
                                 : CachedNetworkImage(
+                                    fadeInDuration: const Duration(milliseconds: 150),
                                     imageUrl: artwork.toString(),
                                     fit: BoxFit.cover,
                                     errorWidget: (_, _, _) => const Center(
@@ -2170,6 +2194,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                                   image == null
                                       ? const _EpisodeArtworkFallback()
                                       : CachedNetworkImage(
+                                          fadeInDuration: const Duration(milliseconds: 150),
                                           imageUrl: image.toString(),
                                           fit: BoxFit.cover,
                                           errorWidget: (_, _, _) =>
@@ -2613,6 +2638,7 @@ class _AllEpisodeCard extends StatelessWidget {
                       image == null
                           ? const _EpisodeArtworkFallback()
                           : CachedNetworkImage(
+                              fadeInDuration: const Duration(milliseconds: 150),
                               imageUrl: image.toString(),
                               fit: BoxFit.cover,
                               errorWidget: (_, _, _) =>
@@ -4040,6 +4066,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         child: Icon(YingjiIcons.person_fill),
                                       )
                                     : CachedNetworkImage(
+                                        fadeInDuration: const Duration(milliseconds: 150),
                                         imageUrl: person.profileUrl.toString(),
                                         fit: BoxFit.cover,
                                         errorWidget: (_, _, _) =>
@@ -4114,6 +4141,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                             maxHeight: 720,
                           ),
                           child: CachedNetworkImage(
+                            fadeInDuration: const Duration(milliseconds: 150),
                             imageUrl: artwork.url.toString(),
                             fit: BoxFit.contain,
                           ),
@@ -4125,6 +4153,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(14),
                         child: CachedNetworkImage(
+                          fadeInDuration: const Duration(milliseconds: 150),
                           imageUrl: artwork.url.toString(),
                           width: 300,
                           fit: BoxFit.cover,
@@ -4184,6 +4213,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         color: YingjiColors.elevated,
                                       )
                                     : CachedNetworkImage(
+                                        fadeInDuration: const Duration(milliseconds: 150),
                                         imageUrl: item.posterUrl.toString(),
                                         fit: BoxFit.cover,
                                         errorWidget: (_, _, _) =>
@@ -4486,6 +4516,7 @@ class _PersonDetailCard extends StatelessWidget {
                         child: Icon(YingjiIcons.person_fill, size: 42),
                       )
                     : CachedNetworkImage(
+                        fadeInDuration: const Duration(milliseconds: 150),
                         imageUrl: person.profileUrl.toString(),
                         fit: BoxFit.cover,
                         errorWidget: (_, _, _) => const ColoredBox(
@@ -4553,6 +4584,7 @@ class _ArtworkDetailCard extends StatelessWidget {
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(16),
                 child: CachedNetworkImage(
+                  fadeInDuration: const Duration(milliseconds: 150),
                   imageUrl: artwork.url.toString(),
                   fit: BoxFit.contain,
                 ),
@@ -4577,6 +4609,7 @@ class _ArtworkDetailCard extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           CachedNetworkImage(
+            fadeInDuration: const Duration(milliseconds: 150),
             imageUrl: artwork.url.toString(),
             fit: BoxFit.cover,
             errorWidget: (_, _, _) => const ColoredBox(
@@ -4638,6 +4671,7 @@ class _RecommendationDetailCard extends StatelessWidget {
               child: item.posterUrl == null
                   ? const ColoredBox(color: YingjiColors.elevated)
                   : CachedNetworkImage(
+                      fadeInDuration: const Duration(milliseconds: 150),
                       imageUrl: item.posterUrl.toString(),
                       fit: BoxFit.cover,
                       errorWidget: (_, _, _) =>
@@ -4838,6 +4872,7 @@ class _PersonPageState extends State<_PersonPage> {
                                             ),
                                           )
                                         : CachedNetworkImage(
+                                            fadeInDuration: const Duration(milliseconds: 150),
                                             imageUrl: value.person.profileUrl
                                                 .toString(),
                                             fit: BoxFit.cover,
