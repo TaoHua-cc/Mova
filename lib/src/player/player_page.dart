@@ -1911,12 +1911,18 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   Widget build(BuildContext context) => CallbackShortcuts(
     bindings: {
-      SingleActivator(_shortcutKey(_shortcuts['exit']!)): () {
+      SingleActivator(_shortcutKey(_shortcuts['exit']!)): () async {
         if (_settingsOpen) {
           setState(() => _settingsOpen = false);
-        } else {
-          _exitPlayer(context);
+          return;
         }
+        // 桌面端全屏时，Esc 先退回窗口、不退出播放，再按一次才关掉播放。
+        // 否则全屏看片时手一抖按到 Esc，整段播放就直接结束了。
+        if (WindowHost.isDesktop && await WindowHost.isFullScreen()) {
+          await WindowHost.setFullScreen(false);
+          return;
+        }
+        await _exitPlayer(context);
       },
       SingleActivator(_shortcutKey(_shortcuts['playPause']!)): _togglePlayback,
       SingleActivator(_shortcutKey(_shortcuts['seekBack']!)): () =>

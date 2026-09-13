@@ -1329,28 +1329,6 @@ class _CinematicHomeState extends State<_CinematicHome>
                   ),
                 if (_showContinue)
                   Positioned(
-                    left: 84,
-                    right: 24,
-                    bottom: 42,
-                    height: continueHeight + 28,
-                    child: IgnorePointer(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(24),
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [
-                              Colors.transparent,
-                              YingjiGlass.surface(strength: .56),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                if (_showContinue)
-                  Positioned(
                     left: 96,
                     right: 40,
                     bottom: 56,
