@@ -70,7 +70,7 @@ Mova 是一款沉浸式私人影音客户端，同时支持 **Windows** 与 **An
 
 ## 系统要求
 
-- **Windows**：Windows 10 或 Windows 11（64 位），支持 D3D11 的显卡驱动
+- **Windows**：Windows 10 或 Windows 11（64 位），支持 D3D11 的显卡驱动。单实例运行，再次启动会把已经打开的窗口唤到前台
 - **Android**：Android 7.0（API 24）及以上，arm64-v8a / armeabi-v7a / x86_64
 - 访问 TMDB、Trakt 或个人媒体服务器所需的网络连接
 

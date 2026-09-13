@@ -5,6 +5,8 @@
 
 #include "resource.h"
 
+#include "single_instance.h"
+
 namespace {
 
 /// Window attribute that enables dark mode window decorations.
@@ -158,6 +160,13 @@ LRESULT CALLBACK Win32Window::WndProc(HWND const window,
                                       UINT const message,
                                       WPARAM const wparam,
                                       LPARAM const lparam) noexcept {
+  // Single instance wake-up broadcast (see single_instance.h). Handled before
+  // the plugins get a look in: this message is ours, nobody else knows it.
+  if (message != WM_NCCREATE &&
+      mova::single_instance::HandleActivateMessage(window, message)) {
+    return 0;
+  }
+
   if (message == WM_NCCREATE) {
     auto window_struct = reinterpret_cast<CREATESTRUCT*>(lparam);
     SetWindowLongPtr(window, GWLP_USERDATA,
