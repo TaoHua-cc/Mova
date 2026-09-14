@@ -44,8 +44,8 @@ git add -A && git commit -m "feat: ..." && git push origin main
 
 推送后 GitHub Actions 会自动：
 
-- `Android Build` → `flutter analyze` + 按 ABI 拆分的三个 APK
 - `Release` 的 Windows job → Windows 程序 + Inno Setup 安装器 + 免安装压缩包
+- `Release` 的 Android job → 按 ABI 拆分的三个 APK
 - `Release` → 更新 GitHub Releases 中的 **Mova Continuous** 预发布，附上本次双端安装包
 
 持续 Release 用于快速测试，始终指向最新 `main` 提交。它不替代稳定正式版：普通提交不会递增 Android `versionCode`，因此 Android 可能无法覆盖旧正式版。
@@ -84,9 +84,11 @@ powershell -ExecutionPolicy Bypass -File scripts\cut-release.ps1 -Version 3.1.81
 
 | 工作流 | 触发 | 作用 |
 |---|---|---|
-| `android-build.yml` | push 到 main、PR | 安卓编译验证 + 上传 APK 产物（不发版） |
+| `android-build.yml` | PR、手动触发 | 安卓编译验证 + 上传 APK 产物（不发版）；main 由 Release workflow 避免重复构建 |
 | `windows-build.yml` | PR、手动触发 | Windows 编译验证 + 上传安装器产物（不发版）；main 由 Release workflow 避免重复构建 |
 | `release.yml` | 推送 `main`、推送 `v*` tag、手动触发 | `main` 更新 Continuous 预发布；标签创建正式 GitHub Release |
+
+标题以 `release:` 开头的正式版本提交在推送 main 时不会启动 Continuous，因为随后推送的 tag 会构建同一提交；这样正式发版只构建一次双端安装包。
 
 ## 一次性配置：安卓发布签名
 

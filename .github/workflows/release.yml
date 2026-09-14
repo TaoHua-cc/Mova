@@ -24,6 +24,8 @@ concurrency:
 jobs:
   meta:
     name: Resolve version
+    # 正式发版提交会紧接着推送 tag；main 事件跳过，避免同一提交构建两遍。
+    if: github.event_name != 'push' || github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'release:')
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.r.outputs.tag }}

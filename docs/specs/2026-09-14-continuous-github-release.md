@@ -29,7 +29,8 @@
 - `main` 事件使用可移动的 `continuous` 标签，发布为 `Mova Continuous` 且标记 prerelease；发布前用 GitHub API 将该标签强制更新到当前提交。
 - 正式标签继续用原标签名发布，标记为 Latest。
 - 启用资产覆盖，保证同版本名的持续构建能够替换旧文件。
-- `main` 不再同时触发独立的 Windows Build 工作流；Release 的 Windows job 是唯一打包任务。
+- `main` 不再同时触发独立的 Windows / Android Build 工作流；Release 是唯一双端打包任务。
+- `release:` 提交的 main 事件跳过 Continuous，随后推送的正式 tag 只构建一次。
 
 ## 兼容与迁移
 
@@ -49,7 +50,8 @@
 - [ ] 推送本提交后检查 Release 工作流成功。
 - [ ] 检查 Releases 页面中的 `Mova Continuous` 资产更新时间和提交。
 - [ ] 推送下一正式标签时检查 Latest 标识。
-- [ ] main 不出现重复 Windows 打包。
+- [ ] main 不出现重复 Windows 或 Android 打包。
+- [ ] 正式发版提交只由 tag 构建一次。
 
 ## 风险与回滚
 
