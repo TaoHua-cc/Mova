@@ -16,6 +16,8 @@ import '../motion.dart';
 import '../history/watch_state_store.dart';
 import '../network/proxy_routing.dart';
 import 'danmaku_client.dart';
+import 'dolby_vision_color.dart';
+import 'native_dolby_vision.dart';
 import 'subtitle_preference.dart';
 import 'segment_client.dart';
 import '../sources/emby_client.dart';
@@ -71,6 +73,7 @@ class PlayerResourceOption {
     this.sourceId,
     this.serverItemId,
     this.source,
+    this.videoRange,
   });
 
   final String url;
@@ -79,6 +82,7 @@ class PlayerResourceOption {
   final String? sourceId;
   final String? serverItemId;
   final MediaSource? source;
+  final String? videoRange;
 }
 
 class PlayerEpisode {
@@ -91,6 +95,7 @@ class PlayerEpisode {
     this.seriesLogoUrl,
     this.episodeTitle,
     this.resourceInfo,
+    this.videoRange,
     this.sourceId,
     this.serverItemId,
     this.tmdbId,
@@ -110,6 +115,7 @@ class PlayerEpisode {
   final String? seriesLogoUrl;
   final String? episodeTitle;
   final String? resourceInfo;
+  final String? videoRange;
   final String? sourceId;
   final String? serverItemId;
   final int? tmdbId;
@@ -129,6 +135,7 @@ class PlayerEpisode {
     seriesLogoUrl: seriesLogoUrl,
     episodeTitle: episodeTitle,
     resourceInfo: resource.label,
+    videoRange: resource.videoRange,
     sourceId: resource.sourceId,
     serverItemId: resource.serverItemId,
     tmdbId: tmdbId,
@@ -149,6 +156,7 @@ class PlayerEpisode {
     seriesLogoUrl: seriesLogoUrl,
     episodeTitle: episodeTitle,
     resourceInfo: resourceInfo,
+    videoRange: videoRange,
     sourceId: sourceId,
     serverItemId: serverItemId,
     tmdbId: tmdbId,
@@ -193,6 +201,7 @@ class PlayerPage extends StatefulWidget {
     this.seriesLogoUrl,
     this.episodeTitle,
     this.resourceInfo,
+    this.videoRange,
     this.sourceId,
     this.serverItemId,
     this.seasonNumber,
@@ -210,6 +219,7 @@ class PlayerPage extends StatefulWidget {
   final String? seriesLogoUrl;
   final String? episodeTitle;
   final String? resourceInfo;
+  final String? videoRange;
   final String? sourceId;
   final String? serverItemId;
   final int? seasonNumber;
@@ -392,6 +402,7 @@ class _PlayerPageState extends State<PlayerPage> {
           seriesLogoUrl: widget.seriesLogoUrl,
           episodeTitle: widget.episodeTitle,
           resourceInfo: widget.resourceInfo,
+          videoRange: widget.videoRange,
           sourceId: widget.sourceId,
           serverItemId: widget.serverItemId,
           seasonNumber: widget.seasonNumber,
@@ -856,6 +867,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _openCurrentMedia() async {
     final episode = _activeEpisode;
+    await _applyVideoPipeline(episode);
     _subtitleChosen = false;
     _audioChosen = false;
     _skipDismissed.clear();
@@ -1630,21 +1642,8 @@ class _PlayerPageState extends State<PlayerPage> {
     return completer.future;
   }
 
-  /// 硬解码后端名按平台给：桌面 D3D11VA，安卓 MediaCodec。
-  ///
-  /// 之前这里无条件写 d3d11va —— 那是 Windows 专用的，安卓上 mpv 不认
-  /// 这个值会退回软解，等于「优先硬解」这个开关在手机上一直是失效的。
-  String _hwdecValue(bool enabled) {
-    if (!enabled) return 'no';
-    // Windows 统一走 copy-back：它比 d3d11va 零拷贝多一次显存/内存传输，
-    // 但与 Flutter 的 ANGLE 纹理组合更稳定，也能让 gpu-next 持续拿到
-    // Dolby Vision 帧侧数据进行 RPU 重塑，避免部分显卡上的黑屏或绿紫画面。
-    return WindowHost.isDesktop ? 'd3d11va-copy' : 'mediacodec-copy';
-  }
-
   Future<void> _applyMpvPreferences() async {
-    await _setMpvProperty('hwdec', _hwdecValue(_hardware));
-    await _applyColorPipeline(_hdr);
+    await _applyVideoPipeline(_activeEpisode);
     await _setMpvProperty('audio-channels', _downmix ? 'stereo' : 'auto');
     await _applyAudioFilters();
     await _setMpvProperty('audio-delay', _audioDelay.toString());
@@ -1664,11 +1663,20 @@ class _PlayerPageState extends State<PlayerPage> {
     // into the target output. Windows/Flutter cannot pass the proprietary DV
     // signal through this texture, so it is deliberately mapped to the actual
     // HDR10/SDR display target instead of pretending native DV passthrough.
-    await _setMpvProperty('target-colorspace-hint', enabled ? 'auto' : 'no');
-    await _setMpvProperty('target-colorspace-hint-mode', 'target');
-    await _setMpvProperty('tone-mapping', 'bt.2446a');
-    await _setMpvProperty('gamut-mapping-mode', 'perceptual');
-    await _setMpvProperty('dither-depth', 'auto');
+    for (final property in playerColorProperties(hdrEnabled: enabled).entries) {
+      await _setMpvProperty(property.key, property.value);
+    }
+  }
+
+  Future<void> _applyVideoPipeline(PlayerEpisode episode) async {
+    final dolbyVision = NativeDolbyVisionPlayer.isDolbyVision(
+      episode.videoRange,
+    );
+    await _setMpvProperty(
+      'hwdec',
+      playerHwdecValue(enabled: _hardware, dolbyVision: dolbyVision),
+    );
+    await _applyColorPipeline(_hdr || dolbyVision);
   }
 
   Future<void> _setMpvProperty(String name, String value) async {
@@ -1744,7 +1752,15 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _setVideoPreference({bool? hardware, bool? hdr}) async {
     final prefs = await SharedPreferences.getInstance();
     if (hardware != null) {
-      await _setMpvProperty('hwdec', _hwdecValue(hardware));
+      await _setMpvProperty(
+        'hwdec',
+        playerHwdecValue(
+          enabled: hardware,
+          dolbyVision: NativeDolbyVisionPlayer.isDolbyVision(
+            _activeEpisode.videoRange,
+          ),
+        ),
+      );
       await prefs.setBool('yingji.player.hardware', hardware);
       _hardware = hardware;
     }

@@ -48,9 +48,7 @@ class NativeDolbyVisionPlaybackResult {
   final bool nativeDolbyVision;
   final String? error;
 
-  factory NativeDolbyVisionPlaybackResult.fromMap(
-    Map<Object?, Object?> value,
-  ) {
+  factory NativeDolbyVisionPlaybackResult.fromMap(Map<Object?, Object?> value) {
     return NativeDolbyVisionPlaybackResult(
       position: Duration(
         milliseconds: (value['positionMs'] as num?)?.toInt() ?? 0,
@@ -76,10 +74,12 @@ class NativeDolbyVisionPlayer {
   /// Emby and Jellyfin currently expose variants such as DOVI, DolbyVision,
   /// Dolby Vision, DV and HDR10+DV in VideoRangeType/VideoRange.
   static bool isDolbyVision(String? videoRange) {
-    final normalized = (videoRange ?? '')
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-z0-9+]'), '');
+    final normalized = (videoRange ?? '').toLowerCase().replaceAll(
+      RegExp(r'[^a-z0-9+]'),
+      '',
+    );
     return normalized == 'dv' ||
+        normalized.split('+').contains('dv') ||
         normalized.contains('dovi') ||
         normalized.contains('dolbyvision');
   }

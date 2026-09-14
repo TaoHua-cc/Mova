@@ -4,9 +4,12 @@ import 'app_route_observer.dart';
 import 'brand.dart';
 import 'media_center.dart';
 import 'motion.dart';
+import 'startup.dart';
 
 class YingjiApp extends StatelessWidget {
-  const YingjiApp({super.key});
+  const YingjiApp({super.key, this.startup});
+
+  final Future<void>? startup;
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -271,7 +274,7 @@ class YingjiApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const MediaCenterShell(),
+      home: MovaStartupGate(startup: startup, child: const MediaCenterShell()),
       navigatorObservers: [yingjiRouteObserver],
     );
   }

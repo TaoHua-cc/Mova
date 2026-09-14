@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,15 +14,26 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   configureNetworkHttpOverrides();
   MediaKit.ensureInitialized();
-  // 桌面端初始化窗口；安卓/iOS 跳过（windowManager 在移动端会抛 MissingPluginException）
+  // Desktop window APIs must be ready before the first frame. Preferences and
+  // proxy state are intentionally loaded after runApp so they cannot delay it.
   await WindowHost.ensureInitialized();
-  await WindowHost.showAppWindow(
-    size: const Size(1440, 900),
-    minimumSize: const Size(1060, 680),
-    title: 'Mova',
-  );
+  final startup = _loadStartupSettings();
+  runApp(YingjiApp(startup: startup));
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(
+      WindowHost.showAppWindow(
+        size: const Size(1440, 900),
+        minimumSize: const Size(1060, 680),
+        title: 'Mova',
+      ),
+    );
+  });
+}
+
+Future<void> _loadStartupSettings() async {
   final prefs = await SharedPreferences.getInstance();
-  await ProxyRouting.load();
+  ProxyRouting.loadFrom(prefs);
   yingjiAppearance.apply(
     themeMode: switch (prefs.getString('yingji.appearance.theme') ?? 'dark') {
       'light' => ThemeMode.light,
@@ -40,5 +53,4 @@ Future<void> main() async {
     ),
     glassTint: prefs.getString('yingji.appearance.glass-tint') ?? 'graphite',
   );
-  runApp(const YingjiApp());
 }

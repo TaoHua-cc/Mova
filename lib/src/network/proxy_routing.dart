@@ -22,11 +22,20 @@ abstract final class ProxyRouting {
   /// 启动时从 prefs 读入开关集合。main() 里 SharedPreferences 就绪后调用。
   static Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
+    loadFrom(prefs);
+  }
+
+  /// Uses an already opened preferences instance during app startup so the
+  /// platform channel is crossed only once for appearance and proxy settings.
+  static void loadFrom(SharedPreferences prefs) {
     final raw = prefs.getString(_key) ?? '';
     _proxyServerIds
       ..clear()
       ..addAll(
-        raw.split(',').map((value) => value.trim()).where((value) => value.isNotEmpty),
+        raw
+            .split(',')
+            .map((value) => value.trim())
+            .where((value) => value.isNotEmpty),
       );
   }
 

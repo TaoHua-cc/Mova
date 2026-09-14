@@ -1080,6 +1080,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             sourceId: candidate.source.id,
             serverItemId: candidate.id,
             source: candidate.source,
+            videoRange: candidate.videoRange,
           ),
         )
         .toList(growable: false);
@@ -1366,6 +1367,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             resource.source.name,
             _resourceSummary(resource),
           ].where((value) => value.isNotEmpty).join(' · '),
+          videoRange: resource.videoRange,
           headers: resource.headers,
           imageUrl: resource.imageUrl?.toString(),
           sourceId: resource.source.id,
@@ -1402,6 +1404,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                     episode.source.name,
                     _resourceSummary(episode),
                   ].where((value) => value.isNotEmpty).join(' · '),
+                  videoRange: episode.videoRange,
                   sourceId: episode.source.id,
                   serverItemId: episode.id,
                   tmdbId: item.id,
