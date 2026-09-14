@@ -1,8 +1,6 @@
 name: Windows Build
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -54,6 +52,12 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+
+      - name: Cache native player NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~\.nuget\packages
+          key: windows-native-dv-${{ runner.os }}-${{ hashFiles('windows/native_dv_player/Mova.NativeDvPlayer.csproj') }}
 
       - name: Build bundled Windows native Dolby Vision player
         shell: pwsh

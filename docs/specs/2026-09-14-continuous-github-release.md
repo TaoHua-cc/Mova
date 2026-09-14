@@ -29,6 +29,7 @@
 - `main` 事件使用可移动的 `continuous` 标签，发布为 `Mova Continuous` 且标记 prerelease；发布前用 GitHub API 将该标签强制更新到当前提交。
 - 正式标签继续用原标签名发布，标记为 Latest。
 - 启用资产覆盖，保证同版本名的持续构建能够替换旧文件。
+- `main` 不再同时触发独立的 Windows Build 工作流；Release 的 Windows job 是唯一打包任务，并缓存 WinUI 的 NuGet 包。
 
 ## 兼容与迁移
 
@@ -48,6 +49,7 @@
 - [ ] 推送本提交后检查 Release 工作流成功。
 - [ ] 检查 Releases 页面中的 `Mova Continuous` 资产更新时间和提交。
 - [ ] 推送下一正式标签时检查 Latest 标识。
+- [ ] 第二次构建命中 NuGet 缓存，且 main 不出现重复 Windows 打包。
 
 ## 风险与回滚
 
@@ -56,4 +58,4 @@
 
 ## 实现记录
 
-- 已配置持续预发布和正式标签发布的并行策略，等待 GitHub Actions 首次运行确认。
+- 已配置持续预发布和正式标签发布的并行策略。首次运行发现 GitHub 创建不存在 ref 时返回 422 的兼容性问题，已改为先查询 ref 再创建；并移除了 main 的重复 Windows 构建、加入 NuGet 缓存，等待后续 CI 验证。

@@ -103,6 +103,12 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Cache native player NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~\.nuget\packages
+          key: windows-native-dv-${{ runner.os }}-${{ hashFiles('windows/native_dv_player/Mova.NativeDvPlayer.csproj') }}
+
       - name: Build bundled Windows native Dolby Vision player
         shell: pwsh
         run: .\tool\build_windows_native_dv.ps1
@@ -269,7 +275,11 @@ jobs:
               force: true,
             };
             try {
-              await github.rest.git.updateRef(parameters);
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'tags/continuous',
+              });
             } catch (error) {
               if (error.status !== 404) throw error;
               await github.rest.git.createRef({
@@ -278,7 +288,9 @@ jobs:
                 ref: 'refs/tags/continuous',
                 sha: context.sha,
               });
+              return;
             }
+            await github.rest.git.updateRef(parameters);
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
