@@ -169,7 +169,6 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
 class YingjiAppearance extends ChangeNotifier {
   ThemeMode themeMode = ThemeMode.dark;
   String iconStyle = 'play';
-  String fontStyle = 'round';
   double glassOpacity = .58;
   double glassBlur = 24;
 
@@ -182,7 +181,6 @@ class YingjiAppearance extends ChangeNotifier {
   void apply({
     ThemeMode? themeMode,
     String? iconStyle,
-    String? fontStyle,
     double? glassOpacity,
     double? glassBlur,
     double? cardDepth,
@@ -190,7 +188,6 @@ class YingjiAppearance extends ChangeNotifier {
   }) {
     if (themeMode != null) this.themeMode = themeMode;
     if (iconStyle != null) this.iconStyle = iconStyle;
-    if (fontStyle != null) this.fontStyle = fontStyle;
     if (glassOpacity != null) this.glassOpacity = glassOpacity.clamp(0, 1);
     if (glassBlur != null) this.glassBlur = glassBlur.clamp(0, 40);
     if (cardDepth != null) this.cardDepth = cardDepth.clamp(0, 1);
@@ -420,22 +417,14 @@ abstract final class YingjiGlass {
   static double get blur => yingjiAppearance.glassBlur;
 }
 
-/// Font choices exposed in Appearance. The first two are bundled with the
-/// app; Windows families remain optional familiar local alternatives.
+/// Mova uses one bundled rounded font across every supported platform.
 abstract final class YingjiFonts {
-  static String get family => switch (yingjiAppearance.fontStyle) {
-    'wenkai' => 'YingjiWenKai',
-    'dengxian' => 'DengXian',
-    'yahei' => 'Microsoft YaHei UI',
-    _ => 'YingjiRound',
-  };
-
-  static List<String> get fallback => switch (yingjiAppearance.fontStyle) {
-    'wenkai' => const ['YingjiRound', 'DengXian', 'Microsoft YaHei UI'],
-    'dengxian' => const ['YingjiRound', 'Microsoft YaHei UI'],
-    'yahei' => const ['YingjiRound', 'DengXian'],
-    _ => const ['DengXian', 'Microsoft YaHei UI', 'Segoe UI Variable'],
-  };
+  static const String family = 'YingjiRound';
+  static const List<String> fallback = [
+    'Microsoft YaHei UI',
+    'Segoe UI Variable',
+    'sans-serif',
+  ];
 }
 
 /// One semantic Iconsax vocabulary for the whole desktop client.  Names mirror

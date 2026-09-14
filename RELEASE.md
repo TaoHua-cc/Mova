@@ -148,5 +148,5 @@ build-release.cmd
 ## 遗留事项
 
 - `pubspec.yaml` 的 `name` 仍是 `yingji`（刻意未改，避免全量 import 变更）；安卓 `applicationId` 是 `com.taohua.mova`
-- 中文字体约 42MB，尚未子集化
+- 内置圆润中文字体约 18MB，尚未子集化
 - 旧包 `com.example.yingji` 的观看记录不会自动迁移到新包名

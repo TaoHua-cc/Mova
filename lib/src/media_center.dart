@@ -8262,7 +8262,6 @@ class _SettingsPageState extends State<SettingsPage>
   String _homeCarouselSource = 'trending';
   String _homeCarouselEffect = 'blur-dissolve';
   String _appearanceTheme = 'dark', _appearanceIcon = 'play';
-  String _appearanceFont = 'round';
   double _appearanceGlassOpacity = .58, _appearanceGlassBlur = 24;
   double _appearanceCardDepth = .62;
   String _appearanceGlassTint = 'graphite';
@@ -8407,7 +8406,6 @@ class _SettingsPageState extends State<SettingsPage>
             : savedEffect;
         _appearanceTheme = prefs.getString('yingji.appearance.theme') ?? 'dark';
         _appearanceIcon = prefs.getString('yingji.appearance.icon') ?? 'play';
-        _appearanceFont = prefs.getString('yingji.appearance.font') ?? 'round';
         _appearanceGlassOpacity =
             (prefs.getDouble('yingji.appearance.glass-opacity') ?? .58).clamp(
               0,
@@ -8565,7 +8563,6 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.home.carousel-effect': _homeCarouselEffect,
       'yingji.appearance.theme': _appearanceTheme,
       'yingji.appearance.icon': _appearanceIcon,
-      'yingji.appearance.font': _appearanceFont,
       'yingji.appearance.glass-opacity': _appearanceGlassOpacity,
       'yingji.appearance.glass-blur': _appearanceGlassBlur,
       'yingji.appearance.card-depth': _appearanceCardDepth,
@@ -8698,7 +8695,6 @@ class _SettingsPageState extends State<SettingsPage>
         _ => ThemeMode.dark,
       },
       iconStyle: _appearanceIcon,
-      fontStyle: _appearanceFont,
       glassOpacity: _appearanceGlassOpacity,
       glassBlur: _appearanceGlassBlur,
       cardDepth: _appearanceCardDepth,
@@ -9357,45 +9353,6 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               const SizedBox(height: 14),
-              YingjiGlassDropdownField<String>(
-                initialValue: _appearanceFont,
-                decoration: InputDecoration(
-                  labelText: '全局字体',
-                  helperText: WindowHost.isDesktop
-                      ? '字体会即时应用到标题、正文、榜单与播放器控件；等线 / 雅黑是 Windows 自带字体'
-                      : '字体会即时应用到标题、正文、榜单与播放器控件；两项内置字体已随安装包提供',
-                ),
-                items: [
-                  const DropdownMenuItem(
-                    value: 'round',
-                    child: Text('Mova 圆润无衬线（内置）'),
-                  ),
-                  const DropdownMenuItem(
-                    value: 'wenkai',
-                    child: Text('Mova 温润文楷（内置）'),
-                  ),
-                  // 等线 / 微软雅黑来自 Windows 系统，安卓上
-                  // 没有对应字族，列出来只会静默回退到内置
-                  // 字体，所以移动端不显示这两项。
-                  if (WindowHost.isDesktop) ...[
-                    const DropdownMenuItem(
-                      value: 'dengxian',
-                      child: Text('方圆 UI · 等线（Windows）'),
-                    ),
-                    const DropdownMenuItem(
-                      value: 'yahei',
-                      child: Text('微软雅黑 UI（Windows）'),
-                    ),
-                  ],
-                ],
-                onChanged: (value) {
-                  if (value == null) return;
-                  setState(() => _appearanceFont = value);
-                  _applyAppearance();
-                  _save();
-                },
-              ),
-              const SizedBox(height: 14),
               Text(
                 '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
                 style: const TextStyle(
@@ -9999,34 +9956,64 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 8),
               const Text(
-                '软件本身（TMDB 海报与元数据、应用更新、弹幕）始终跟随系统代理：'
-                '系统开着代理就走，没开走正常网络。下面每个媒体服务器单独控制——'
-                '默认不勾选时，该服务器的浏览、聚合与播放都走正常网络；勾选后则'
-                '跟随系统代理。播放视频流始终直连。',
+                '为已连接的服务器选择联网方式。未选中时直接连接；选中后，软件访问'
+                '该服务器时跟随系统代理。再次点击已选中的服务器即可恢复直连。',
                 style: TextStyle(
                   color: Color(0xFFABB1BE),
                   height: 1.5,
                 ),
               ),
+              const SizedBox(height: 6),
+              const Text(
+                'TMDB、应用更新与弹幕等在线服务始终自动跟随系统网络设置。',
+                style: TextStyle(color: YingjiColors.muted, fontSize: 12),
+              ),
               const SizedBox(height: 14),
               if (_proxySources.isEmpty)
-                const Text(
-                  '还没有添加任何媒体服务器。',
-                  style: TextStyle(
-                    color: YingjiColors.muted,
-                    fontSize: 13,
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Row(
+                    children: [
+                      Icon(YingjiIcons.server, color: YingjiColors.muted),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '还没有已连接的服务器。添加服务器后，可在这里单独选择代理方式。',
+                          style: TextStyle(
+                            color: YingjiColors.muted,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 )
               else
-                for (final source in _proxySources) ...[
-                  _ToggleRow(
-                    title: source.name,
-                    detail: '${source.kind.label} · ${source.endpoint.host}',
-                    value: _proxyServers.contains(source.id),
-                    onChanged: (value) =>
-                        _setServerProxy(source.id, value),
-                  ),
-                ],
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final cardWidth = constraints.maxWidth >= 620
+                        ? (constraints.maxWidth - 12) / 2
+                        : constraints.maxWidth;
+                    return Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        for (final source in _proxySources)
+                          SizedBox(
+                            width: cardWidth,
+                            child: _ProxyServerCard(
+                              source: source,
+                              selected: _proxyServers.contains(source.id),
+                              onTap: () => _setServerProxy(
+                                source.id,
+                                !_proxyServers.contains(source.id),
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
             ],
           ),
         ),
@@ -14376,6 +14363,146 @@ class _ToggleRow extends StatelessWidget {
       ),
     ),
   );
+}
+
+class _ProxyServerCard extends StatefulWidget {
+  const _ProxyServerCard({
+    required this.source,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final MediaSource source;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  State<_ProxyServerCard> createState() => _ProxyServerCardState();
+}
+
+class _ProxyServerCardState extends State<_ProxyServerCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final selected = widget.selected;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: '${widget.source.name}，${selected ? '跟随系统代理' : '直连'}',
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          decoration: BoxDecoration(
+            color: selected
+                ? Colors.white.withValues(alpha: .12)
+                : Colors.white.withValues(alpha: _hovered ? .075 : .045),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: selected
+                  ? Colors.white.withValues(alpha: .72)
+                  : Colors.white.withValues(alpha: _hovered ? .22 : .1),
+              width: selected ? 1.4 : 1,
+            ),
+            boxShadow: selected
+                ? [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: .2),
+                      blurRadius: 18,
+                      offset: const Offset(0, 8),
+                    ),
+                  ]
+                : null,
+          ),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: widget.onTap,
+              borderRadius: BorderRadius.circular(18),
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Row(
+                  children: [
+                    ServerMark(source: widget.source, size: 48),
+                    const SizedBox(width: 13),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            widget.source.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${widget.source.kindLabel} · ${widget.source.endpoint.host}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: YingjiColors.muted,
+                              fontSize: 11.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 180),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? Colors.white
+                            : Colors.white.withValues(alpha: .07),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            selected
+                                ? YingjiIcons.checkmark_circle_fill
+                                : YingjiIcons.link,
+                            size: 14,
+                            color: selected
+                                ? YingjiColors.canvas
+                                : YingjiColors.muted,
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            selected ? '系统代理' : '直连',
+                            style: TextStyle(
+                              color: selected
+                                  ? YingjiColors.canvas
+                                  : YingjiColors.muted,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 extension on SourceKind {
