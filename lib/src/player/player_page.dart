@@ -10,6 +10,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
+import '../platform/native_video_host.dart';
 
 import '../brand.dart';
 import '../motion.dart';
@@ -235,7 +236,7 @@ class PlayerPage extends StatefulWidget {
 
 class _PlayerPageState extends State<PlayerPage> {
   late final Player _player;
-  late final VideoController _controller;
+  late final VideoController? _controller;
   late final FocusNode _focusNode;
   late int _activeEpisodeIndex;
   bool _showControls = true;
@@ -437,7 +438,9 @@ class _PlayerPageState extends State<PlayerPage> {
       ),
     );
     _focusNode = FocusNode(debugLabel: 'Mova 播放器快捷键');
-    _controller = VideoController(_player);
+    // The Windows native child window keeps `vo=gpu-next`. Creating a
+    // VideoController would change that same Player to Flutter's `vo=libmpv`.
+    _controller = WindowHost.isDesktop ? null : VideoController(_player);
     _subtitleSubscription = _player.stream.tracks.listen((tracks) {
       if (_preferAudioTrack &&
           !_audioChosen &&
@@ -859,6 +862,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_danmakuEnabled && _danmakuApis.isNotEmpty) {
       unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
     }
+    if (!await _attachNativeVideoHost()) return;
     await _applyMpvPreferences();
     await _openCurrentMedia();
     unawaited(_loadSegmentData());
@@ -909,6 +913,26 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     }
     await _player.setVolume(_volume);
+  }
+
+  Future<bool> _attachNativeVideoHost() async {
+    if (!WindowHost.isDesktop) return true;
+    try {
+      final handle = await NativeVideoHost.create();
+      if (handle == null || handle == 0) {
+        throw StateError('Windows 原生视频宿主创建失败');
+      }
+      // Bind this existing media_kit Player before opening media. The native
+      // gpu-next VO then presents straight into the Win32 child HWND.
+      await _setRequiredMpvProperty('wid', '${handle & 0xffffffff}');
+      await _setRequiredMpvProperty('vo', 'gpu-next');
+      return true;
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error = 'Windows 原生视频输出不可用：$error');
+      }
+      return false;
+    }
   }
 
   /// 后台把这一集整份存到本机，下次打开直接播本地文件。
@@ -1659,10 +1683,8 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _applyColorPipeline(bool enabled) async {
-    // gpu-next parses Dolby Vision RPU metadata and reshapes Profile 5/7/8
-    // into the target output. Windows/Flutter cannot pass the proprietary DV
-    // signal through this texture, so it is deliberately mapped to the actual
-    // HDR10/SDR display target instead of pretending native DV passthrough.
+    // gpu-next/libplacebo parses Dolby Vision RPU metadata and reshapes
+    // Profile 5/7/8 to the actual HDR10 or SDR display target.
     for (final property in playerColorProperties(hdrEnabled: enabled).entries) {
       await _setMpvProperty(property.key, property.value);
     }
@@ -1685,6 +1707,10 @@ class _PlayerPageState extends State<PlayerPage> {
     } catch (_) {
       // Keep playback available on libmpv builds without an optional property.
     }
+  }
+
+  Future<void> _setRequiredMpvProperty(String name, String value) async {
+    await (_player.platform as dynamic).setProperty(name, value);
   }
 
   Future<void> _setAudioPreference({bool? downmix, bool? night}) async {
@@ -2103,11 +2129,20 @@ class _PlayerPageState extends State<PlayerPage> {
                 //
                 // media_kit 自带的原生控制条也必须关掉，否则折叠模式下
                 // 会多出一条原生控制栏。
-                Video(
-                  controller: _controller,
-                  fit: BoxFit.contain,
-                  controls: NoVideoControls,
-                ),
+                if (WindowHost.isDesktop)
+                  NativeVideoSurface(
+                    visible:
+                        !_settingsOpen &&
+                        _error == null &&
+                        _skipKind == null &&
+                        !_gestureVisible,
+                  )
+                else
+                  Video(
+                    controller: _controller!,
+                    fit: BoxFit.contain,
+                    controls: NoVideoControls,
+                  ),
                 if (_danmakuComments.isNotEmpty)
                   Positioned.fill(
                     child: _DanmakuOverlay(

@@ -18,14 +18,21 @@ set "ANDROID_HOME=C:\Users\gctyk\AppData\Local\Temp\yj-dummy-android-sdk"
 set "ANDROID_SDK_ROOT=%ANDROID_HOME%"
 if not exist "%ANDROID_HOME%\licenses" mkdir "%ANDROID_HOME%\licenses"
 
-echo [1/2] flutter build windows --release ...
+echo [1/3] flutter build windows --release ...
 call "D:\DevTools\flutter\bin\flutter.bat" build windows --release
 if errorlevel 1 (
   echo FLUTTER_BUILD_FAILED
   exit /b 1
 )
 
-echo [2/2] Inno Setup packaging ...
+echo [2/3] install libplacebo-enabled Windows libmpv ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tool\install_windows_gpu_next.ps1" -TargetDirectory "%~dp0build\windows\x64\runner\Release"
+if errorlevel 1 (
+  echo GPU_NEXT_LIBMPV_INSTALL_FAILED
+  exit /b 1
+)
+
+echo [3/3] Inno Setup packaging ...
 "C:\Users\gctyk\AppData\Local\Programs\Inno Setup 6\ISCC.exe" "%~dp0installer\Mova.iss"
 if errorlevel 1 (
   echo INNO_PACKAGING_FAILED

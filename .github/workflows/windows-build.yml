@@ -48,6 +48,13 @@ jobs:
       - name: Build Windows release
         run: flutter build windows --release
 
+      - name: Install 7-Zip for pinned libmpv archive
+        run: choco install 7zip --no-progress -y
+
+      - name: Replace legacy Flutter texture libmpv
+        shell: pwsh
+        run: .\tool\install_windows_gpu_next.ps1 -TargetDirectory build\windows\x64\runner\Release
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 

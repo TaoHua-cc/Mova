@@ -104,7 +104,7 @@ flutter build windows --release
 flutter build apk --split-per-abi --release
 ```
 
-Windows 使用单一的 `media_kit` / libmpv 播放器。`gpu-next` 负责 Dolby Vision RPU 重塑，并按实际显示能力映射到 HDR10 或 SDR；不要把该兼容播放路径描述成 Windows 原生 Dolby Vision 直通。
+Windows 使用单一的 `media_kit` / libmpv 播放器。普通 Android 视频继续走 Flutter 纹理；Windows 视频输出使用 Win32 原生嵌入窗口，以免 `media_kit_video` 的 Render API 重设 `vo=libmpv`。Windows 发布必须执行 `tool/install_windows_gpu_next.ps1`，用受 SHA-256 校验、启用 libplacebo 的 libmpv 替换历史 DLL；`gpu-next` 才能重塑 Dolby Vision RPU 并按实际显示能力映射为 HDR10 或 SDR。不要把该兼容播放路径描述成 Windows 原生 Dolby Vision 直通。
 
 如果本机缺少 SDK、平台工具、凭据或真机，不能把“未运行”写成“通过”。交付时明确列出未执行项及原因，依赖 GitHub Actions 的部分也要说明。
 
