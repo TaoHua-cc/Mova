@@ -88,4 +88,8 @@ dependencies {
     // androidx.core。它本来就会作为 Flutter 嵌入层的传递依赖进来，这里
     // 显式声明一遍是为了让版本可见、好升级。
     implementation("androidx.core:core-ktx:1.13.1")
+    // Dolby Vision 必须走系统 MediaCodec + SurfaceView，不能经过 Flutter
+    // Texture。Media3 负责选择设备提供的 video/dolby-vision 解码器。
+    implementation("androidx.media3:media3-exoplayer:1.11.0")
+    implementation("androidx.media3:media3-ui:1.11.0")
 }

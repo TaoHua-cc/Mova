@@ -15,6 +15,7 @@ import '../cache/image_prefetch.dart';
 import '../cache/media_cache.dart';
 import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
+import '../player/native_dolby_vision.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
@@ -1285,9 +1286,74 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       ..sort((a, b) {
         final season = (a.seasonNumber ?? 0).compareTo(b.seasonNumber ?? 0);
         return season == 0
-            ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
-            : season;
+              ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
+              : season;
       });
+    if (NativeDolbyVisionPlayer.isAvailablePlatform &&
+        NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
+      final capabilities = await NativeDolbyVisionPlayer.capabilities();
+      if (!context.mounted) return;
+      if (capabilities.supported) {
+        try {
+          final result = await NativeDolbyVisionPlayer.play(
+            url: resource.playbackUrl.toString(),
+            title: item.title,
+            headers: resource.headers,
+            initialPosition: resumePosition,
+            container: resource.container,
+          );
+          final duration = result.duration > Duration.zero
+              ? result.duration
+              : resource.runtime ?? Duration.zero;
+          if (result.position > Duration.zero || result.completed) {
+            await watchStore.save(
+              WatchState(
+                mediaId: resource.playbackUrl.toString(),
+                title: item.title,
+                position: result.position,
+                duration: duration,
+                imageUrl: resource.imageUrl?.toString(),
+                sourceId: resource.source.id,
+                serverItemId: resource.id,
+                tmdbId: item.id,
+                episodeTitle: resource.title,
+                seasonNumber: resource.seasonNumber,
+                episodeNumber: resource.episodeNumber,
+                isPlayed: result.completed,
+              ),
+            );
+          }
+          if (!context.mounted) return;
+          final message = result.error != null
+              ? '原生 Dolby Vision 播放失败：${result.error}'
+              : result.nativeDolbyVision
+              ? '已使用 Android 原生 Dolby Vision 解码'
+              : '系统未选中 Dolby Vision 轨道，请检查片源封装与设备支持的 Profile';
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+          await _refreshProgressAfterPlayback();
+          return;
+        } on PlatformException catch (error) {
+          if (!context.mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '无法启动原生 Dolby Vision，已切换兼容模式：${error.message ?? error.code}',
+              ),
+            ),
+          );
+        }
+      } else {
+        final missing = [
+          if (!capabilities.decoder) 'Dolby Vision 解码器',
+          if (!capabilities.display) 'Dolby Vision 显示能力',
+        ].join('和');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('当前设备缺少$missing，已使用兼容模式')),
+        );
+      }
+    }
     await Navigator.push(
       context,
       MaterialPageRoute(

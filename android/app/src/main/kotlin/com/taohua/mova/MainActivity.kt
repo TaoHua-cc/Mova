@@ -17,7 +17,7 @@ import java.io.File
 /**
  * Mova 的 Android 宿主。
  *
- * 除 Flutter 默认行为外额外暴露三项能力：
+ * 除 Flutter 默认行为外额外暴露平台能力：
  *
  * 1. 屏幕亮度——播放器里「左半屏上下滑动调亮度」需要它。这里用的是**窗口级
  *    亮度**（`WindowManager.LayoutParams.screenBrightness`），而不是系统亮度，
@@ -28,12 +28,17 @@ import java.io.File
  * 3. 应用内更新——查「安装未知来源应用」的授权、跳授权页，以及把下载好的 APK
  *    交给系统安装器。Android 7.0 起不能再抛 file:// 的 URI（会
  *    FileUriExposedException），必须用 FileProvider 换成 content://。
+ * 4. 原生 Dolby Vision——查询系统解码器与显示能力，并启动独立的
+ *    SurfaceView 播放 Activity，避免视频帧经过 Flutter Texture。
  */
 class MainActivity : FlutterActivity() {
     private companion object {
         const val PLATFORM_CHANNEL = "mova/platform"
         const val SYSTEM_BRIGHTNESS_MAX = 255f
+        const val DOLBY_VISION_REQUEST = 7301
     }
+
+    private var pendingDolbyVisionResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -66,9 +71,101 @@ class MainActivity : FlutterActivity() {
                         installApk(call.argument<String>("path")),
                     )
                     "networkType" -> result.success(networkType())
+                    "dolbyVisionCapabilities" -> result.success(
+                        DolbyVisionSupport.query(this).asMap(),
+                    )
+                    "playDolbyVision" -> playDolbyVision(call.arguments, result)
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    /** Starts the native SurfaceView player and keeps the channel reply pending. */
+    private fun playDolbyVision(arguments: Any?, result: MethodChannel.Result) {
+        if (pendingDolbyVisionResult != null) {
+            result.error("already_playing", "原生 Dolby Vision 播放器已打开", null)
+            return
+        }
+        val args = arguments as? Map<*, *>
+        if (args == null) {
+            result.error("invalid_arguments", "原生播放器参数无效", null)
+            return
+        }
+        val url = args["url"] as? String
+        if (url.isNullOrBlank()) {
+            result.error("invalid_url", "播放地址为空", null)
+            return
+        }
+        val capabilities = DolbyVisionSupport.query(this)
+        if (!capabilities.supported) {
+            result.error("unsupported", "设备解码器或当前显示屏不支持 Dolby Vision", capabilities.asMap())
+            return
+        }
+        val rawHeaders = args["headers"] as? Map<*, *> ?: emptyMap<Any, Any>()
+        val headers = rawHeaders.entries
+            .mapNotNull { (key, value) ->
+                val name = key as? String ?: return@mapNotNull null
+                val headerValue = value as? String ?: return@mapNotNull null
+                name to headerValue
+            }
+        val intent = Intent(this, DolbyVisionPlayerActivity::class.java).apply {
+            putExtra(DolbyVisionPlayerActivity.EXTRA_URL, url)
+            putExtra(DolbyVisionPlayerActivity.EXTRA_TITLE, args["title"] as? String)
+            putExtra(DolbyVisionPlayerActivity.EXTRA_CONTAINER, args["container"] as? String)
+            putExtra(
+                DolbyVisionPlayerActivity.EXTRA_POSITION_MS,
+                (args["positionMs"] as? Number)?.toLong() ?: 0L,
+            )
+            putExtra(
+                DolbyVisionPlayerActivity.EXTRA_HEADER_NAMES,
+                headers.map { it.first }.toTypedArray(),
+            )
+            putExtra(
+                DolbyVisionPlayerActivity.EXTRA_HEADER_VALUES,
+                headers.map { it.second }.toTypedArray(),
+            )
+        }
+        pendingDolbyVisionResult = result
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, DOLBY_VISION_REQUEST)
+        } catch (error: Exception) {
+            pendingDolbyVisionResult = null
+            result.error("launch_failed", "无法打开原生 Dolby Vision 播放器", error.message)
+        }
+    }
+
+    @Deprecated("Deprecated in Android")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != DOLBY_VISION_REQUEST) return
+        val pending = pendingDolbyVisionResult ?: return
+        pendingDolbyVisionResult = null
+        if (resultCode != RESULT_OK) {
+            pending.error("player_closed", "原生 Dolby Vision 播放器未返回播放状态", null)
+            return
+        }
+        pending.success(
+            mapOf(
+                "positionMs" to (data?.getLongExtra(
+                    DolbyVisionPlayerActivity.EXTRA_RESULT_POSITION_MS,
+                    0L,
+                ) ?: 0L),
+                "durationMs" to (data?.getLongExtra(
+                    DolbyVisionPlayerActivity.EXTRA_RESULT_DURATION_MS,
+                    0L,
+                ) ?: 0L),
+                "completed" to (data?.getBooleanExtra(
+                    DolbyVisionPlayerActivity.EXTRA_RESULT_COMPLETED,
+                    false,
+                ) ?: false),
+                "nativeDolbyVision" to (data?.getBooleanExtra(
+                    DolbyVisionPlayerActivity.EXTRA_RESULT_NATIVE_DV,
+                    false,
+                ) ?: false),
+                "error" to data?.getStringExtra(DolbyVisionPlayerActivity.EXTRA_RESULT_ERROR),
+            ),
+        )
     }
 
     /**

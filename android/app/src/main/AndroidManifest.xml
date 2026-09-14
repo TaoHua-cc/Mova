@@ -55,6 +55,16 @@
             </intent-filter>
         </activity>
 
+        <!-- Dolby Vision 使用系统 MediaCodec 直接输出到 SurfaceView。独立
+             Activity 避免视频帧经过 Flutter Texture 后丢失动态 HDR 元数据。 -->
+        <activity
+            android:name=".DolbyVisionPlayerActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|uiMode|colorMode"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/DolbyVisionPlayerTheme" />
+
         <!-- 应用内更新：把缓存目录里的 APK 以 content:// 交给系统安装器。
              直接传 file:// 在 Android 7.0 起会抛 FileUriExposedException。
              authority 用 ${applicationId} 拼接，debug 包的 .debug 后缀也能对上。 -->

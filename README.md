@@ -33,7 +33,8 @@ Mova 是一款沉浸式私人影音客户端，同时支持 **Windows** 与 **An
 
 ### 播放器
 
-- 基于 libmpv，支持硬件解码、外挂字幕、音轨切换、弹幕与章节。
+- 常规播放基于 libmpv；受支持的 Android 设备可通过系统 MediaCodec +
+  SurfaceView 原生输出 Dolby Vision。支持硬件解码、外挂字幕、音轨切换、弹幕与章节。
 - 播放位置记忆：退出再进，从上次的位置继续；也可设为只保存在本机，不上报服务器与 Trakt。
 - 手势：单击呼出控件、双击播放 / 暂停、横划快进快退、左半屏调亮度、右半屏调音量。
 - 亮度、音量、快进快退以 HUD 回显，位置抬高，不遮挡字幕。
@@ -75,6 +76,13 @@ Mova 是一款沉浸式私人影音客户端，同时支持 **Windows** 与 **An
 - 访问 TMDB、Trakt 或个人媒体服务器所需的网络连接
 
 安装包请从 [GitHub Releases](https://github.com/TaoHua-cc/Mova/releases) 获取。
+
+## 开发文档
+
+- [开发协作入口](AGENTS.md)：供开发者、AI 编程工具和自动化代理首先阅读
+- [开发规范与工作流程](docs/DEVELOPMENT_GUIDE.md)：工程结构、实现约束、测试和交付流程
+- [改动规格模板](docs/CHANGE_SPEC_TEMPLATE.md)：较大功能、跨模块或数据变更开工前使用
+- [界面规范](DESIGN.md) / [产品定义](PRODUCT.md) / [发布流程](RELEASE.md)
 
 ## 隐私
 
