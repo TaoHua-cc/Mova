@@ -104,6 +104,14 @@ flutter build windows --release
 flutter build apk --split-per-abi --release
 ```
 
+Windows 发布包还必须构建并复制随包内置的 WinUI 3 原生 Dolby Vision 播放器：
+
+```powershell
+.\tool\build_windows_native_dv.ps1
+```
+
+该脚本需要 .NET 8 SDK，并会执行自包含发布。DV 是否最终进入原生显示模式仍需在安装了系统/OEM Dolby Vision 与 HEVC 组件、驱动和显示链路均支持的 Windows 设备上确认。
+
 如果本机缺少 SDK、平台工具、凭据或真机，不能把“未运行”写成“通过”。交付时明确列出未执行项及原因，依赖 GitHub Actions 的部分也要说明。
 
 ### 测试要求
@@ -157,4 +165,3 @@ flutter build apk --split-per-abi --release
 - 版本、构建、签名或发布变化：更新 `RELEASE.md`。
 - 单项功能设计与决策：保存在 `docs/specs/`，实现完成后补上最终结果和偏差。
 - 若代码与文档不一致，应在同一改动中修正文档，避免把过期说明留给下一个工具。
-

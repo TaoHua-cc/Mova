@@ -81,6 +81,15 @@ jobs:
       - name: Build Windows release
         run: flutter build windows --release
 
+      - name: Setup .NET for native player
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build bundled Windows native Dolby Vision player
+        shell: pwsh
+        run: .\tool\build_windows_native_dv.ps1
+
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
