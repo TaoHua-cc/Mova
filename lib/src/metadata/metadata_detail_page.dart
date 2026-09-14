@@ -16,7 +16,6 @@ import '../cache/media_cache.dart';
 import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
 import '../player/native_dolby_vision.dart';
-import '../player/native_windows_dolby_vision.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
@@ -1290,58 +1289,6 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
               : season;
       });
-    if (NativeWindowsDolbyVisionPlayer.isAvailablePlatform &&
-        NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
-      try {
-        final result = await NativeWindowsDolbyVisionPlayer.play(
-          url: resource.playbackUrl.toString(),
-          title: item.title,
-          initialPosition: resumePosition,
-          container: resource.container,
-        );
-        final duration = result.duration > Duration.zero
-            ? result.duration
-            : resource.runtime ?? Duration.zero;
-        if (result.position > Duration.zero || result.completed) {
-          await watchStore.save(
-            WatchState(
-              mediaId: resource.playbackUrl.toString(),
-              title: item.title,
-              position: result.position,
-              duration: duration,
-              imageUrl: resource.imageUrl?.toString(),
-              sourceId: resource.source.id,
-              serverItemId: resource.id,
-              tmdbId: item.id,
-              episodeTitle: resource.title,
-              seasonNumber: resource.seasonNumber,
-              episodeNumber: resource.episodeNumber,
-              isPlayed: result.completed,
-            ),
-          );
-        }
-        if (!context.mounted) return;
-        if (result.error == null && result.nativeDolbyVision) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('已使用 Windows 原生 Dolby Vision 媒体管线')),
-          );
-          await _refreshProgressAfterPlayback();
-          return;
-        }
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Windows 原生播放失败，已切换兼容模式：${result.error ?? '系统未接受 Dolby Vision 轨道'}',
-            ),
-          ),
-        );
-      } on Exception {
-        if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Windows 原生播放模块不可用，已切换兼容模式')),
-        );
-      }
-    }
     if (NativeDolbyVisionPlayer.isAvailablePlatform &&
         NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
       final capabilities = await NativeDolbyVisionPlayer.capabilities();

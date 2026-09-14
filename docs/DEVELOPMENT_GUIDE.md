@@ -104,13 +104,7 @@ flutter build windows --release
 flutter build apk --split-per-abi --release
 ```
 
-Windows 发布包还必须构建并复制随包内置的 WinUI 3 原生 Dolby Vision 播放器：
-
-```powershell
-.\tool\build_windows_native_dv.ps1
-```
-
-该脚本需要 .NET 8 SDK，并会执行自包含发布。DV 是否最终进入原生显示模式仍需在安装了系统/OEM Dolby Vision 与 HEVC 组件、驱动和显示链路均支持的 Windows 设备上确认。
+Windows 使用单一的 `media_kit` / libmpv 播放器。`gpu-next` 负责 Dolby Vision RPU 重塑，并按实际显示能力映射到 HDR10 或 SDR；不要把该兼容播放路径描述成 Windows 原生 Dolby Vision 直通。
 
 如果本机缺少 SDK、平台工具、凭据或真机，不能把“未运行”写成“通过”。交付时明确列出未执行项及原因，依赖 GitHub Actions 的部分也要说明。
 

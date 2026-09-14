@@ -1636,12 +1636,15 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 这个值会退回软解，等于「优先硬解」这个开关在手机上一直是失效的。
   String _hwdecValue(bool enabled) {
     if (!enabled) return 'no';
-    return WindowHost.isDesktop ? 'd3d11va' : 'mediacodec-copy';
+    // Windows 统一走 copy-back：它比 d3d11va 零拷贝多一次显存/内存传输，
+    // 但与 Flutter 的 ANGLE 纹理组合更稳定，也能让 gpu-next 持续拿到
+    // Dolby Vision 帧侧数据进行 RPU 重塑，避免部分显卡上的黑屏或绿紫画面。
+    return WindowHost.isDesktop ? 'd3d11va-copy' : 'mediacodec-copy';
   }
 
   Future<void> _applyMpvPreferences() async {
     await _setMpvProperty('hwdec', _hwdecValue(_hardware));
-    await _setMpvProperty('target-colorspace-hint', _hdr ? 'yes' : 'no');
+    await _applyColorPipeline(_hdr);
     await _setMpvProperty('audio-channels', _downmix ? 'stereo' : 'auto');
     await _applyAudioFilters();
     await _setMpvProperty('audio-delay', _audioDelay.toString());
@@ -1654,6 +1657,18 @@ class _PlayerPageState extends State<PlayerPage> {
       _ => '0',
     });
     await _player.setRate(_speed);
+  }
+
+  Future<void> _applyColorPipeline(bool enabled) async {
+    // gpu-next parses Dolby Vision RPU metadata and reshapes Profile 5/7/8
+    // into the target output. Windows/Flutter cannot pass the proprietary DV
+    // signal through this texture, so it is deliberately mapped to the actual
+    // HDR10/SDR display target instead of pretending native DV passthrough.
+    await _setMpvProperty('target-colorspace-hint', enabled ? 'auto' : 'no');
+    await _setMpvProperty('target-colorspace-hint-mode', 'target');
+    await _setMpvProperty('tone-mapping', 'bt.2446a');
+    await _setMpvProperty('gamut-mapping-mode', 'perceptual');
+    await _setMpvProperty('dither-depth', 'auto');
   }
 
   Future<void> _setMpvProperty(String name, String value) async {
@@ -1734,7 +1749,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _hardware = hardware;
     }
     if (hdr != null) {
-      await _setMpvProperty('target-colorspace-hint', hdr ? 'yes' : 'no');
+      await _applyColorPipeline(hdr);
       await prefs.setBool('yingji.player.hdr', hdr);
       _hdr = hdr;
     }

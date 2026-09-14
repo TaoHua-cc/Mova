@@ -4,7 +4,7 @@
 
 - 标题：Windows 原生 Dolby Vision 双引擎播放
 - 日期：2026-09-14
-- 状态：已完成（待 CI 与认证设备验收）
+- 状态：已搁置（被 Windows 单引擎稳定 DV 方案取代）
 - 影响平台：Windows（Android 原生路径保持不变）
 - 关联 Issue、提交或版本：待提交
 
@@ -102,3 +102,4 @@ Mova 的 Windows 播放器当前使用 libmpv 与 Flutter 纹理输出。该链�
 - 已在详情页加入 Windows DV 优先路由、进度回传与失败回退；Android 路由未改变。
 - 已接入 Windows Build、Release 和本地 Inno 打包流程。
 - 当前开发机未安装 Flutter、Dart 与 .NET SDK，因此仅完成脚本/XML/diff 静态检查；完整构建由 GitHub Actions 执行，实际 DV 输出仍需认证设备验证。
+- 2026-09-14 用户实测 Windows 系统播放器路径无法稳定播放，并明确要求取消双播放器。本规格停止实施；后续方案见 `2026-09-14-windows-single-engine-dolby-vision.md`。
