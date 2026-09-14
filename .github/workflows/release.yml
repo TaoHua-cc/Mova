@@ -1,11 +1,11 @@
 name: Release
 
-# 打 tag（v3.1.81 这种）时自动构建双端安装包并发布到 GitHub Releases，
-# 其他人就能在 Releases 页面直接下载更新。
-# 也可以在 Actions 页面手动触发：填 tag 则发布，留空则只构建不发布。
+# 每次推送 main 都更新 Mova Continuous 预发布；推送 v3.1.81 这类标签
+# 则创建正式 GitHub Release。手动触发时填 tag 才发布，留空只构建。
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -29,6 +29,8 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       version: ${{ steps.r.outputs.version }}
       publish: ${{ steps.r.outputs.publish }}
+      continuous: ${{ steps.r.outputs.continuous }}
+      release_name: ${{ steps.r.outputs.release_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,26 +39,41 @@ jobs:
         id: r
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           IN_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           pub=$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' pubspec.yaml | head -1)
-          if [ "$EVENT" = "push" ]; then
+          continuous=false
+          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            tag="continuous"; publish=true; continuous=true
+          elif [ "$EVENT" = "push" ]; then
             tag="$REF_NAME"; publish=true
           elif [ -n "${IN_TAG:-}" ]; then
             tag="$IN_TAG"; publish=true
           else
             tag="v$pub"; publish=false
           fi
-          version="${tag#v}"
+          if [ "$continuous" = true ]; then
+            version="$pub"
+          else
+            version="${tag#v}"
+          fi
+          if [ "$continuous" = true ]; then
+            release_name="Mova Continuous"
+          else
+            release_name="Mova $tag"
+          fi
           {
             echo "tag=$tag"
             echo "version=$version"
             echo "publish=$publish"
+            echo "continuous=$continuous"
+            echo "release_name=$release_name"
           } >> "$GITHUB_OUTPUT"
           echo "tag=$tag  version=$version  publish=$publish  pubspec=$pub"
-          if [ "$version" != "$pub" ]; then
+          if [ "$continuous" != true ] && [ "$version" != "$pub" ]; then
             echo "::warning::pubspec.yaml 版本为 $pub，与 tag $version 不一致，安装包以 tag 为准"
           fi
 
@@ -239,6 +256,30 @@ jobs:
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Move continuous tag to this build
+        if: needs.meta.outputs.continuous == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const parameters = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'tags/continuous',
+              sha: context.sha,
+              force: true,
+            };
+            try {
+              await github.rest.git.updateRef(parameters);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'refs/tags/continuous',
+                sha: context.sha,
+              });
+            }
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -256,7 +297,7 @@ jobs:
       - name: Write summary
         run: |
           {
-            echo "### Release ${{ needs.meta.outputs.tag }}"
+            echo "### ${{ needs.meta.outputs.release_name }}"
             echo ""
             echo "- Windows: 安装程序 + 免安装包"
             echo "- Android: 三个 ABI 的 APK（签名方式：${{ needs.android.outputs.signing }}）"
@@ -266,10 +307,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
-          name: Mova ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.meta.outputs.release_name }}
           files: flat/*
-          generate_release_notes: true
+          overwrite_files: true
+          prerelease: ${{ needs.meta.outputs.continuous == 'true' }}
+          make_latest: ${{ needs.meta.outputs.continuous != 'true' }}
+          generate_release_notes: ${{ needs.meta.outputs.continuous != 'true' }}
           body: |
+            > 若此发布名为 `Mova Continuous`，它是随 main 更新的测试预发布；Android 包不保证可覆盖正式版，请优先使用正式标签 Release。
+
             ## 下载
 
             **Windows**

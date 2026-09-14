@@ -34,7 +34,7 @@ Windows 与 Android 共用同一套业务源码（`lib/`），所以绝大多数
 - `movaVersion` **不要在别处再硬编码**：源里只留这一处，两个发版脚本都会自动改写它。
   （这条规则是因为「关于」面板曾经停在 `3.1.65`，比实际发布版本落后了十几个版本。）
 
-## 日常改动（不发布）
+## 日常改动（自动更新持续 Release）
 
 ```bash
 # 1. 改代码
@@ -46,11 +46,11 @@ git add -A && git commit -m "feat: ..." && git push origin main
 
 - `Android Build` → `flutter analyze` + 按 ABI 拆分的三个 APK
 - `Windows Build` → `flutter analyze` + Windows 程序 + Inno Setup 安装器 + 免安装压缩包
+- `Release` → 更新 GitHub Releases 中的 **Mova Continuous** 预发布，附上本次双端安装包
 
-两个都绿了，说明双端都能编译。**再分别在真机上验证行为**（尤其是布局与交互类改动），
-然后才进入发版。
+持续 Release 用于快速测试，始终指向最新 `main` 提交。它不替代稳定正式版：普通提交不会递增 Android `versionCode`，因此 Android 可能无法覆盖旧正式版。
 
-## 发版（打 tag 自动发布）
+## 正式发版（打 tag 自动发布）
 
 ```bash
 # 1. 递增版本号
@@ -86,7 +86,7 @@ powershell -ExecutionPolicy Bypass -File scripts\cut-release.ps1 -Version 3.1.81
 |---|---|---|
 | `android-build.yml` | push 到 main、PR | 安卓编译验证 + 上传 APK 产物（不发版） |
 | `windows-build.yml` | push 到 main、PR | Windows 编译验证 + 上传安装器产物（不发版） |
-| `release.yml` | 推送 `v*` tag、手动触发 | 双端构建 → 创建 GitHub Release 并挂上全部安装包 |
+| `release.yml` | 推送 `main`、推送 `v*` tag、手动触发 | `main` 更新 Continuous 预发布；标签创建正式 GitHub Release |
 
 ## 一次性配置：安卓发布签名
 

@@ -136,7 +136,7 @@ Windows 发布包还必须构建并复制随包内置的 WinUI 3 原生 Dolby Vi
 
 ### 发布
 
-发布属于独立、显式操作。只有用户明确要求发布时，才按 `RELEASE.md` 修改版本、提交、推送 tag 并触发流水线。开发任务完成不等于自动发布。
+推送 `main` 会自动更新 GitHub Releases 中的 `Mova Continuous` 预发布。正式发版仍属于独立、显式操作：只有用户明确要求时，才按 `RELEASE.md` 修改版本、提交、推送 tag 并创建稳定 Release。开发任务完成不等于自动推送。
 
 ## 6. 提交与交付约定
 
