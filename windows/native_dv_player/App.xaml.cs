@@ -40,7 +40,7 @@ public partial class App : Application
     }
 }
 
-internal sealed record PlaybackRequest(
+public sealed record PlaybackRequest(
     string Url,
     string? Title,
     long PositionMs,
