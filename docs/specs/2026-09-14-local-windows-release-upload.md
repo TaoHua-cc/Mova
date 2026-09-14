@@ -4,7 +4,7 @@
 
 - 标题：本地 Windows 包直传并保留 GitHub Android 构建
 - 日期：2026-09-14
-- 状态：已完成
+- 状态：已搁置
 - 影响平台：Windows / Android
 
 ## 背景与问题
@@ -13,9 +13,7 @@
 
 ## 目标
 
-- Windows 开发机将本地构建的安装包与便携包直接上传至 `Mova Continuous`。
-- `main` 推送后的 GitHub Actions 只构建 Android 并上传 APK。
-- 正式 tag 继续在 GitHub 完整构建 Windows 和 Android，保证可复现的正式版本。
+- 该方案已搁置。日常推送恢复由 GitHub Actions 完整构建 Windows 与 Android，并更新 `Mova Continuous`。
 
 ## 非目标
 
@@ -46,10 +44,7 @@
 
 ## 验收标准
 
-- [x] 本地脚本能检查 GitHub CLI 授权与两份 Windows 产物。
-- [x] `main` 推送不再触发 Windows GitHub job。
-- [x] tag 与手动构建仍包含 Windows GitHub job。
-- [x] GitHub Release 可包含本地 Windows 产物及 Actions 构建的 Android APK。
+- [ ] 该方案不再作为日常发布流程。
 
 ## 验证计划
 
@@ -76,4 +71,4 @@
 - 已新增 `scripts/upload-continuous-windows.ps1`，上传前检查授权、版本与两个本地产物。
 - `main` 工作流跳过 Windows job；tag 和 workflow_dispatch 保留 Windows job。publish job 接受 Windows job 的 skipped 状态。
 - 本次旧工作流在策略切换前已完成，Continuous Release 中已存在 3.1.101 Windows 与 Android 附件。后续推送需用新脚本验证直传流程。
-- 已实际运行本地上传脚本，成功将 3.1.101 的 Windows 安装包与便携包直传至 Continuous Release。
+- 已实际验证过本地直传，但用户选择以“推送即 GitHub 完整构建并发布”为唯一日常流程，因此已恢复完整云端构建；本规格保留为已搁置的决策记录。

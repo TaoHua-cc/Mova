@@ -82,10 +82,6 @@ jobs:
   windows:
     name: Build Windows
     needs: meta
-    # 日常 main 推送的 Windows 包由开发机本地构建并直传 Continuous
-    # Release，避免与本地打包重复。正式 tag 和手动触发仍保留可复现的
-    # 云端 Windows 构建。
-    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -250,10 +246,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [meta, windows, android]
-    if: >-
-      always() && needs.meta.outputs.publish == 'true' &&
-      needs.android.result == 'success' &&
-      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+    if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Move continuous tag to this build
@@ -291,12 +284,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-
-      - name: Explain local Windows assets
-        if: needs.windows.result == 'skipped'
-        run: |
-          echo "Windows assets are uploaded from the local release script." \
-            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Flatten assets
         # 兜底：不管 artifact 内部是什么结构，都展平到一个目录再发布，

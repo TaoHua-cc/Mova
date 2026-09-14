@@ -37,19 +37,16 @@ Windows 与 Android 共用同一套业务源码（`lib/`），所以绝大多数
 ## 日常改动（自动更新持续 Release）
 
 ```bash
-# 1. 本地构建并打出 Windows 安装包（开发机首次需安装 Flutter、C++ Build Tools 和 Inno Setup）
-# 2. 提交并推送 main
-# 3. 直接上传本地 Windows 包；GitHub Actions 只构建 Android APK
+# 1. 改代码
+# 2. 提交并推送 —— GitHub Actions 完整构建 Windows 与 Android，并更新 Release
 git add -A && git commit -m "feat: ..." && git push origin main
-powershell -ExecutionPolicy Bypass -File scripts\upload-continuous-windows.ps1
 ```
 
-推送后会：
+推送后 GitHub Actions 会自动：
 
-- 本机脚本将 Windows 安装器和免安装压缩包上传到 **Mova Continuous** 预发布
-- `Release` 的 Android job → 按 ABI 拆分的三个 APK 并更新同一 Release
-
-本地上传脚本要求安装并登录 GitHub CLI：`gh auth login`。它只读取 GitHub CLI 的系统安全凭据，绝不在仓库中保存 Token。若没有本地 Windows 环境，仍可通过正式 tag 或手动触发 Release 工作流让 GitHub 构建 Windows。
+- `Release` 的 Windows job → Windows 程序、Inno Setup 安装器与免安装压缩包
+- `Release` 的 Android job → 按 ABI 拆分的三个 APK
+- `Release` → 更新 GitHub Releases 中的 **Mova Continuous** 预发布，附上完整双端安装包
 
 持续 Release 用于快速测试，始终指向最新 `main` 提交。它不替代稳定正式版：普通提交不会递增 Android `versionCode`，因此 Android 可能无法覆盖旧正式版。
 
@@ -144,8 +141,6 @@ flutter build windows --release
 ISCC.exe /DAppVersion=3.1.81 installer\Mova.iss
 # 产物：dist-installer\Mova-3.1.81-Windows-x64-Setup.exe
 
-# 上传本地 Windows 安装包和免安装包到 Continuous Release
-powershell -ExecutionPolicy Bypass -File scripts\upload-continuous-windows.ps1
 
 # 或者直接跑现成脚本（内含 Flutter 与 ISCC 路径）
 build-release.cmd
