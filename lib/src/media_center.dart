@@ -14,6 +14,7 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import 'platform/window_host.dart';
 
 import 'app_route_observer.dart';
@@ -34,6 +35,7 @@ import 'playlists/playlist_detail_page.dart';
 import 'player/danmaku_client.dart';
 import 'player/subtitle_preference.dart';
 import 'player/player_page.dart';
+import 'player/windows_native_player.dart';
 import 'sources/emby_client.dart';
 import 'sources/media_source.dart';
 import 'sources/server_mark.dart';
@@ -272,8 +274,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     yingjiSectionFocus.value = _sectionKey(value);
     // 被切到前台的这一页从顶部开始显示（重复点同一个入口也算一次）。
     yingjiSectionTopTick.value++;
-    final current =
-        _pageController.hasClients && _pageController.page != null
+    final current = _pageController.hasClients && _pageController.page != null
         ? _pageController.page!.round()
         : _pageSections.indexOf(previous);
     if ((target - current).abs() > 1) {
@@ -300,8 +301,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     // Search owns its vertical scroll completely, and the home feed is now a
     // scrollable page in its own right (home canvas + discover shelves).
     // Wheel input on either must never accumulate into shell page navigation.
-    if (_section == _CenterSection.search ||
-        _section == _CenterSection.home) {
+    if (_section == _CenterSection.search || _section == _CenterSection.home) {
       return;
     }
     if (signal is! PointerScrollEvent ||
@@ -375,10 +375,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
             final section = _pageSections[index];
             final page = _pageFor(section);
             if (section == _CenterSection.home) return page;
-            return Padding(
-              padding: YingjiLayout.pageInset,
-              child: page,
-            );
+            return Padding(padding: YingjiLayout.pageInset, child: page);
           },
         ),
         const _FloatingHomeDragRegion(),
@@ -499,10 +496,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
                 physics: yingjiWheelPhysics,
                 padding: EdgeInsets.zero,
                 children: [
-                  SizedBox(
-                    height: canvasHeight,
-                    child: const _CinematicHome(),
-                  ),
+                  SizedBox(height: canvasHeight, child: const _CinematicHome()),
                   Padding(
                     // 与原独立“发现”页在壳层中收到的边距保持一致
                     padding: YingjiLayout.pageInset,
@@ -527,14 +521,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
   );
 }
 
-enum _CenterSection {
-  home,
-  search,
-  sources,
-  playlists,
-  calendar,
-  settings,
-}
+enum _CenterSection { home, search, sources, playlists, calendar, settings }
 
 class _ContinuousShellBackdrop extends StatelessWidget {
   const _ContinuousShellBackdrop({required this.controller});
@@ -1390,8 +1377,7 @@ class _CinematicHomeState extends State<_CinematicHome>
             );
           },
         );
-      
-  },
+      },
     );
   }
 }
@@ -2061,6 +2047,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final Set<String> _hiddenSections = {};
   late Future<Map<String, List<TmdbItem>>> _items;
   List<String> _sections = List.of(_defaultSections);
+
   /// 元数据后台刷新后的重读消抖计时器。
   Timer? _revisionDebounce;
 
@@ -5170,11 +5157,11 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                     slivers: [
                       SliverPadding(
                         padding: EdgeInsets.fromLTRB(
-                            YingjiLayout.pageLeft,
-                            32,
-                            YingjiLayout.pageRight,
-                            24,
-                          ),
+                          YingjiLayout.pageLeft,
+                          32,
+                          YingjiLayout.pageRight,
+                          24,
+                        ),
                         sliver: SliverToBoxAdapter(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -5276,11 +5263,11 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                       ),
                       SliverPadding(
                         padding: EdgeInsets.fromLTRB(
-                            YingjiLayout.pageLeft,
-                            0,
-                            YingjiLayout.pageRight,
-                            56,
-                          ),
+                          YingjiLayout.pageLeft,
+                          0,
+                          YingjiLayout.pageRight,
+                          56,
+                        ),
                         sliver: SliverGrid(
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -6307,7 +6294,9 @@ class _SourceHubState extends State<_SourceHub>
           client.dispose();
         }
       } else {
-        final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
+        final client = EmbyClient(
+          proxy: ProxyRouting.serverUsesProxy(source.id),
+        );
         try {
           final resolved = await client.resolveSession(
             EmbySession(source: source, token: token),
@@ -6506,9 +6495,9 @@ class _SourceHubState extends State<_SourceHub>
                     Text(
                       _historyLocalOnly
                           ? '播放进度与“标记已看”只写本机，不再上报给这些服务器和 Trakt；'
-                              '服务器媒体照常播放，上面的记录也照常读取。'
+                                '服务器媒体照常播放，上面的记录也照常读取。'
                           : '播放进度实时上报给这些服务器，退出播放时同步到 Trakt；'
-                              '换设备可以接着看。',
+                                '换设备可以接着看。',
                       style: const TextStyle(
                         color: YingjiColors.muted,
                         fontSize: 12,
@@ -7390,6 +7379,7 @@ class _CalendarPageState extends State<_CalendarPage>
   final _tmdb = TmdbClient();
   List<TraktEvent> _events = const [];
   Map<String, String> _trackingStatus = const {};
+
   /// 待看列表，与详情页 / 片单页共用 yingji.watchlist。日历上的「待看」
   /// 直接读它，不再自己另存一份状态，两边才不会各说各话。
   List<TmdbItem> _watchlist = const [];
@@ -7710,10 +7700,7 @@ class _CalendarPageState extends State<_CalendarPage>
             Expanded(
               child: Text(
                 '已弃剧 ${_droppedTitles.length} 部，不再出现在日历里',
-                style: const TextStyle(
-                  fontSize: 13,
-                  color: YingjiColors.muted,
-                ),
+                style: const TextStyle(fontSize: 13, color: YingjiColors.muted),
               ),
             ),
           ],
@@ -8292,11 +8279,13 @@ class _SettingsPageState extends State<SettingsPage>
   int _videoCacheCount = 0;
   int _danmakuCacheBytes = 0;
   int _danmakuCacheCount = 0;
+
   /// 视频缓存上限。桌面只有一档；安卓额外有一档移动数据的（计量网络）。
   int _videoCacheLimit = WindowHost.isDesktop
       ? VideoCachePolicy.defaultDesktop
       : VideoCachePolicy.defaultWifi;
   int _videoCacheMobileLimit = VideoCachePolicy.defaultMobile;
+
   /// 本地已知的新版本号（null = 不知道，或者已经是最新）。
   ///
   /// 只用来给按钮配一句说明，真正的判定在 UpdateChecker 里。
@@ -8326,8 +8315,10 @@ class _SettingsPageState extends State<SettingsPage>
   Set<String> _proxyServers = const {};
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
+
   /// 横向胶囊的 key（按需生成），用来把高亮的那一项滚回可视区。
   final _settingsChipKeys = <GlobalKey>[];
+
   /// 高亮稳定一小段时间后才回滚胶囊条（见 _revealActiveSettingChip）。
   Timer? _chipRevealTimer;
   Map<String, Object> _persistedSettings = const {};
@@ -8364,8 +8355,7 @@ class _SettingsPageState extends State<SettingsPage>
     final release = await UpdateChecker.cached();
     if (!mounted) return;
     setState(() {
-      _knownUpdateVersion =
-          release != null && UpdateChecker.isNewer(release)
+      _knownUpdateVersion = release != null && UpdateChecker.isNewer(release)
           ? release.version
           : null;
     });
@@ -8537,9 +8527,7 @@ class _SettingsPageState extends State<SettingsPage>
   Future<void> _setServerProxy(String sourceId, bool enabled) async {
     await ProxyRouting.setServerProxy(sourceId, enabled);
     if (!mounted) return;
-    setState(
-      () => _proxyServers = Set.of(ProxyRouting.proxyServerIds),
-    );
+    setState(() => _proxyServers = Set.of(ProxyRouting.proxyServerIds));
   }
 
   Map<String, Object> _settingsSnapshot() {
@@ -8821,8 +8809,8 @@ class _SettingsPageState extends State<SettingsPage>
     final size = mb < 1
         ? '${(_videoCacheBytes / 1024).round()} KB'
         : mb < 1024
-            ? '${mb.toStringAsFixed(1)} MB'
-            : '${(mb / 1024).toStringAsFixed(2)} GB';
+        ? '${mb.toStringAsFixed(1)} MB'
+        : '${(mb / 1024).toStringAsFixed(2)} GB';
     return '$_videoCacheCount 份 · $size';
   }
 
@@ -8840,9 +8828,8 @@ class _SettingsPageState extends State<SettingsPage>
     await _refreshCacheStats();
     if (mounted)
       setState(
-        () => _savedMessage = removed == 0
-            ? '没有可清理的视频缓存'
-            : '已清理 $removed 份视频缓存',
+        () =>
+            _savedMessage = removed == 0 ? '没有可清理的视频缓存' : '已清理 $removed 份视频缓存',
       );
   }
 
@@ -8852,9 +8839,8 @@ class _SettingsPageState extends State<SettingsPage>
     await _refreshCacheStats();
     if (mounted)
       setState(
-        () => _savedMessage = removed == 0
-            ? '没有可清理的弹幕缓存'
-            : '已清理 $removed 集弹幕缓存',
+        () =>
+            _savedMessage = removed == 0 ? '没有可清理的弹幕缓存' : '已清理 $removed 集弹幕缓存',
       );
   }
 
@@ -9174,10 +9160,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '首页',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -9189,9 +9172,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '在首页海报下方显示本机播放进度',
                 value: _homeContinueWatching,
                 onChanged: (value) {
-                  setState(
-                    () => _homeContinueWatching = value,
-                  );
+                  setState(() => _homeContinueWatching = value);
                   _save();
                 },
               ),
@@ -9218,9 +9199,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '在海报右下方显示当前轮播进度',
                 value: _homeShowCarouselDots,
                 onChanged: (value) {
-                  setState(
-                    () => _homeShowCarouselDots = value,
-                  );
+                  setState(() => _homeShowCarouselDots = value);
                   _save();
                 },
               ),
@@ -9258,26 +9237,14 @@ class _SettingsPageState extends State<SettingsPage>
                     value: 'blur-dissolve',
                     child: Text('模糊溶解（推荐）'),
                   ),
-                  DropdownMenuItem(
-                    value: 'slide-fade',
-                    child: Text('上浮渐变'),
-                  ),
-                  DropdownMenuItem(
-                    value: 'fade',
-                    child: Text('淡入式'),
-                  ),
-                  DropdownMenuItem(
-                    value: 'zoom-fade',
-                    child: Text('缩放淡入'),
-                  ),
+                  DropdownMenuItem(value: 'slide-fade', child: Text('上浮渐变')),
+                  DropdownMenuItem(value: 'fade', child: Text('淡入式')),
+                  DropdownMenuItem(value: 'zoom-fade', child: Text('缩放淡入')),
                   DropdownMenuItem(
                     value: 'slide-horizontal',
                     child: Text('横向滑入'),
                   ),
-                  DropdownMenuItem(
-                    value: 'instant',
-                    child: Text('即时切换'),
-                  ),
+                  DropdownMenuItem(value: 'instant', child: Text('即时切换')),
                 ],
                 onChanged: (value) {
                   if (value == null) return;
@@ -9286,18 +9253,15 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               const SizedBox(height: 14),
-              Text(
-                '海报停留时间  ${_homeCarouselSeconds.round()} 秒',
-              ),
+              Text('海报停留时间  ${_homeCarouselSeconds.round()} 秒'),
               Slider(
                 value: _homeCarouselSeconds,
                 min: 3,
                 max: 15,
                 divisions: 12,
                 label: '${_homeCarouselSeconds.round()} 秒',
-                onChanged: (value) => setState(
-                  () => _homeCarouselSeconds = value,
-                ),
+                onChanged: (value) =>
+                    setState(() => _homeCarouselSeconds = value),
                 onChangeEnd: (_) => _save(),
               ),
             ],
@@ -9312,10 +9276,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '外观',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -9332,18 +9293,9 @@ class _SettingsPageState extends State<SettingsPage>
                       : '系统模式会跟随 Android 系统的浅色/深色设置',
                 ),
                 items: const [
-                  DropdownMenuItem(
-                    value: 'dark',
-                    child: Text('深色模式'),
-                  ),
-                  DropdownMenuItem(
-                    value: 'light',
-                    child: Text('浅色模式'),
-                  ),
-                  DropdownMenuItem(
-                    value: 'system',
-                    child: Text('跟随系统'),
-                  ),
+                  DropdownMenuItem(value: 'dark', child: Text('深色模式')),
+                  DropdownMenuItem(value: 'light', child: Text('浅色模式')),
+                  DropdownMenuItem(value: 'system', child: Text('跟随系统')),
                 ],
                 onChanged: (value) {
                   if (value == null) return;
@@ -9355,9 +9307,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 14),
               Text(
                 '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
-                style: const TextStyle(
-                  fontWeight: FontWeight.w700,
-                ),
+                style: const TextStyle(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
               const Text(
@@ -9369,12 +9319,9 @@ class _SettingsPageState extends State<SettingsPage>
                 min: 0,
                 max: 1,
                 divisions: 20,
-                label:
-                    '${(_appearanceGlassOpacity * 100).round()}%',
+                label: '${(_appearanceGlassOpacity * 100).round()}%',
                 onChanged: (value) {
-                  setState(
-                    () => _appearanceGlassOpacity = value,
-                  );
+                  setState(() => _appearanceGlassOpacity = value);
                 },
                 onChangeEnd: (_) {
                   _applyAppearance();
@@ -9384,9 +9331,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 4),
               Text(
                 '背景模糊  ${_appearanceGlassBlur.round()} px',
-                style: const TextStyle(
-                  fontWeight: FontWeight.w700,
-                ),
+                style: const TextStyle(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
               const Text(
@@ -9400,9 +9345,7 @@ class _SettingsPageState extends State<SettingsPage>
                 divisions: 15,
                 label: '${_appearanceGlassBlur.round()} px',
                 onChanged: (value) {
-                  setState(
-                    () => _appearanceGlassBlur = value,
-                  );
+                  setState(() => _appearanceGlassBlur = value);
                 },
                 onChangeEnd: (_) {
                   _applyAppearance();
@@ -9412,9 +9355,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 4),
               Text(
                 '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
-                style: const TextStyle(
-                  fontWeight: FontWeight.w700,
-                ),
+                style: const TextStyle(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
               const Text(
@@ -9426,12 +9367,9 @@ class _SettingsPageState extends State<SettingsPage>
                 min: 0,
                 max: 1,
                 divisions: 20,
-                label:
-                    '${(_appearanceCardDepth * 100).round()}%',
+                label: '${(_appearanceCardDepth * 100).round()}%',
                 onChanged: (value) {
-                  setState(
-                    () => _appearanceCardDepth = value,
-                  );
+                  setState(() => _appearanceCardDepth = value);
                 },
                 onChangeEnd: (_) {
                   _applyAppearance();
@@ -9439,10 +9377,7 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               const SizedBox(height: 10),
-              const Text(
-                '玻璃色调',
-                style: TextStyle(fontWeight: FontWeight.w700),
-              ),
+              const Text('玻璃色调', style: TextStyle(fontWeight: FontWeight.w700)),
               const SizedBox(height: 2),
               const Text(
                 '决定所有按钮、卡片与播放器浮层的底色；与上面的不透明度、模糊叠加生效。',
@@ -9477,19 +9412,14 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '播放器',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               Text(
                 WindowHost.isDesktop
                     ? '内置 libmpv；这些偏好会在播放时下发给内核。'
                     : '内置 libmpv，视频解码走 Android 的 MediaCodec 硬解；这些偏好会在播放时下发给内核。',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE)),
               ),
               _ToggleRow(
                 title: '硬件解码',
@@ -9599,10 +9529,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '播放行为与默认值',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -9616,18 +9543,12 @@ class _SettingsPageState extends State<SettingsPage>
                 const SizedBox(height: 16),
                 const Text(
                   '触屏手势',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w800,
-                  ),
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 2),
                 const Text(
                   '下面这些手势在画面区域生效，和控制台里的按钮等价。',
-                  style: TextStyle(
-                    color: Color(0xFFABB1BE),
-                    fontSize: 12,
-                  ),
+                  style: TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
                 ),
                 const SizedBox(height: 6),
                 const _GestureHintRow(
@@ -9638,38 +9559,32 @@ class _SettingsPageState extends State<SettingsPage>
                 const _GestureHintRow(
                   icon: YingjiIcons.pause_fill,
                   title: '双击画面',
-                  detail:
-                      '播放 / 暂停。判断窗口是 280 毫秒，单击不会被推迟等待，点一下立刻出控件',
+                  detail: '播放 / 暂停。判断窗口是 280 毫秒，单击不会被推迟等待，点一下立刻出控件',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.goforward_10,
                   title: '左右滑动',
-                  detail:
-                      '快进 / 快退：横向滑满一屏约 90 秒，滑动过程中画面中央显示目标时间与 ±偏移，松手才真正跳转',
+                  detail: '快进 / 快退：横向滑满一屏约 90 秒，滑动过程中画面中央显示目标时间与 ±偏移，松手才真正跳转',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.sparkles,
                   title: '左半屏上下滑动',
-                  detail:
-                      '调节屏幕亮度：纵向滑满一屏约 100%，中央显示百分比。只改本应用窗口的亮度，退出播放器后自动还原，不动系统设置',
+                  detail: '调节屏幕亮度：纵向滑满一屏约 100%，中央显示百分比。只改本应用窗口的亮度，退出播放器后自动还原，不动系统设置',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.speaker_2_fill,
                   title: '右半屏上下滑动',
-                  detail:
-                      '调节音量：纵向滑满一屏约 100%，中央显示百分比；滑到底自动静音，往上滑恢复',
+                  detail: '调节音量：纵向滑满一屏约 100%，中央显示百分比；滑到底自动静音，往上滑恢复',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.scissors,
                   title: '左右半屏怎么分',
-                  detail:
-                      '按手指按下的横坐标判断，不是按滑到哪儿；上下方向也只认纵向拖动，斜着滑按主方向走',
+                  detail: '按手指按下的横坐标判断，不是按滑到哪儿；上下方向也只认纵向拖动，斜着滑按主方向走',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.rectangle_stack,
                   title: '手势与控件的关系',
-                  detail:
-                      '整个画面都是手势区，控件浮在上面时手势依然可用；只有直接按在按钮或滑条上才交给控件',
+                  detail: '整个画面都是手势区，控件浮在上面时手势依然可用；只有直接按在按钮或滑条上才交给控件',
                 ),
                 const SizedBox(height: 16),
               ],
@@ -9685,15 +9600,11 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 6),
               YingjiGlassDropdownField<String>(
                 initialValue: _aspect,
-                decoration: const InputDecoration(
-                  labelText: '默认画面比例',
-                ),
+                decoration: const InputDecoration(labelText: '默认画面比例'),
                 items: const ['自动', '16:9', '4:3', '21:9']
                     .map(
-                      (value) => DropdownMenuItem(
-                        value: value,
-                        child: Text(value),
-                      ),
+                      (value) =>
+                          DropdownMenuItem(value: value, child: Text(value)),
                     )
                     .toList(),
                 onChanged: (value) {
@@ -9703,17 +9614,14 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               const SizedBox(height: 14),
-              Text(
-                '默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x',
-              ),
+              Text('默认播放速度  ${_defaultSpeed.toStringAsFixed(2)}x'),
               Slider(
                 value: _defaultSpeed,
                 min: .5,
                 max: 2,
                 divisions: 30,
                 label: '${_defaultSpeed.toStringAsFixed(2)}x',
-                onChanged: (value) =>
-                    setState(() => _defaultSpeed = value),
+                onChanged: (value) => setState(() => _defaultSpeed = value),
                 onChangeEnd: (_) => _save(),
               ),
               Text('预读缓存  ${_cacheSeconds.round()} 秒'),
@@ -9723,8 +9631,7 @@ class _SettingsPageState extends State<SettingsPage>
                 max: 120,
                 divisions: 23,
                 label: '${_cacheSeconds.round()} 秒',
-                onChanged: (value) =>
-                    setState(() => _cacheSeconds = value),
+                onChanged: (value) => setState(() => _cacheSeconds = value),
                 onChangeEnd: (_) => _save(),
               ),
               _ToggleRow(
@@ -9737,18 +9644,15 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               if (_preloadNextEpisode) ...[
-                Text(
-                  '距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载',
-                ),
+                Text('距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载'),
                 Slider(
                   value: _preloadLeadMinutes,
                   min: 1,
                   max: 15,
                   divisions: 14,
                   label: '${_preloadLeadMinutes.round()} 分钟',
-                  onChanged: (value) => setState(
-                    () => _preloadLeadMinutes = value,
-                  ),
+                  onChanged: (value) =>
+                      setState(() => _preloadLeadMinutes = value),
                   onChangeEnd: (_) => _save(),
                 ),
               ],
@@ -9757,10 +9661,7 @@ class _SettingsPageState extends State<SettingsPage>
                 WindowHost.isDesktop
                     ? '播放器左右方向键每次跳转的时间；长片可调大，短片建议保持 10 秒。'
                     : '外接键盘 / 遥控器左右键每次跳转的时间。触屏左右滑动是独立手势，不受这一项影响（见上方手势说明）。',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               Slider(
                 value: _seekSeconds,
@@ -9768,8 +9669,7 @@ class _SettingsPageState extends State<SettingsPage>
                 max: 60,
                 divisions: 11,
                 label: '${_seekSeconds.round()} 秒',
-                onChanged: (value) =>
-                    setState(() => _seekSeconds = value),
+                onChanged: (value) => setState(() => _seekSeconds = value),
                 onChangeEnd: (_) => _save(),
               ),
               Text('音量按键步长  ${_volumeStep.round()}%'),
@@ -9777,10 +9677,7 @@ class _SettingsPageState extends State<SettingsPage>
                 WindowHost.isDesktop
                     ? '键盘上下方向键按一次增减的音量。'
                     : '外接键盘 / 遥控器按一次增减的音量；触屏右半屏上下滑动是按满屏 100% 调节的。',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               Slider(
                 value: _volumeStep,
@@ -9788,35 +9685,27 @@ class _SettingsPageState extends State<SettingsPage>
                 max: 20,
                 divisions: 19,
                 label: '${_volumeStep.round()}%',
-                onChanged: (value) =>
-                    setState(() => _volumeStep = value),
+                onChanged: (value) => setState(() => _volumeStep = value),
                 onChangeEnd: (_) => _save(),
               ),
-              Text(
-                '默认音频延迟  ${(_audioDelay * 1000).round()} ms',
-              ),
+              Text('默认音频延迟  ${(_audioDelay * 1000).round()} ms'),
               Slider(
                 value: _audioDelay,
                 min: -3,
                 max: 3,
                 divisions: 120,
                 label: '${(_audioDelay * 1000).round()} ms',
-                onChanged: (value) =>
-                    setState(() => _audioDelay = value),
+                onChanged: (value) => setState(() => _audioDelay = value),
                 onChangeEnd: (_) => _save(),
               ),
-              Text(
-                '默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
-              ),
+              Text('默认字幕延迟  ${(_subtitleDelay * 1000).round()} ms'),
               Slider(
                 value: _subtitleDelay,
                 min: -3,
                 max: 3,
                 divisions: 120,
-                label:
-                    '${(_subtitleDelay * 1000).round()} ms',
-                onChanged: (value) =>
-                    setState(() => _subtitleDelay = value),
+                label: '${(_subtitleDelay * 1000).round()} ms',
+                onChanged: (value) => setState(() => _subtitleDelay = value),
                 onChangeEnd: (_) => _save(),
               ),
             ],
@@ -9831,10 +9720,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '网络与同步',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -9854,21 +9740,14 @@ class _SettingsPageState extends State<SettingsPage>
               Row(
                 children: [
                   FilledButton.tonalIcon(
-                    onPressed: _tmdbTesting
-                        ? null
-                        : _testTmdb,
+                    onPressed: _tmdbTesting ? null : _testTmdb,
                     icon: _tmdbTesting
                         ? const SizedBox(
                             width: 16,
                             height: 16,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                            ),
+                            child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(
-                            YingjiIcons.wifi,
-                            size: 16,
-                          ),
+                        : const Icon(YingjiIcons.wifi, size: 16),
                     label: const Text('测试 TMDB 网络'),
                   ),
                   if (_tmdbMessage != null) ...[
@@ -9876,9 +9755,7 @@ class _SettingsPageState extends State<SettingsPage>
                     Expanded(
                       child: Text(
                         _tmdbMessage!,
-                        style: const TextStyle(
-                          color: Color(0xFFABB1BE),
-                        ),
+                        style: const TextStyle(color: Color(0xFFABB1BE)),
                       ),
                     ),
                   ],
@@ -9887,9 +9764,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 14),
               TextField(
                 controller: _traktClientId,
-                decoration: const InputDecoration(
-                  labelText: 'Trakt Client ID',
-                ),
+                decoration: const InputDecoration(labelText: 'Trakt Client ID'),
               ),
               const SizedBox(height: 10),
               TextField(
@@ -9912,14 +9787,8 @@ class _SettingsPageState extends State<SettingsPage>
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   FilledButton.tonal(
-                    onPressed: _traktAuthorizing
-                        ? null
-                        : _authorizeTrakt,
-                    child: Text(
-                      _traktAuthorizing
-                          ? '等待授权…'
-                          : '浏览器授权 Trakt',
-                    ),
+                    onPressed: _traktAuthorizing ? null : _authorizeTrakt,
+                    child: Text(_traktAuthorizing ? '等待授权…' : '浏览器授权 Trakt'),
                   ),
                   const SizedBox(width: 10),
                   FilledButton(
@@ -9932,9 +9801,7 @@ class _SettingsPageState extends State<SettingsPage>
                 const SizedBox(height: 8),
                 Text(
                   _traktMessage!,
-                  style: const TextStyle(
-                    color: Color(0xFFABB1BE),
-                  ),
+                  style: const TextStyle(color: Color(0xFFABB1BE)),
                 ),
               ],
             ],
@@ -9949,19 +9816,13 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '代理',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
                 '为已连接的服务器选择联网方式。未选中时直接连接；选中后，软件访问'
                 '该服务器时跟随系统代理。再次点击已选中的服务器即可恢复直连。',
-                style: TextStyle(
-                  color: Color(0xFFABB1BE),
-                  height: 1.5,
-                ),
+                style: TextStyle(color: Color(0xFFABB1BE), height: 1.5),
               ),
               const SizedBox(height: 6),
               const Text(
@@ -10026,10 +9887,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '音轨、字幕与片头片尾',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -10058,18 +9916,12 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 16),
               SwitchListTile.adaptive(
                 contentPadding: EdgeInsets.zero,
-                secondary: const Icon(
-                  YingjiIcons.captions_bubble,
-                ),
+                secondary: const Icon(YingjiIcons.captions_bubble),
                 title: const Text('启用字幕语言优先'),
-                subtitle: const Text(
-                  '按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。',
-                ),
+                subtitle: const Text('按所选语言识别字幕；没有匹配时保留媒体默认，手动选择优先。'),
                 value: _preferChineseSubtitle,
                 onChanged: (value) {
-                  setState(
-                    () => _preferChineseSubtitle = value,
-                  );
+                  setState(() => _preferChineseSubtitle = value);
                   _save();
                 },
               ),
@@ -10078,8 +9930,7 @@ class _SettingsPageState extends State<SettingsPage>
                 label: '首选字幕语言',
                 value: _subtitleLanguage,
                 items: subtitleLanguages.keys.toList(),
-                labelBuilder: (v) =>
-                    subtitleLanguages[v] ?? v,
+                labelBuilder: (v) => subtitleLanguages[v] ?? v,
                 onChanged: (v) {
                   setState(() => _subtitleLanguage = v);
                   _save();
@@ -10090,10 +9941,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 12),
               const Text(
                 '自动跳过',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
               ),
               _ToggleRow(
                 title: '自动跳过片头片尾',
@@ -10105,18 +9953,15 @@ class _SettingsPageState extends State<SettingsPage>
                 },
               ),
               if (_autoSkipSegments) ...[
-                Text(
-                  '跳转提示停留  ${_autoSkipDelaySeconds.round()} 秒',
-                ),
+                Text('跳转提示停留  ${_autoSkipDelaySeconds.round()} 秒'),
                 Slider(
                   value: _autoSkipDelaySeconds,
                   min: 1,
                   max: 10,
                   divisions: 9,
                   label: '${_autoSkipDelaySeconds.round()} 秒',
-                  onChanged: (value) => setState(
-                    () => _autoSkipDelaySeconds = value,
-                  ),
+                  onChanged: (value) =>
+                      setState(() => _autoSkipDelaySeconds = value),
                   onChangeEnd: (_) => _save(),
                 ),
               ],
@@ -10125,9 +9970,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '优先读取 Emby / Jellyfin 当前文件的媒体章节',
                 value: _segmentServerSource,
                 onChanged: (value) {
-                  setState(
-                    () => _segmentServerSource = value,
-                  );
+                  setState(() => _segmentServerSource = value);
                   _save();
                 },
               ),
@@ -10136,9 +9979,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '按 IMDb、季和集读取片头、前情与片尾',
                 value: _segmentIntroDbSource,
                 onChanged: (value) {
-                  setState(
-                    () => _segmentIntroDbSource = value,
-                  );
+                  setState(() => _segmentIntroDbSource = value);
                   _save();
                 },
               ),
@@ -10147,9 +9988,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '按 TMDB、季和集匹配公共片头片尾数据',
                 value: _segmentTheIntroDbSource,
                 onChanged: (value) {
-                  setState(
-                    () => _segmentTheIntroDbSource = value,
-                  );
+                  setState(() => _segmentTheIntroDbSource = value);
                   _save();
                 },
               ),
@@ -10158,9 +9997,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '动画专用；仅在 TMDB 能唯一映射到 MAL 时读取',
                 value: _segmentAniSkipSource,
                 onChanged: (value) {
-                  setState(
-                    () => _segmentAniSkipSource = value,
-                  );
+                  setState(() => _segmentAniSkipSource = value);
                   _save();
                 },
               ),
@@ -10169,9 +10006,7 @@ class _SettingsPageState extends State<SettingsPage>
                 detail: '使用评分最高的公共章节作为备用分段',
                 value: _segmentChaptersDbSource,
                 onChanged: (value) {
-                  setState(
-                    () => _segmentChaptersDbSource = value,
-                  );
+                  setState(() => _segmentChaptersDbSource = value);
                   _save();
                 },
               ),
@@ -10180,10 +10015,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 16),
               const Text(
                 '弹幕服务',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -10192,9 +10024,7 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               _ToggleRow(
                 title: '启用弹幕',
-                detail: _danmakuEnabled
-                    ? '播放时读取下方 API'
-                    : '当前关闭',
+                detail: _danmakuEnabled ? '播放时读取下方 API' : '当前关闭',
                 value: _danmakuEnabled,
                 onChanged: (value) {
                   setState(() => _danmakuEnabled = value);
@@ -10209,10 +10039,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 4),
               const Text(
                 '每个地址独立保存。播放时并行测速，使用最先返回实际弹幕的服务。',
-                style: TextStyle(
-                  color: Color(0xFFABB1BE),
-                  fontSize: 12,
-                ),
+                style: TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               const SizedBox(height: 8),
               for (
@@ -10225,8 +10052,7 @@ class _SettingsPageState extends State<SettingsPage>
                     SizedBox(
                       width: 118,
                       child: TextField(
-                        controller:
-                            _danmakuApiNameControllers[index],
+                        controller: _danmakuApiNameControllers[index],
                         decoration: InputDecoration(
                           labelText: '名称',
                           hintText: '弹幕 ${index + 1}',
@@ -10236,15 +10062,12 @@ class _SettingsPageState extends State<SettingsPage>
                     const SizedBox(width: 8),
                     Expanded(
                       child: TextField(
-                        controller:
-                            _danmakuApiControllers[index],
+                        controller: _danmakuApiControllers[index],
                         keyboardType: TextInputType.url,
                         decoration: InputDecoration(
                           labelText: 'API ${index + 1}',
                           hintText: 'https://example.com/api',
-                          prefixIcon: const Icon(
-                            YingjiIcons.link,
-                          ),
+                          prefixIcon: const Icon(YingjiIcons.link),
                         ),
                       ),
                     ),
@@ -10259,27 +10082,20 @@ class _SettingsPageState extends State<SettingsPage>
                           : () {
                               unawaited(
                                 _testDanmaku(
-                                  _danmakuApiControllers[index]
-                                      .text
-                                      .trim(),
+                                  _danmakuApiControllers[index].text.trim(),
                                 ),
                               );
                             },
                     ),
-                    if (_danmakuApiControllers.length >
-                        1) ...[
+                    if (_danmakuApiControllers.length > 1) ...[
                       const SizedBox(width: 8),
                       YingjiMotionIconButton(
                         icon: YingjiIcons.trash,
                         tooltip: '移除 API ${index + 1}',
                         size: 38,
                         onPressed: () => setState(() {
-                          _danmakuApiControllers
-                              .removeAt(index)
-                              .dispose();
-                          _danmakuApiNameControllers
-                              .removeAt(index)
-                              .dispose();
+                          _danmakuApiControllers.removeAt(index).dispose();
+                          _danmakuApiNameControllers.removeAt(index).dispose();
                         }),
                       ),
                     ],
@@ -10294,13 +10110,10 @@ class _SettingsPageState extends State<SettingsPage>
                   tooltip: '添加弹幕 API',
                   size: 38,
                   onPressed: () => setState(() {
-                    _danmakuApiControllers.add(
-                      TextEditingController(),
-                    );
+                    _danmakuApiControllers.add(TextEditingController());
                     _danmakuApiNameControllers.add(
                       TextEditingController(
-                        text:
-                            '弹幕 ${_danmakuApiControllers.length}',
+                        text: '弹幕 ${_danmakuApiControllers.length}',
                       ),
                     );
                   }),
@@ -10319,21 +10132,14 @@ class _SettingsPageState extends State<SettingsPage>
               Row(
                 children: [
                   FilledButton.tonalIcon(
-                    onPressed: _danmakuTesting
-                        ? null
-                        : _testDanmaku,
+                    onPressed: _danmakuTesting ? null : _testDanmaku,
                     icon: _danmakuTesting
                         ? const SizedBox(
                             width: 16,
                             height: 16,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                            ),
+                            child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : const Icon(
-                            YingjiIcons.checkmark_seal,
-                            size: 16,
-                          ),
+                        : const Icon(YingjiIcons.checkmark_seal, size: 16),
                     label: const Text('测试弹幕 API'),
                   ),
                   if (_danmakuMessage != null) ...[
@@ -10341,9 +10147,7 @@ class _SettingsPageState extends State<SettingsPage>
                     Expanded(
                       child: Text(
                         _danmakuMessage!,
-                        style: const TextStyle(
-                          color: Color(0xFFABB1BE),
-                        ),
+                        style: const TextStyle(color: Color(0xFFABB1BE)),
                       ),
                     ),
                   ],
@@ -10371,17 +10175,14 @@ class _SettingsPageState extends State<SettingsPage>
                 WindowHost.isDesktop
                     ? '播放器快捷键会立即保存；同一个按键不能绑定两个操作。'
                     : '手机上没有键盘，播放器的全部操作都由画面手势完成。下面是完整对照。',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE)),
               ),
               if (WindowHost.isDesktop) ...[
                 for (final entry in _shortcutNames.entries) ...[
                   _ShortcutRecorder(
                     label: entry.value,
                     value: _shortcuts[entry.key]!,
-                    onChanged: (value) =>
-                        _changeShortcut(entry.key, value),
+                    onChanged: (value) => _changeShortcut(entry.key, value),
                   ),
                   const SizedBox(height: 10),
                 ],
@@ -10425,10 +10226,7 @@ class _SettingsPageState extends State<SettingsPage>
                 const SizedBox(height: 6),
                 const Text(
                   '系统返回手势与手势导航由 Android 接管，Mova 不会覆盖。',
-                  style: TextStyle(
-                    color: Color(0xFFABB1BE),
-                    fontSize: 12,
-                  ),
+                  style: TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
                 ),
               ],
             ],
@@ -10443,10 +10241,7 @@ class _SettingsPageState extends State<SettingsPage>
             children: [
               const Text(
                 '缓存与数据',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                ),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -10458,14 +10253,8 @@ class _SettingsPageState extends State<SettingsPage>
                 spacing: 10,
                 runSpacing: 8,
                 children: [
-                  _CacheStat(
-                    label: '元数据与详情',
-                    value: '$_metadataCacheCount 项',
-                  ),
-                  _CacheStat(
-                    label: '照片与其他临时缓存',
-                    value: _imageCacheLabel,
-                  ),
+                  _CacheStat(label: '元数据与详情', value: '$_metadataCacheCount 项'),
+                  _CacheStat(label: '照片与其他临时缓存', value: _imageCacheLabel),
                   _CacheStat(label: '视频缓存', value: _videoCacheLabel),
                   _CacheStat(label: '弹幕缓存', value: _danmakuCacheLabel),
                 ],
@@ -10481,8 +10270,8 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 8),
               Text(
                 WindowHost.isDesktop
-                    ? '播放时把整份视频存到本机，下次直接开本地文件；超过上限先删最久没看的。'
-                    : '播放时把整份视频存到本机，下次直接开本地文件；移动数据是计量网络，默认不缓存。',
+                    ? '播放时持续预读并持久保存所选容量；下次播放同一视频会复用已缓存区间，范围内快进无需重新下载。'
+                    : '播放时按当前网络预读并保留所选容量；下次播放会复用已缓存区间，移动数据默认不缓存。',
                 style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               const SizedBox(height: 10),
@@ -10514,42 +10303,27 @@ class _SettingsPageState extends State<SettingsPage>
                 children: [
                   FilledButton.tonalIcon(
                     onPressed: _clearTmdbCache,
-                    icon: const Icon(
-                      YingjiIcons.trash,
-                      size: 16,
-                    ),
+                    icon: const Icon(YingjiIcons.trash, size: 16),
                     label: const Text('清理 TMDB 缓存'),
                   ),
                   FilledButton.tonalIcon(
                     onPressed: _clearImageCache,
-                    icon: const Icon(
-                      YingjiIcons.photo,
-                      size: 16,
-                    ),
+                    icon: const Icon(YingjiIcons.photo, size: 16),
                     label: const Text('清理照片缓存'),
                   ),
                   FilledButton.tonalIcon(
                     onPressed: _clearVideoCache,
-                    icon: const Icon(
-                      YingjiIcons.film,
-                      size: 16,
-                    ),
+                    icon: const Icon(YingjiIcons.film, size: 16),
                     label: const Text('清理视频缓存'),
                   ),
                   FilledButton.tonalIcon(
                     onPressed: _clearDanmakuCache,
-                    icon: const Icon(
-                      YingjiIcons.danmaku,
-                      size: 16,
-                    ),
+                    icon: const Icon(YingjiIcons.danmaku, size: 16),
                     label: const Text('清理弹幕缓存'),
                   ),
                   FilledButton.tonalIcon(
                     onPressed: _clearWatchHistory,
-                    icon: const Icon(
-                      YingjiIcons.clock,
-                      size: 16,
-                    ),
+                    icon: const Icon(YingjiIcons.clock, size: 16),
                     label: const Text('清空观看记录'),
                   ),
                 ],
@@ -10559,18 +10333,12 @@ class _SettingsPageState extends State<SettingsPage>
                 WindowHost.isDesktop
                     ? '元数据、图片、视频与弹幕缓存保存在本机用户目录；清理不会影响服务器上的媒体文件。'
                     : '元数据、图片、视频与弹幕缓存保存在应用私有目录；卸载应用会一并清除，重装后需要重新连接服务器。',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               const SizedBox(height: 6),
               Text(
                 _savedMessage ?? '本机缓存与观看记录',
-                style: const TextStyle(
-                  color: Color(0xFFABB1BE),
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
             ],
           ),
@@ -10588,8 +10356,7 @@ class _SettingsPageState extends State<SettingsPage>
                   const SizedBox(width: 22),
                   Expanded(
                     child: Column(
-                      crossAxisAlignment:
-                          CrossAxisAlignment.start,
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
                           'Mova',
@@ -10601,9 +10368,7 @@ class _SettingsPageState extends State<SettingsPage>
                         const SizedBox(height: 6),
                         const Text(
                           '私人媒体中心',
-                          style: TextStyle(
-                            color: YingjiColors.muted,
-                          ),
+                          style: TextStyle(color: YingjiColors.muted),
                         ),
                         const SizedBox(height: 12),
                         Text(
@@ -10615,9 +10380,7 @@ class _SettingsPageState extends State<SettingsPage>
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          WindowHost.isDesktop
-                              ? '连接你的媒体，延续每一次观看。'
-                              : '连接你的媒体，延续每一次观看。播放时用画面手势操作：单击呼出控件、双击播放暂停、左右滑动快进快退、左半屏调亮度、右半屏调音量。',
+                          WindowHost.isDesktop ? '连接你的媒体，延续每一次观看。' : '连接你的媒体，延续每一次观看。播放时用画面手势操作：单击呼出控件、双击播放暂停、左右滑动快进快退、左半屏调亮度、右半屏调音量。',
                         ),
                       ],
                     ),
@@ -10659,10 +10422,7 @@ class _SettingsPageState extends State<SettingsPage>
                   else
                     const Text(
                       '每次打开都会自动检查一次',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: YingjiColors.muted,
-                      ),
+                      style: TextStyle(fontSize: 12, color: YingjiColors.muted),
                     ),
                 ],
               ),
@@ -10738,7 +10498,8 @@ class _SettingsPageState extends State<SettingsPage>
                                     scale: .97,
                                     visualOnly: true,
                                     child: TextButton(
-                                      onPressed: () => _jumpToSetting(i, keys[i]),
+                                      onPressed: () =>
+                                          _jumpToSetting(i, keys[i]),
                                       style: TextButton.styleFrom(
                                         alignment: Alignment.centerLeft,
                                         foregroundColor: active == i
@@ -10752,7 +10513,9 @@ class _SettingsPageState extends State<SettingsPage>
                                           vertical: 12,
                                         ),
                                         shape: RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(12),
+                                          borderRadius: BorderRadius.circular(
+                                            12,
+                                          ),
                                         ),
                                       ),
                                       child: Row(
@@ -10816,83 +10579,80 @@ class _SettingsPageState extends State<SettingsPage>
   /// 改为按住左侧手柄拖动排序：用 ReorderableListView 但 shrinkWrap +
   /// NeverScrollableScrollPhysics，列表本身不滚动，不会和设置页外层滚动抢手势。
   Widget _playerToolOrderList() => ReorderableListView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        padding: EdgeInsets.zero,
-        buildDefaultDragHandles: false,
-        onReorder: _reorderPlayerTool,
-        itemCount: _playerToolOrder.length,
-        itemBuilder: (context, index) {
-          final id = _playerToolOrder[index];
-          final enabled = !_playerToolHidden.contains(id);
-          return _playerToolTile(
-            key: Key(id),
-            index: index,
-            id: id,
-            enabled: enabled,
-          );
-        },
+    shrinkWrap: true,
+    physics: const NeverScrollableScrollPhysics(),
+    padding: EdgeInsets.zero,
+    buildDefaultDragHandles: false,
+    onReorder: _reorderPlayerTool,
+    itemCount: _playerToolOrder.length,
+    itemBuilder: (context, index) {
+      final id = _playerToolOrder[index];
+      final enabled = !_playerToolHidden.contains(id);
+      return _playerToolTile(
+        key: Key(id),
+        index: index,
+        id: id,
+        enabled: enabled,
       );
+    },
+  );
 
   Widget _playerToolTile({
     required Key key,
     required int index,
     required String id,
     required bool enabled,
-  }) =>
-      Padding(
-        key: key,
-        padding: const EdgeInsets.only(bottom: 8),
-        child: AnimatedContainer(
-          duration: MovaMotion.quick,
-          curve: MovaMotion.standardEase,
-          decoration: BoxDecoration(
-            color: enabled
-                ? YingjiGlass.surface(strength: .92)
-                : YingjiGlass.surface(strength: .42),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: YingjiGlass.line(strength: 1.25)),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(8, 4, 6, 4),
-            child: Row(
-              children: [
-                ReorderableDragStartListener(
-                  index: index,
-                  child: Icon(
-                    Icons.drag_handle,
-                    size: 22,
-                    color: enabled ? Colors.white70 : const Color(0xFF7C818D),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Icon(
-                  YingjiPlayerTools.iconOf(id),
-                  size: 17,
+  }) => Padding(
+    key: key,
+    padding: const EdgeInsets.only(bottom: 8),
+    child: AnimatedContainer(
+      duration: MovaMotion.quick,
+      curve: MovaMotion.standardEase,
+      decoration: BoxDecoration(
+        color: enabled
+            ? YingjiGlass.surface(strength: .92)
+            : YingjiGlass.surface(strength: .42),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: YingjiGlass.line(strength: 1.25)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 4, 6, 4),
+        child: Row(
+          children: [
+            ReorderableDragStartListener(
+              index: index,
+              child: Icon(
+                Icons.drag_handle,
+                size: 22,
+                color: enabled ? Colors.white70 : const Color(0xFF7C818D),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Icon(
+              YingjiPlayerTools.iconOf(id),
+              size: 17,
+              color: enabled ? Colors.white : const Color(0xFF7C818D),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                id,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
                   color: enabled ? Colors.white : const Color(0xFF7C818D),
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    id,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      fontWeight: FontWeight.w700,
-                      color: enabled
-                          ? Colors.white
-                          : const Color(0xFF7C818D),
-                    ),
-                  ),
-                ),
-                Switch(
-                  value: enabled,
-                  onChanged: (value) => _togglePlayerTool(id, value),
-                ),
-              ],
+              ),
             ),
-          ),
+            Switch(
+              value: enabled,
+              onChanged: (value) => _togglePlayerTool(id, value),
+            ),
+          ],
         ),
-      );
+      ),
+    ),
+  );
 
   /// 把保存的顺序补全 / 去重：丢掉已不存在的入口，新加入口补到末尾。
   List<String> _sanitizePlayerToolOrder(List<String>? saved) {
@@ -10976,7 +10736,8 @@ class _SettingsPageState extends State<SettingsPage>
                     size: 16,
                     color: selected
                         ? Colors.white
-                        : Theme.of(context).colorScheme.onSurface.withValues(alpha: .66),
+                        : Theme.of(context).colorScheme.onSurface
+                              .withValues(alpha: .66),
                   ),
                   const SizedBox(width: 8),
                   Text(
@@ -10987,7 +10748,8 @@ class _SettingsPageState extends State<SettingsPage>
                       fontWeight: FontWeight.w600,
                       color: selected
                           ? Colors.white
-                          : Theme.of(context).colorScheme.onSurface.withValues(alpha: .66),
+                          : Theme.of(context).colorScheme.onSurface
+                                .withValues(alpha: .66),
                     ),
                   ),
                 ],
@@ -12733,6 +12495,31 @@ Future<void> _resumePlayback(BuildContext context, WatchState state) async {
     if (choice == 'restart') startPosition = Duration.zero;
   }
   if (!context.mounted) return;
+  if (WindowHost.isDesktop) {
+    try {
+      await WindowsNativePlayer.play(
+        WindowsNativePlaybackRequest(
+          url: state.mediaId,
+          title: state.title,
+          headers: headers,
+          initialPosition: startPosition,
+          imageUrl: state.imageUrl,
+          sourceId: state.sourceId,
+          serverItemId: state.serverItemId,
+          tmdbId: state.tmdbId,
+          episodeTitle: state.episodeTitle,
+          seasonNumber: state.seasonNumber,
+          episodeNumber: state.episodeNumber,
+        ),
+      );
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Windows 原生播放器启动失败：$error')));
+      }
+    }
+    return;
+  }
   await Navigator.push(
     context,
     MaterialPageRoute(
@@ -14261,7 +14048,6 @@ class _CacheStat extends StatelessWidget {
     ),
   );
 }
-
 
 /// 设置页里的一条手势说明：图标 + 动作 + 触发方式。
 ///

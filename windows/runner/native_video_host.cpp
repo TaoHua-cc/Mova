@@ -54,8 +54,11 @@ NativeVideoHost::NativeVideoHost(flutter::BinaryMessenger* messenger,
       [this](const auto& call, auto result) {
         if (call.method_name() == "create") {
           Create();
-          const auto wid = static_cast<int64_t>(
-              reinterpret_cast<uintptr_t>(host_) & 0xffffffffULL);
+          // HWND is pointer-sized. Truncating it to 32 bits on x64 leaves mpv
+          // with an invalid render target: audio continues, but no video can
+          // ever reach the native child window.
+          const auto wid =
+              static_cast<int64_t>(reinterpret_cast<intptr_t>(host_));
           result->Success(flutter::EncodableValue(wid));
           return;
         }
@@ -99,6 +102,8 @@ void NativeVideoHost::Create() {
 void NativeVideoHost::SetBounds(int left, int top, int width, int height) {
   Create();
   if (host_ == nullptr) return;
+  // Flutter reports this RenderBox position in the Flutter view's coordinate
+  // space. WS_CHILD uses the same parent-client coordinate system.
   SetWindowPos(host_, HWND_TOP, left, top, (std::max)(1, width),
                (std::max)(1, height), SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }

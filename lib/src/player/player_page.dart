@@ -9,8 +9,10 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../platform/window_host.dart';
 import '../platform/native_video_host.dart';
+import 'playback_progress.dart';
 
 import '../brand.dart';
 import '../motion.dart';
@@ -240,6 +242,7 @@ class _PlayerPageState extends State<PlayerPage> {
   late final FocusNode _focusNode;
   late int _activeEpisodeIndex;
   bool _showControls = true;
+
   /// 是否真正播过（用来决定暂停时是否显示中央播放钮）。
   bool _hasPlayed = false;
   double _volume = 100;
@@ -297,13 +300,19 @@ class _PlayerPageState extends State<PlayerPage> {
   List<DanmakuComment> _danmakuComments = const [];
   String? _danmakuError;
   DanmakuClient? _danmakuClient;
+
   /// 视频缓存与弹幕缓存。拿不到目录时保持 null，播放器按「没有缓存」正常播，
   /// 只是少一层加速，不会因此打不开。
   VideoCacheStore? _videoCache;
   DanmakuCache? _danmakuCache;
+
   /// 正在进行的后台视频缓存任务。切集或退出必须打断：否则它既继续占带宽，
   /// 又会把下一集的地址写进同一个分片文件。
   VideoCacheDownload? _videoDownload;
+  StreamSubscription<VideoCacheProgress>? _videoCacheProgressSubscription;
+  bool _playingCachedFile = false;
+  double _persistentCacheFraction = 0;
+  String? _videoCacheStatus;
   double _speed = 1;
   double _audioDelay = 0;
   double _subtitleDelay = 0;
@@ -341,29 +350,41 @@ class _PlayerPageState extends State<PlayerPage> {
   // ── 触摸手势状态（仅移动端注册拖动，见 build）────────────────────
   /// 进行中的手势类型；null 表示当前没有手势。
   _GestureKind? _gestureKind;
+
   /// 画面中央手势指示器的主文案（时间点 / 百分比）。
   String _gestureLabel = '';
+
   /// 手势指示器的图标。
   IconData _gestureIcon = Icons.brightness_6;
+
   /// 手势指示器的进度，0..1。
   double _gestureProgress = 0;
+
   /// 手势指示器的副文案（快进快退的偏移量）；为空时不显示。
   String _gestureCaption = '';
+
   /// 指示器当前该不该显示。手势结束只置 false 让它按统一规范淡出，
   /// 数值保留到淡出结束，免得最后一帧跳回默认值。
   bool _gestureVisible = false;
+
   /// 水平拖动的累计位移，用来换算快进快退的秒数。
   double _seekDragPixels = 0;
+
   /// 水平拖动开始时的播放位置。
   Duration _seekDragAnchor = Duration.zero;
+
   /// 水平拖动过程中的预览落点，松手时 seek 到它。
   Duration? _seekPreview;
+
   /// 垂直拖动开始时的基准值（亮度或音量的百分比）。
   double _valueDragAnchor = 0;
+
   /// 垂直拖动的累计位移。
   double _valueDragPixels = 0;
+
   /// 屏幕亮度 0..1，由宿主窗口提供。
   double _brightness = .5;
+
   /// 是否已从宿主读到过真实亮度，读到之前不写回宿主。
   bool _brightnessKnown = false;
 
@@ -378,6 +399,7 @@ class _PlayerPageState extends State<PlayerPage> {
   List<String> _toolOrder = YingjiPlayerTools.all
       .map((tool) => tool.id)
       .toList(growable: true);
+
   /// 被关掉的入口 id。
   List<String> _toolHidden = <String>[];
 
@@ -431,8 +453,9 @@ class _PlayerPageState extends State<PlayerPage> {
     );
     if (_activeEpisodeIndex < 0) _activeEpisodeIndex = 0;
     _player = Player(
-      configuration: const PlayerConfiguration(
+      configuration: PlayerConfiguration(
         vo: 'gpu-next',
+        osc: WindowHost.isDesktop,
         title: 'Mova',
         libass: true,
       ),
@@ -879,7 +902,12 @@ class _PlayerPageState extends State<PlayerPage> {
     _skipTicks = 0;
     _videoDownload?.cancel();
     _videoDownload = null;
+    await _videoCacheProgressSubscription?.cancel();
+    _videoCacheProgressSubscription = null;
     final cached = await _videoCache?.cachedFile(episode.url);
+    _playingCachedFile = cached != null;
+    _persistentCacheFraction = cached == null ? 0 : 1;
+    _videoCacheStatus = cached == null ? null : '已完整缓存';
     if (cached != null) {
       // 命中本机缓存：直接开本地文件。本地文件用不上鉴权头，带了反而可能
       // 让 mpv 走一次无谓的 HTTP 请求流程。这里传的是**原始绝对路径**而不是
@@ -887,8 +915,30 @@ class _PlayerPageState extends State<PlayerPage> {
       // mpv 在 Windows 上未必能解回正确的路径。
       await _player.open(Media(cached.path));
     } else {
-      await _player.open(Media(episode.url, httpHeaders: episode.headers));
+      final playbackUrl = await _videoCache?.playbackUrl(
+        episode.url,
+        headers: episode.headers,
+      );
+      await _player.open(
+        Media(
+          playbackUrl ?? episode.url,
+          httpHeaders: playbackUrl == null ? episode.headers : const {},
+        ),
+      );
       unawaited(_cacheCurrentEpisode(episode));
+    }
+    if (WindowHost.isDesktop) {
+      await (_player.platform as dynamic).command(<String>[
+        'script-message-to',
+        'osc',
+        'osc-visibility',
+        'auto',
+      ]);
+      await (_player.platform as dynamic).command(<String>[
+        'script-message-to',
+        'osc',
+        'osc-show',
+      ]);
     }
     if (episode.initialAudioTrack != null) {
       await _setMpvProperty('aid', '${episode.initialAudioTrack! + 1}');
@@ -923,9 +973,38 @@ class _PlayerPageState extends State<PlayerPage> {
         throw StateError('Windows 原生视频宿主创建失败');
       }
       // Bind this existing media_kit Player before opening media. The native
-      // gpu-next VO then presents straight into the Win32 child HWND.
-      await _setRequiredMpvProperty('wid', '${handle & 0xffffffff}');
+      // gpu-next VO then presents straight into the Win32 child HWND. mpv's
+      // Win32 contract takes the HWND as an unsigned 32-bit value even in a
+      // 64-bit process; passing the sign-extended/pointer-sized representation
+      // can leave audio running while the video VO never attaches.
+      final mpvWindowId = handle & 0xffffffff;
+      await _setRequiredMpvProperty('wid', '$mpvWindowId');
       await _setRequiredMpvProperty('vo', 'gpu-next');
+      // Do not let gpu-next auto-select Vulkan/ANGLE for an embedded HWND.
+      // D3D11 is mpv's native Windows presentation path and is also the path
+      // used by D3D11VA hardware decoding.
+      await _setRequiredMpvProperty('gpu-api', 'd3d11');
+      await _setRequiredMpvProperty('gpu-context', 'd3d11');
+      // media_kit initializes every Player with `vid=no` and normally changes
+      // it to `auto` from VideoController. Windows deliberately has no
+      // VideoController because gpu-next renders into the native HWND, so the
+      // video track must be enabled here or playback is audio-only.
+      await _setRequiredMpvProperty('vid', 'auto');
+      // Raw HWND embedding cannot be composited with Flutter widgets. Let mpv
+      // draw the playback controls in the same native surface instead.
+      await _setRequiredMpvProperty('osc', 'yes');
+      await _setRequiredMpvProperty('osd-level', '1');
+      await _setRequiredMpvProperty('input-default-bindings', 'yes');
+      await _setRequiredMpvProperty('input-vo-keyboard', 'yes');
+      await _setMpvProperty(
+        'script-opts',
+        'osc-layout=floating,osc-floatingtitle=no,osc-floatingwidth=920,'
+            'osc-floatingalpha=125,osc-windowcontrols=no,'
+            'osc-tracknumberswidth=0,osc-seekbarstyle=bar,'
+            'osc-seekrangestyle=bar,osc-timetotal=yes,'
+            'osc-icon_style=fluent,osc-hidetimeout=1800,'
+            'osc-fadeduration=180,osc-fadein=yes,osc-deadzonesize=0.82',
+      );
       return true;
     } catch (error) {
       if (mounted) {
@@ -951,6 +1030,22 @@ class _PlayerPageState extends State<PlayerPage> {
       title: episode.title,
     );
     _videoDownload = job;
+    void update(VideoCacheProgress progress) {
+      final fraction = progress.fraction;
+      if (fraction != null) _persistentCacheFraction = fraction;
+      _videoCacheStatus = switch (progress.status) {
+        VideoCacheStatus.downloading =>
+          fraction == null ? '正在缓存' : '缓存 ${(fraction * 100).round()}%',
+        VideoCacheStatus.buffered => '已预读 ${VideoCachePolicy.label(limit)}',
+        VideoCacheStatus.complete => '已完整缓存',
+        VideoCacheStatus.unavailable => '缓存暂不可用',
+        VideoCacheStatus.idle => null,
+      };
+      if (mounted && (_showControls || _settingsOpen)) setState(() {});
+    }
+
+    update(job.state);
+    _videoCacheProgressSubscription = job.progress.listen(update);
     await job.done;
   }
 
@@ -1204,7 +1299,9 @@ class _PlayerPageState extends State<PlayerPage> {
             source.kind != SourceKind.webdav &&
             token != null &&
             token.isNotEmpty) {
-          final server = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
+          final server = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(source.id),
+          );
           try {
             final native = await server.mediaSegments(
               EmbySession(source: source, token: token),
@@ -1816,9 +1913,7 @@ class _PlayerPageState extends State<PlayerPage> {
       'Mova 播放诊断',
       '标题: ${_activeEpisode.title}',
       '内核: libmpv / gpu-next',
-      '硬件解码: ${_hardware
-          ? (WindowHost.isDesktop ? 'D3D11VA' : 'MediaCodec')
-          : '关闭'}',
+      '硬件解码: ${_hardware ? (WindowHost.isDesktop ? 'D3D11VA' : 'MediaCodec') : '关闭'}',
       'HDR: ${_hdr ? '自动' : '关闭'}',
       '播放速度: ${_speed.toStringAsFixed(2)}x',
       '状态: ${_error ?? '正常'}',
@@ -1837,6 +1932,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _subtitleSubscription?.cancel();
     _videoDownload?.cancel();
     _videoDownload = null;
+    _videoCacheProgressSubscription?.cancel();
     _danmakuRequest++;
     unawaited(_syncProgress(syncTrakt: true, ending: true));
     unawaited(_saveWatchState());
@@ -2307,6 +2403,15 @@ class _PlayerPageState extends State<PlayerPage> {
                   label: _networkSpeedLabel(),
                   ok: !_player.state.buffering,
                 ),
+                if (_videoCacheStatus != null) ...[
+                  const SizedBox(width: 8),
+                  _StateChip(
+                    label: _videoCacheStatus!,
+                    ok:
+                        !_videoCacheStatus!.contains('超过') &&
+                        !_videoCacheStatus!.contains('不可用'),
+                  ),
+                ],
                 if (!WindowHost.isDesktop) ...[
                   const SizedBox(width: 10),
                   YingjiMotionIconButton(
@@ -2316,6 +2421,16 @@ class _PlayerPageState extends State<PlayerPage> {
                     tooltip: _mobileFullScreen ? '退出全屏' : '全屏',
                     size: 46,
                     onPressed: _toggleFullScreen,
+                  ),
+                ],
+                if (WindowHost.isDesktop) ...[
+                  const SizedBox(width: 10),
+                  YingjiMotionIconButton(
+                    icon: YingjiIcons.gear_alt,
+                    tooltip: '播放设置',
+                    selected: _settingsOpen,
+                    size: 46,
+                    onPressed: _toggleSettings,
                   ),
                 ],
                 // 窗口按钮在移动端整组不渲染，这里也别留空档，
@@ -2359,25 +2474,36 @@ class _PlayerPageState extends State<PlayerPage> {
                         final max = duration.inMilliseconds == 0
                             ? 1.0
                             : duration.inMilliseconds.toDouble();
-                        final buffered =
-                            (bufferSnap.data ?? _player.state.buffer)
-                                .inMilliseconds
-                                .clamp(0, duration.inMilliseconds)
-                                .toDouble();
+                        final buffered = normalizedBufferedPosition(
+                          position: position,
+                          buffer: bufferSnap.data ?? _player.state.buffer,
+                          duration: duration,
+                          fullyCached: _playingCachedFile,
+                          persistentCacheFraction: _persistentCacheFraction,
+                        ).inMilliseconds.toDouble();
                         final current = duration.inMilliseconds == 0
                             ? 0.0
                             : position.inMilliseconds
                                   .clamp(0, duration.inMilliseconds)
                                   .toDouble();
-                        return Slider(
-                          value: current,
-                          secondaryTrackValue: buffered,
-                          max: max,
-                          onChanged: (v) =>
-                              _player.seek(Duration(milliseconds: v.round())),
-                          activeColor: Colors.white,
-                          secondaryActiveColor: Colors.white38,
-                          inactiveColor: Colors.white24,
+                        return SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 4,
+                            activeTrackColor: Colors.white,
+                            secondaryActiveTrackColor: const Color(0x8AFFFFFF),
+                            inactiveTrackColor: const Color(0x30FFFFFF),
+                            overlayColor: const Color(0x24FFFFFF),
+                          ),
+                          child: Slider(
+                            value: current,
+                            secondaryTrackValue: buffered,
+                            max: max,
+                            semanticFormatterCallback: (value) =>
+                                '${_time(Duration(milliseconds: value.round()))}，'
+                                '已缓存至 ${_time(Duration(milliseconds: buffered.round()))}',
+                            onChanged: (v) =>
+                                _player.seek(Duration(milliseconds: v.round())),
+                          ),
                         );
                       },
                     ),
@@ -3279,7 +3405,8 @@ class _PlayerPageState extends State<PlayerPage> {
             child: Text(labelBuilder(item)),
           ),
       ],
-      child: display ??
+      child:
+          display ??
           Container(
             width: 40,
             height: 40,

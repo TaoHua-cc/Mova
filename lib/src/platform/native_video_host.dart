@@ -19,6 +19,8 @@ class NativeVideoHost {
 
   static Future<void> setBounds(Rect rect, double devicePixelRatio) async {
     if (!isSupported) return;
+    // The value is already in the Flutter view's coordinate space. The
+    // runner positions its WS_CHILD directly in that same client space.
     await _channel.invokeMethod<void>('setBounds', {
       'left': (rect.left * devicePixelRatio).round(),
       'top': (rect.top * devicePixelRatio).round(),
@@ -43,8 +45,8 @@ class NativeVideoSurface extends StatefulWidget {
   const NativeVideoSurface({
     super.key,
     required this.visible,
-    this.topInset = 78,
-    this.bottomInset = 154,
+    this.topInset = 68,
+    this.bottomInset = 0,
   });
 
   final bool visible;

@@ -3,7 +3,7 @@
 ;   ISCC.exe /DAppVersion=3.1.81 installer\Mova.iss
 ; 不传参数时用下面的默认值（本地手工打包用）。
 #ifndef AppVersion
-  #define AppVersion "3.1.103"
+  #define AppVersion "3.1.104"
 #endif
 #define AppPublisher "Mova"
 #define AppExeName "mova.exe"
@@ -37,7 +37,12 @@ Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
 
 [Files]
-Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Excludes: "mpv.exe,mpv\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Remove files left by the retired external-mpv/Lua control implementation.
+Type: files; Name: "{app}\mpv.exe"
+Type: filesandordirs; Name: "{app}\mpv"
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"

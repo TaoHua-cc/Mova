@@ -88,10 +88,15 @@ class VideoCacheDownload {
   VideoCacheDownload._();
 
   final Completer<void> _completer = Completer<void>();
+  final StreamController<VideoCacheProgress> _progressController =
+      StreamController<VideoCacheProgress>.broadcast();
+  VideoCacheProgress _state = const VideoCacheProgress();
   bool _cancelled = false;
   HttpClientRequest? _request;
 
   Future<void> get done => _completer.future;
+  Stream<VideoCacheProgress> get progress => _progressController.stream;
+  VideoCacheProgress get state => _state;
 
   bool get isCancelled => _cancelled;
 
@@ -103,9 +108,33 @@ class VideoCacheDownload {
       // 请求可能已经结束，abort 会抛；打断只是尽力而为。
     }
   }
+
+  void _update(VideoCacheProgress value) {
+    _state = value;
+    if (!_progressController.isClosed) _progressController.add(value);
+  }
 }
 
-/// 视频缓存：播放时把整份视频存到本机，下次直接开本地文件播放。
+enum VideoCacheStatus { idle, downloading, buffered, complete, unavailable }
+
+class VideoCacheProgress {
+  const VideoCacheProgress({
+    this.receivedBytes = 0,
+    this.totalBytes = 0,
+    this.mediaTotalBytes = 0,
+    this.status = VideoCacheStatus.idle,
+  });
+
+  final int receivedBytes;
+  final int totalBytes;
+  final int mediaTotalBytes;
+  final VideoCacheStatus status;
+
+  double? get fraction =>
+      totalBytes <= 0 ? null : (receivedBytes / totalBytes).clamp(0.0, 1.0);
+}
+
+/// 视频缓存：持久保存可复用的前向分段，并通过本机 Range 代理供 mpv 播放。
 ///
 /// 为什么不用 mpv 自带的磁盘缓冲：那份缓冲由播放器自己管，应用**读得到但管
 /// 不了** —— 清不掉、上限不可控、设置页也给不出占用。这里自己落一份，才能
@@ -119,6 +148,8 @@ class VideoCacheStore {
   static const String _folder = 'mova-video-cache';
 
   final Directory _root;
+  HttpServer? _proxy;
+  final Map<String, _ProxySource> _proxySources = <String, _ProxySource>{};
 
   /// 建好目录并返回实例；拿不到目录时返回 null（调用方按「没有缓存」处理）。
   static Future<VideoCacheStore?> tryCreate() async {
@@ -134,8 +165,114 @@ class VideoCacheStore {
     }
   }
 
-  String _path(String key) =>
-      '${_root.path}${Platform.pathSeparator}$key.bin';
+  String _path(String key) => '${_root.path}${Platform.pathSeparator}$key.bin';
+
+  /// A loopback URL which gives mpv a single seekable stream backed by the
+  /// persistent prefix on disk and the origin server for cache misses.
+  Future<String> playbackUrl(
+    String url, {
+    Map<String, String> headers = const {},
+  }) async {
+    final server = _proxy ??= await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    if (_proxySources.isEmpty) unawaited(_serveProxy(server));
+    final key = _keyFor(url);
+    _proxySources[key] = _ProxySource(url, headers);
+    return 'http://${server.address.address}:${server.port}/media/$key';
+  }
+
+  Future<void> _serveProxy(HttpServer server) async {
+    await for (final request in server) {
+      unawaited(_handleProxy(request));
+    }
+  }
+
+  Future<void> _handleProxy(HttpRequest request) async {
+    HttpClient? client;
+    try {
+      final key =
+          request.uri.pathSegments.length == 2 &&
+              request.uri.pathSegments.first == 'media'
+          ? request.uri.pathSegments.last
+          : '';
+      final source = _proxySources[key];
+      if (source == null) {
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+        return;
+      }
+      final range = _parseRange(request.headers.value(HttpHeaders.rangeHeader));
+      final part = File('${_path(key)}.part');
+      final cached = await _lengthOf(part);
+      final meta = await _readMeta(key);
+      final total = (meta?['totalBytes'] as num?)?.toInt() ?? 0;
+      final start = range?.$1 ?? 0;
+      if (request.method == 'GET' && cached > start) {
+        final requestedEnd = range?.$2;
+        final end =
+            (requestedEnd == null
+                    ? cached - 1
+                    : requestedEnd.clamp(start, cached - 1))
+                .toInt();
+        final length = end - start + 1;
+        request.response.statusCode = HttpStatus.partialContent;
+        request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+        request.response.headers.set(
+          HttpHeaders.contentRangeHeader,
+          'bytes $start-$end/${total > 0 ? total : '*'}',
+        );
+        request.response.contentLength = length;
+        await request.response.addStream(part.openRead(start, end + 1));
+        await request.response.close();
+        return;
+      }
+
+      client = HttpClient()..findProxy = findNetworkProxy;
+      final origin = await client.openUrl(
+        request.method,
+        Uri.parse(source.url),
+      );
+      for (final entry in source.headers.entries) {
+        origin.headers.set(entry.key, entry.value);
+      }
+      final incomingRange = request.headers.value(HttpHeaders.rangeHeader);
+      if (incomingRange != null) {
+        origin.headers.set(HttpHeaders.rangeHeader, incomingRange);
+      }
+      final response = await origin.close();
+      request.response.statusCode = response.statusCode;
+      for (final name in <String>[
+        HttpHeaders.contentTypeHeader,
+        HttpHeaders.contentRangeHeader,
+        HttpHeaders.acceptRangesHeader,
+        HttpHeaders.etagHeader,
+        HttpHeaders.lastModifiedHeader,
+      ]) {
+        final value = response.headers.value(name);
+        if (value != null) request.response.headers.set(name, value);
+      }
+      if (response.contentLength >= 0) {
+        request.response.contentLength = response.contentLength;
+      }
+      if (request.method != 'HEAD') await request.response.addStream(response);
+      await request.response.close();
+    } catch (_) {
+      try {
+        request.response.statusCode = HttpStatus.badGateway;
+        await request.response.close();
+      } catch (_) {}
+    } finally {
+      client?.close(force: true);
+    }
+  }
+
+  static (int, int?)? _parseRange(String? value) {
+    final match = RegExp(r'^bytes=(\d+)-(\d*)$').firstMatch(value ?? '');
+    if (match == null) return null;
+    return (int.parse(match.group(1)!), int.tryParse(match.group(2) ?? ''));
+  }
 
   /// 文件名用 URL 的 FNV-1a 散列：URL 里常带 token 之类的长查询串，
   /// 直接拿来当文件名既超长又把凭据写进磁盘。
@@ -205,9 +342,9 @@ class VideoCacheStore {
       if (entity is! File) continue;
       final isMedia =
           entity.path.endsWith('.bin') || entity.path.endsWith('.part');
-      final length = await _lengthOf(entity);
-      total += length;
       if (isMedia) {
+        final length = await _lengthOf(entity);
+        total += length;
         files.add(_CacheFile(entity, length, await _lastUsed(entity)));
       }
     }
@@ -220,10 +357,10 @@ class VideoCacheStore {
     }
   }
 
-  /// 后台把 [url] 整份存下来。返回句柄，调用方可以 [VideoCacheDownload.cancel]。
+  /// 后台为 [url] 预读至所选容量。返回句柄，调用方可以取消且保留分片。
   ///
-  /// [limitBytes] 为 0 时直接不缓存；文件比上限还大时也放弃 —— 缓存一个放不
-  /// 下的文件只会把上一部剧挤掉，什么也换不来。
+  /// [limitBytes] is the reusable read-ahead window, not a maximum media size.
+  /// A large movie therefore keeps a persistent prefix up to this size.
   VideoCacheDownload download({
     required String url,
     required int limitBytes,
@@ -257,7 +394,8 @@ class VideoCacheStore {
     HttpClient? client;
     try {
       final uri = Uri.tryParse(url);
-      if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return;
+      if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https'))
+        return;
       final key = _keyFor(url);
       final target = File(_path(key));
       if (await target.exists()) return;
@@ -270,6 +408,12 @@ class VideoCacheStore {
           offset = 0;
         }
       }
+      job._update(
+        VideoCacheProgress(
+          receivedBytes: offset,
+          status: VideoCacheStatus.downloading,
+        ),
+      );
       client = HttpClient()..findProxy = findNetworkProxy;
       final request = await client
           .getUrl(uri)
@@ -294,8 +438,27 @@ class VideoCacheStore {
       // 200 说明服务端没接 Range，分片对不上号，只能从头重写。
       if (response.statusCode == 200) offset = 0;
       final remaining = response.contentLength;
-      if (remaining > 0 && offset + remaining > limitBytes) {
-        await _delete(part);
+      final total = remaining > 0 ? offset + remaining : 0;
+      final targetBytes = total > 0 && total < limitBytes ? total : limitBytes;
+      await _writeMeta(
+        key,
+        url: url,
+        title: title,
+        bytes: offset,
+        totalBytes: total,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      if (offset >= targetBytes) {
+        job._update(
+          VideoCacheProgress(
+            receivedBytes: offset,
+            totalBytes: targetBytes,
+            mediaTotalBytes: total,
+            status: total > 0 && offset >= total
+                ? VideoCacheStatus.complete
+                : VideoCacheStatus.buffered,
+          ),
+        );
         return;
       }
       var completed = false;
@@ -304,17 +467,28 @@ class VideoCacheStore {
       );
       try {
         var written = offset;
+        var lastReported = offset;
         await for (final chunk in response) {
           if (job._cancelled) break;
           sink.add(chunk);
           written += chunk.length;
-          if (written > limitBytes) {
-            job._cancelled = true;
+          if (written - lastReported >= _mb) {
+            lastReported = written;
+            job._update(
+              VideoCacheProgress(
+                receivedBytes: written,
+                totalBytes: targetBytes,
+                mediaTotalBytes: total,
+                status: VideoCacheStatus.downloading,
+              ),
+            );
+          }
+          if (written >= targetBytes) {
             break;
           }
         }
         await sink.flush();
-        completed = !job._cancelled;
+        completed = !job._cancelled && total > 0 && written >= total;
       } catch (_) {
         // 网络中断或被打断：分片留在磁盘上，下次续传。
         completed = false;
@@ -323,27 +497,44 @@ class VideoCacheStore {
           await sink.close();
         } catch (_) {}
       }
-      if (!completed) return;
       final size = await _lengthOf(part);
       if (size <= 0) {
         await _delete(part);
         return;
       }
-      if (remaining > 0 && size < offset + remaining) return;
-      await part.rename(target.path);
+      if (completed) await part.rename(target.path);
       await _writeMeta(
         key,
         url: url,
         title: title,
         bytes: size,
+        totalBytes: total,
         createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      job._update(
+        VideoCacheProgress(
+          receivedBytes: size,
+          totalBytes: completed ? size : targetBytes,
+          mediaTotalBytes: total,
+          status: completed
+              ? VideoCacheStatus.complete
+              : VideoCacheStatus.buffered,
+        ),
       );
       await prune(limitBytes);
     } catch (_) {
-      // 缓存失败不影响播放，静默放弃。
+      // 缓存失败不影响播放，但向播放器暴露真实状态。
+      job._update(
+        VideoCacheProgress(
+          receivedBytes: job.state.receivedBytes,
+          totalBytes: job.state.totalBytes,
+          status: VideoCacheStatus.unavailable,
+        ),
+      );
     } finally {
       client?.close(force: true);
       if (!job._completer.isCompleted) job._completer.complete();
+      await job._progressController.close();
     }
   }
 
@@ -352,12 +543,14 @@ class VideoCacheStore {
     final meta = File('${_root.path}${Platform.pathSeparator}$key.json');
     var createdAt = DateTime.now().millisecondsSinceEpoch;
     var title = '';
+    var totalBytes = 0;
     if (await meta.exists()) {
       try {
         final data = jsonDecode(await meta.readAsString());
         if (data is Map) {
           createdAt = (data['createdAt'] as int?) ?? createdAt;
           title = '${data['title'] ?? ''}';
+          totalBytes = (data['totalBytes'] as num?)?.toInt() ?? 0;
         }
       } catch (_) {}
     }
@@ -366,6 +559,7 @@ class VideoCacheStore {
       url: url,
       title: title,
       bytes: bytes,
+      totalBytes: totalBytes,
       createdAt: createdAt,
     );
   }
@@ -375,6 +569,7 @@ class VideoCacheStore {
     required String url,
     required String title,
     required int bytes,
+    required int totalBytes,
     required int createdAt,
   }) async {
     final meta = File('${_root.path}${Platform.pathSeparator}$key.json');
@@ -384,11 +579,23 @@ class VideoCacheStore {
           'url': url,
           'title': title,
           'bytes': bytes,
+          'totalBytes': totalBytes,
           'createdAt': createdAt,
           'lastUsedAt': DateTime.now().millisecondsSinceEpoch,
         }),
       );
     } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>?> _readMeta(String key) async {
+    final file = File('${_root.path}${Platform.pathSeparator}$key.json');
+    if (!await file.exists()) return null;
+    try {
+      final value = jsonDecode(await file.readAsString());
+      return value is Map ? value.cast<String, dynamic>() : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<int> _lastUsed(File file) async {
@@ -438,6 +645,12 @@ class VideoCacheStore {
       if (await meta.exists()) await meta.delete();
     } catch (_) {}
   }
+}
+
+class _ProxySource {
+  const _ProxySource(this.url, this.headers);
+  final String url;
+  final Map<String, String> headers;
 }
 
 class _CacheFile {

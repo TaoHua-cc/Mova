@@ -39,3 +39,14 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
+
+add_executable(mova_native_player WIN32
+  "../native_player/main.cpp"
+)
+apply_standard_settings(mova_native_player)
+target_compile_options(mova_native_player PRIVATE /utf-8)
+target_compile_definitions(mova_native_player PRIVATE "NOMINMAX")
+target_link_libraries(mova_native_player PRIVATE gdiplus.lib shell32.lib)
+set_target_properties(mova_native_player PROPERTIES OUTPUT_NAME "MovaNativePlayer")
+install(TARGETS mova_native_player RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  COMPONENT Runtime)

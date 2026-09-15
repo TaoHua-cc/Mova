@@ -18,12 +18,10 @@ New-Item -ItemType Directory -Force -Path $cache | Out-Null
 if (-not (Test-Path $archive)) {
   Invoke-WebRequest -Uri $url -OutFile $archive
 }
-
 $actualSha256 = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualSha256 -ne $expectedSha256) {
   throw "libmpv archive SHA-256 mismatch: $actualSha256"
 }
-
 $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
 if (-not $sevenZip) {
   $sevenZip = @(

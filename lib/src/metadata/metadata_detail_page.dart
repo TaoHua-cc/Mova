@@ -8,6 +8,7 @@ import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../platform/window_host.dart';
 
 import '../brand.dart';
@@ -16,6 +17,7 @@ import '../cache/media_cache.dart';
 import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
 import '../player/native_dolby_vision.dart';
+import '../player/windows_native_player.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
@@ -173,10 +175,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       _episodeProgress = derived.progress;
       _selectedSeason =
           preferred?.seasonNumber ??
-          rows
-              .map((row) => row.seasonNumber)
-              .whereType<int>()
-              .firstOrNull;
+          rows.map((row) => row.seasonNumber).whereType<int>().firstOrNull;
       _loadingResources = false;
     });
     // 剧集名与剧照也立刻补上：TMDB 那侧同样是缓存优先的，不会卡住界面。
@@ -656,11 +655,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(
-            completed
-                ? '已标记播放完成 · 仅保存在本机'
-                : '已标记未播放 · 仅保存在本机',
-          ),
+          content: Text(completed ? '已标记播放完成 · 仅保存在本机' : '已标记未播放 · 仅保存在本机'),
         ),
       );
       return;
@@ -1106,153 +1101,154 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-            RepaintBoundary(
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  if (item.backdropUrl != null)
-                    CachedNetworkImage(
-                      imageUrl: item.backdropUrl.toString(),
-                      fit: BoxFit.cover,
-                      // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成（正好压在进
-                      // 页面的转场上），背景直接显示。
-                      fadeInDuration: Duration.zero,
-                      fadeOutDuration: Duration.zero,
-                      // 全屏窗口下 backdrop 原图可能上千像素：按窗口实际物理宽度
-                      // 解码，省内存也省每帧纹理带宽。
-                      memCacheWidth:
-                          (MediaQuery.sizeOf(context).width *
-                                  MediaQuery.devicePixelRatioOf(context))
-                              .clamp(1.0, 2560.0)
-                              .round(),
-                      errorWidget: (_, _, _) => const SizedBox.shrink(),
-                    ),
-                  const DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: RadialGradient(
-                        center: Alignment.topRight,
-                        radius: 1.15,
-                        colors: [Color(0x553B6A4D), Color(0xE807090D)],
+              RepaintBoundary(
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (item.backdropUrl != null)
+                      CachedNetworkImage(
+                        imageUrl: item.backdropUrl.toString(),
+                        fit: BoxFit.cover,
+                        // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成（正好压在进
+                        // 页面的转场上），背景直接显示。
+                        fadeInDuration: Duration.zero,
+                        fadeOutDuration: Duration.zero,
+                        // 全屏窗口下 backdrop 原图可能上千像素：按窗口实际物理宽度
+                        // 解码，省内存也省每帧纹理带宽。
+                        memCacheWidth:
+                            (MediaQuery.sizeOf(context).width *
+                                    MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 2560.0)
+                                .round(),
+                        errorWidget: (_, _, _) => const SizedBox.shrink(),
+                      ),
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: RadialGradient(
+                          center: Alignment.topRight,
+                          radius: 1.15,
+                          colors: [Color(0x553B6A4D), Color(0xE807090D)],
+                        ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-            SafeArea(
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _DetailSidebar(
-                    onNavigate: (section) {
-                      yingjiSectionRequest.value = section;
-                      Navigator.pop(context);
-                    },
-                  ),
-                  Expanded(
-                    child: Column(
-                      children: [
-                        _DetailTopBar(
-                          onBack: () => Navigator.pop(context),
-                          onSearch: () => _showResourceSearch(context),
-                        ),
-                        Expanded(
-                          child: YingjiSmoothWheel(
-                            controller: _pageScroll,
-                            child: ListView(
+              SafeArea(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _DetailSidebar(
+                      onNavigate: (section) {
+                        yingjiSectionRequest.value = section;
+                        Navigator.pop(context);
+                      },
+                    ),
+                    Expanded(
+                      child: Column(
+                        children: [
+                          _DetailTopBar(
+                            onBack: () => Navigator.pop(context),
+                            onSearch: () => _showResourceSearch(context),
+                          ),
+                          Expanded(
+                            child: YingjiSmoothWheel(
                               controller: _pageScroll,
-                              scrollCacheExtent: const ScrollCacheExtent.pixels(
-                                900,
-                              ),
-                              // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel
-                              // 平滑驱动；移动端保持原有的回弹手感。
-                              physics:
-                                  yingjiWheelPhysics ??
-                                  const BouncingScrollPhysics(
-                                    parent: AlwaysScrollableScrollPhysics(),
-                                  ),
-                              padding: EdgeInsets.fromLTRB(
-                                YingjiLayout.detailLeadingInset,
-                                10,
-                                YingjiLayout.pageRight,
-                                80,
-                              ),
-                              children: [
-                                _DetailHeroCopy(
-                                  item: item,
-                                  selected: _selectedResource,
-                                  loading: _loadingResources,
-                                  inWatchlist: _inWatchlist,
-                                  favorite: _isFavorite,
-                                  onPlay: () => _play(context, item),
-                                  onWatchlist: () async {
-                                    final store = _watchlist;
-                                    if (store == null) return;
-                                    await store.toggle(item);
-                                    if (mounted) {
-                                      setState(
-                                        () => _inWatchlist = !_inWatchlist,
-                                      );
-                                    }
-                                  },
-                                  onFavorite: _toggleFavorite,
+                              child: ListView(
+                                controller: _pageScroll,
+                                scrollCacheExtent:
+                                    const ScrollCacheExtent.pixels(900),
+                                // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel
+                                // 平滑驱动；移动端保持原有的回弹手感。
+                                physics:
+                                    yingjiWheelPhysics ??
+                                    const BouncingScrollPhysics(
+                                      parent: AlwaysScrollableScrollPhysics(),
+                                    ),
+                                padding: EdgeInsets.fromLTRB(
+                                  YingjiLayout.detailLeadingInset,
+                                  10,
+                                  YingjiLayout.pageRight,
+                                  80,
                                 ),
-                                const SizedBox(height: 32),
-                                if (_resources.isNotEmpty &&
-                                    item.kind == '剧集') ...[
-                                  _SeasonRail(
-                                    resources: _resources,
-                                    posters: _seasonPosters,
-                                    selectedSeason: _selectedSeason,
-                                    onSelect: _selectSeason,
-                                  ),
-                                  const SizedBox(height: 24),
-                                  _EpisodePreviewRail(
-                                    resources: _episodeChoices,
+                                children: [
+                                  _DetailHeroCopy(
+                                    item: item,
                                     selected: _selectedResource,
-                                    completedResourceIds: _completedResourceIds,
-                                    metadata: _episodeMetadata,
-                                    episodeProgress: _episodeProgress,
-                                    onMarkPlayed: _setEpisodeCompleted,
-                                    onSelect: _selectEpisode,
+                                    loading: _loadingResources,
+                                    inWatchlist: _inWatchlist,
+                                    favorite: _isFavorite,
+                                    onPlay: () => _play(context, item),
+                                    onWatchlist: () async {
+                                      final store = _watchlist;
+                                      if (store == null) return;
+                                      await store.toggle(item);
+                                      if (mounted) {
+                                        setState(
+                                          () => _inWatchlist = !_inWatchlist,
+                                        );
+                                      }
+                                    },
+                                    onFavorite: _toggleFavorite,
                                   ),
-                                  const SizedBox(height: 30),
+                                  const SizedBox(height: 32),
+                                  if (_resources.isNotEmpty &&
+                                      item.kind == '剧集') ...[
+                                    _SeasonRail(
+                                      resources: _resources,
+                                      posters: _seasonPosters,
+                                      selectedSeason: _selectedSeason,
+                                      onSelect: _selectSeason,
+                                    ),
+                                    const SizedBox(height: 24),
+                                    _EpisodePreviewRail(
+                                      resources: _episodeChoices,
+                                      selected: _selectedResource,
+                                      completedResourceIds:
+                                          _completedResourceIds,
+                                      metadata: _episodeMetadata,
+                                      episodeProgress: _episodeProgress,
+                                      onMarkPlayed: _setEpisodeCompleted,
+                                      onSelect: _selectEpisode,
+                                    ),
+                                    const SizedBox(height: 30),
+                                  ],
+                                  _ResourceSection(
+                                    resources: _visibleResources,
+                                    selected: _selectedResource,
+                                    loading: _loadingResources,
+                                    error: _resourceError,
+                                    // 手动重试要绕开冷却间隔，立刻重搜。
+                                    onRetry: () => _loadResources(force: true),
+                                    onPicker: (resource) => _showResourcePicker(
+                                      source: resource.source,
+                                    ),
+                                    onSelect: (resource) => setState(
+                                      () => _selectedResource = resource,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 18),
+                                  _ResourceDetailsPanel(
+                                    item: item,
+                                    resource: _selectedResource,
+                                    selectedAudioTrack: _selectedAudioTrack,
+                                    selectedSubtitleTrack:
+                                        _selectedSubtitleTrack,
+                                    onSelectTracks: _showTrackPicker,
+                                  ),
+                                  const SizedBox(height: 36),
+                                  _DetailExtrasSection(extras: _extras),
                                 ],
-                                _ResourceSection(
-                                  resources: _visibleResources,
-                                  selected: _selectedResource,
-                                  loading: _loadingResources,
-                                  error: _resourceError,
-                                  // 手动重试要绕开冷却间隔，立刻重搜。
-                                  onRetry: () => _loadResources(force: true),
-                                  onPicker: (resource) => _showResourcePicker(
-                                    source: resource.source,
-                                  ),
-                                  onSelect: (resource) => setState(
-                                    () => _selectedResource = resource,
-                                  ),
-                                ),
-                                const SizedBox(height: 18),
-                                _ResourceDetailsPanel(
-                                  item: item,
-                                  resource: _selectedResource,
-                                  selectedAudioTrack: _selectedAudioTrack,
-                                  selectedSubtitleTrack: _selectedSubtitleTrack,
-                                  onSelectTracks: _showTrackPicker,
-                                ),
-                                const SizedBox(height: 36),
-                                _DetailExtrasSection(extras: _extras),
-                              ],
+                              ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
           ),
         );
       },
@@ -1287,8 +1283,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       ..sort((a, b) {
         final season = (a.seasonNumber ?? 0).compareTo(b.seasonNumber ?? 0);
         return season == 0
-              ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
-              : season;
+            ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
+            : season;
       });
     if (NativeDolbyVisionPlayer.isAvailablePlatform &&
         NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
@@ -1330,9 +1326,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               : result.nativeDolbyVision
               ? '已使用 Android 原生 Dolby Vision 解码'
               : '系统未选中 Dolby Vision 轨道，请检查片源封装与设备支持的 Profile';
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text(message)));
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(message)));
           await _refreshProgressAfterPlayback();
           return;
         } on PlatformException catch (error) {
@@ -1350,10 +1345,60 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           if (!capabilities.decoder) 'Dolby Vision 解码器',
           if (!capabilities.display) 'Dolby Vision 显示能力',
         ].join('和');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('当前设备缺少$missing，已使用兼容模式')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('当前设备缺少$missing，已使用兼容模式')));
       }
+    }
+    if (WindowHost.isDesktop) {
+      try {
+        await WindowsNativePlayer.play(
+          WindowsNativePlaybackRequest(
+            url: resource.playbackUrl.toString(),
+            title: item.title,
+            headers: resource.headers,
+            initialPosition: resumePosition,
+            imageUrl: resource.imageUrl?.toString(),
+            sourceId: resource.source.id,
+            serverItemId: resource.id,
+            tmdbId: item.id,
+            episodeTitle: resource.title,
+            seasonNumber: resource.seasonNumber,
+            episodeNumber: resource.episodeNumber,
+            videoRange: resource.videoRange,
+            initialAudioTrack: _selectedAudioTrack,
+            initialSubtitleTrack: _selectedSubtitleTrack,
+            playlist: episodeOptions
+                .map(
+                  (episode) => WindowsNativePlaylistEntry(
+                    url: episode.playbackUrl.toString(),
+                    title: episode.title,
+                    headers: episode.headers,
+                    imageUrl: episode.imageUrl?.toString(),
+                    sourceId: episode.source.id,
+                    serverItemId: episode.id,
+                    tmdbId: item.id,
+                    episodeTitle: episode.title,
+                    seasonNumber: episode.seasonNumber,
+                    episodeNumber: episode.episodeNumber,
+                  ),
+                )
+                .toList(growable: false),
+            playlistIndex: episodeOptions.indexWhere(
+              (episode) =>
+                  _episodeKey(episode.seasonNumber, episode.episodeNumber) ==
+                  _episodeKey(resource.seasonNumber, resource.episodeNumber),
+            ),
+          ),
+        );
+      } catch (error) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Windows 原生播放器启动失败：$error')));
+        }
+      }
+      await _refreshProgressAfterPlayback();
+      return;
     }
     await Navigator.push(
       context,
@@ -1584,24 +1629,24 @@ class _DetailTopBar extends StatelessWidget {
                 : const SizedBox.expand(),
           ),
           _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
-        if (WindowHost.isDesktop) ...[
-          const SizedBox(width: 8),
-          _DetailRailButton(
-            icon: YingjiIcons.minus,
-            onPressed: WindowHost.minimize,
-          ),
-          const SizedBox(width: 8),
-          _DetailRailButton(
-            icon: YingjiIcons.square,
-            onPressed: WindowHost.toggleMaximize,
-          ),
-          const SizedBox(width: 8),
-          _DetailRailButton(
-            icon: YingjiIcons.xmark,
-            onPressed: WindowHost.close,
-          ),
-          const SizedBox(width: 14),
-        ],
+          if (WindowHost.isDesktop) ...[
+            const SizedBox(width: 8),
+            _DetailRailButton(
+              icon: YingjiIcons.minus,
+              onPressed: WindowHost.minimize,
+            ),
+            const SizedBox(width: 8),
+            _DetailRailButton(
+              icon: YingjiIcons.square,
+              onPressed: WindowHost.toggleMaximize,
+            ),
+            const SizedBox(width: 8),
+            _DetailRailButton(
+              icon: YingjiIcons.xmark,
+              onPressed: WindowHost.close,
+            ),
+            const SizedBox(width: 14),
+          ],
         ],
       ),
     ),
@@ -2060,7 +2105,9 @@ class _SeasonRailState extends State<_SeasonRail> {
                                     ),
                                   )
                                 : CachedNetworkImage(
-                                    fadeInDuration: const Duration(milliseconds: 150),
+                                    fadeInDuration: const Duration(
+                                      milliseconds: 150,
+                                    ),
                                     imageUrl: artwork.toString(),
                                     fit: BoxFit.cover,
                                     errorWidget: (_, _, _) => const Center(
@@ -2358,7 +2405,9 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                                   image == null
                                       ? const _EpisodeArtworkFallback()
                                       : CachedNetworkImage(
-                                          fadeInDuration: const Duration(milliseconds: 150),
+                                          fadeInDuration: const Duration(
+                                            milliseconds: 150,
+                                          ),
                                           imageUrl: image.toString(),
                                           fit: BoxFit.cover,
                                           errorWidget: (_, _, _) =>
@@ -4234,7 +4283,9 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         child: Icon(YingjiIcons.person_fill),
                                       )
                                     : CachedNetworkImage(
-                                        fadeInDuration: const Duration(milliseconds: 150),
+                                        fadeInDuration: const Duration(
+                                          milliseconds: 150,
+                                        ),
                                         imageUrl: person.profileUrl.toString(),
                                         fit: BoxFit.cover,
                                         errorWidget: (_, _, _) =>
@@ -4381,7 +4432,9 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         color: YingjiColors.elevated,
                                       )
                                     : CachedNetworkImage(
-                                        fadeInDuration: const Duration(milliseconds: 150),
+                                        fadeInDuration: const Duration(
+                                          milliseconds: 150,
+                                        ),
                                         imageUrl: item.posterUrl.toString(),
                                         fit: BoxFit.cover,
                                         errorWidget: (_, _, _) =>
@@ -5043,7 +5096,9 @@ class _PersonPageState extends State<_PersonPage> {
                                             ),
                                           )
                                         : CachedNetworkImage(
-                                            fadeInDuration: const Duration(milliseconds: 150),
+                                            fadeInDuration: const Duration(
+                                              milliseconds: 150,
+                                            ),
                                             imageUrl: value.person.profileUrl
                                                 .toString(),
                                             fit: BoxFit.cover,
