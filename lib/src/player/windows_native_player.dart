@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 import '../cache/video_cache.dart';
 import '../history/watch_state_store.dart';
 import 'dolby_vision_color.dart';
@@ -14,6 +17,7 @@ class WindowsNativePlaybackRequest {
     this.headers = const {},
     this.initialPosition = Duration.zero,
     this.imageUrl,
+    this.seriesLogoUrl,
     this.sourceId,
     this.serverItemId,
     this.tmdbId,
@@ -32,6 +36,7 @@ class WindowsNativePlaybackRequest {
   final Map<String, String> headers;
   final Duration initialPosition;
   final String? imageUrl;
+  final String? seriesLogoUrl;
   final String? sourceId;
   final String? serverItemId;
   final int? tmdbId;
@@ -87,6 +92,68 @@ class WindowsNativePlayer {
 
     final cache = await VideoCacheStore.tryCreate();
     final limit = await VideoCachePolicy.current();
+    final preferences = await SharedPreferences.getInstance();
+    final seriesLogoPath = await _cachedImagePath(request.seriesLogoUrl);
+    final hardware = preferences.getBool('yingji.player.hardware') ?? true;
+    final hdr = preferences.getBool('yingji.player.hdr') ?? true;
+    final downmix = preferences.getBool('yingji.player.downmix') ?? false;
+    final night = preferences.getBool('yingji.player.night') ?? false;
+    final voiceEnhance =
+        preferences.getBool('yingji.player.voice-enhance') ?? false;
+    final speed = preferences.getDouble('yingji.player.speed') ?? 1;
+    final audioDelay = preferences.getDouble('yingji.player.audio-delay') ?? 0;
+    final subtitleDelay =
+        preferences.getDouble('yingji.player.subtitle-delay') ?? 0;
+    final cacheSeconds =
+        preferences.getDouble('yingji.player.cache-seconds') ?? 30;
+    final aspect = preferences.getString('yingji.player.aspect') ?? '自动';
+    final preferSubtitles =
+        preferences.getBool('yingji.player.subtitle-priority-enabled') ??
+        preferences.getBool('yingji.player.prefer-chinese-subtitle') ??
+        true;
+    final subtitleLanguage =
+        preferences.getString('yingji.player.subtitle-language') ?? 'zh';
+    final preferAudio =
+        preferences.getBool('yingji.player.audio-priority-enabled') ?? false;
+    final audioLanguage =
+        preferences.getString('yingji.player.audio-language') ?? 'zh';
+    final preloadNext =
+        preferences.getBool('yingji.player.preload-next') ?? true;
+    final preloadLead = Duration(
+      minutes:
+          (preferences.getDouble('yingji.player.preload-lead-minutes') ?? 5)
+              .round(),
+    );
+    final seekSeconds =
+        preferences.getDouble('yingji.player.seek-seconds') ?? 10;
+    final volumeStep = preferences.getDouble('yingji.player.volume-step') ?? 5;
+    final danmakuEnabled =
+        preferences.getBool('yingji.danmaku.enabled') ?? false;
+    final autoSkipSegments =
+        preferences.getBool('yingji.segment.auto-skip') ?? true;
+    final shortcuts = <String, String>{
+      'playPause': 'Space',
+      'seekBack': 'Arrow Left',
+      'seekForward': 'Arrow Right',
+      'volumeUp': 'Arrow Up',
+      'volumeDown': 'Arrow Down',
+      'mute': 'M',
+      'fullscreen': 'F',
+      'exit': 'Escape',
+    };
+    final shortcutJson = preferences.getString('yingji.player.shortcuts');
+    if (shortcutJson != null) {
+      try {
+        final saved = jsonDecode(shortcutJson);
+        if (saved is Map) {
+          shortcuts.addAll(
+            saved.map((key, value) => MapEntry('$key', '$value')),
+          );
+        }
+      } on FormatException {
+        // Keep the working defaults if an older preference was malformed.
+      }
+    }
     final entries = request.playlist.isEmpty
         ? <WindowsNativePlaylistEntry>[
             WindowsNativePlaylistEntry(
@@ -128,7 +195,7 @@ class WindowsNativePlayer {
       '--vo=gpu-next',
       '--gpu-api=d3d11',
       '--gpu-context=d3d11',
-      '--hwdec=${playerHwdecValue(enabled: true, dolbyVision: NativeDolbyVisionPlayer.isDolbyVision(request.videoRange), isDesktop: true)}',
+      '--hwdec=${playerHwdecValue(enabled: hardware, dolbyVision: hdr && NativeDolbyVisionPlayer.isDolbyVision(request.videoRange), isDesktop: true)}',
       '--vid=auto',
       '--osc=no',
       '--input-default-bindings=yes',
@@ -136,6 +203,25 @@ class WindowsNativePlayer {
       '--osd-level=1',
       '--autofit-larger=90%x90%',
       '--force-media-title=${request.title}',
+      '--speed=$speed',
+      '--audio-delay=$audioDelay',
+      '--sub-delay=$subtitleDelay',
+      '--demuxer-readahead-secs=$cacheSeconds',
+      '--video-aspect-override=${_aspectValue(aspect)}',
+      '--mova-seek-seconds=$seekSeconds',
+      '--mova-volume-step=$volumeStep',
+      '--mova-danmaku-enabled=${danmakuEnabled ? 'yes' : 'no'}',
+      '--mova-auto-skip-segments=${autoSkipSegments ? 'yes' : 'no'}',
+      ...shortcuts.entries.map(
+        (entry) =>
+            '--mova-shortcut=${entry.key}|${_shortcutLabel(entry.value)}',
+      ),
+      '--audio-channels=${downmix ? 'stereo' : 'auto'}',
+      if (preferAudio) '--alang=$audioLanguage',
+      if (preferSubtitles) '--slang=$subtitleLanguage',
+      if (voiceEnhance || night)
+        '--af=lavfi=[${[if (voiceEnhance) 'equalizer=f=1800:t=q:w=1.2:g=4', if (night) 'dynaudnorm'].join(',')}]',
+      if (seriesLogoPath != null) '--mova-series-logo=$seriesLogoPath',
       if (request.initialPosition > Duration.zero)
         '--start=${request.initialPosition.inMilliseconds / 1000}',
       if (request.initialAudioTrack != null)
@@ -145,12 +231,16 @@ class WindowsNativePlayer {
       if (cache == null && request.headers.isNotEmpty)
         '--http-header-fields=${request.headers.entries.map((entry) => '${entry.key}: ${entry.value}').join(',')}',
       ...playerColorProperties(
-        hdrEnabled: NativeDolbyVisionPlayer.isDolbyVision(request.videoRange),
+        hdrEnabled:
+            hdr || NativeDolbyVisionPlayer.isDolbyVision(request.videoRange),
       ).entries.map((entry) => '--${entry.key}=${entry.value}'),
       '--terminal=yes',
       r'--term-status-msg=MOVA_POSITION=${time-pos}|${duration}',
       '--mova-playlist-start=${request.playlistIndex.clamp(0, playbackUrls.length - 1)}',
       ...entries.map((entry) => '--mova-playlist-title=${entry.title}'),
+      ...entries.map(
+        (entry) => '--mova-playlist-detail=${_episodeLabel(entry)}',
+      ),
       ...playbackUrls,
     ];
 
@@ -160,13 +250,35 @@ class WindowsNativePlayer {
       workingDirectory: executable.parent.path,
       mode: ProcessStartMode.normal,
     );
+    var lastNetworkBytes = 0;
+    final networkSample = Stopwatch()..start();
     void sendCacheProgress(VideoCacheProgress progress) {
       process.stdin.writeln(
         'MOVA_CACHE=${progress.receivedBytes}|${progress.mediaTotalBytes}',
       );
+      final received = progress.receivedBytes;
+      final elapsedMilliseconds = networkSample.elapsedMilliseconds;
+      if (received < lastNetworkBytes) {
+        lastNetworkBytes = received;
+        networkSample
+          ..reset()
+          ..start();
+        process.stdin.writeln('MOVA_NETWORK=0');
+      } else if (elapsedMilliseconds >= 250) {
+        final bytesPerSecond =
+            (received - lastNetworkBytes) * 1000 / elapsedMilliseconds;
+        process.stdin.writeln('MOVA_NETWORK=$bytesPerSecond');
+        lastNetworkBytes = received;
+        networkSample
+          ..reset()
+          ..start();
+      }
     }
 
     StreamSubscription<VideoCacheProgress>? cacheProgress;
+    VideoCacheDownload? nextEpisodePreload;
+    final preloadedUrls = <String>{};
+    final completedEpisodes = <int>{};
     var activeCacheIndex = request.playlistIndex.clamp(0, entries.length - 1);
     if (download != null) {
       sendCacheProgress(download.state);
@@ -193,6 +305,24 @@ class WindowsNativePlayer {
             if (duration > Duration.zero) {
               episodeDurations[playlistPosition] = duration;
             }
+            if (preloadNext &&
+                cache != null &&
+                limit > 0 &&
+                duration > Duration.zero &&
+                duration - position <= preloadLead &&
+                playlistPosition >= 0 &&
+                playlistPosition < entries.length - 1) {
+              final nextEntry = entries[playlistPosition + 1];
+              if (preloadedUrls.add(nextEntry.url)) {
+                nextEpisodePreload = cache.download(
+                  url: nextEntry.url,
+                  limitBytes: limit,
+                  targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
+                  headers: nextEntry.headers,
+                  title: nextEntry.title,
+                );
+              }
+            }
             final nextCacheIndex = playlistPosition.clamp(
               0,
               entries.length - 1,
@@ -201,6 +331,8 @@ class WindowsNativePlayer {
                 limit > 0 &&
                 nextCacheIndex != activeCacheIndex) {
               activeCacheIndex = nextCacheIndex;
+              nextEpisodePreload?.cancel();
+              nextEpisodePreload = null;
               download?.cancel();
               final previousProgress = cacheProgress;
               if (previousProgress != null) {
@@ -217,6 +349,12 @@ class WindowsNativePlayer {
               cacheProgress = download!.progress.listen(sendCacheProgress);
             }
           }
+          for (final match in RegExp(
+            r'MOVA_COMPLETED=([0-9]+)',
+          ).allMatches(chunk)) {
+            final index = int.tryParse(match.group(1) ?? '');
+            if (index != null) completedEpisodes.add(index);
+          }
         });
     await process.stderr.drain<void>();
     final exitCode = await process.exitCode;
@@ -224,6 +362,7 @@ class WindowsNativePlayer {
     await process.stdin.close();
     await output.cancel();
     download?.cancel();
+    nextEpisodePreload?.cancel();
     if (episodeDurations.isNotEmpty) {
       final store = await WatchStateStore.create();
       for (final item in episodeDurations.entries) {
@@ -244,6 +383,7 @@ class WindowsNativePlayer {
             episodeTitle: activeEntry.episodeTitle ?? activeEntry.title,
             seasonNumber: activeEntry.seasonNumber,
             episodeNumber: activeEntry.episodeNumber,
+            isPlayed: completedEpisodes.contains(item.key),
           ),
         );
       }
@@ -251,7 +391,37 @@ class WindowsNativePlayer {
     if (exitCode != 0) throw StateError('原生播放器异常退出（$exitCode）');
   }
 
+  static String _shortcutLabel(String saved) =>
+      saved.contains('|') ? saved.split('|').skip(1).join('|') : saved;
+
+  static String _episodeLabel(WindowsNativePlaylistEntry entry) {
+    final parts = <String>[];
+    if (entry.seasonNumber != null) parts.add('第 ${entry.seasonNumber} 季');
+    if (entry.episodeNumber != null) parts.add('第 ${entry.episodeNumber} 集');
+    final episodeTitle = entry.episodeTitle?.trim();
+    if (episodeTitle != null && episodeTitle.isNotEmpty) {
+      parts.add(episodeTitle);
+    }
+    return parts.join(' · ');
+  }
+
+  static String _aspectValue(String aspect) => switch (aspect) {
+    '16:9' => '1.7777778',
+    '4:3' => '1.3333333',
+    '21:9' => '2.3333333',
+    _ => '0',
+  };
+
   static Duration _seconds(String? value) => Duration(
     milliseconds: ((double.tryParse(value ?? '') ?? 0) * 1000).round(),
   );
+
+  static Future<String?> _cachedImagePath(String? url) async {
+    if (url == null || url.isEmpty) return null;
+    try {
+      return (await DefaultCacheManager().getSingleFile(url)).path;
+    } catch (_) {
+      return null;
+    }
+  }
 }

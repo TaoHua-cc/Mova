@@ -12,6 +12,26 @@ const int _kb = 1024;
 const int _mb = 1024 * _kb;
 const int _gb = 1024 * _mb;
 
+int cacheDownloadTargetBytes({
+  required int retainLimitBytes,
+  int? requestedBytes,
+  int mediaTotalBytes = 0,
+}) {
+  if (retainLimitBytes <= 0) return 0;
+  final requested = (requestedBytes ?? retainLimitBytes)
+      .clamp(1, retainLimitBytes)
+      .toInt();
+  return mediaTotalBytes > 0 && mediaTotalBytes < requested
+      ? mediaTotalBytes
+      : requested;
+}
+
+int cacheChunkBytesToWrite({
+  required int writtenBytes,
+  required int targetBytes,
+  required int chunkBytes,
+}) => (targetBytes - writtenBytes).clamp(0, chunkBytes).toInt();
+
 /// 视频缓存的上限策略。
 ///
 /// 桌面端只有一份上限；安卓分「无线局域网」和「移动数据」两份 —— 移动数据
@@ -38,6 +58,7 @@ class VideoCachePolicy {
   static const int defaultDesktop = 5 * _gb;
   static const int defaultWifi = 2 * _gb;
   static const int defaultMobile = 0;
+  static const int nextEpisodePreheatBytes = 2 * _mb;
 
   static int readDesktop(SharedPreferences prefs) =>
       prefs.getInt(desktopKey) ?? defaultDesktop;
@@ -364,6 +385,7 @@ class VideoCacheStore {
   VideoCacheDownload download({
     required String url,
     required int limitBytes,
+    int? targetBytes,
     Map<String, String> headers = const {},
     String title = '',
   }) {
@@ -377,6 +399,7 @@ class VideoCacheStore {
         job,
         url: url,
         limitBytes: limitBytes,
+        targetBytes: targetBytes,
         headers: headers,
         title: title,
       ),
@@ -388,14 +411,16 @@ class VideoCacheStore {
     VideoCacheDownload job, {
     required String url,
     required int limitBytes,
+    required int? targetBytes,
     required Map<String, String> headers,
     required String title,
   }) async {
     HttpClient? client;
     try {
       final uri = Uri.tryParse(url);
-      if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https'))
+      if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
         return;
+      }
       final key = _keyFor(url);
       final target = File(_path(key));
       if (await target.exists()) return;
@@ -439,7 +464,11 @@ class VideoCacheStore {
       if (response.statusCode == 200) offset = 0;
       final remaining = response.contentLength;
       final total = remaining > 0 ? offset + remaining : 0;
-      final targetBytes = total > 0 && total < limitBytes ? total : limitBytes;
+      final downloadTargetBytes = cacheDownloadTargetBytes(
+        retainLimitBytes: limitBytes,
+        requestedBytes: targetBytes,
+        mediaTotalBytes: total,
+      );
       await _writeMeta(
         key,
         url: url,
@@ -448,11 +477,11 @@ class VideoCacheStore {
         totalBytes: total,
         createdAt: DateTime.now().millisecondsSinceEpoch,
       );
-      if (offset >= targetBytes) {
+      if (offset >= downloadTargetBytes) {
         job._update(
           VideoCacheProgress(
             receivedBytes: offset,
-            totalBytes: targetBytes,
+            totalBytes: downloadTargetBytes,
             mediaTotalBytes: total,
             status: total > 0 && offset >= total
                 ? VideoCacheStatus.complete
@@ -470,20 +499,30 @@ class VideoCacheStore {
         var lastReported = offset;
         await for (final chunk in response) {
           if (job._cancelled) break;
-          sink.add(chunk);
-          written += chunk.length;
+          final bytesToWrite = cacheChunkBytesToWrite(
+            writtenBytes: written,
+            targetBytes: downloadTargetBytes,
+            chunkBytes: chunk.length,
+          );
+          if (bytesToWrite <= 0) break;
+          sink.add(
+            bytesToWrite == chunk.length
+                ? chunk
+                : chunk.sublist(0, bytesToWrite),
+          );
+          written += bytesToWrite;
           if (written - lastReported >= _mb) {
             lastReported = written;
             job._update(
               VideoCacheProgress(
                 receivedBytes: written,
-                totalBytes: targetBytes,
+                totalBytes: downloadTargetBytes,
                 mediaTotalBytes: total,
                 status: VideoCacheStatus.downloading,
               ),
             );
           }
-          if (written >= targetBytes) {
+          if (written >= downloadTargetBytes) {
             break;
           }
         }
@@ -514,7 +553,7 @@ class VideoCacheStore {
       job._update(
         VideoCacheProgress(
           receivedBytes: size,
-          totalBytes: completed ? size : targetBytes,
+          totalBytes: completed ? size : downloadTargetBytes,
           mediaTotalBytes: total,
           status: completed
               ? VideoCacheStatus.complete

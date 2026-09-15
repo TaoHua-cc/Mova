@@ -421,6 +421,7 @@ abstract final class YingjiGlass {
 abstract final class YingjiFonts {
   static const String family = 'YingjiRound';
   static const List<String> fallback = [
+    'YingjiCjkFallback',
     'Microsoft YaHei UI',
     'Segoe UI Variable',
     'sans-serif',

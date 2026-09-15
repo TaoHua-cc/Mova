@@ -46,7 +46,7 @@ add_executable(mova_native_player WIN32
 apply_standard_settings(mova_native_player)
 target_compile_options(mova_native_player PRIVATE /utf-8)
 target_compile_definitions(mova_native_player PRIVATE "NOMINMAX")
-target_link_libraries(mova_native_player PRIVATE gdiplus.lib shell32.lib)
+target_link_libraries(mova_native_player PRIVATE gdiplus.lib shell32.lib dwmapi.lib)
 set_target_properties(mova_native_player PROPERTIES OUTPUT_NAME "MovaNativePlayer")
-install(TARGETS mova_native_player RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+install(TARGETS mova_native_player RUNTIME DESTINATION "${BUILD_BUNDLE_DIR}"
   COMPONENT Runtime)

@@ -70,12 +70,16 @@ flutter:
     - app/yingji-hero-original.png
     - app/yingji-posters-original.png
     - app/assets/
+    - app/fonts/AlimamaFangYuanTi-Player.ttf
     # 注：已移除 windows/runner/resources/app_icon.ico
     # 该 .ico 由 Windows 打包流程直接使用，无需进入 Flutter assets；
     # 打安卓包时会白白多带一份，且它本不应出现在移动端产物里。
 
   fonts:
     - family: YingjiRound
+      fonts:
+        - asset: app/fonts/AlimamaFangYuanTiVF-Thin.ttf
+    - family: YingjiCjkFallback
       fonts:
         - asset: app/fonts/NotoSansSC-VF.ttf
   # The following line ensures that the Material Icons font is

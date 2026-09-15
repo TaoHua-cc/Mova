@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -309,6 +308,7 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 正在进行的后台视频缓存任务。切集或退出必须打断：否则它既继续占带宽，
   /// 又会把下一集的地址写进同一个分片文件。
   VideoCacheDownload? _videoDownload;
+  VideoCacheDownload? _nextEpisodePreload;
   StreamSubscription<VideoCacheProgress>? _videoCacheProgressSubscription;
   bool _playingCachedFile = false;
   double _persistentCacheFraction = 0;
@@ -1127,7 +1127,10 @@ class _PlayerPageState extends State<PlayerPage> {
     );
   }
 
-  Future<void> _switchEpisode(int index) async {
+  Future<void> _switchEpisode(
+    int index, {
+    bool markCurrentPlayed = false,
+  }) async {
     if (_switchingEpisode ||
         index < 0 ||
         index >= widget.episodes.length ||
@@ -1137,7 +1140,18 @@ class _PlayerPageState extends State<PlayerPage> {
     _switchingEpisode = true;
     try {
       await _player.pause();
-      await _saveWatchState();
+      await _saveWatchState(isPlayed: markCurrentPlayed);
+      try {
+        await _syncProgress(
+          ending: true,
+          positionOverride: markCurrentPlayed ? _player.state.duration : null,
+        ).timeout(const Duration(seconds: 4));
+      } catch (_) {
+        // Local history is authoritative; a server timeout must not block
+        // switching.
+      }
+      _nextEpisodePreload?.cancel();
+      _nextEpisodePreload = null;
       final target = widget.episodes[index];
       final resume = await _episodeResumePosition(target);
       if (!mounted || _exitStarted) return;
@@ -1166,31 +1180,35 @@ class _PlayerPageState extends State<PlayerPage> {
     if (!_preloadNextEpisode ||
         _switchingEpisode ||
         widget.episodes.isEmpty ||
-        _activeEpisodeIndex >= widget.episodes.length - 1)
+        _activeEpisodeIndex >= widget.episodes.length - 1) {
       return;
+    }
     final duration = _player.state.duration;
     final position = _player.state.position;
     if (duration <= Duration.zero ||
-        duration - position > Duration(minutes: _preloadLeadMinutes.round()))
+        duration - position > Duration(minutes: _preloadLeadMinutes.round())) {
       return;
+    }
     final next = widget.episodes[_activeEpisodeIndex + 1];
     if (_preloadedUrl == next.url) return;
     _preloadedUrl = next.url;
     final uri = Uri.tryParse(next.url);
     if (uri == null || !['http', 'https'].contains(uri.scheme)) return;
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
-    try {
-      final request = await client.getUrl(uri);
-      next.headers.forEach(request.headers.set);
-      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-2097151');
-      final response = await request.close().timeout(
-        const Duration(seconds: 8),
-      );
-      await response.drain<void>();
-    } catch (_) {
+    final store = _videoCache;
+    if (store == null) return;
+    final limit = await VideoCachePolicy.current();
+    if (limit <= 0) return;
+    final job = store.download(
+      url: next.url,
+      limitBytes: limit,
+      targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
+      headers: next.headers,
+      title: next.title,
+    );
+    _nextEpisodePreload = job;
+    await job.done;
+    if (job.state.status == VideoCacheStatus.unavailable) {
       _preloadedUrl = null;
-    } finally {
-      client.close(force: true);
     }
   }
 
@@ -1547,7 +1565,7 @@ class _PlayerPageState extends State<PlayerPage> {
         await _player.seek(_introEnd!);
       } else if (widget.episodes.isNotEmpty &&
           _activeEpisodeIndex < widget.episodes.length - 1) {
-        await _switchEpisode(_activeEpisodeIndex + 1);
+        await _switchEpisode(_activeEpisodeIndex + 1, markCurrentPlayed: true);
       } else {
         await _player.seek(_player.state.duration);
       }
@@ -1932,6 +1950,8 @@ class _PlayerPageState extends State<PlayerPage> {
     _subtitleSubscription?.cancel();
     _videoDownload?.cancel();
     _videoDownload = null;
+    _nextEpisodePreload?.cancel();
+    _nextEpisodePreload = null;
     _videoCacheProgressSubscription?.cancel();
     _danmakuRequest++;
     unawaited(_syncProgress(syncTrakt: true, ending: true));
@@ -1947,7 +1967,7 @@ class _PlayerPageState extends State<PlayerPage> {
     super.dispose();
   }
 
-  Future<void> _saveWatchState() async {
+  Future<void> _saveWatchState({bool isPlayed = false}) async {
     final store = _watchStore;
     if (store == null) return;
     final state = _player.state;
@@ -1965,6 +1985,7 @@ class _PlayerPageState extends State<PlayerPage> {
         episodeTitle: _activeEpisode.episodeTitle,
         seasonNumber: _activeEpisode.seasonNumber,
         episodeNumber: _activeEpisode.episodeNumber,
+        isPlayed: isPlayed,
       ),
     );
   }
@@ -2003,6 +2024,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _syncProgress({
     bool syncTrakt = false,
     bool ending = false,
+    Duration? positionOverride,
   }) async {
     // 「观看记录只保存在本机」时不向媒体服务器与 Trakt 上报任何进度。
     // 本机记录由 _saveWatchState 照常写入，服务器资源也照常播放；读取
@@ -2012,7 +2034,7 @@ class _PlayerPageState extends State<PlayerPage> {
     // lookup, HTTP) can race an in-page episode switch, and the stop for the
     // *old* item must never target the *new* one.
     final episode = _activeEpisode;
-    final position = _player.state.position;
+    final position = positionOverride ?? _player.state.position;
     final duration = _player.state.duration;
     if (duration <= Duration.zero) return;
     final sourceId = episode.sourceId;
