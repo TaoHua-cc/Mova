@@ -148,6 +148,10 @@ std::unique_ptr<Gdiplus::PrivateFontCollection> g_iconsax_font_collection;
 std::unique_ptr<Gdiplus::FontFamily> g_iconsax_font_family;
 BYTE g_controls_alpha = 232;
 ULONGLONG g_last_interaction = 0;
+// 自动隐藏改为轮询光标位置：mpv 子类化了主窗口，光标停在画面或控件条上时
+// 移动消息会被 mpv 吞掉，窗口过程收不到 WM_MOUSEMOVE，消息驱动永远学不到
+// 「光标已经停了」。50ms 一次的位置对比不依赖消息，被吞也一样有效。
+POINT g_last_cursor{-0x7fffffff, -0x7fffffff};
 bool g_fullscreen = false;
 LONG_PTR g_windowed_style = 0;
 WINDOWPLACEMENT g_window_placement{sizeof(WINDOWPLACEMENT)};
@@ -275,9 +279,38 @@ PanelItem PanelEpisode(wchar_t icon, std::wstring label, std::wstring detail,
   return item;
 }
 
+// ---- 自绘 UI 的全局缩放 --------------------------------------------------
+//
+// 下面的尺寸常量都是按 1280×760 的窗口量出来的设计稿值。窗口比这小的时候
+// 照搬就会互相挤压、探出屏幕；比这大时又显得小气。所有绘制与命中判定统一
+// 从 UiScale() 取系数：窗口变小整体等比缩小，变大轻微放大（封顶，避免 4K
+// 全屏时按钮大到夸张）。绘制与命中必须用同一个系数，否则点不准。
+constexpr float kUiDesignWidth = 1280.0f;
+constexpr float kUiDesignHeight = 760.0f;
+constexpr float kUiMinScale = 0.55f;
+constexpr float kUiMaxScale = 1.25f;
+float g_ui_scale = 1.0f;
+
+float UiScale() { return g_ui_scale; }
+
+int Scaled(int value) {
+  return static_cast<int>(std::lround(static_cast<double>(value) *
+                                      g_ui_scale));
+}
+
+float ScaledF(float value) { return value * g_ui_scale; }
+
+// 由主窗口客户区推导缩放系数，取宽高比例中较小者，保证小维度也放得下。
+void UpdateUiScale(const RECT& client) {
+  const float width = static_cast<float>(client.right - client.left);
+  const float height = static_cast<float>(client.bottom - client.top);
+  g_ui_scale = std::clamp(std::min(width / kUiDesignWidth,
+                                   height / kUiDesignHeight),
+                          kUiMinScale, kUiMaxScale);
+}
+
 // 弹出菜单的度量与 Flutter 弹窗对齐：卡片式行、12px 圆角、图标容器 34px。
-constexpr int kPanelPadding = 10;
-constexpr float kPanelRowGap = 6.0f;
+constexpr int kPanelPadding = 10;constexpr float kPanelRowGap = 6.0f;
 constexpr float kPanelOptionHeight = 68.0f;
 constexpr float kPanelHeaderHeight = 32.0f;
 constexpr float kPanelNoteHeight = 34.0f;
@@ -401,18 +434,25 @@ int PanelIndexAt(int x, int y) {
 }
 
 void ShowControls();
+// 自动隐藏的计时器只有一个入口，一旦「该隐藏却不隐藏」，最要紧的是知道
+// 谁在刷新它。宏把调用点行号带进 ShowControlsAt，配合下面的诊断开关就能
+// 直接看到刷新来源，不用每次排查都临时改代码。
+void ShowControlsAt(int line);
+#define ShowControls() ShowControlsAt(__LINE__)
+void SetOverlayHitTest(bool enabled);
 std::string Utf8(const std::wstring& value);
 void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
                PanelMetrics metrics);
-// 提示浮层的两种形态：贴控件上方的名称提示，和调整操作时的实时反馈。
-enum class HintMode { Hidden, Tooltip, Toast };
+// 提示浮层：调整操作（音量 / 亮度 / 倍速 / 快进退 / 跳转）时的实时反馈。
+// 按钮悬浮名称气泡已移除：鼠标扫过一排按钮时每个按钮都弹一张卡，比
+// 「确认悬停目标」更干扰；按钮身份用高亮动效表达已经足够。
+enum class HintMode { Hidden, Toast };
 
 void ShowHint(const std::wstring& text, const std::wstring& detail,
               wchar_t icon, HintMode mode, float fraction, int anchor_x);
 void HideHint();
 void ShowAdjustHint(const std::wstring& title, const std::wstring& detail,
                     wchar_t icon, float fraction);
-std::wstring ControlTooltip(int control);
 
 Gdiplus::Font MakeInterfaceFont(float size, int style) {
   const Gdiplus::FontFamily* family =
@@ -941,26 +981,27 @@ void PositionControls() {
   if (!g_window || !g_controls) return;
   RECT client{};
   GetClientRect(g_window, &client);
+  UpdateUiScale(client);
   POINT origin{0, 0};
   ClientToScreen(g_window, &origin);
   const int client_width = static_cast<int>(client.right - client.left);
   const int available_width = std::max(240, client_width - 32);
-  const int width = std::min(1040, available_width);
-  const int height = kControlsHeight;
+  const int width = std::min(Scaled(1040), available_width);
+  const int height = Scaled(kControlsHeight);
   SetWindowPos(g_controls, HWND_TOP, origin.x + (client.right - width) / 2,
-               origin.y + client.bottom - height - 20, width, height,
+               origin.y + client.bottom - height - Scaled(20), width, height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   SetWindowRgn(g_controls, CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                                              28, 28), TRUE);
+                                              Scaled(28), Scaled(28)), TRUE);
   InvalidateRect(g_controls, nullptr, FALSE);
   if (g_top_bar) {
     // The title bar belongs to the window edges, unlike the deliberately
     // compact transport dock.  Keeping it full-width means its two groups
     // remain anchored correctly while the window is resized.
     const int top_width = std::max(240, client_width - 32);
-    const int top_height = kTopBarHeight;
-    SetWindowPos(g_top_bar, HWND_TOP, origin.x + 16,
-                 origin.y + kTopBarTopMargin, top_width, top_height,
+    const int top_height = Scaled(kTopBarHeight);
+    SetWindowPos(g_top_bar, HWND_TOP, origin.x + Scaled(16),
+                 origin.y + Scaled(kTopBarTopMargin), top_width, top_height,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetWindowRgn(g_top_bar, nullptr, TRUE);
     InvalidateRect(g_top_bar, nullptr, FALSE);
@@ -974,15 +1015,15 @@ void PositionControls() {
 }
 
 // 控件条顶边的屏幕 y。底部工具的面板挂在它上方，而不是挂在被点击的像素上 ——
-// 控件条本身有 112 px，贴着点的位置展开会让面板盖住同一排的其它按钮。
+// 控件条本身的高度（缩放后）贴着点的位置展开会让面板盖住同一排的其它按钮。
 int DockTopScreen() {
   if (!g_window) return 0;
   RECT client{};
   GetClientRect(g_window, &client);
   POINT origin{0, 0};
   ClientToScreen(g_window, &origin);
-  return origin.y + static_cast<int>(client.bottom) - kControlsHeight -
-         kControlsBottomMargin;
+  return origin.y + static_cast<int>(client.bottom) - Scaled(kControlsHeight) -
+         Scaled(kControlsBottomMargin);
 }
 
 // 控件条上某个控件的锚点：横向对准被点的那个按钮，纵向贴控件条顶边并向上展开。
@@ -991,7 +1032,9 @@ int DockTopScreen() {
 // 它从 x=120 起），拿主窗口换算会把面板整体左移那半个内边距，鼠标点着 A 按钮、
 // 面板却挂在 A 左边一段。
 PanelAnchor DockAnchor(int client_x) {
-  POINT point{client_x, 0};
+  // client_x 是设计稿坐标系里的按钮位置；控件条窗口是缩放后的物理大小，
+  // 换算屏幕坐标前先放大回去。
+  POINT point{static_cast<LONG>(std::lround(client_x * UiScale())), 0};
   if (g_controls) ClientToScreen(g_controls, &point);
   PanelAnchor anchor;
   anchor.x = point.x;
@@ -1000,8 +1043,49 @@ PanelAnchor DockAnchor(int client_x) {
   return anchor;
 }
 
-void ShowControls() {
+// 诊断开关：设 MOVA_TRACE_AUTOHIDE=<文件路径> 后，自动隐藏的每个 timer tick
+// 与每次计时器刷新都会落一行。排查「该隐藏却不隐藏」时，看 idle 是否被周期
+// 性清零，再对照 show 行的行号就能定位刷新来源。正常情况下完全不写盘。
+FILE* AutoHideTrace() {
+  static const std::wstring path = []() -> std::wstring {
+    wchar_t buffer[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"MOVA_TRACE_AUTOHIDE", buffer, MAX_PATH) > 0) {
+      return std::wstring(buffer);
+    }
+    return std::wstring();
+  }();
+  if (path.empty()) return nullptr;
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"a") != 0 || !file) return nullptr;
+  return file;
+}
+
+// 控件条与顶栏退场时要连命中测试一起退出。它们退场后仍压在画面上，鼠标移到
+// 控件条区域会被这两个窗口接住：类光标（手型 / 箭头）会在 WM_SETCURSOR 里
+// 立刻把光标重新点亮，透明区域上的点击也会落空。退场就彻底穿透，回来再恢复。
+void SetOverlayHitTest(bool enabled) {
+  const HWND overlays[] = {g_controls, g_top_bar};
+  for (HWND overlay : overlays) {
+    if (!overlay) continue;
+    const LONG_PTR style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
+    const LONG_PTR mask = static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    const LONG_PTR next = enabled ? (style & ~mask) : (style | mask);
+    if (next == style) continue;
+    SetWindowLongPtrW(overlay, GWL_EXSTYLE, next);
+    SetWindowPos(overlay, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                     SWP_FRAMECHANGED);
+  }
+}
+
+void ShowControlsAt(int line) {
+  if (FILE* trace = AutoHideTrace()) {
+    std::fprintf(trace, "show line=%d tick=%llu idle=%llu\n", line,
+                 GetTickCount64(), GetTickCount64() - g_last_interaction);
+    std::fclose(trace);
+  }
   g_last_interaction = GetTickCount64();
+  SetOverlayHitTest(true);
   if (g_controls) {
     ShowWindow(g_controls, SW_SHOWNOACTIVATE);
   }
@@ -2109,8 +2193,12 @@ void PresentPanel(HWND window, int width, int height) {
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
-    PaintPanelContent(graphics, skin, static_cast<float>(width),
-                      static_cast<float>(height));
+    // 窗口是缩放后的物理大小，面板内部的布局全是设计稿坐标：一次
+    // ScaleTransform 换到设计坐标系，行高、缩略图、字号就都跟着窗口走。
+    const float scale = UiScale();
+    graphics.ScaleTransform(scale, scale);
+    PaintPanelContent(graphics, skin, static_cast<float>(width) / scale,
+                      static_cast<float>(height) / scale);
     graphics.Flush(Gdiplus::FlushIntentionSync);
   }
   POINT source{0, 0};
@@ -2139,8 +2227,10 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
       return 0;
     }
     case WM_MOUSEMOVE: {
-      const int next =
-          PanelIndexAt(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+      const float scale = UiScale();
+      const int next = PanelIndexAt(
+          static_cast<int>(GET_X_LPARAM(lparam) / scale),
+          static_cast<int>(GET_Y_LPARAM(lparam) / scale));
       if (g_panel_hover != next) {
         g_panel_hover = next;
         InvalidateRect(window, nullptr, FALSE);
@@ -2148,8 +2238,10 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
       return 0;
     }
     case WM_LBUTTONDOWN: {
-      const int index =
-          PanelIndexAt(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+      const float scale = UiScale();
+      const int index = PanelIndexAt(
+          static_cast<int>(GET_X_LPARAM(lparam) / scale),
+          static_cast<int>(GET_Y_LPARAM(lparam) / scale));
       if (index < 0) {
         // 点到了投影或空白处：当作关闭菜单，而不是把点击吞掉。
         ShowWindow(window, SW_HIDE);
@@ -2224,9 +2316,14 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   g_panel_anchor = anchor;
   g_panel_hover = -1;
   g_panel_scroll = 0;
-  const int panel_width = g_panel_metrics.width;
-  const int content = std::min(g_panel_metrics.max_height, PanelContentHeight());
-  g_panel_viewport_height = content - kPanelPadding * 2;
+  // 度量与布局全部是设计稿坐标；窗口开成缩放后的物理大小，绘制端用
+  // ScaleTransform 一次放大，滚动、命中继续留在设计坐标系，两套坐标不混算。
+  const int shadow = Scaled(kPanelShadowMargin);
+  const int panel_width = Scaled(g_panel_metrics.width);
+  const int content_design =
+      std::min(g_panel_metrics.max_height, PanelContentHeight());
+  const int content = Scaled(content_design);
+  g_panel_viewport_height = content_design - kPanelPadding * 2;
   // 打开时把指定的行滚进视野：剧集面板要定位到正在播的那一集，而不是永远从
   // 第一集开始。把当前集顶到内容区第一行，一打开视线就落在它上面；越靠近
   // 列表末尾时由 clamp 兜底，不会滚过头。
@@ -2251,10 +2348,10 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   // 保证面板完整落在工作区内。
   int body_y = anchor.open_above ? anchor.y - content - 8 : anchor.y + 8;
   body_y = std::min(std::max(body_y, top_limit), bottom_limit);
-  SetWindowPos(g_panel, HWND_TOP, body_x - kPanelShadowMargin,
-               body_y - kPanelShadowMargin,
-               panel_width + kPanelShadowMargin * 2,
-               content + kPanelShadowMargin * 2,
+  SetWindowPos(g_panel, HWND_TOP, body_x - shadow,
+               body_y - shadow,
+               panel_width + shadow * 2,
+               content + shadow * 2,
                SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
   InvalidateRect(g_panel, nullptr, FALSE);
   SetForegroundWindow(g_panel);
@@ -2264,9 +2361,7 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
 
 // ------------------------------------------------------------ 提示浮层
 //
-// 两种形态共用一个分层小窗：
-//   * Tooltip —— 鼠标停在某个控件上时，在控件正上方显示它的名字；
-//   * Toast   —— 调整音量 / 亮度 / 倍速 / 快进退时给一行实时反馈。
+// 调整音量 / 亮度 / 倍速 / 快进退时给一行实时反馈。
 //
 // 以前这些「实时提示」全部是转调 mpv 自己的 show-text，弹出来的是 mpv 的字体、
 // mpv 的位置、mpv 的样式，和 Mova 的玻璃面板是两套语言。改成自绘之后，提示与
@@ -2289,9 +2384,8 @@ ULONGLONG g_hint_until = 0;
 int g_hint_seek_percent = -1;
 int g_hint_volume_percent = -1;
 
-Gdiplus::Font MakeHintFont(HintMode mode) {
-  return MakeInterfaceFont(mode == HintMode::Tooltip ? 12.0f : 13.0f,
-                           Gdiplus::FontStyleRegular);
+Gdiplus::Font MakeHintFont() {
+  return MakeInterfaceFont(13.0f, Gdiplus::FontStyleRegular);
 }
 
 void MeasureHint(const std::wstring& text, const std::wstring& detail,
@@ -2300,7 +2394,7 @@ void MeasureHint(const std::wstring& text, const std::wstring& detail,
   int text_width = 0;
   {
     Gdiplus::Graphics graphics(dc);
-    auto font = MakeHintFont(HintMode::Toast);
+    auto font = MakeHintFont();
     auto detail_font = MakeInterfaceFont(11.0f, Gdiplus::FontStyleRegular);
     const float measured = std::max(
         MeasurePanelText(graphics, text.c_str(), font),
@@ -2389,16 +2483,17 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   int width = 0;
   int height = 0;
   MeasureHint(text, detail, icon, fraction >= 0.0f, &width, &height);
+  // MeasureHint 给的是设计稿尺寸，窗口与位置都按缩放后的物理大小摆放。
+  width = Scaled(width);
+  height = Scaled(height);
   RECT work_area{};
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
   const int work_left = static_cast<int>(work_area.left) + 8;
   const int work_right = static_cast<int>(work_area.right) - 8;
   const int dock_top = DockTopScreen();
-  int x = mode == HintMode::Tooltip
-              ? anchor_x - width / 2
-              : work_left + (work_right - work_left - width) / 2;
+  int x = work_left + (work_right - work_left - width) / 2;
   x = std::clamp(x, work_left, std::max(work_left, work_right - width));
-  const int gap = mode == HintMode::Tooltip ? 10 : 16;
+  const int gap = 16;
   int y = dock_top - height - gap;
   y = std::max(y, static_cast<int>(work_area.top) + 8);
   g_hint_mode = mode;
@@ -2410,10 +2505,6 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   SetWindowPos(g_hint, HWND_TOP, x, y, width, height,
                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   InvalidateRect(g_hint, nullptr, FALSE);
-}
-
-void ShowTooltip(const std::wstring& text, int anchor_x) {
-  ShowHint(text, std::wstring(), 0, HintMode::Tooltip, -1.0f, anchor_x);
 }
 
 LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
@@ -2429,8 +2520,12 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
       PanelSurface surface;
       if (surface.Create(rect.right, rect.bottom)) {
         Gdiplus::Graphics graphics(surface.target);
-        PaintHint(graphics, rect.right, rect.bottom, g_hint_icon, g_hint_text,
-                  g_hint_detail, g_hint_fraction);
+        // 与面板同一套做法：物理窗口 + ScaleTransform，内部按设计稿绘制。
+        const float scale = UiScale();
+        graphics.ScaleTransform(scale, scale);
+        PaintHint(graphics, static_cast<int>(rect.right / scale),
+                  static_cast<int>(rect.bottom / scale), g_hint_icon,
+                  g_hint_text, g_hint_detail, g_hint_fraction);
         graphics.Flush(Gdiplus::FlushIntentionSync);
         POINT source{0, 0};
         SIZE size{rect.right, rect.bottom};
@@ -2447,63 +2542,6 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
     default:
       return DefWindowProcW(window, message, wparam, lparam);
   }
-}
-
-// 控件悬浮时显示的名字。工具按钮走 ToolLabel，播放控制另外给一套说法。
-std::wstring ControlTooltip(int control) {
-  switch (static_cast<ControlId>(control)) {
-    case kPlayPause:
-      return g_paused.load() ? L"播放" : L"暂停";
-    case kBackTen:
-      return L"后退 " + std::to_wstring(static_cast<int>(g_seek_seconds)) + L" 秒";
-    case kForwardTen:
-      return L"前进 " + std::to_wstring(static_cast<int>(g_seek_seconds)) + L" 秒";
-    case kPreviousEpisode:
-      return L"上一集";
-    case kNextEpisode:
-      return L"下一集";
-    case kMute:
-      return g_muted.load() ? L"取消静音" : L"静音";
-    case kVolume:
-      return L"音量";
-    default:
-      break;
-  }
-  const ControlId id = static_cast<ControlId>(control);
-  if (id == kAudio || id == kSubtitle || id == kDanmaku || id == kPicture ||
-      id == kSpeed || id == kChapters || id == kEpisodes || id == kSegments ||
-      id == kPlaylist || id == kMore) {
-    return ToolLabel(id);
-  }
-  return std::wstring();
-}
-
-// 控件在控件条客户区里的中心 x。悬浮提示要贴在它正上方，所以命中范围和绘制
-// 位置必须来自同一套布局函数，不能再抄一份坐标。
-float ControlCenterX(ControlId control, int width) {
-  const float center = width / 2.0f;
-  switch (control) {
-    case kPreviousEpisode:
-      return center - 140.0f;
-    case kBackTen:
-      return center - 76.0f;
-    case kPlayPause:
-      return center;
-    case kForwardTen:
-      return center + 76.0f;
-    case kNextEpisode:
-      return center + 140.0f;
-    case kMute:
-      return VolumeStart(width) - 28.0f;
-    case kVolume:
-      return VolumeStart(width) + 29.0f;
-    default:
-      break;
-  }
-  for (const auto& item : ToolLayout(width)) {
-    if (item.first == control) return item.second;
-  }
-  return -1.0f;
 }
 
 // 调整类操作的统一说法：一行标题 + 一行明细 +（可选）一条进度。音量与亮度这
@@ -2574,11 +2612,20 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
       HDC buffer_dc = CreateCompatibleDC(dc);
       HBITMAP bitmap = CreateCompatibleBitmap(dc, rect.right, rect.bottom);
       HGDIOBJ old_bitmap = SelectObject(buffer_dc, bitmap);
+      // 物理客户区留给 BitBlt；绘制全部换到设计稿坐标系。
+      const int physical_width = rect.right;
+      const int physical_height = rect.bottom;
       {
         Gdiplus::Graphics graphics(buffer_dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         graphics.Clear(Gdiplus::Color(255, 1, 2, 3));
+        // 顶栏窗口保持全宽，内部按设计稿坐标绘制、ScaleTransform 放大到物理：
+        // 窗口变小时字号与按钮等比缩小，相对布局关系不变。
+        const float ui_scale = UiScale();
+        graphics.ScaleTransform(ui_scale, ui_scale);
+        rect.right = static_cast<LONG>(std::lround(rect.right / ui_scale));
+        rect.bottom = static_cast<LONG>(std::lround(rect.bottom / ui_scale));
         Gdiplus::SolidBrush title_brush(Gdiplus::Color(235, 244, 244, 247));
         Gdiplus::SolidBrush title_shadow(Gdiplus::Color(180, 0, 0, 0));
         auto title_font = MakeInterfaceFont(15, Gdiplus::FontStyleBold);
@@ -2701,7 +2748,8 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         }
         graphics.Flush(Gdiplus::FlushIntentionSync);
       }
-      BitBlt(dc, 0, 0, rect.right, rect.bottom, buffer_dc, 0, 0, SRCCOPY);
+      BitBlt(dc, 0, 0, physical_width, physical_height, buffer_dc, 0, 0,
+            SRCCOPY);
       SelectObject(buffer_dc, old_bitmap);
       DeleteObject(bitmap);
       DeleteDC(buffer_dc);
@@ -2709,12 +2757,17 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
       return 0;
     }
     case WM_MOUSEMOVE: {
-      ShowControls();
+      // 鼠标移动不在这里刷新计时器：mpv 嵌入后会周期性重投 WM_MOUSEMOVE，
+      // 光标静止时也收得到（实测约每 500 ms 一次，坐标一字不差），无条件
+      // 刷新会让控件永远不隐藏。移动由 timer 里基于真实位移的轮询负责。
       TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0};
       TrackMouseEvent(&tracking);
       RECT rect{};
       GetClientRect(window, &rect);
-      const int hover = TopHit(GET_X_LPARAM(lparam), rect.right);
+      const float scale = UiScale();
+      const int hover =
+          TopHit(static_cast<int>(GET_X_LPARAM(lparam) / scale),
+                 static_cast<int>(rect.right / scale));
       if (g_top_hover != hover) {
         g_top_hover = hover;
         InvalidateRect(window, nullptr, FALSE);
@@ -2727,7 +2780,9 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
     case WM_LBUTTONDOWN: {
       RECT rect{};
       GetClientRect(window, &rect);
-      const int hit = TopHit(GET_X_LPARAM(lparam), rect.right);
+      const float scale = UiScale();
+      const int hit = TopHit(static_cast<int>(GET_X_LPARAM(lparam) / scale),
+                             static_cast<int>(rect.right / scale));
       if (hit == 1) {
         ShowWindow(g_window, SW_MINIMIZE);
       } else if (hit == 2) {
@@ -2768,6 +2823,12 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       Gdiplus::Graphics graphics(buffer_dc);
       graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
       graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+      // 控件条窗口已经是缩放后的物理大小；内部布局仍全部是设计稿坐标，
+      // 一次 ScaleTransform 换过去，按钮、字号、进度条就都跟着窗口走。
+      const float ui_scale = UiScale();
+      graphics.ScaleTransform(ui_scale, ui_scale);
+      rect.right = static_cast<LONG>(std::lround(rect.right / ui_scale));
+      rect.bottom = static_cast<LONG>(std::lround(rect.bottom / ui_scale));
       Gdiplus::LinearGradientBrush surface(
           Gdiplus::Point(0, 0), Gdiplus::Point(0, rect.bottom),
           Gdiplus::Color(224, 39, 41, 48), Gdiplus::Color(244, 14, 15, 19));
@@ -2933,8 +2994,11 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       ShowControls();
       RECT rect{};
       GetClientRect(window, &rect);
-      const int x = GET_X_LPARAM(lparam);
-      const int y = GET_Y_LPARAM(lparam);
+      // 命中判定与绘制共用设计稿坐标系：物理坐标先除回缩放系数。
+      const float scale = UiScale();
+      const int x = static_cast<int>(GET_X_LPARAM(lparam) / scale);
+      const int y = static_cast<int>(GET_Y_LPARAM(lparam) / scale);
+      rect.right = static_cast<LONG>(std::lround(rect.right / scale));
       const int center = rect.right / 2;
       const bool compact = rect.right < 780;
       const ControlId hit = HitControl(x, y, rect.right);
@@ -3009,13 +3073,16 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
                                 0.0, 100.0));
       return 0;
     case WM_MOUSEMOVE: {
-      ShowControls();
+      // 同上：不在这里刷新计时器，鼠标移动交给 timer 的真实位移判定。
       RECT rect{};
       GetClientRect(window, &rect);
       TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0};
       TrackMouseEvent(&tracking);
-      const int mouse_x = GET_X_LPARAM(lparam);
-      const int mouse_y = GET_Y_LPARAM(lparam);
+      // 命中判定与进度条换算都在设计稿坐标系里做。
+      const float scale = UiScale();
+      const int mouse_x = static_cast<int>(GET_X_LPARAM(lparam) / scale);
+      const int mouse_y = static_cast<int>(GET_Y_LPARAM(lparam) / scale);
+      rect.right = static_cast<LONG>(std::lround(rect.right / scale));
       if (mouse_y <= 32) {
         const double fraction = std::clamp(
             (mouse_x - 24.0) / (rect.right - 48.0), 0.0, 1.0);
@@ -3053,22 +3120,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         g_hint_volume_percent = -1;
       }
       const int hovered = HitControl(mouse_x, mouse_y, rect.right);
-      if (g_hover_control.exchange(hovered) != hovered) {
-        InvalidateRect(window, nullptr, FALSE);
-        // 悬浮名称：工具按钮与播放控制都给出自己的名字，悬浮在高亮动效之外
-        // 再给一次文字确认。
-        const std::wstring label =
-            hovered == kNone ? std::wstring() : ControlTooltip(hovered);
-        const float anchor = ControlCenterX(static_cast<ControlId>(hovered),
-                                            rect.right);
-        if (!label.empty() && anchor >= 0.0f) {
-          POINT point{static_cast<LONG>(anchor), 0};
-          ClientToScreen(window, &point);
-          ShowTooltip(label, point.x);
-        } else if (g_hint_mode == HintMode::Tooltip) {
-          HideHint();
-        }
-      }
+      g_hover_control.store(hovered);
       InvalidateRect(window, nullptr, FALSE);
       return 0;
     }
@@ -3076,7 +3128,6 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       g_seek_hover = -1;
       g_hint_seek_percent = -1;
       g_hint_volume_percent = -1;
-      if (g_hint_mode == HintMode::Tooltip) HideHint();
       g_hover_control = kNone;
       InvalidateRect(window, nullptr, FALSE);
       return 0;
@@ -3274,8 +3325,21 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     case WM_SIZE:
       PositionControls();
       return DefWindowProcW(window, message, wparam, lparam);
+    case WM_SETCURSOR: {
+      // 退场期间光标必须保持隐藏。命中测试已经交还给画面，但系统每移动一次
+      // 光标还是会问一次 WM_SETCURSOR，这里直接按住不放。
+      if (g_controls_alpha == 0) {
+        SetCursor(nullptr);
+        return TRUE;
+      }
+      return DefWindowProcW(window, message, wparam, lparam);
+    }
     case WM_MOUSEMOVE:
-      ShowControls();
+      // 这里以前无条件 ShowControls()。mpv 以 wid 嵌入主窗口后，即使光标
+      // 一动不动也会周期性重投 WM_MOUSEMOVE（实测约每 500 ms 一次，坐标
+      // 一字不差），计时器被不断清零，控件条和光标就永远不会自动隐藏。
+      // 现在鼠标移动只由 50 ms timer 里「位移 ≥3px 且落在窗口内」的轮询
+      // 负责刷新，合成消息进不来。
       return 0;
     case WM_LBUTTONDBLCLK:
       ToggleFullscreen();
@@ -3307,9 +3371,44 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         g_buffer_phase = std::fmod(g_buffer_phase + 22.0f, 360.0f);
         if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
       }
+      // 自动隐藏看「光标最后一次在播放器窗口内移动」：轮询光标位置，动了且
+      // 在窗口内就算一次交互；光标停在窗口里任何地方（画面、控件条都算）
+      // 2.6 秒后，控件条、顶栏与光标一起退场。用户在窗口外打字或动鼠标不会
+      // 打扰播放器的计时。
+      POINT cursor{};
+      bool cursor_moved = false;
+      bool cursor_in_window = false;
+      if (GetCursorPos(&cursor)) {
+        const LONG dx = cursor.x - g_last_cursor.x;
+        const LONG dy = cursor.y - g_last_cursor.y;
+        // 3px 死区：光学鼠标静止时常有 ±1px 抖动，手搭在鼠标上不该把控件
+        // 一直钉在屏幕上；参考点只在累计位移过阈值时刷新，缓慢漂移也算移动。
+        if (dx * dx + dy * dy >= 9) {
+          cursor_moved = true;
+          RECT window_rect{};
+          if (g_window && GetWindowRect(g_window, &window_rect) &&
+              PtInRect(&window_rect, cursor)) {
+            cursor_in_window = true;
+            ShowControls();
+          }
+          g_last_cursor = cursor;
+        }
+      }
       const bool should_hide = GetTickCount64() - g_last_interaction > 2600 &&
                                !g_paused.load() &&
                                !(g_panel && IsWindowVisible(g_panel));
+      if (FILE* trace = AutoHideTrace()) {
+        std::fprintf(trace,
+                     "tick=%llu cur=%ld,%ld moved=%d inwin=%d idle=%llu "
+                     "hide=%d paused=%d panelvis=%d alpha=%d\n",
+                     GetTickCount64(), cursor.x, cursor.y,
+                     cursor_moved ? 1 : 0, cursor_in_window ? 1 : 0,
+                     GetTickCount64() - g_last_interaction,
+                     should_hide ? 1 : 0, g_paused.load() ? 1 : 0,
+                     (g_panel && IsWindowVisible(g_panel)) ? 1 : 0,
+                     static_cast<int>(g_controls_alpha));
+        std::fclose(trace);
+      }
       const BYTE target = should_hide ? 0 : 232;
       if (g_controls_alpha != target) {
         const int step = should_hide ? -24 : 32;
@@ -3322,7 +3421,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
                                      g_controls_alpha,
                                      LWA_ALPHA | LWA_COLORKEY);
         }
-        if (g_controls_alpha == 0) SetCursor(nullptr);
+        if (g_controls_alpha == 0) {
+          SetCursor(nullptr);
+        } else if (next == 232) {
+          SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        }
+        // 退场后把命中测试也交还给画面（见 SetOverlayHitTest 的说明）。
+        SetOverlayHitTest(g_controls_alpha > 0);
       }
       return 0;
     }
@@ -3354,7 +3459,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   window_class.hInstance = instance;
   window_class.lpszClassName = kWindowClass;
   window_class.lpfnWndProc = WindowProc;
-  window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  // 类光标留空：光标显隐完全跟着控件条走（ShowControls 里设箭头、控件退场时
+  // 设 null）。若在这里挂 ARROW，控件隐藏后每一次鼠标微动都会经 WM_SETCURSOR
+  // 把光标重新点亮，出现「面板退场了光标还亮着」。
+  window_class.hCursor = nullptr;
   window_class.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
   window_class.style = CS_DBLCLKS;
   RegisterClassW(&window_class);
@@ -3497,6 +3605,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   SetOption(g_handle, "input-vo-keyboard", "yes");
   SetOption(g_handle, "keep-open", "no");
   SetOption(g_handle, "vid", "auto");
+  // 光标隐藏由窗口的 50ms timer 统一管理（控件条与光标同进退）；mpv 自己的
+  // autohide 与它各管各的，会出现「控件退场了光标还亮着」的分裂状态。
+  SetOption(g_handle, "cursor-autohide", "no");
 
   std::vector<std::string> media_urls;
   int playlist_start = 0;
@@ -3692,7 +3803,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   }
   ShowWindow(window, show_command);
   UpdateWindow(window);
-  g_last_interaction = GetTickCount64();
   SetTimer(window, 1, 50, nullptr);
   PositionControls();
 
