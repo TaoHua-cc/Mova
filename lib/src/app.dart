@@ -273,6 +273,36 @@ class YingjiApp extends StatelessWidget {
             borderSide: BorderSide(color: YingjiColors.danger),
           ),
         ),
+        // 悬浮提示是浮在内容之上的 HUD，固定用当前色调的深端材质 + 白字，
+        // 两种主题下都压得住背景 —— 此前裸 Tooltip 弹出来是框架默认的白底
+        // 黑字（「加入待看」那颗按钮最明显），和玻璃面板是两套语言。
+        tooltipTheme: TooltipThemeData(
+          waitDuration: const Duration(milliseconds: 320),
+          showDuration: const Duration(seconds: 8),
+          preferBelow: true,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          margin: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: YingjiGlassTints.of(yingjiAppearance.glassTint).deep
+                .withValues(alpha: .96),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white.withValues(alpha: .2)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x66000000),
+                blurRadius: 24,
+                offset: Offset(0, 12),
+              ),
+            ],
+          ),
+          textStyle: const TextStyle(
+            color: Colors.white,
+            fontSize: 12.5,
+            height: 1.4,
+            fontWeight: FontWeight.w600,
+            letterSpacing: .2,
+          ),
+        ),
       ),
       home: MovaStartupGate(startup: startup, child: const MediaCenterShell()),
       navigatorObservers: [yingjiRouteObserver],

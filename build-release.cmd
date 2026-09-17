@@ -18,8 +18,19 @@ set "ANDROID_HOME=C:\Users\gctyk\AppData\Local\Temp\yj-dummy-android-sdk"
 set "ANDROID_SDK_ROOT=%ANDROID_HOME%"
 if not exist "%ANDROID_HOME%\licenses" mkdir "%ANDROID_HOME%\licenses"
 
+rem -- Locate the Flutter SDK: prefer PATH, then common local installs.
+set "FLUTTER_BIN="
+for %%F in (flutter.bat) do if not defined FLUTTER_BIN set "FLUTTER_BIN=%%~$PATH:F"
+if not defined FLUTTER_BIN if exist "D:\flutter\bin\flutter.bat" set "FLUTTER_BIN=D:\flutter\bin\flutter.bat"
+if not defined FLUTTER_BIN if exist "D:\DevTools\flutter\bin\flutter.bat" set "FLUTTER_BIN=D:\DevTools\flutter\bin\flutter.bat"
+if not defined FLUTTER_BIN (
+  echo FLUTTER_NOT_FOUND
+  echo Set the Flutter SDK on PATH or edit FLUTTER_BIN in this script.
+  exit /b 1
+)
+
 echo [1/3] flutter build windows --release ...
-call "D:\DevTools\flutter\bin\flutter.bat" build windows --release
+call "%FLUTTER_BIN%" build windows --release
 if errorlevel 1 (
   echo FLUTTER_BUILD_FAILED
   exit /b 1

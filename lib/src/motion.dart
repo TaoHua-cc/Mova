@@ -567,19 +567,17 @@ class MovaPageTransitionsBuilder extends PageTransitionsBuilder {
       reverseCurve: const Interval(0, .42, curve: Curves.easeIn),
     );
     return SlideTransition(
-      position:
-          Tween<Offset>(
-            begin: const Offset(1, 0),
-            end: Offset.zero,
-          ).animate(forward),
+      position: Tween<Offset>(
+        begin: const Offset(1, 0),
+        end: Offset.zero,
+      ).animate(forward),
       child: FadeTransition(
         opacity: fade,
         child: SlideTransition(
-          position:
-              Tween<Offset>(
-                begin: Offset.zero,
-                end: const Offset(-.28, 0),
-              ).animate(outgoing),
+          position: Tween<Offset>(
+            begin: Offset.zero,
+            end: const Offset(-.28, 0),
+          ).animate(outgoing),
           child: child,
         ),
       ),

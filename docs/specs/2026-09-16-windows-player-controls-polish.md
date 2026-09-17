@@ -73,6 +73,8 @@
 ### 自动化
 
 - [x] 本机 `flutter build windows --release --no-pub`
+- [x] `windows/native_player/main.cpp` 独立通过 MSVC `/W4 /WX` 编译（`CL_EXIT=0`）
+- [x] `scripts/dev-verify.ps1 -SkipChecks -Deploy` 构建并同步到 `D:\Mova`（`BUILD_OK`）
 - [x] 本次修改文件无 analyzer warning/error（保留 `player_page.dart` 既有的 6 条 info）
 - [ ] 完整 `flutter test`：70 项中 69 项通过；既有发现栏目 Widget 测试失败
 
@@ -80,9 +82,12 @@
 
 | 平台/尺寸 | 操作路径 | 预期结果 | 结果 |
 |---|---|---|---|
-| Windows 1280×760 | 播放、悬停、拖动、打开各菜单 | 分组清晰，无位移或遮挡 | 待验证 |
+| Windows 1280×760 | 播放、悬停、拖动、打开各菜单 | 分组清晰，无位移或遮挡 | 截图通过：面板卡片化，图标与文字无锯齿、无彩边 |
+| Windows 1280×760 | 打开选集/音轨/字幕/设置面板 | 与应用弹窗风格一致 | 截图通过：填充率 0.89/0.64/0.76 对齐应用 0.91/0.74/0.77 |
+| Windows 1280×760 | 关闭播放器窗口 | 无错误弹窗、退出码为 0 | 通过：连续三次退出码 0 |
 | Windows 极窄窗口 | 缩小后操作可见控件 | 浮层不越界，命中准确 | 待验证 |
 | Windows 全屏 | 等待自动隐藏后移动鼠标 | 淡入淡出自然，视频无遮挡 | 待验证 |
+| Windows 播放中切上下集 | 观察跳集按钮与标题 | 图标可见、标题同步更新 | 待验证（跳集空字形已修复） |
 
 ## 风险与回滚
 
@@ -118,3 +123,52 @@
 - 修复 Visual Studio 2026 所带新版 CMake 不再可靠接受 `CMAKE_INSTALL_PREFIX` 中生成器表达式的问题；安装目标仍输出到 `runner/<配置>`，不再错误写入 `C:\Program Files\mova`。
 - Windows Release 构建已通过并生成 `build/windows/x64/runner/Release/mova.exe`；实机截图验收仍待进行。
 - Iconsax 风格图标与动效完成后再次通过 MSVC `/W4 /WX` 严格编译及 Windows Release 构建。
+- 修复控件与顶栏文字/图标的锯齿与彩色镶边：三处 `WM_PAINT` 显式设置
+  `SetTextRenderingHint(TextRenderingHintAntiAliasGridFit)`；`DrawIconsaxGlyph` 内部对图标字形
+  单独使用不带网格拟合的 `TextRenderingHintAntiAlias` 并在绘制后还原调用方设置。此前未设置该选项，
+  GDI+ 回落到系统默认的 ClearType 次像素渲染，深色半透明面板上所有字形边缘出现橙/蓝彩边。
+  实测图标区边缘 `max|R-B|` 由 160 降到 8，中间调像素数由 129 升到 256。
+
+### 第四轮：弹窗与图标体系统一（以 Flutter 应用界面为设计基准）
+
+前三轮只改了顶栏与底部控制条，播放器弹窗（选集 / 音轨 / 字幕 / 设置面板）仍是早期的
+纯文本行列表，与 Home 页弹窗风格脱节。本轮把 Flutter 侧的真实控件规格抄成原生侧常量。
+
+- 探测确认 `FlutterIconsax.ttf` 是**被 tree-shake 过的字体**：717 个字形中只有 65 个落在
+  `iconsax_flutter` Dart 码点表内，其余 652 个位于 U+E000–U+E2FE 私有区、无法按设计系统
+  名称访问。因此原生侧选码点前必须先探测，不能凭图标名称拼码点。
+  （新增 `icon_font_probe.cpp`：`scan` 列出可用码点与墨迹/em 比，`check` 校验待用码点，
+  `sheet` 输出对照表 PNG。）
+- 依此发现并修复了长期存在的空按钮：上一集/下一集原用 `U+EE0D` / `U+EE76`，两者均不在
+  该字体中，按钮始终无字形；改为复用 `arrow_left`（`U+E964`）并按方向做水平镜像。
+  全量审计后 26 个在用码点全部有效。
+- **图标尺寸口径修正**：`Icon(size: N)` 是按 **em 盒**缩放，而非墨迹外接框。原实现按测得
+  墨迹范围缩放，导致同尺寸下原生图标系统性偏大偏重。改为以 100 设计 em 为基准缩放，
+  并把锚点定在**墨迹外接框中心**——`AddString` 的原点是 em 盒左上角，若用
+  `GetCellAscent/GetCellDescent` 推 em 中心会把整行图标下移约 1/5 图标高。
+- 弹窗内选项行对齐 `_TrackPickerOption`：图标承载块 36 px（圆角 12）、图标 17 px、
+  文字间距 11 px、行最小高度 68 px、卡片圆角 14 px、选中态 2 px 白色描边、
+  拖尾状态图标 19 px；面板标题行图标 20 px，提示行图标 18 px。
+- 顶栏窗口按钮统一按 `36.0f * 0.43f`（≈15.5 px）取尺寸，取代此前逐按钮 14/15/16 的写法，
+  与 `YingjiWindowControls`（按钮直径 = size，内嵌 `Icon(size: size * 0.43)`）一致。
+- 底部控制条图标按同一 em 口径重设：播放 25 px、音量/全屏/跳集/10 秒/工具均 19 px。
+- 用 `bbox.py` 量化对比原生顶栏与应用窗口的图标填充率：实心 ⊗ 0.89 / 空心 □ 0.64 /
+  实心 ⊟ 0.76，对应应用侧 0.91 / 0.74 / 0.77，粗细与尺寸已对齐。
+- 清理死代码：删除重构后已无引用的 `DrawRoundedRect`、`MakeIconsaxFont`、`ToolCenter`、
+  `ToolCount`（引用计数为 1，`/W4 /WX` 不会报出）。
+- 修复第二次退出崩溃 `0xC0000005`：字形缓存原为函数内 `static std::map<wchar_t,
+  std::unique_ptr<GlyphShape>>`，其中 `GraphicsPath` 的析构发生在 `GdiplusShutdown`
+  之后。改为 `GlyphCache()` / `ReleaseGlyphCache()`，并在关闭 GDI+ 之前显式释放。
+  A/B 验证：部署版必崩，修复版连续三次退出码为 0。
+- 本轮再次通过 MSVC `/W4 /WX` 编译（`CL_EXIT=0`）与 `scripts/dev-verify.ps1 -SkipChecks
+  -Deploy` 构建部署，退出码回归测试 0×3。
+- 对比图归档于 `build/ui-compare/`：`panel_before_after.png`、`topbar_before_after.png`、
+  `dock_before_after.png`、`panel_after.png`、`app_reference_full.png`。
+
+> 与本文「技术方案」的偏差（两项）：
+> 1. 方案原定「使用路径构造函数重绘图标，不加载外部图标字体」，实现改为加载
+>    `FlutterIconsax.ttf` 并以 `DrawString` 绘制字形。这带来字形级彩边风险（第三轮已用
+>    灰度抗锯齿规避）；后续继续走字体路线需保留 `TextRenderingHint` 设置，并且**必须
+>    先探测可用码点**（字体已被 tree-shake）；若回到路径绘制则不受提示影响。
+> 2. 方案原定「统一 24×24 视觉网格、1.9 px 描边」，实现改为直接复用 Flutter 设计系统的
+>    em 盒尺寸与 `Icon(size:)` 数值，不再另立一套网格，以保证两端同尺寸图标观感一致。

@@ -1038,16 +1038,82 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (track.sampleRate != null) '${track.sampleRate} Hz',
   ].join(' · ');
 
+  /// 资源版本概要：分辨率 · 色彩范围 · 码率 · 大小。原生资源面板的明细行、
+  /// 应用内播放器的资源标签共用这一份；缺哪项就跳过哪项，不画假数据。
   String _resourceSummary(MediaItem resource) => [
     if (resource.width != null && resource.height != null)
       '${resource.width}×${resource.height}',
-    if (resource.videoCodec != null) resource.videoCodec!.toUpperCase(),
-    if (resource.container != null) resource.container!.toUpperCase(),
+    if (resource.videoRange?.isNotEmpty == true)
+      _videoRangeLabel(resource.videoRange!),
     if (resource.bitrate != null)
       '${(resource.bitrate! / 1000000).toStringAsFixed(1)} Mbps',
+    if (resource.size != null && resource.size! > 0)
+      _fileSizeLabel(resource.size!),
   ].join(' · ');
 
-  List<PlayerResourceOption> _playerResourcesFor(MediaItem episode) {
+  /// Emby / Jellyfin 的 VideoRangeType 取值五花八门（DOVIWithHDR10 之类），
+  /// 统一收敛成面板能放下的短标签；未知取值原样展示，总好过消失。
+  String _videoRangeLabel(String range) {
+    final value = range.trim().toUpperCase();
+    if (value.contains('DOVI') || value.contains('DOLBY') || value == 'DV') {
+      return '杜比视界';
+    }
+    if (value.contains('HDR10+')) return 'HDR10+';
+    if (value.contains('HDR')) return 'HDR10';
+    if (value.contains('HLG')) return 'HLG';
+    return value;
+  }
+
+  String _fileSizeLabel(int bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+    }
+    return '${(bytes / (1024 * 1024)).round()} MB';
+  }
+
+  /// 资源版本在「全部已连接服务器」聚合列表里的稳定标识。同一台服务器上的同一
+  /// 集，用来源 id 加条目 id 就能唯一定位 —— 服务器图标与名次都按它对齐。
+  String _resourceKey(MediaItem version) =>
+      '${version.source.id}|${version.id}';
+
+  /// 原生资源面板的兜底标记编号，与 `ServerMark` 的配色一一对应：
+  /// Emby 绿、Jellyfin 紫、WebDAV 蓝。图标文件取不到时才用得上。
+  int _serverMarkOf(MediaSource source) => switch (source.kind) {
+    SourceKind.emby => 1,
+    SourceKind.jellyfin => 2,
+    SourceKind.webdav => 3,
+  };
+
+  /// 该集总时长（秒）。服务器给的时长最准，TMDB 的分钟数只在服务器没报时兜底，
+  /// 两者都没有就返回 null —— 原生卡片会省掉进度条，而不是画一条假的。
+  int? _episodeSeconds(MediaItem episode, TmdbEpisode? metadata) {
+    final runtime = episode.runtime;
+    if (runtime != null && runtime > Duration.zero) return runtime.inSeconds;
+    final minutes = metadata?.runtime;
+    return minutes != null && minutes > 0 ? minutes * 60 : null;
+  }
+
+  /// 剧集卡片副标题里附在季号之后的「日期 · 时长」，例如「2023-05-12 · 44 分钟」。
+  /// 数据来自 TMDB，缺项就少写一段，不拿服务器首播年份之类的近似值硬凑。
+  String _episodeMetaLine(MediaItem episode, TmdbEpisode? metadata) {
+    final parts = <String>[];
+    final date = metadata?.airDate;
+    if (date != null) {
+      parts.add(
+        '${date.year}-${date.month.toString().padLeft(2, '0')}'
+        '-${date.day.toString().padLeft(2, '0')}',
+      );
+    }
+    final minutes = metadata?.runtime;
+    if (minutes != null && minutes > 0) parts.add('$minutes 分钟');
+    return parts.join(' · ');
+  }
+
+  /// 「资源」的候选版本：当前剧集在**全部已连接服务器**上的条目，按分辨率、
+  /// 动态范围、码率排序。原生「资源」面板与 Flutter 播放页共用这一份顺序。
+  /// 返回条目本身（而不是 PlayerResourceOption），因为重新起播还需要 headers、
+  /// videoRange、时长等字段，只有 URL 是重建不出来的。
+  List<MediaItem> _resourceVersionsFor(MediaItem episode) {
     final rows = _resources
         .where(
           (candidate) =>
@@ -1063,7 +1129,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       if (range != 0) return range;
       return (b.bitrate ?? 0).compareTo(a.bitrate ?? 0);
     });
-    return rows
+    return rows;
+  }
+
+  List<PlayerResourceOption> _playerResourcesFor(MediaItem episode) {
+    return _resourceVersionsFor(episode)
         .map(
           (candidate) => PlayerResourceOption(
             url: candidate.playbackUrl!.toString(),
@@ -1350,71 +1420,168 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       }
     }
     if (WindowHost.isDesktop) {
-      try {
-        await WindowsNativePlayer.play(
-          WindowsNativePlaybackRequest(
-            url: resource.playbackUrl.toString(),
-            title: item.title,
-            headers: resource.headers,
-            initialPosition: resumePosition,
-            imageUrl: resource.imageUrl?.toString(),
-            seriesLogoUrl: item.logoUrl?.toString(),
-            sourceId: resource.source.id,
-            serverItemId: resource.id,
-            tmdbId: item.id,
-            episodeTitle: _episodeTitle(
-              resource,
-              _episodeMetadata[_episodeKey(
-                resource.seasonNumber,
-                resource.episodeNumber,
-              )],
-              resource.episodeNumber ?? 1,
-            ),
-            seasonNumber: resource.seasonNumber,
-            episodeNumber: resource.episodeNumber,
-            videoRange: resource.videoRange,
-            initialAudioTrack: _selectedAudioTrack,
-            initialSubtitleTrack: _selectedSubtitleTrack,
-            playlist: episodeOptions
-                .map(
-                  (episode) => WindowsNativePlaylistEntry(
-                    url: episode.playbackUrl.toString(),
-                    title: episode.title,
-                    headers: episode.headers,
-                    imageUrl: episode.imageUrl?.toString(),
-                    sourceId: episode.source.id,
-                    serverItemId: episode.id,
-                    tmdbId: item.id,
-                    episodeTitle: _episodeTitle(
-                      episode,
-                      _episodeMetadata[_episodeKey(
-                        episode.seasonNumber,
-                        episode.episodeNumber,
-                      )],
-                      episode.episodeNumber ?? 1,
-                    ),
-                    seasonNumber: episode.seasonNumber,
-                    episodeNumber: episode.episodeNumber,
-                  ),
-                )
-                .toList(growable: false),
-            playlistIndex: episodeOptions.indexWhere(
+      // 原生窗口的「资源」面板可以切到当前剧集在任意已连接服务器上的版本。
+      // 原生自己换不了 —— 播放列表、headers 与 hwdec 选择都绑在起播时那个
+      // 服务器上 —— 所以它把选择交回来，由这里用新资源重新起播。
+      final versions = _resourceVersionsFor(resource);
+      var available = versions;
+      var activeResource = resource;
+      var activeIndex = available.indexWhere(
+        (candidate) =>
+            candidate.source.id == resource.source.id &&
+            candidate.id == resource.id,
+      );
+      if (activeIndex < 0) {
+        // 当前条目不在聚合列表里（例如从播放历史直接起播）：把它放进列表，免得
+        // 面板把别的版本标成「正在播放」。
+        available = <MediaItem>[resource, ...versions];
+        activeIndex = 0;
+      }
+      var startAt = resumePosition;
+      // 剧集面板要逐集显示剧照，资源面板要显示服务器图标 —— 两样都必须由应用侧
+      // 先取好：原生不联网，也不该持有令牌。图落到本地磁盘缓存后只把路径下发。
+      // 这一步放在重播循环之外，换资源重播时不必重新取图；两者都有时限，起播
+      // 不该被取图拖住，赶不上的图在面板里退化成占位图或兜底标记。
+      final episodeImages = await WindowsNativePlayer.cacheImageFiles({
+        for (final episode in episodeOptions)
+          _episodeKey(
+            episode.seasonNumber,
+            episode.episodeNumber,
+          ): _episodeImage(
+            episode,
+            _episodeMetadata[_episodeKey(
+              episode.seasonNumber,
+              episode.episodeNumber,
+            )],
+          )?.toString(),
+      });
+      // 名次取自「按画质排序」的那一份版本列表，和详情页资源卡片上的金 / 银 / 铜
+      // 标记同源。当前条目不在其中时（比如从播放历史直接起播）不排名次。
+      final ranks = <String, int>{
+        for (var index = 0; index < versions.length && index < 3; index++)
+          _resourceKey(versions[index]): index + 1,
+      };
+      // 服务器图标：并发取、整体限时。某台服务器不响应时不能让起播一直等它，
+      // 超时的那几项退回原生按来源类型画的兜底标记，配色仍然是对的。
+      final resourceIcons = <String, String?>{};
+      await Future.wait<void>(
+        available.map((version) async {
+          resourceIcons[_resourceKey(version)] = await cacheServerMarkFile(
+            version.source,
+            version.headers['X-Emby-Token'],
+          );
+        }),
+      ).timeout(const Duration(seconds: 4), onTimeout: () => <void>[]);
+      WindowsNativePlaylistEntry nativeEntry(MediaItem episode) {
+        final key = _episodeKey(episode.seasonNumber, episode.episodeNumber);
+        final metadata = _episodeMetadata[key];
+        return WindowsNativePlaylistEntry(
+          url: episode.playbackUrl.toString(),
+          title: episode.title,
+          headers: episode.headers,
+          imageUrl: episode.imageUrl?.toString(),
+          sourceId: episode.source.id,
+          serverItemId: episode.id,
+          tmdbId: item.id,
+          episodeTitle: _episodeTitle(
+            episode,
+            metadata,
+            episode.episodeNumber ?? 1,
+          ),
+          seasonNumber: episode.seasonNumber,
+          episodeNumber: episode.episodeNumber,
+          imagePath: episodeImages[key],
+          progress: _episodeProgress[key],
+          duration: _episodeSeconds(episode, metadata),
+          watched: _completedResourceIds.contains(episode.id),
+          meta: _episodeMetaLine(episode, metadata),
+        );
+      }
+
+      while (true) {
+        // 剧集列表本身跨服务器取自 episodeByKey；只有当前这一集要换成正在播放
+        // 的那个版本，否则换资源之后列表里的选中项还停在旧服务器上。
+        final playlist = episodeOptions
+            .map(
               (episode) =>
                   _episodeKey(episode.seasonNumber, episode.episodeNumber) ==
-                  _episodeKey(resource.seasonNumber, resource.episodeNumber),
+                      _episodeKey(
+                        activeResource.seasonNumber,
+                        activeResource.episodeNumber,
+                      )
+                  ? activeResource
+                  : episode,
+            )
+            .toList(growable: false);
+        try {
+          final result = await WindowsNativePlayer.play(
+            WindowsNativePlaybackRequest(
+              url: activeResource.playbackUrl.toString(),
+              title: item.title,
+              headers: activeResource.headers,
+              initialPosition: startAt,
+              imageUrl: activeResource.imageUrl?.toString(),
+              seriesLogoUrl: item.logoUrl?.toString(),
+              sourceId: activeResource.source.id,
+              serverItemId: activeResource.id,
+              tmdbId: item.id,
+              episodeTitle: _episodeTitle(
+                activeResource,
+                _episodeMetadata[_episodeKey(
+                  activeResource.seasonNumber,
+                  activeResource.episodeNumber,
+                )],
+                activeResource.episodeNumber ?? 1,
+              ),
+              seasonNumber: activeResource.seasonNumber,
+              episodeNumber: activeResource.episodeNumber,
+              videoRange: activeResource.videoRange,
+              initialAudioTrack: _selectedAudioTrack,
+              initialSubtitleTrack: _selectedSubtitleTrack,
+              playlist: playlist.map(nativeEntry).toList(growable: false),
+              playlistIndex: playlist.indexWhere(
+                (episode) =>
+                    _episodeKey(episode.seasonNumber, episode.episodeNumber) ==
+                    _episodeKey(
+                      activeResource.seasonNumber,
+                      activeResource.episodeNumber,
+                    ),
+              ),
+              resources: available
+                  .map(
+                    (version) => WindowsNativeResourceOption(
+                      source: version.source.name,
+                      detail: _resourceSummary(version),
+                      iconPath: resourceIcons[_resourceKey(version)],
+                      mark: _serverMarkOf(version.source),
+                      rank: ranks[_resourceKey(version)] ?? 0,
+                    ),
+                  )
+                  .toList(growable: false),
+              resourceIndex: activeIndex,
             ),
-          ),
-        );
-      } catch (error) {
-        if (context.mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('Windows 原生播放器启动失败：$error')));
+          );
+          final picked = result.resourceIndex;
+          if (picked == null || picked < 0 || picked >= available.length) {
+            break;
+          }
+          activeResource = available[picked];
+          activeIndex = picked;
+          // 接着刚才的位置继续，而不是从这一集的开头重放。
+          startAt = result.resourcePosition ?? startAt;
+        } catch (error) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('Windows 原生播放器启动失败：$error')));
+          }
+          break;
         }
       }
       await _refreshProgressAfterPlayback();
       return;
     }
+    if (!context.mounted) return;
     await Navigator.push(
       context,
       MaterialPageRoute(

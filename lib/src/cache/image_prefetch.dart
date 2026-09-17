@@ -44,45 +44,25 @@ abstract final class YingjiImageWarmup {
     bool backdrop = false,
     bool logo = false,
     int maxItems = 24,
-  }) => urls(
-    [
-      for (final item in values.take(maxItems)) ...[
-        item.posterUrl,
-        if (backdrop) item.backdropUrl,
-        if (logo) item.logoUrl,
-      ],
+  }) => urls([
+    for (final item in values.take(maxItems)) ...[
+      item.posterUrl,
+      if (backdrop) item.backdropUrl,
+      if (logo) item.logoUrl,
     ],
-  );
+  ]);
 
   /// 演员头像。
-  static void people(
-    Iterable<TmdbPerson> values, {
-    int maxItems = 40,
-  }) => urls(
-    [
-      for (final person in values.take(maxItems)) person.profileUrl,
-    ],
-  );
+  static void people(Iterable<TmdbPerson> values, {int maxItems = 40}) =>
+      urls([for (final person in values.take(maxItems)) person.profileUrl]);
 
   /// 剧集剧照。
-  static void episodes(
-    Iterable<TmdbEpisode> values, {
-    int maxItems = 40,
-  }) => urls(
-    [
-      for (final episode in values.take(maxItems)) episode.stillUrl,
-    ],
-  );
+  static void episodes(Iterable<TmdbEpisode> values, {int maxItems = 40}) =>
+      urls([for (final episode in values.take(maxItems)) episode.stillUrl]);
 
   /// 季海报。
-  static void seasons(
-    Iterable<TmdbSeason> values, {
-    int maxItems = 24,
-  }) => urls(
-    [
-      for (final season in values.take(maxItems)) season.posterUrl,
-    ],
-  );
+  static void seasons(Iterable<TmdbSeason> values, {int maxItems = 24}) =>
+      urls([for (final season in values.take(maxItems)) season.posterUrl]);
 
   static Future<void> _drain() async {
     if (_draining) return;

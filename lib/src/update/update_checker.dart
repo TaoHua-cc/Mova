@@ -138,7 +138,8 @@ class UpdatePlan {
   bool get canDownload => kind != UpdateKind.pageOnly;
 
   /// 粗略的下载体积描述，用在取消下载前的确认提示里。
-  String get sizeLabel => size <= 0 ? '' : '${(size / 1048576).toStringAsFixed(1)} MB';
+  String get sizeLabel =>
+      size <= 0 ? '' : '${(size / 1048576).toStringAsFixed(1)} MB';
 }
 
 /// 版本检查：查 GitHub Releases，比版本号，记住「跳过此版本」。
@@ -419,16 +420,16 @@ abstract final class UpdateChecker {
       final resolved = target.hasScheme
           ? target
           : _pageLatest.resolve(location);
-      final match = RegExp(r'/tag/v?([0-9][0-9.]*)').firstMatch(
-        resolved.path,
-      );
+      final match = RegExp(r'/tag/v?([0-9][0-9.]*)').firstMatch(resolved.path);
       if (match == null) return null;
       final version = match.group(1)!;
       return UpdateRelease(
         version: version,
         tag: 'v$version',
         body: '',
-        pageUrl: Uri.parse('https://github.com/$repository/releases/tag/v$version'),
+        pageUrl: Uri.parse(
+          'https://github.com/$repository/releases/tag/v$version',
+        ),
         assets: const [],
       );
     } catch (_) {

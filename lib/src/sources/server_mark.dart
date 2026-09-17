@@ -1,9 +1,11 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as image_lib;
+import 'package:path_provider/path_provider.dart';
 
 import '../brand.dart';
 import '../images/icon_background.dart';
@@ -145,6 +147,80 @@ Future<Uint8List?> _load(String value) async {
         : decoded.convert(numChannels: 4);
     removeFlatIconBackground(rgba);
     return Uint8List.fromList(image_lib.encodePng(rgba));
+  } catch (_) {
+    return null;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+const String _markFolder = 'server_marks';
+final Map<String, Future<String?>> _markFileCache = {};
+
+/// 把 [ServerMark] 要显示的那张服务器图标落到本地磁盘，返回文件路径。
+///
+/// Windows 原生播放器的「资源」面板也要显示同一个图标，但它不该持有地址、令牌
+/// 与请求头 —— 所以由应用按 [ServerMark] 的同一套规则先把图取下来（自定义图标
+/// 去平底色、同源时带 `X-Emby-Token`），只把**文件路径**交给原生。
+///
+/// 任何一步失败都返回 `null`：原生会退回按来源类型画的兜底标记，图标拿不到
+/// 不该影响播放。同一台服务器每次都落到同名文件，换图标直接覆盖。
+Future<String?> cacheServerMarkFile(MediaSource source, String? token) {
+  final iconUrl = source.iconUrl;
+  if (iconUrl == null || iconUrl.isEmpty) return Future<String?>.value();
+  final uri = Uri.tryParse(iconUrl);
+  if (uri == null || !uri.hasScheme) return Future<String?>.value();
+  return _markFileCache.putIfAbsent(
+    '${source.customIcon ? 'c' : 's'}|$iconUrl',
+    () => _cacheMark(
+      uri,
+      customIcon: source.customIcon,
+      token: token,
+      sameHost: uri.host == source.endpoint.host,
+    ),
+  );
+}
+
+Future<String?> _cacheMark(
+  Uri uri, {
+  required bool customIcon,
+  required bool sameHost,
+  String? token,
+}) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+  try {
+    final request = await client.getUrl(uri);
+    if (!customIcon && sameHost && token != null && token.isNotEmpty) {
+      request.headers.set('X-Emby-Token', token);
+    }
+    final response = await request.close();
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    final output = BytesBuilder(copy: false);
+    await for (final chunk in response) {
+      output.add(chunk);
+    }
+    var bytes = output.takeBytes();
+    if (customIcon) {
+      final decoded = image_lib.decodeImage(bytes);
+      if (decoded == null) return null;
+      final rgba = decoded.numChannels == 4
+          ? decoded
+          : decoded.convert(numChannels: 4);
+      removeFlatIconBackground(rgba);
+      bytes = Uint8List.fromList(image_lib.encodePng(rgba));
+    }
+    final base = await getApplicationSupportDirectory();
+    final folder = Directory(
+      '${base.path}${Platform.pathSeparator}$_markFolder',
+    );
+    if (!await folder.exists()) await folder.create(recursive: true);
+    final digest = base64Url
+        .encode(utf8.encode(uri.toString()))
+        .replaceAll('=', '');
+    final name = digest.length > 48 ? digest.substring(0, 48) : digest;
+    final file = File('${folder.path}${Platform.pathSeparator}$name.png');
+    await file.writeAsBytes(bytes, flush: true);
+    return file.path;
   } catch (_) {
     return null;
   } finally {

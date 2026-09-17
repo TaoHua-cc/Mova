@@ -138,9 +138,7 @@ class EmbyClient {
   /// 判定）；否则直连。默认直连——服务器流量默认走正常网络，只有用户在
   /// 「设置 → 代理」里勾选该服务器后才跟随系统代理。
   EmbyClient({http.Client? client, bool proxy = false})
-      : _client =
-            client ??
-            (proxy ? createNetworkHttpClient() : http.Client());
+    : _client = client ?? (proxy ? createNetworkHttpClient() : http.Client());
   final http.Client _client;
 
   /// Jellyfin 10.10+ native media segments. Older Jellyfin and Emby servers
@@ -359,9 +357,9 @@ class EmbyClient {
             'Accept': 'application/json',
             'X-Emby-Authorization':
                 'MediaBrowser Client="Mova", '
-                    'Device="$movaPlatform", '
-                    'DeviceId="mova-${movaPlatform.toLowerCase()}", '
-                    'Version="$movaVersion"',
+                'Device="$movaPlatform", '
+                'DeviceId="mova-${movaPlatform.toLowerCase()}", '
+                'Version="$movaVersion"',
           },
           body: jsonEncode({'Username': username, 'Pw': password}),
         )

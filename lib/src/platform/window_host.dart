@@ -150,7 +150,9 @@ class WindowHost {
   static Future<bool> canInstallApk() async {
     if (isDesktop) return false;
     try {
-      final allowed = await _platformChannel.invokeMethod<bool>('canInstallApk');
+      final allowed = await _platformChannel.invokeMethod<bool>(
+        'canInstallApk',
+      );
       return allowed ?? false;
     } on PlatformException {
       return false;
@@ -231,7 +233,9 @@ class WindowHost {
   static Future<double?> get screenBrightness async {
     if (isDesktop) return null;
     try {
-      final value = await _platformChannel.invokeMethod<double>('getBrightness');
+      final value = await _platformChannel.invokeMethod<double>(
+        'getBrightness',
+      );
       return value?.clamp(0.0, 1.0);
     } on PlatformException {
       return null;

@@ -42,7 +42,8 @@ class SourceStore {
   /// Cached library statistics (movie/series/episode counts, latency and the
   /// check time), so the server page can render instantly without a network
   /// round-trip on every visit.
-  String? statsFor(String sourceId) => _prefs.getString('$_statsPrefix$sourceId');
+  String? statsFor(String sourceId) =>
+      _prefs.getString('$_statsPrefix$sourceId');
 
   Future<void> saveStats(String sourceId, String json) =>
       _prefs.setString('$_statsPrefix$sourceId', json);

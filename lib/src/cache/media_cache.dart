@@ -110,8 +110,9 @@ abstract final class MediaDetailCache {
       final prefs = await SharedPreferences.getInstance();
       final stamp = prefs.getInt(_key(_scanPrefix, item));
       if (stamp == null) return false;
-      return DateTime.now()
-              .difference(DateTime.fromMillisecondsSinceEpoch(stamp)) <
+      return DateTime.now().difference(
+            DateTime.fromMillisecondsSinceEpoch(stamp),
+          ) <
           scanCooldown;
     } catch (_) {
       return false;
@@ -138,8 +139,7 @@ abstract final class MediaDetailCache {
       final keys = prefs
           .getKeys()
           .where(
-            (key) =>
-                key.startsWith(_rowsPrefix) || key.startsWith(_scanPrefix),
+            (key) => key.startsWith(_rowsPrefix) || key.startsWith(_scanPrefix),
           )
           .toList(growable: false);
       var count = 0;
@@ -156,10 +156,7 @@ abstract final class MediaDetailCache {
   static Future<int> count() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs
-          .getKeys()
-          .where((key) => key.startsWith(_rowsPrefix))
-          .length;
+      return prefs.getKeys().where((key) => key.startsWith(_rowsPrefix)).length;
     } catch (_) {
       return 0;
     }
@@ -206,9 +203,7 @@ Map<String, dynamic> _mediaItemToJson(MediaItem item) => {
   'videoRange': item.videoRange,
   'bitDepth': item.bitDepth,
   'frameRate': item.frameRate,
-  'audioTracks': [
-    for (final track in item.audioTracks) _trackToJson(track),
-  ],
+  'audioTracks': [for (final track in item.audioTracks) _trackToJson(track)],
   'subtitleTracks': [
     for (final track in item.subtitleTracks) _trackToJson(track),
   ],
@@ -282,28 +277,25 @@ MediaItem? _mediaItemFromJson(Map<String, dynamic> json) {
   }
 }
 
-List<MediaTrack> _tracks(dynamic value) =>
-    (value as List<dynamic>? ?? const [])
-        .whereType<Map<String, dynamic>>()
-        .map(
-          (row) => MediaTrack(
-            index: (row['index'] as num?)?.toInt() ?? 0,
-            title: '${row['title'] ?? ''}',
-            codec: '${row['codec'] ?? ''}',
-            language: row['language'] as String?,
-            channels: (row['channels'] as num?)?.toInt(),
-            sampleRate: (row['sampleRate'] as num?)?.toInt(),
-            bitrate: (row['bitrate'] as num?)?.toInt(),
-            isDefault: row['isDefault'] == true,
-          ),
-        )
-        .toList(growable: false);
+List<MediaTrack> _tracks(dynamic value) => (value as List<dynamic>? ?? const [])
+    .whereType<Map<String, dynamic>>()
+    .map(
+      (row) => MediaTrack(
+        index: (row['index'] as num?)?.toInt() ?? 0,
+        title: '${row['title'] ?? ''}',
+        codec: '${row['codec'] ?? ''}',
+        language: row['language'] as String?,
+        channels: (row['channels'] as num?)?.toInt(),
+        sampleRate: (row['sampleRate'] as num?)?.toInt(),
+        bitrate: (row['bitrate'] as num?)?.toInt(),
+        isDefault: row['isDefault'] == true,
+      ),
+    )
+    .toList(growable: false);
 
 Map<String, String> _stringMap(dynamic value) {
   if (value is! Map) return const {};
-  return {
-    for (final entry in value.entries) '${entry.key}': '${entry.value}',
-  };
+  return {for (final entry in value.entries) '${entry.key}': '${entry.value}'};
 }
 
 Uri? _uri(dynamic value) {
@@ -314,6 +306,5 @@ Uri? _uri(dynamic value) {
 DateTime? _date(dynamic value) =>
     value is String ? DateTime.tryParse(value) : null;
 
-Duration? _duration(dynamic value) => value is num
-    ? Duration(milliseconds: value.toInt())
-    : null;
+Duration? _duration(dynamic value) =>
+    value is num ? Duration(milliseconds: value.toInt()) : null;

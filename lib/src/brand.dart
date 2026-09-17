@@ -7,6 +7,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
+
 import 'platform/window_host.dart';
 import 'motion.dart';
 
@@ -357,6 +358,7 @@ abstract final class YingjiPlayerTools {
   static const all = <YingjiPlayerTool>[
     YingjiPlayerTool('声音', YingjiIcons.speaker_2_fill),
     YingjiPlayerTool('字幕', YingjiIcons.captions_bubble),
+    YingjiPlayerTool('剧集', YingjiIcons.episodes),
     YingjiPlayerTool('弹幕', YingjiIcons.danmaku),
     YingjiPlayerTool('画面', YingjiIcons.film),
     YingjiPlayerTool('倍速', YingjiIcons.gauge),
@@ -391,7 +393,8 @@ abstract final class YingjiGlass {
   }
 
   /// 选中态 / 高亮态用的实心色：直接取当前色调的浅端，和悬浮卡片同一色系。
-  static Color get accent => YingjiGlassTints.of(yingjiAppearance.glassTint).light;
+  static Color get accent =>
+      YingjiGlassTints.of(yingjiAppearance.glassTint).light;
 
   static Color surface({double strength = 1}) => tint.withValues(
     alpha: (yingjiAppearance.glassOpacity * strength).clamp(0, 1),
@@ -463,6 +466,7 @@ abstract final class YingjiIcons {
   static const paintbrush = Iconsax.brush;
   static const gauge = Iconsax.speedometer;
   static const wifi = Iconsax.wifi;
+
   /// 代理设置入口：地球图标，表示「走系统代理」这类网络级开关。
   static const global = Iconsax.global;
   static const captions_bubble = Iconsax.subtitle;
@@ -496,7 +500,11 @@ abstract final class YingjiIcons {
   static const ellipsis = Iconsax.more;
   static const doc_on_doc = Iconsax.document_copy;
   static const doc_on_clipboard = Iconsax.document_text;
+
+  /// 剧集列表：一排条目，刻意与「资源」的服务器图标区分开，避免两个入口撞脸。
+  static const episodes = Iconsax.document_text;
   static const refresh = Iconsax.refresh;
+
   /// 进入全屏（四向外的箭头）与退出全屏（四向内的箭头）成对使用。
   static const fullscreen = Iconsax.maximize_1;
   static const fullscreen_exit = Iconsax.maximize;

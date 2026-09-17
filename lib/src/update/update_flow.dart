@@ -28,11 +28,7 @@ Future<void> checkMovaUpdate(
 }) async {
   if (_prompting) return;
   if (manual) {
-    MovaToast.show(
-      context,
-      message: '正在检查新版本…',
-      icon: YingjiIcons.cloud,
-    );
+    MovaToast.show(context, message: '正在检查新版本…', icon: YingjiIcons.cloud);
   }
   if (!manual) {
     final cached = await UpdateChecker.cached();
@@ -77,10 +73,7 @@ Future<void> checkMovaUpdate(
 /// 同一时刻只允许一个更新弹窗（启动提示与手动检查可能碰在一起）。
 bool _prompting = false;
 
-Future<void> _present(
-  BuildContext context,
-  UpdateRelease release,
-) async {
+Future<void> _present(BuildContext context, UpdateRelease release) async {
   if (_prompting) return;
   _prompting = true;
   try {
@@ -139,7 +132,8 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
     unawaited(_installAndroid(_downloaded));
   }
 
-  double? get _progress => _total > 0 ? (_received / _total).clamp(0.0, 1.0) : null;
+  double? get _progress =>
+      _total > 0 ? (_received / _total).clamp(0.0, 1.0) : null;
 
   String get _progressLabel {
     final received = (_received / 1048576).toStringAsFixed(1);
@@ -219,9 +213,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
         // 必须是应用缓存目录下的 update/：FileProvider 的 file_paths.xml
         // 只放开了这一个子目录，放到别处系统安装器读不到这个文件。
         final base = await getTemporaryDirectory();
-        directory = Directory(
-          '${base.path}${Platform.pathSeparator}update',
-        );
+        directory = Directory('${base.path}${Platform.pathSeparator}update');
       } else {
         final downloads = await getDownloadsDirectory();
         final base = downloads ?? Directory.systemTemp;
@@ -306,16 +298,12 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
       // 静默安装。安装器自己的 PrepareToInstall 会先 taskkill 掉 mova.exe
       // （installer/Mova.iss），所以这里不需要先退出；装完由 iss 里那条
       // `skipifnotsilent` 的 [Run] 重新拉起新版。
-      await Process.start(
-        setup.path,
-        const [
-          '/VERYSILENT',
-          '/SUPPRESSMSGBOXES',
-          '/NORESTART',
-          '/CLOSEAPPLICATIONS',
-        ],
-        mode: ProcessStartMode.detached,
-      );
+      await Process.start(setup.path, const [
+        '/VERYSILENT',
+        '/SUPPRESSMSGBOXES',
+        '/NORESTART',
+        '/CLOSEAPPLICATIONS',
+      ], mode: ProcessStartMode.detached);
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -396,10 +384,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
             Text(
               '当前版本 $movaVersion（$movaPlatform）'
               '${widget.release.publishedAt == null ? '' : '  ·  发布于 ${_date(widget.release.publishedAt!)}'}',
-              style: const TextStyle(
-                fontSize: 12.5,
-                color: YingjiColors.muted,
-              ),
+              style: const TextStyle(fontSize: 12.5, color: YingjiColors.muted),
             ),
             if (notes.isNotEmpty) ...[
               const SizedBox(height: 14),

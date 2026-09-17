@@ -146,8 +146,56 @@ ISCC.exe /DAppVersion=3.1.81 installer\Mova.iss
 build-release.cmd
 ```
 
+### 本机路径速查
+
+| 用途 | 路径 |
+|---|---|
+| 源码 | `D:\codex\Mova` |
+| Flutter SDK | `D:\flutter` |
+| **开发构建产物**（可直接运行） | `D:\codex\Mova\build\windows\x64\runner\Release\mova.exe` |
+| **本机安装目录**（桌面快捷方式指向） | `D:\Mova\mova.exe` |
+| 安装包输出 | `D:\codex\Mova\dist-installer\Mova-<版本>-Windows-x64-Setup.exe` |
+| 用户数据（偏好、缓存、播放进度） | `%APPDATA%\Mova\Mova\` |
+
+> 安装目录不是 `Mova.iss` 里的默认值 `%LOCALAPPDATA%\Programs\Mova`——本机安装时手工改到了 `D:\Mova`。
+> 改代码只影响源码和 `build\...\Release`，**不会自动同步到 `D:\Mova`**；要在真实安装环境里验证，
+> 必须重新构建后同步，或重打安装包重装。
+
+### 改完代码后的本地验证
+
+```powershell
+# 构建 + 同步到安装目录 D:\Mova（改一行就想立刻看到效果时用这个）
+powershell -ExecutionPolicy Bypass -File scripts\dev-verify.ps1 -Deploy
+
+# 只构建，不动安装目录
+powershell -ExecutionPolicy Bypass -File scripts\dev-verify.ps1
+
+# 最快一轮：跳过 flutter analyze / flutter test
+powershell -ExecutionPolicy Bypass -File scripts\dev-verify.ps1 -Deploy -SkipChecks
+
+# 需要安装包时
+powershell -ExecutionPolicy Bypass -File scripts\dev-verify.ps1 -WithInstaller
+```
+
+脚本会依次执行：静态检查与测试（可跳过）→ `flutter build windows --release` → 用受校验、启用 libplacebo 的 libmpv 替换 `Release\libmpv-2.dll` → 可选同步到安装目录。
+
+**必须带上第 3 步**：`flutter build` 会把 media_kit 自带的旧 `libmpv-2.dll` 覆盖回来，漏掉替换就会退化成无 `gpu-next` 的旧播放路径，Dolby Vision 元数据与 HDR 输出全部失效。
+
+> 脚本一律保持纯 ASCII：本机是 Windows PowerShell 5.1，无 BOM 的 UTF-8 脚本会按 ANSI 代码页解码，中文会破坏引号配对导致解析失败。
+
+### PowerShell 编码约定（踩过的坑）
+
+CI 里所有 PowerShell 步骤都写 `shell: pwsh`（PowerShell 7），能正确按 UTF-8 读取无 BOM 脚本；
+本地 `build-release.cmd` 调的是 `powershell`（Windows PowerShell 5.1），**必须**满足下列之一：
+
+- `.ps1` 内只写 ASCII（`scripts\*.ps1`、`build-release.cmd` 属于这一类）；或
+- `.ps1` 存为 **UTF-8 带 BOM**（`tool\install_windows_gpu_next.ps1` 含中文提示，属于这一类——不要用不写 BOM 的编辑器保存它）。
+
+否则本地会在解析阶段就报「字符串缺少终止符」，而不是运行时报错。
+
 ## 遗留事项
 
 - `pubspec.yaml` 的 `name` 仍是 `yingji`（刻意未改，避免全量 import 变更）；安卓 `applicationId` 是 `com.taohua.mova`
 - 内置圆润中文字体约 18MB，尚未子集化
 - 旧包 `com.example.yingji` 的观看记录不会自动迁移到新包名
+

@@ -19,7 +19,8 @@ class DanmakuCacheEntry {
   final String? matchedEpisode;
 
   /// 超过这个时长就值得再拉一次（弹幕会被后来的观众补充）。
-  bool get isStale => DateTime.now().difference(savedAt) > DanmakuCache.refreshAfter;
+  bool get isStale =>
+      DateTime.now().difference(savedAt) > DanmakuCache.refreshAfter;
 }
 
 /// 弹幕缓存：把匹配结果按「API 列表 + 标题 + 季 + 集」存成本机 JSON。
@@ -80,8 +81,7 @@ class DanmakuCache {
     return hash.toRadixString(16).padLeft(8, '0');
   }
 
-  String _path(String key) =>
-      '${_root.path}${Platform.pathSeparator}$key.json';
+  String _path(String key) => '${_root.path}${Platform.pathSeparator}$key.json';
 
   Future<DanmakuCacheEntry?> read(String key) async {
     final file = File(_path(key));
@@ -95,10 +95,9 @@ class DanmakuCache {
           .map(_decodeComment)
           .whereType<DanmakuComment>()
           .toList(growable: false);
-      final saved =
-          data['savedAt'] is int
-              ? DateTime.fromMillisecondsSinceEpoch(data['savedAt'] as int)
-              : DateTime.now();
+      final saved = data['savedAt'] is int
+          ? DateTime.fromMillisecondsSinceEpoch(data['savedAt'] as int)
+          : DateTime.now();
       final matched = data['matched'];
       return DanmakuCacheEntry(
         comments: comments,
@@ -218,7 +217,8 @@ class DanmakuCache {
       time: Duration(milliseconds: ms < 0 ? 0 : ms),
       content: content,
       color: color,
-      mode: DanmakuMode.values[modeIndex.clamp(0, DanmakuMode.values.length - 1)],
+      mode:
+          DanmakuMode.values[modeIndex.clamp(0, DanmakuMode.values.length - 1)],
     );
   }
 }
