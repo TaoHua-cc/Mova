@@ -519,3 +519,215 @@ C2589 min/max 宏冲突假错误，已补进工具链技能）；`dart format` 1
 
 验证：MSVC `/W4 /WX /std:c++17 /utf-8 /O2 /DNOMINMAX` → `CL_EXIT=0`；
 `dart format` 0 changed；`flutter analyze` 18 条 info 全部既有；部署 `BUILD_OK`。
+
+## 第五轮：去悬浮气泡 + 自动隐藏修复（2026-09-18）
+
+用户反馈（截图：控件条上方挂着「静音」气泡）：
+1. 鼠标悬浮在控件按钮上时不要弹小气泡；
+2. 播放器控件条和鼠标不会自动隐藏。
+
+### 1. 移除控件悬浮名称气泡
+
+上一轮加的「悬浮名称」提示（`HintMode::Tooltip`，悬停按钮在控件条上方弹名字卡）
+实测比想象中干扰：鼠标扫过一排按钮时每个都弹一张卡。整条链路删除：
+
+- `ShowTooltip` / `ControlTooltip` / `ControlCenterX` 三个函数与前置声明；
+- 控件条 `WM_MOUSEMOVE` 里的 tooltip 分支（保留 hover 高亮动效与
+  `g_hover_control` 状态）；
+- `HintMode` 收敛为 `{Hidden, Toast}`，`MakeHintFont` 去掉 12px 档；
+- `WM_MOUSELEAVE` 里的 Tooltip 隐藏分支。
+
+音量 / 亮度 / 倍速 / 快进退 / 跳转的 Toast（带数值与进度条）保留——那是
+「调整反馈」，不是「悬浮确认」。
+
+### 2. 控件条与光标自动隐藏修复（根因：消息被 mpv 吞掉）
+
+原实现：`WM_MOUSEMOVE → ShowControls()` 刷新 `g_last_interaction`，
+50ms timer 里超过 2.6s 未刷新就淡出，alpha 到 0 时 `SetCursor(nullptr)`。
+
+**根因**：mpv 以 `wid` 嵌入主窗口并子类化了窗口过程，光标停在画面或控件条
+上时移动消息会被 mpv 消费。实测（`tool/probe_autohide.py` 轮询分层窗口
+alpha）：光标悬停在控件条上不动时 alpha 永远 232；光标不在窗口上时衰减
+正常——消息驱动的计时器在「最需要隐藏的场景」收不到信号。
+
+新实现（全部在 50ms timer 里，不依赖鼠标消息）：
+
+- **轮询光标位置**：`GetCursorPos` 对比 `g_last_cursor`，位移 ≥ 3px 且落在
+  播放器窗口内 → `ShowControls()`（刷新计时 + 显示窗口 + 箭头光标）。
+  窗口外的鼠标活动不影响播放器的计时。
+- **3px 死区**：光学鼠标静止常有 ±1px 抖动，手搭在鼠标上不该把控件钉在
+  屏幕上；参考点只在累计位移过阈值时刷新，缓慢漂移仍算移动。
+- **类光标置空**：主窗口 `window_class.hCursor = nullptr`。否则控件隐藏后
+  每次微动都会经 `WM_SETCURSOR` 用类光标把箭头重新点亮，出现「面板退场了
+  光标还亮着」。光标显隐完全由 `ShowControls`（箭头）与 alpha==0（null）管理。
+- **mpv `cursor-autohide=no`**：mpv 自己的 autohide 与本窗口的 timer 各管
+  各的，会分裂；光标统一由 timer 管理。
+- 恢复路径：alpha 从 0 回到 232 时 `SetCursor(arrow)`，微动过死区即整体
+  复活，与旧交互手感一致。暂停与面板打开时照旧不隐藏。
+
+### 验证
+
+- `tool/probe_autohide.py`（新，留作回归工具）：起真实播放器播 60s 静音
+  wav，每秒采样控件条分层 alpha，并支持 park 光标到指定区域。
+- 追踪日志（临时 `MOVA_TRACE_SHOW`，已移除）证明 `ShowControls` 只随
+  真实位移（≥3px）触发；光标 park 后 3187ms 无任何触发，随后采样到
+  alpha=88（衰减中），用户移动后恢复 232 —— 隐藏/恢复/死区三条链路都对。
+- `tool/verify_native_panels.py` 8/8 用例 OK（面板几何与点击不受影响）。
+- 退出码回归 `run_close.py` ×3 全部 `EXITCODE=0`（改了类光标与 timer，
+  必须重跑；顺带确认 `hCursor=null` 不引入收尾异常）。
+- `tool/probe_autohide_shots.py`（新）：自动隐藏前后双截图。**注意**：
+  跑它时人不能碰鼠标——光标一动（>3px）控件就复活，截图会拍到未隐藏态。
+
+## 第六轮：自动隐藏的真正根因（2026-09-18）
+
+用户反馈：重启后控件与鼠标的自动隐藏仍然不生效。上一轮（第五轮）的修复
+「改成 50ms timer 轮询光标」方向是对的，但没解决——因为**刷新源不止一个**。
+
+### 根因：mpv 周期性重投合成的 WM_MOUSEMOVE
+
+给计时器加落盘 trace 后一目了然（`MOVA_TRACE_AUTOHIDE`）：
+
+```
+tick=9259625 cur=1484,623 moved=0 inwin=0 idle=454 hide=0 alpha=232
+tick=9259687 cur=1484,623 moved=0 inwin=0 idle=516 alpha=232
+show line=3220 tick=9259687           ← 光标坐标一字没变，计时器却被清零
+tick=9259750 cur=1484,623 moved=0 idle=63  alpha=232
+```
+
+`line=3220` 是主窗口 `case WM_MOUSEMOVE: ShowControls();`。**光标一动不动，
+每约 500ms 仍然收到一次 `WM_MOUSEMOVE`**——mpv 以 `wid` 嵌入后重投的合成消息。
+它每半秒把 `g_last_interaction` 清零一次，2.6s 的空闲阈值永远达不到。
+
+（第五轮判断的「消息被 mpv 吞掉、宿主收不到」被实测推翻：消息来得很勤，
+只是全是合成的。症状相同，对策不同。）
+
+### 修改
+
+- 三处 `WM_MOUSEMOVE`（主窗口 / 控件条 / 顶栏）都不再调用 `ShowControls()`。
+  鼠标移动交给 timer 的真实位移判定（≥3px 且落在窗口内），合成消息坐标不变，
+  进不来。点击 / 滚轮 / 键盘 / 拖放这些确定交互照旧刷新。
+- 主窗口新增 `case WM_SETCURSOR`：控件条 alpha 为 0 时 `SetCursor(nullptr)`
+  并 `return TRUE`，把隐藏态按住不放。
+- 新增 `SetOverlayHitTest(bool)`：alpha 归零时给控件条与顶栏加
+  `WS_EX_TRANSPARENT`（配 `SWP_FRAMECHANGED`），恢复时摘掉。alpha=0 的分层
+  窗口仍然接得住鼠标，类光标（手型 / 箭头）会在 `WM_SETCURSOR` 里把光标
+  重新点亮，透明区域上的点击也会落空。
+- `ShowControls()` 经 `#define ShowControls() ShowControlsAt(__LINE__)` 带上
+  调用行号；配合 `MOVA_TRACE_AUTOHIDE=<路径>`（默认关闭）可落盘每 tick 的
+  `tick / 光标 / moved / inwin / idle / hide / paused / panelvis / alpha`。
+  下次再「该隐藏却不隐藏」，看 idle 是否被周期性清零就能直接定位。
+
+### 验证
+
+- `tool/probe_autohide_trace.py`（新，自带 PASS/FAIL）：静止 8s →
+  `alpha=0`、`CURSOR_SHOWING=False`；随后晃动光标 → `alpha=232`、
+  `CURSOR_SHOWING=True`。**RESULT PASS**。
+- trace 里 `idle drops = 0`（不再有隐藏刷新源），`hide=1` 持续 100+ tick。
+- `tool/verify_native_panels.py` 8/8 OK，退出码 0。
+- 退出码回归 `run_close.py` ×3 全 `EXITCODE=0`。
+- 已部署 `D:\Mova`（MD5 `cc1e86f1…`）。未提交。
+
+### 测试环境坑
+
+沙箱里物理鼠标一直在被移动（20 次采样 13 个不同位置），只读外部 alpha 会
+恒为 232、误判修复无效。`BlockInput` 需要管理员权限、调不动。可靠做法是
+park 光标后等 8 秒再读 alpha + `CURSOR_SHOWING`，然后用内部 trace 交叉验证。
+
+## 第七轮：自绘 UI 随窗口等比缩放（2026-09-18）
+
+用户反馈（两张截图）：控件条、资源面板、剧集面板的尺寸是固定的，窗口变小
+时互相挤压、探出屏幕；要求控件 UI / 菜单 / 二级菜单的大小、布局、背景按
+窗口大小显示合适比例。
+
+### 方案：设计稿坐标系 + 一次 ScaleTransform
+
+所有自绘 UI（控件条、顶栏、面板、提示浮层）的尺寸常量都按 **1280×760 的
+设计稿**量出。与其把几百处常量逐个乘系数，不如把「绘制」和「命中」分开处理：
+
+- **窗口尺寸**（`PositionControls` / `OpenPanel` / `ShowHint`）用物理大小：
+  `Scaled(常量)`，并在 `PositionControls` 里由客户区推导全局缩放
+  `UpdateUiScale`：`scale = clamp(min(w/1280, h/760), 0.55, 1.25)`。
+- **绘制**：各 WM_PAINT 开头 `graphics.ScaleTransform(scale, scale)`，再把
+  客户区 rect 换算回设计值（`rect.right /= scale`），之后所有既有绘制代码
+  一字不改——按钮、字号、行高、缩略图、进度条整体跟随窗口缩放。BitBlt 与
+  位图创建仍用物理尺寸（分开保存，避免混用）。
+- **命中判定**：鼠标坐标先除回 scale（`HitControl`、`TopHit`、
+  `PanelIndexAt`、音量拖动、进度条换算），与绘制共用设计坐标系，点得准。
+  `DockAnchor` 反向：设计坐标 × scale 再 `ClientToScreen`（控件条窗口是
+  缩放后的物理大小）。
+- 面板的滚动、reveal、`PanelMaxScroll` 全部留在设计坐标系，只有窗口
+  SetWindowPos 用物理值；两套坐标不混算。
+- 面板与浮层位置本就 clamp 在工作区内，缩放后小窗口也不会探出屏幕。
+
+### 验证
+
+- `tool/probe_ui_scale.py`（新，自带 PASS/FAIL）：把窗口缩到 720×480 →
+  scale=0.5625；控件条 585×63（=1040×112×0.5625）✓；点「剧集」槽
+  （设计 850,72 → 物理 478,40）打开面板 300px 宽（=532×0.5625）✓ 且完整
+  落在窗口内；截图确认控件条、顶栏等比缩小、布局关系不变。
+- 默认 1280×760 窗口（scale=1）`tool/verify_native_panels.py` 8/8 OK。
+- 退出码回归 ×3 全 `EXITCODE=0`；已部署 `D:\Mova`（MD5 `bb53f52d…`）。未提交。
+
+## 第八轮：详情页季选择海报（Flutter 侧，2026-09-18）
+
+用户反馈（三张截图）：季海报选中出现双白框；海报太小；白框与海报之间有空隙。
+
+### 1. 去双描边 + 放大海报（`_SeasonRail`）
+
+- 卡片内层 `AnimatedContainer` 选中态不再画白边（原 2.2px）——白框只保留
+  `_DetailPosterHover` 的外层大框一层；未选中保留 1px alpha .12 淡分界。
+- 海报宽 112→140、栏高 190→232（海报比例约 0.71）、卡片间距 14→16、
+  箭头翻页步长 420→470（约 3 张卡）。
+
+### 2. 描边与海报之间的「空隙」——三次定位才找到真身
+
+| 轮次 | 判断 | 实测 |
+|---|---|---|
+| 第 1 次 | 外层 `padding 2.2` 留出的缝 | gap 4.4→2.2，缝还在 |
+| 第 2 次 | `BoxDecoration` 的 border 会计入 `decoration.padding` 内缩子元素 | 改成 Stack 覆盖层（描边画在海报上层）后仍见黑圈 |
+| 第 3 次 | 像素级测量 → 黑圈是**海报素材自带的暗边** | 见下 |
+
+**关键手法：先量再改。** 用 pillow 逐像素扫用户截图：白描边 2px 正常，
+描边内侧暗带颜色 `(15,15,17)`，而卡片深色底 `0xCC1A1D22` 叠在页面背景上
+应为 `(26,29,33)`——比背景还暗说明这段**不是布局缝，是图片像素**。左侧 7px、
+右侧 5px 对称，即《人生切割》季海报自带的暗角。
+
+随后补了几何 golden 测试彻底排除布局嫌疑：`test/frame_geometry_test.dart`
+原样复刻 `_DetailPosterHover` 结构、海报换成纯红，渲染后
+（`tool/measure_golden.py`）量出：白描边 2.6px → x82 是白/红抗锯齿混合像素 →
+纯红从 x83 起 → **GAP = 0px**。描边确实压在海报边缘上。
+
+### 3. 描边实现（覆盖层，不参与布局）
+
+```dart
+AnimatedContainer(            // 只留阴影
+  decoration: BoxDecoration(borderRadius: r14, boxShadow: lifted ? [...] : []),
+  child: Stack(children: [
+    ClipRRect(borderRadius: r14, child: child),   // 普通子级，负责定尺寸
+    Positioned.fill(IgnorePointer(                // 描边叠在海报上层
+      child: AnimatedContainer(decoration: BoxDecoration(
+        borderRadius: r14,
+        border: Border.all(color: lifted ? white : transparent,
+                           width: lifted ? 2.6 : 0))))),
+  ]))
+```
+
+两个坑：
+
+- 描边**不能**放在外层 Container 的 `border`：`BoxDecoration` 的 border 会作为
+  `decoration.padding` 把 child 内缩，缝永远存在（调 padding 无效）。
+- 海报层必须是 **Stack 的普通子级**。改成 `Positioned.fill` 后，纯 positioned 的
+  Stack 在横向 ListView 的无界宽度下尺寸塌成 0，整排季海报消失（analyze 不报错，
+  只有运行时白屏）。
+
+### 4. 素材暗边：放大 4% 裁掉
+
+用户选「轻微裁掉」：`CachedNetworkImage` 包 `Transform.scale(1.04)`，只吃掉
+素材边缘那 5~7px 暗角。（曾用 1.08，裁得偏多，用户要求收回。）
+
+### 验证与部署
+
+- `flutter analyze` 18 条既有 info，无 error/warning；`dart format lib test` 已跑。
+- 部署校验：比对 `D:\Mova\data\app.so` 与构建产物的**时间戳 + 大小**
+  （Dart 改动不更新 `mova.exe` 时间戳，只看 exe 会误判部署成功）。
+- 沙箱跑 `flutter test` 需先清空 `HTTP(S)_PROXY`，否则 flutter_tester 连不上。

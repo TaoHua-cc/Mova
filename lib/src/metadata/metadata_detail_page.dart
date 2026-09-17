@@ -2221,27 +2221,27 @@ class _SeasonRailState extends State<_SeasonRail> {
               previous: true,
               tooltip: '上一组季',
               size: 34,
-              onPressed: () => _move(-420),
+              onPressed: () => _move(-470),
             ),
             const SizedBox(width: 7),
             YingjiDirectionalArrow(
               previous: false,
               tooltip: '下一组季',
               size: 34,
-              onPressed: () => _move(420),
+              onPressed: () => _move(470),
             ),
           ],
         ),
         const SizedBox(height: 12),
         SizedBox(
-          height: 190,
+          height: 232,
           child: ListView.separated(
             controller: _controller,
             scrollDirection: Axis.horizontal,
             physics: const BouncingScrollPhysics(),
             padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
             itemCount: seasons.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 14),
+            separatorBuilder: (_, _) => const SizedBox(width: 16),
             itemBuilder: (context, index) {
               final season = seasons[index];
               final active = season == widget.selectedSeason;
@@ -2253,7 +2253,7 @@ class _SeasonRailState extends State<_SeasonRail> {
                   selected: active,
                   borderRadius: 14,
                   child: SizedBox(
-                    width: 112,
+                    width: 140,
                     child: Column(
                       children: [
                         Expanded(
@@ -2263,11 +2263,13 @@ class _SeasonRailState extends State<_SeasonRail> {
                             decoration: BoxDecoration(
                               color: const Color(0xCC1A1D22),
                               borderRadius: BorderRadius.circular(14),
+                              // 选中态的白框只保留 _DetailPosterHover 的外层大框；
+                              // 这里再画一圈会形成双描边，未选中保留极淡的分界。
                               border: Border.all(
                                 color: active
-                                    ? Colors.white
+                                    ? Colors.transparent
                                     : Colors.white.withValues(alpha: .12),
-                                width: active ? 2.2 : 1,
+                                width: active ? 0 : 1,
                               ),
                               boxShadow: active
                                   ? const [
@@ -2286,14 +2288,21 @@ class _SeasonRailState extends State<_SeasonRail> {
                                       color: YingjiColors.muted,
                                     ),
                                   )
-                                : CachedNetworkImage(
-                                    fadeInDuration: const Duration(
-                                      milliseconds: 150,
-                                    ),
-                                    imageUrl: artwork.toString(),
-                                    fit: BoxFit.cover,
-                                    errorWidget: (_, _, _) => const Center(
-                                      child: Icon(YingjiIcons.film),
+                                // 放大 4% 再裁切：季海报素材四周常自带一圈
+                                // 5~7px 的暗边/暗角，不裁掉的话白描边（已严格
+                                // 贴住海报边缘，缝隙实测 0px）与画面之间仍会
+                                // 看成一条黑缝。4% 只吃掉边缘，画面损失极小。
+                                : Transform.scale(
+                                    scale: 1.04,
+                                    child: CachedNetworkImage(
+                                      fadeInDuration: const Duration(
+                                        milliseconds: 150,
+                                      ),
+                                      imageUrl: artwork.toString(),
+                                      fit: BoxFit.cover,
+                                      errorWidget: (_, _, _) => const Center(
+                                        child: Icon(YingjiIcons.film),
+                                      ),
                                     ),
                                   ),
                           ),
@@ -3289,13 +3298,11 @@ class _DetailPosterHoverState extends State<_DetailPosterHover> {
           curve: Curves.easeOutCubic,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 220),
-            padding: EdgeInsets.all(lifted ? 2.2 : 0),
+            // 只有阴影留在这一层。描边不能画在这里：BoxDecoration 的 border
+            // 会作为 decoration.padding 把 child 内缩，白框与海报之间永远
+            // 隔一条缝——描边改为覆盖层画在海报上层，内半边压住海报边缘。
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(widget.borderRadius),
-              border: Border.all(
-                color: lifted ? Colors.white : Colors.transparent,
-                width: lifted ? 2.2 : 0,
-              ),
               boxShadow: lifted
                   ? const [
                       BoxShadow(
@@ -3306,11 +3313,31 @@ class _DetailPosterHoverState extends State<_DetailPosterHover> {
                     ]
                   : const [],
             ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(
-                math.max(0, widget.borderRadius - 2),
-              ),
-              child: widget.child,
+            child: Stack(
+              children: [
+                // 海报层是普通子级，负责给 Stack 定尺寸（水平列表给的是
+                // 无界宽度，纯 Positioned 的 Stack 会塌成 0 导致海报消失）。
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(widget.borderRadius),
+                  child: widget.child,
+                ),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 220),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(
+                          widget.borderRadius,
+                        ),
+                        border: Border.all(
+                          color: lifted ? Colors.white : Colors.transparent,
+                          width: lifted ? 2.6 : 0,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
