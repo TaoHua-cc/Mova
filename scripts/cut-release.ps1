@@ -28,10 +28,20 @@ function Write-Utf8NoBom([string]$Path, [string]$Text) {
 }
 
 # Run git, always echo its output, hard-fail on non-zero exit.
-# Without capturing output a failure looks like a silent hang.
+# Two traps this wrapper exists for:
+#   - Without capturing output a failure looks like a silent hang.
+#   - git prints CRLF/LF notices on stderr; with $ErrorActionPreference = 'Stop'
+#     and 2>&1 those become terminating errors, so a harmless warning aborted the
+#     release right after the version bump. Downgrade stderr for this call only.
 function Invoke-Git([string[]]$GitArgs) {
-  $out = & git @GitArgs 2>&1
-  $code = $LASTEXITCODE
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & git @GitArgs 2>&1
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previous
+  }
   $text = ($out | Out-String).Trim()
   if ($text) { Write-Host "  git $($GitArgs[0]): $text" }
   if ($code -ne 0) { throw "git $($GitArgs -join ' ') failed (exit $code): $text" }
