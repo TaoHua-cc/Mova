@@ -624,6 +624,8 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                         key: ValueKey('clear-$imageUrl'),
                         imageUrl: imageUrl,
                         fit: BoxFit.cover,
+                        // 全屏 backdrop 按窗口实际物理宽度解码，省内存也省每帧纹理带宽。
+                        memCacheWidth: 1280,
                         errorWidget: (_, _, _) =>
                             const ColoredBox(color: YingjiColors.canvas),
                       ),
@@ -641,6 +643,9 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                             key: ValueKey('blur-$imageUrl'),
                             imageUrl: imageUrl,
                             fit: BoxFit.cover,
+                            // 这一层会被 34px 高斯模糊糊掉，原图分辨率纯属浪费：
+                            // 降到 320px 宽再放大，肉眼完全看不出差别，却能少占数 MB。
+                            memCacheWidth: 320,
                             errorWidget: (_, _, _) => const SizedBox.shrink(),
                           ),
                         ),
@@ -1062,6 +1067,13 @@ class _CinematicHomeState extends State<_CinematicHome>
       if (mounted && !_sameWatchStates(_history, merged)) {
         setState(() => _history = merged);
       }
+      // 封面在合并后一次性解析并落盘（可疑/缺图行 → TMDB 稳定图），解析完再刷新
+      // 一次。渲染层此后只显示已存好的图，不再有任何异步闪烁。
+      unawaited(
+        _resolveArtworkForRows(merged, store).then((resolved) {
+          if (mounted) setState(() => _history = resolved);
+        }),
+      );
     } finally {
       _historyLoadRunning = false;
     }
@@ -1260,6 +1272,14 @@ class _CinematicHomeState extends State<_CinematicHome>
                                         height: compact ? 104 : 132,
                                         alignment: Alignment.centerLeft,
                                         fit: BoxFit.contain,
+                                        // 正在播放条 logo 容器宽 560，按显示分辨率解码。
+                                        memCacheWidth:
+                                            (560 *
+                                                    MediaQuery.devicePixelRatioOf(
+                                                      context,
+                                                    ))
+                                                .clamp(1.0, 640.0)
+                                                .round(),
                                         errorWidget: (_, _, _) => Text(
                                           selected.title,
                                           style: TextStyle(
@@ -1486,7 +1506,30 @@ Future<List<WatchState>> _mergeServerWatchHistory(
         !serverNewer &&
         state.duration > Duration.zero &&
         state.position > existing.position + const Duration(seconds: 30);
-    if (!serverNewer && !serverAhead) continue; // Local is at least as fresh.
+    if (!serverNewer && !serverAhead) {
+      // 本机进度更新时进度保留本机的，但命名以服务器为准：旧版本写入的
+      // 记录会把单集条目名（「博登家的女儿」）或通用集名（「第 1 集」）
+      // 存成剧名，导致同一部剧在架子上裂成两张卡。服务器 resume rail 带
+      //回了权威的剧集名/集名/TMDB id —— 行有 seriesTitle（episodeTitle
+      //非空即代表服务器给了剧名）时就地修补本地行的命名，让分组别名
+      //（series:剧名 / tv:tmdbId）重新对齐。
+      final episodic =
+          existing.seasonNumber != null || existing.episodeNumber != null;
+      final serverNamed =
+          state.episodeTitle != null && state.title.trim().isNotEmpty;
+      if (episodic &&
+          serverNamed &&
+          state.title.trim() != existing.title.trim()) {
+        merged[existingIndex] = normalizeWatchState(
+          existing.withEpisodeMetadata(
+            title: state.title,
+            episodeTitle: state.episodeTitle,
+            tmdbId: state.tmdbId,
+          ),
+        );
+      }
+      continue; // Local is at least as fresh.
+    }
     // Adopt the server content. Its timestamp for ordering is the later of
     // the server's last-played time and this device's save time, keeping the
     // shelf and the store consistent. When neither side carries a timestamp
@@ -1499,7 +1542,8 @@ Future<List<WatchState>> _mergeServerWatchHistory(
             (localTime == null || serverTime.isAfter(localTime)))
         ? serverTime
         : localTime;
-    final adopted = bestTime == null ? state : state.withUpdatedAt(bestTime);
+    final adopted = (bestTime == null ? state : state.withUpdatedAt(bestTime))
+        .withImage(_pickBetterArtwork(state.imageUrl, existing.imageUrl));
     merged[existingIndex] = adopted;
   }
   try {
@@ -1547,7 +1591,10 @@ Future<List<WatchState>> _mergeServerWatchHistory(
     // Trakt is optional; playable local and server rows remain available.
   }
   _demoteFabricatedImportBursts(merged);
-  final ordered = _orderForShelf(merged, remote);
+  // 入库前全量清洗一遍：老版本写入的「副标题 == 剧名 / 通用集名」就地修复，
+  // 之后首页、全部页与恢复播放读到的都是干净数据。
+  final cleaned = merged.map(normalizeWatchState).toList(growable: false);
+  final ordered = _orderForShelf(cleaned, remote);
   // Persist the exact order the shelf will show. Without this the stored
   // undated rows stayed in reverse rail order (each per-row import() had put
   // its row at the head of the undated block) and any render that starts from
@@ -5332,9 +5379,13 @@ class _RankingPosterCard extends StatelessWidget {
                           ),
                           child: const Center(child: Icon(YingjiIcons.film)),
                         )
-                      : CachedNetworkImage(
+                      : _OverscanImage(
                           imageUrl: item.posterUrl.toString(),
-                          fit: BoxFit.cover,
+                          // 发现列表网格卡显示宽 ~224，按物理像素解码即可，不必用原图。
+                          memCacheWidth:
+                              (320 * MediaQuery.devicePixelRatioOf(context))
+                                  .clamp(1.0, 512.0)
+                                  .round(),
                           errorWidget: (_, _, _) => DecoratedBox(
                             decoration: BoxDecoration(
                               color: YingjiGlass.surface(),
@@ -7540,7 +7591,7 @@ class _CalendarPageState extends State<_CalendarPage>
                     episode:
                         '第 ${next.seasonNumber} 季 · 第 ${next.episodeNumber} 集 · ${next.title}',
                     airDate: next.airDate,
-                    posterUrl: next.stillUrl ?? item.posterUrl,
+                    posterUrl: item.posterUrl ?? next.stillUrl,
                     platform: next.network,
                     timeKnown: next.timeKnown,
                   ),
@@ -8133,6 +8184,11 @@ class _TrackingEventCard extends StatelessWidget {
                     : CachedNetworkImage(
                         imageUrl: event.posterUrl.toString(),
                         fit: BoxFit.cover,
+                        // 活动海报仅 166px 宽，按显示分辨率解码，避免首屏原图批量解码卡顿。
+                        memCacheWidth:
+                            (320 * MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 512.0)
+                                .round(),
                         errorWidget: (_, _, _) =>
                             const ColoredBox(color: YingjiColors.elevated),
                       ),
@@ -8299,6 +8355,14 @@ class _SettingsPageState extends State<SettingsPage>
   final _danmakuApiNameControllers = <TextEditingController>[];
   final _danmakuApiControllers = <TextEditingController>[];
   final _danmakuToken = TextEditingController();
+  double _danmakuOpacity = .82;
+  double _danmakuArea = .65;
+  double _danmakuFontSize = 18;
+  double _danmakuSpeed = 1;
+  double _danmakuDensity = .55;
+  bool _danmakuScroll = true;
+  bool _danmakuTop = true;
+  bool _danmakuBottom = true;
   String? _savedMessage;
   bool _tmdbTesting = false;
   String? _tmdbMessage;
@@ -8315,6 +8379,19 @@ class _SettingsPageState extends State<SettingsPage>
   Set<String> _proxyServers = const {};
   bool _jumpingToSetting = false;
   int _settingJumpGeneration = 0;
+
+  /// 改了要立刻推给播放器的「播放器设置」键。弹幕与片头片尾那两组按前缀判断
+  /// （见 [_saveChangedSettings]），单独列出的是步长这类散项。
+  static const _liveSettingKeys = <String>{
+    'yingji.player.seek-seconds',
+    'yingji.player.volume-step',
+    // 播放器偏好：改了要立刻作用到正在播放的那一集，同时与控件菜单里改的值
+    // 保持同一个来源（改动方向反过来由原生回写这两个键）。
+    'yingji.player.speed',
+    'yingji.player.volume',
+    'yingji.player.brightness',
+    'yingji.player.aspect',
+  };
 
   /// 横向胶囊的 key（按需生成），用来把高亮的那一项滚回可视区。
   final _settingsChipKeys = <GlobalKey>[];
@@ -8369,6 +8446,14 @@ class _SettingsPageState extends State<SettingsPage>
     _activeSetting.addListener(_revealActiveSettingChip);
     _load();
     unawaited(_loadKnownUpdate());
+    // keep-alive 之下切回本页不会重跑 initState：在原生控件菜单里改过弹幕设置
+    // （已回写偏好）、或应用内播放器改过之后，这一页显示的还是进入应用时读到
+    // 的那份旧值。切到本分区就重读一次，与其他分区（如片单）同一套做法。
+    yingjiSectionFocus.addListener(_handleSectionFocus);
+  }
+
+  void _handleSectionFocus() {
+    if (yingjiSectionFocus.value == 'settings') unawaited(_load());
   }
 
   Future<void> _load() async {
@@ -8466,6 +8551,14 @@ class _SettingsPageState extends State<SettingsPage>
             : Map.of(_defaultPlayerShortcuts);
         _tmdbApiKey.text = prefs.getString('yingji.tmdb.api-key') ?? '';
         _danmakuEnabled = prefs.getBool('yingji.danmaku.enabled') ?? false;
+        _danmakuOpacity = prefs.getDouble('yingji.danmaku.opacity') ?? .82;
+        _danmakuArea = prefs.getDouble('yingji.danmaku.area') ?? .65;
+        _danmakuFontSize = prefs.getDouble('yingji.danmaku.font-size') ?? 18;
+        _danmakuSpeed = prefs.getDouble('yingji.danmaku.speed') ?? 1;
+        _danmakuDensity = prefs.getDouble('yingji.danmaku.density') ?? .55;
+        _danmakuScroll = prefs.getBool('yingji.danmaku.scroll') ?? true;
+        _danmakuTop = prefs.getBool('yingji.danmaku.top') ?? true;
+        _danmakuBottom = prefs.getBool('yingji.danmaku.bottom') ?? true;
         _traktClientId.text = prefs.getString('yingji.trakt.client-id') ?? '';
         _traktClientSecret.text =
             prefs.getString('yingji.trakt.client-secret') ?? '';
@@ -8592,6 +8685,14 @@ class _SettingsPageState extends State<SettingsPage>
             : '',
       ),
       'yingji.danmaku.token': _danmakuToken.text.trim(),
+      'yingji.danmaku.opacity': _danmakuOpacity,
+      'yingji.danmaku.area': _danmakuArea,
+      'yingji.danmaku.font-size': _danmakuFontSize,
+      'yingji.danmaku.speed': _danmakuSpeed,
+      'yingji.danmaku.density': _danmakuDensity,
+      'yingji.danmaku.scroll': _danmakuScroll,
+      'yingji.danmaku.top': _danmakuTop,
+      'yingji.danmaku.bottom': _danmakuBottom,
     };
   }
 
@@ -8671,6 +8772,17 @@ class _SettingsPageState extends State<SettingsPage>
     }
     if (changed.containsKey('yingji.home.carousel-effect')) {
       yingjiBackdropEffect.value = _homeCarouselEffect;
+    }
+    // 播放器（桌面端是独立进程）不会自己重读偏好：这一页改的「弹幕显示 / 片头
+    // 片尾 / 步长」要立刻推给正在跑的播放器，否则设置页显示新值、播放器还按
+    // 旧值走（这些值以前只在起播时下发过一次）。
+    if (changed.keys.any(
+      (key) =>
+          key.startsWith('yingji.danmaku.') ||
+          key.startsWith('yingji.segment.') ||
+          _liveSettingKeys.contains(key),
+    )) {
+      unawaited(WindowsNativePlayer.pushLiveSettings(keys: changed.keys));
     }
     if (feedback && mounted) setState(() => _savedMessage = '已保存');
   }
@@ -9086,6 +9198,7 @@ class _SettingsPageState extends State<SettingsPage>
   @override
   void dispose() {
     disposeSectionTopListener();
+    yingjiSectionFocus.removeListener(_handleSectionFocus);
     _activeSetting.removeListener(_revealActiveSettingChip);
     _settingsScroll.removeListener(_syncActiveSetting);
     _chipRevealTimer?.cancel();
@@ -10153,6 +10266,96 @@ class _SettingsPageState extends State<SettingsPage>
                   ],
                 ],
               ),
+              const SizedBox(height: 16),
+              const Divider(color: Color(0x22FFFFFF)),
+              const SizedBox(height: 16),
+              const Text(
+                '弹幕显示',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '控制弹幕出现的范围与密度。播放中修改会立即应用到正在播放的播放器。',
+                style: TextStyle(color: Color(0xFFABB1BE)),
+              ),
+              const SizedBox(height: 8),
+              Text('显示区域  占画面高度 ${(_danmakuArea * 100).round()}%'),
+              Slider(
+                value: _danmakuArea,
+                min: 0.25,
+                max: 1,
+                divisions: 15,
+                label: '${(_danmakuArea * 100).round()}%',
+                onChanged: (value) => setState(() => _danmakuArea = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('不透明度  ${(_danmakuOpacity * 100).round()}%'),
+              Slider(
+                value: _danmakuOpacity,
+                min: 0.3,
+                max: 1,
+                divisions: 14,
+                label: '${(_danmakuOpacity * 100).round()}%',
+                onChanged: (value) => setState(() => _danmakuOpacity = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('字号  ${_danmakuFontSize.round()} px'),
+              Slider(
+                value: _danmakuFontSize,
+                min: 12,
+                max: 36,
+                divisions: 24,
+                label: '${_danmakuFontSize.round()} px',
+                onChanged: (value) => setState(() => _danmakuFontSize = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('滚动速度  ${_danmakuSpeed.toStringAsFixed(1)}×'),
+              Slider(
+                value: _danmakuSpeed,
+                min: 0.5,
+                max: 2,
+                divisions: 15,
+                label: '${_danmakuSpeed.toStringAsFixed(1)}×',
+                onChanged: (value) => setState(() => _danmakuSpeed = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              Text('同屏密度  ${(_danmakuDensity * 100).round()}%'),
+              Slider(
+                value: _danmakuDensity,
+                min: 0.2,
+                max: 1,
+                divisions: 16,
+                label: '${(_danmakuDensity * 100).round()}%',
+                onChanged: (value) => setState(() => _danmakuDensity = value),
+                onChangeEnd: (_) => _save(),
+              ),
+              _ToggleRow(
+                title: '滚动弹幕',
+                detail: '从左到右穿越画面的常规弹幕',
+                value: _danmakuScroll,
+                onChanged: (value) {
+                  setState(() => _danmakuScroll = value);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '顶部弹幕',
+                detail: '固定在画面上方停留数秒',
+                value: _danmakuTop,
+                onChanged: (value) {
+                  setState(() => _danmakuTop = value);
+                  _save();
+                },
+              ),
+              _ToggleRow(
+                title: '底部弹幕',
+                detail: '固定在弹幕区域底部停留数秒',
+                value: _danmakuBottom,
+                onChanged: (value) {
+                  setState(() => _danmakuBottom = value);
+                  _save();
+                },
+              ),
             ],
           ),
         ),
@@ -11127,6 +11330,8 @@ class _PlatformArtwork extends StatelessWidget {
     final image = CachedNetworkImage(
       imageUrl: uri.toString(),
       fit: BoxFit.cover,
+      // 平台 logo / 背景图按展示尺寸封顶解码（多为小图，大图也不会超过 1024 宽）。
+      memCacheWidth: 1024,
       alignment: alignment,
       errorWidget: (_, _, _) => const SizedBox.shrink(),
     );
@@ -11230,9 +11435,12 @@ class _PosterTile extends StatelessWidget {
             fit: StackFit.expand,
             children: [
               if (item.posterUrl != null)
-                CachedNetworkImage(
+                _OverscanImage(
                   imageUrl: item.posterUrl.toString(),
-                  fit: BoxFit.cover,
+                  // 海报卡显示宽 168（高 280），按物理像素解码即可，不必用原图 500px 宽。
+                  memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
+                      .clamp(1.0, 512.0)
+                      .round(),
                   errorWidget: (_, _, _) =>
                       const ColoredBox(color: Color(0xFF1A1D25)),
                 )
@@ -11332,6 +11540,10 @@ class _LandscapeTile extends StatelessWidget {
               CachedNetworkImage(
                 imageUrl: item.backdropUrl.toString(),
                 fit: BoxFit.cover,
+                // 趋势卡背景图卡片宽 286，按显示分辨率解码。
+                memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
+                    .clamp(1.0, 512.0)
+                    .round(),
                 errorWidget: (_, _, _) =>
                     const ColoredBox(color: Color(0xFF1A1D25)),
               )
@@ -11429,7 +11641,6 @@ class _RankTile extends StatefulWidget {
 class _RankTileState extends State<_RankTile>
     with SingleTickerProviderStateMixin {
   final _link = LayerLink();
-  final _cardKey = GlobalKey();
   OverlayEntry? _preview;
   bool _hovered = false;
   late final AnimationController _previewController = AnimationController(
@@ -11444,7 +11655,7 @@ class _RankTileState extends State<_RankTile>
       return;
     }
     final overlay = Overlay.of(context);
-    final box = _cardKey.currentContext?.findRenderObject() as RenderBox?;
+    final box = context.findRenderObject() as RenderBox?;
     if (box == null) return;
     final rect = box.localToGlobal(Offset.zero) & box.size;
     final showOnRight = MediaQuery.sizeOf(context).width - rect.left >= 520;
@@ -11520,7 +11731,6 @@ class _RankTileState extends State<_RankTile>
   Widget build(BuildContext context) => CompositedTransformTarget(
     link: _link,
     child: MouseRegion(
-      key: _cardKey,
       onEnter: (_) {
         setState(() => _hovered = true);
         _showPreview();
@@ -11576,9 +11786,13 @@ class _RankTileState extends State<_RankTile>
                       fit: StackFit.expand,
                       children: [
                         if (widget.item.posterUrl != null)
-                          CachedNetworkImage(
+                          _OverscanImage(
                             imageUrl: widget.item.posterUrl.toString(),
-                            fit: BoxFit.cover,
+                            // 榜单卡显示宽 166，按物理像素解码即可，不必用原图。
+                            memCacheWidth:
+                                (320 * MediaQuery.devicePixelRatioOf(context))
+                                    .clamp(1.0, 512.0)
+                                    .round(),
                             errorWidget: (_, _, _) =>
                                 const ColoredBox(color: Color(0xFF1A1D25)),
                           )
@@ -11664,6 +11878,11 @@ class _RankHoverPreview extends StatelessWidget {
                   child: CachedNetworkImage(
                     imageUrl: item.backdropUrl.toString(),
                     fit: BoxFit.cover,
+                    // 玻璃卡底色背景图宽 135，按显示分辨率解码。
+                    memCacheWidth:
+                        (160 * MediaQuery.devicePixelRatioOf(context))
+                            .clamp(1.0, 512.0)
+                            .round(),
                   ),
                 ),
               DecoratedBox(
@@ -11691,6 +11910,11 @@ class _RankHoverPreview extends StatelessWidget {
                         : CachedNetworkImage(
                             imageUrl: item.posterUrl.toString(),
                             fit: BoxFit.cover,
+                            // 玻璃卡海报宽 135，按显示分辨率解码。
+                            memCacheWidth:
+                                (160 * MediaQuery.devicePixelRatioOf(context))
+                                    .clamp(1.0, 512.0)
+                                    .round(),
                             errorWidget: (_, _, _) =>
                                 const ColoredBox(color: Color(0xFF1A1D25)),
                           ),
@@ -11854,6 +12078,11 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
       if (mounted && !_sameWatchStates(_rows, merged)) {
         setState(() => _rows = merged);
       }
+      unawaited(
+        _resolveArtworkForRows(merged, store).then((resolved) {
+          if (mounted) setState(() => _rows = resolved);
+        }),
+      );
     } finally {
       _busy = false;
     }
@@ -12046,14 +12275,7 @@ class _ContinueTile extends StatelessWidget {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  state.imageUrl == null
-                      ? _ContinueArtworkFallback(title: state.title)
-                      : CachedNetworkImage(
-                          imageUrl: state.imageUrl!,
-                          fit: BoxFit.cover,
-                          errorWidget: (_, _, _) =>
-                              _ContinueArtworkFallback(title: state.title),
-                        ),
+                  _ContinueArtwork(state: state),
                   const DecoratedBox(
                     decoration: BoxDecoration(
                       gradient: LinearGradient(
@@ -12129,7 +12351,7 @@ class _ContinueTile extends StatelessWidget {
             state.episodeTitle?.isNotEmpty == true
                 ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1} · ${state.episodeTitle}'
                 : state.episodeNumber != null
-                ? '第 ${state.episodeNumber} 集'
+                ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1}'
                 : '继续上次观看',
             style: const TextStyle(
               fontSize: 11.5,
@@ -12142,6 +12364,142 @@ class _ContinueTile extends StatelessWidget {
       ),
     ),
   );
+}
+
+/// 继续观看卡片封面：直接显示记录里「已经解析并落盘好」的图，稳定显示。
+///
+/// 记录写入时用的就是详情页同一张图（[MetadataDetailPage] 的 `_episodeImage`：
+/// TMDB 剧照优先，否则 Emby 单集图），所以这里只需原样展示即可——和详情页
+/// 显示的是同一张图。渲染层绝不做任何异步探测/重试/替换，因此不会闪烁，
+/// 首页 shelf 与「全部列表」页读到的也都是同一条持久化记录。
+class _ContinueArtwork extends StatelessWidget {
+  const _ContinueArtwork({required this.state});
+
+  final WatchState state;
+
+  @override
+  Widget build(BuildContext context) {
+    final imageUrl = state.imageUrl;
+    if (imageUrl != null && imageUrl.isNotEmpty) {
+      return CachedNetworkImage(
+        imageUrl: imageUrl,
+        fit: BoxFit.cover,
+        // 续看卡显示宽 274（16:9），按物理像素解码即可，不必用单集剧照原图分辨率。
+        memCacheWidth: (274 * MediaQuery.devicePixelRatioOf(context))
+            .clamp(1.0, 640.0)
+            .round(),
+        placeholder: (_, _) => _ContinueArtworkFallback(title: state.title),
+        errorWidget: (_, _, _) => _ContinueArtworkFallback(title: state.title),
+      );
+    }
+    return _ContinueArtworkFallback(title: state.title);
+  }
+}
+
+/// 合并时若服务器行要覆盖本机行，优先保留非空封面；两边都非空时服务器优先
+/// （服务器同步过来的图同样来自详情页逻辑，质量一致）。
+String? _pickBetterArtwork(String? server, String? local) {
+  if (server == null || server.isEmpty) return local;
+  if (local == null || local.isEmpty) return server;
+  return server;
+}
+
+/// 只对「封面缺失」的记录做一次 TMDB 解析补图（单集剧照 > 剧集海报 > 按剧名
+/// 搜索），写回 store 并返回更新后的列表；调用方刷新一次即可，之后渲染层不再
+/// 触碰网络，彻底消除闪烁。非空封面一律保留（它本就是详情页同款图，不应重解析）。
+/// 同一会话用静态缓存去重，避免重复打 TMDB。
+final Map<String, Future<String?>> _artworkResolutionCache = {};
+
+Future<List<WatchState>> _resolveArtworkForRows(
+  List<WatchState> rows,
+  WatchStateStore store,
+) async {
+  // 跳过「已经试过解析」的行（成功或失败都算，见 [WatchStateStore.markArtworkResolved]），
+  // 这样每行最多解析一次：新记录首次出现时补图，之后再打开软件不再为它打 TMDB，
+  // 彻底消除「每次启动都重新获取封面」的观感。非空行本来就直接保留，无需解析。
+  final alreadyTried = await store.loadResolvedArtwork();
+  final targets = <WatchState>[];
+  for (final row in rows) {
+    final url = row.imageUrl;
+    if ((url == null || url.isEmpty) && !alreadyTried.contains(row.mediaId)) {
+      targets.add(row);
+    }
+  }
+  final attempted = <String>{...alreadyTried};
+  if (targets.isEmpty) {
+    // 没有新行要解析，但仍把本次已知行记账（幂等），避免遗漏。
+    return rows;
+  }
+  final client = TmdbClient();
+  final updates = <String, String>{};
+  try {
+    for (final row in targets) {
+      attempted.add(row.mediaId);
+      final url = await _artworkResolutionCache.putIfAbsent(
+        '${row.mediaId}:${row.sourceId}:${row.serverItemId}',
+        () => _resolvedArtworkFor(row, client),
+      );
+      if (url != null && url.isNotEmpty) updates[row.mediaId] = url;
+    }
+  } finally {
+    client.dispose();
+  }
+  // 无论成功与否，都把本次涉及过的 mediaId 记下来，下一启动直接跳过。
+  await store.markArtworkResolved(attempted);
+  if (updates.isEmpty) return rows;
+  await store.persistImages(updates);
+  return rows
+      .map((r) {
+        final u = updates[r.mediaId];
+        return u != null ? r.withImage(u) : r;
+      })
+      .toList(growable: false);
+}
+
+Future<String?> _resolvedArtworkFor(WatchState row, TmdbClient client) async {
+  // 1) 已知 TMDB：单集剧照优先，剧集海报兜底。
+  if (row.tmdbId != null && row.tmdbId! > 0) {
+    try {
+      final episodes = await client.seasonEpisodes(
+        row.tmdbId!,
+        row.seasonNumber ?? 1,
+      );
+      String? still;
+      for (final e in episodes) {
+        if (e.episodeNumber == row.episodeNumber) {
+          still = e.stillUrl?.toString();
+          break;
+        }
+      }
+      if (still != null && still.isNotEmpty) return still;
+    } catch (_) {
+      // 剧照拉取失败就退一步取海报。
+    }
+    try {
+      final detail = await client.details(row.tmdbId!, kind: '剧集');
+      final poster = detail.posterUrl?.toString();
+      if (poster != null && poster.isNotEmpty) return poster;
+    } catch (_) {
+      // 剧集详情失败再走标题搜索。
+    }
+  }
+  // 2) 按剧名现查 TMDB（剧集优先，再试电影，覆盖单集/电影两种记录）。
+  final title = row.title.trim();
+  if (title.isNotEmpty) {
+    final kinds = row.episodeNumber == null
+        ? const ['movie']
+        : const ['tv', 'movie'];
+    for (final kind in kinds) {
+      try {
+        final hit = await client.searchFirst(title, type: kind);
+        final poster = hit?.posterUrl?.toString();
+        if (poster != null && poster.isNotEmpty) return poster;
+      } catch (_) {
+        // 该类型搜索失败就试下一个类型。
+      }
+    }
+  }
+  return null;
 }
 
 class _WatchProgressOriginBadge extends StatefulWidget {
@@ -12275,6 +12633,31 @@ class _ContinueArtworkFallback extends StatelessWidget {
   );
 }
 
+/// 圆角海报图：轻微放大溢出裁剪框，让圆角抗锯齿接缝落在不透明图片上而非透明区，
+/// 消除滚动时海报边缘闪白边（ClipRRect 接缝的经典修法）。调用方仍需用 ClipRRect
+/// 裁出圆角——这里的放大正好被外层 ClipRRect 切掉，不会露边。
+class _OverscanImage extends StatelessWidget {
+  const _OverscanImage({
+    required this.imageUrl,
+    this.memCacheWidth,
+    this.errorWidget,
+  });
+  final String imageUrl;
+  final int? memCacheWidth;
+  final Widget Function(BuildContext, String, dynamic)? errorWidget;
+
+  @override
+  Widget build(BuildContext context) => Transform.scale(
+    scale: 1.05,
+    child: CachedNetworkImage(
+      imageUrl: imageUrl,
+      fit: BoxFit.cover,
+      memCacheWidth: memCacheWidth,
+      errorWidget: errorWidget,
+    ),
+  );
+}
+
 class _MediaHover extends StatefulWidget {
   const _MediaHover({required this.borderRadius, required this.child});
 
@@ -12301,6 +12684,9 @@ class _MediaHoverState extends State<_MediaHover> {
         curve: Curves.easeOutCubic,
         transform: Matrix4.translationValues(0, _hovered ? -4 : 0, 0),
         decoration: BoxDecoration(
+          // 不透明深色底：图片未加载/透明时圆角内显示深色而非页面背景，
+          // 杜绝滚动中圆角透出白边（与 errorWidget 的 0xFF1A1D25 一致）。
+          color: const Color(0xFF1A1D25),
           borderRadius: BorderRadius.circular(widget.borderRadius),
           border: Border.all(
             color: _hovered
@@ -12319,7 +12705,10 @@ class _MediaHoverState extends State<_MediaHover> {
               : const [],
         ),
         child: ClipRRect(
-          borderRadius: BorderRadius.circular(widget.borderRadius - 1),
+          // 裁切半径与容器圆角取齐（之前 radius-1 会留 1px 透明环，
+          // 圆角处透出页面背景形成白边）。内部图片已用 _OverscanImage
+          // 放大溢出，接缝落在实拍图上，不再闪白。
+          borderRadius: BorderRadius.circular(widget.borderRadius),
           child: widget.child,
         ),
       ),
@@ -12564,6 +12953,11 @@ Future<void> _showDiscoverItems(
                         width: 38,
                         height: 54,
                         fit: BoxFit.cover,
+                        // 弹窗列表缩略图 38px 宽，按显示分辨率解码。
+                        memCacheWidth:
+                            (160 * MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 256.0)
+                                .round(),
                         errorWidget: (_, _, _) => const Icon(YingjiIcons.film),
                       ),
                     ),

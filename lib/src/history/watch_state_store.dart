@@ -101,6 +101,28 @@ class WatchState {
     progressOriginName: progressOriginName,
   );
 
+  WatchState withEpisodeMetadata({
+    String? title,
+    String? episodeTitle,
+    int? tmdbId,
+  }) => WatchState(
+    mediaId: mediaId,
+    title: title ?? this.title,
+    position: position,
+    duration: duration,
+    imageUrl: imageUrl,
+    sourceId: sourceId,
+    serverItemId: serverItemId,
+    tmdbId: tmdbId ?? this.tmdbId,
+    episodeTitle: episodeTitle ?? this.episodeTitle,
+    seasonNumber: seasonNumber,
+    episodeNumber: episodeNumber,
+    updatedAt: updatedAt,
+    isPlayed: isPlayed,
+    progressOrigin: progressOrigin,
+    progressOriginName: progressOriginName,
+  );
+
   WatchState withProgress({
     required Duration position,
     required DateTime? updatedAt,
@@ -123,6 +145,26 @@ class WatchState {
     progressOrigin: origin,
     progressOriginName: originName,
   );
+
+  /// Replace only the artwork pointer. Used by the one-shot resolution pass
+  /// that upgrades broken/suspect cover URLs to a stable TMDB-backed image.
+  WatchState withImage(String? value) => WatchState(
+    mediaId: mediaId,
+    title: title,
+    position: position,
+    duration: duration,
+    imageUrl: value,
+    sourceId: sourceId,
+    serverItemId: serverItemId,
+    tmdbId: tmdbId,
+    episodeTitle: episodeTitle,
+    seasonNumber: seasonNumber,
+    episodeNumber: episodeNumber,
+    updatedAt: updatedAt,
+    isPlayed: isPlayed,
+    progressOrigin: progressOrigin,
+    progressOriginName: progressOriginName,
+  );
 }
 
 class WatchStateStore {
@@ -139,6 +181,28 @@ class WatchStateStore {
 
   static Future<bool> localOnly() async =>
       (await SharedPreferences.getInstance()).getBool(localOnlyKey) ?? false;
+
+  /// mediaIds that have already been through [_resolveArtworkForRows] — whether
+  /// the resolution succeeded or failed. Persisted so the one-shot artwork
+  /// upgrade does not re-hit TMDB on every app launch for rows that can never
+  /// resolve (e.g. no tmdbId and the title search returned nothing). That
+  /// re-resolution loop made the continue-watching shelf feel like it re-fetched
+  /// covers on each open even though the image bytes themselves were cached.
+  static const _resolvedArtworkKey = 'yingji.watch-artwork-resolved';
+
+  Future<Set<String>> loadResolvedArtwork() async =>
+      (_prefs.getStringList(_resolvedArtworkKey) ?? const <String>[]).toSet();
+
+  /// Records that [mediaIds] have each been resolved exactly once. Called after
+  /// a resolution pass so subsequent launches skip them; only genuinely new
+  /// records (not yet in this set) ever trigger a TMDB lookup.
+  Future<void> markArtworkResolved(Set<String> mediaIds) async {
+    if (mediaIds.isEmpty) return;
+    final next =
+        (_prefs.getStringList(_resolvedArtworkKey) ?? const <String>[]).toSet()
+          ..addAll(mediaIds);
+    await _prefs.setStringList(_resolvedArtworkKey, next.toList());
+  }
 
   /// Returns every stored record ordered by most recent watch time first.
   /// Records without a timestamp (written by very old builds) stay at the end
@@ -212,6 +276,18 @@ class WatchStateStore {
   }
 
   Future<void> clear() => _prefs.remove(key);
+
+  /// Writes resolved cover URLs back onto their records without touching the
+  /// recency order or timestamps — so the artwork upgrade pass never reorders
+  /// the shelf or stamps "now" on old rows. Keys are [WatchState.mediaId].
+  Future<void> persistImages(Map<String, String> imageByMediaId) async {
+    if (imageByMediaId.isEmpty) return;
+    final rows = load().map((item) {
+      final url = imageByMediaId[item.mediaId];
+      return url != null ? item.withImage(url) : item;
+    }).toList();
+    await replaceAll(rows);
+  }
 }
 
 /// Sorts continue-watching states by their real playback time. Dated entries
@@ -238,6 +314,52 @@ List<WatchState> sortWatchStatesByRecency(Iterable<WatchState> source) {
     return byOrigin != 0 ? byOrigin : a.$1.compareTo(b.$1);
   });
   return indexed.map((entry) => entry.$2).toList(growable: false);
+}
+
+/// 「第 1 集」「Episode 2」这类只有序号的通用集名 —— 作为副标题毫无信息量。
+final RegExp _genericEpisodeLabel = RegExp(
+  r'^(?:第\s*\d+\s*[集话話]|EP?\s*\d+|Episode\s*\d+)$',
+  caseSensitive: false,
+);
+
+/// 清洗写入路径可能产生的两类脏数据，返回可直接入库/上架的副本：
+///
+/// 1. 副标题与剧名同名 —— 部分服务器的单集条目会直接以剧名命名（如
+///    「叛逆的女仆」的 E2 条目标题也叫「叛逆的女仆」），副标题就变成
+///    「S1E2 · 叛逆的女仆」。清空后卡片回退显示「第 N 集」。
+/// 2. 副标题是通用集名（「第 2 集」）—— 与卡片缺省回退重复，清掉一致化。
+///
+/// 剧名本身不动：旧版本把单集名写进 title 的存量行只能在合并时用服务器的
+/// 权威命名自愈（见 [_mergeServerWatchHistory]），这里没有可靠依据改名。
+WatchState normalizeWatchState(WatchState state) {
+  final episodic = state.seasonNumber != null || state.episodeNumber != null;
+  var episodeTitle = state.episodeTitle;
+  if (episodic && episodeTitle != null) {
+    final trimmed = episodeTitle.trim();
+    if (trimmed.isEmpty ||
+        trimmed == state.title.trim() ||
+        _genericEpisodeLabel.hasMatch(trimmed)) {
+      episodeTitle = null;
+    }
+  }
+  if (episodeTitle == state.episodeTitle) return state;
+  return WatchState(
+    mediaId: state.mediaId,
+    title: state.title,
+    position: state.position,
+    duration: state.duration,
+    imageUrl: state.imageUrl,
+    sourceId: state.sourceId,
+    serverItemId: state.serverItemId,
+    tmdbId: state.tmdbId,
+    episodeTitle: null,
+    seasonNumber: state.seasonNumber,
+    episodeNumber: state.episodeNumber,
+    updatedAt: state.updatedAt,
+    isPlayed: state.isPlayed,
+    progressOrigin: state.progressOrigin,
+    progressOriginName: state.progressOriginName,
+  );
 }
 
 /// A display projection only: episode history stays intact for resume/rewatch.

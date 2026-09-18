@@ -326,6 +326,11 @@ class _SourceMediaCard extends StatelessWidget {
                     : CachedNetworkImage(
                         imageUrl: item.imageUrl.toString(),
                         fit: BoxFit.cover,
+                        // 源缩略图卡片约 260px 宽，按显示分辨率解码。
+                        memCacheWidth: (320 *
+                                MediaQuery.devicePixelRatioOf(context))
+                            .clamp(1.0, 512.0)
+                            .round(),
                         errorWidget: (_, _, _) =>
                             const ColoredBox(color: YingjiColors.elevated),
                       ),

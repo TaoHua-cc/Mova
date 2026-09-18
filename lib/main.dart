@@ -12,6 +12,10 @@ import 'src/platform/window_host.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 限制解码后位图常驻内存上限：首页大量全屏 backdrop / 海报默认会按原图分辨率
+  // 解码进内存，叠加起来很占内存。限定后超出部分按 LRU 淘汰（单图仍按显示尺寸
+  // 经各 CachedNetworkImage 的 memCacheWidth 降采样，见 media_center / 详情页）。
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 96 << 20;
   configureNetworkHttpOverrides();
   MediaKit.ensureInitialized();
   // Desktop window APIs must be ready before the first frame. Preferences and

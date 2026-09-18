@@ -283,6 +283,11 @@ class YingjiBackdrop extends StatelessWidget {
             child: CachedNetworkImage(
               imageUrl: imageUrl,
               fit: BoxFit.cover,
+              // 全局模糊背景铺满整窗，原图常 1k+ px：按窗口物理宽度解码，
+              // 否则第一次打开软件就要解码+模糊一张超大图，首屏掉帧明显。
+              // 全局模糊背景：反正会被高斯模糊掉，固定 1280 宽即可，
+              // 不必按窗口物理宽解码（大屏/高 DPI 下会比原图还大，反而更卡）。
+              memCacheWidth: 1280,
               errorWidget: (_, _, _) => const SizedBox.shrink(),
             ),
           ),

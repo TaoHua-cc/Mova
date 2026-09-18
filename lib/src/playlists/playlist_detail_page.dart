@@ -129,6 +129,14 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                                                       imageUrl: item.posterUrl
                                                           .toString(),
                                                       fit: BoxFit.cover,
+                                                      // 列表缩略图仅 52px 宽，按显示分辨率解码。
+                                                      memCacheWidth: (160 *
+                                                              MediaQuery
+                                                                  .devicePixelRatioOf(
+                                                                context,
+                                                              ))
+                                                          .clamp(1.0, 256.0)
+                                                          .round(),
                                                       errorWidget: (_, _, _) =>
                                                           const _PosterFallback(),
                                                     ),

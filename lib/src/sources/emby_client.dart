@@ -432,7 +432,7 @@ class EmbyClient {
                   'SortBy': 'DatePlayed',
                   'SortOrder': 'Descending',
                   'Limit': '50',
-                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData',
+                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,ImageTags,SeriesPrimaryImageTag',
                   'api_key': session.token,
                 },
               ),
@@ -530,7 +530,7 @@ class EmbyClient {
               .resolve('Users/$userId/Items/$itemId')
               .replace(
                 queryParameters: {
-                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData',
+                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,ImageTags,SeriesPrimaryImageTag',
                   'api_key': session.token,
                 },
               ),
@@ -905,8 +905,18 @@ class EmbyClient {
 
   MediaItem _item(EmbySession session, Map<String, dynamic> item) {
     final id = '${item['Id'] ?? ''}';
+    // 单集/季条目常常没有自己的 Primary 图（服务器对缺失图返回 500 而非
+    // 404），此时回退到剧集主图，让继续观看卡不至于直接落到字形占位。
+    final imageTags = item['ImageTags'] as Map<String, dynamic>? ?? const {};
+    final hasOwnImage = '${imageTags['Primary'] ?? ''}'.isNotEmpty;
+    final ownSeriesId = '${item['SeriesId'] ?? ''}';
+    final seriesImageTag = '${item['SeriesPrimaryImageTag'] ?? ''}';
+    final imageSourceId =
+        !hasOwnImage && ownSeriesId.isNotEmpty && seriesImageTag.isNotEmpty
+        ? ownSeriesId
+        : id;
     final image = session.source.endpoint
-        .resolve('Items/$id/Images/Primary')
+        .resolve('Items/$imageSourceId/Images/Primary')
         .replace(queryParameters: {'api_key': session.token});
     final mediaSources = item['MediaSources'] as List<dynamic>? ?? const [];
     final mediaSourceId = mediaSources
