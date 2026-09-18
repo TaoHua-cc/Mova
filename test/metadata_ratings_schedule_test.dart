@@ -91,6 +91,18 @@ void main() {
     expect(rows.first.timeKnown, isTrue);
     expect(rows.last.timeKnown, isFalse);
   });
+  test('schedule ignores TVmaze specials (season 0)', () {
+    final rows = upcomingListFromTvmaze(
+      [
+        {'season': 0, 'number': 1, 'airdate': '2026-09-12', 'airtime': ''},
+        {'season': 2, 'number': 3, 'airdate': '2026-09-15', 'airtime': ''},
+      ],
+      {'network': {'name': 'Example TV'}},
+      DateTime(2026, 9, 5),
+      until: DateTime(2026, 10),
+    );
+    expect(rows.map((row) => row.seasonNumber), [2]);
+  });
   test(
     'Trakt calendar requests 31 days and preserves the exact instant',
     () async {

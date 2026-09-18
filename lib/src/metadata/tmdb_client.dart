@@ -208,7 +208,11 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
     final date = DateTime.tryParse(known ? stamp : '${row['airdate'] ?? ''}');
     final season = row['season'];
     final number = row['number'];
-    if (date == null || season is! num || number is! num || number <= 0) {
+    if (date == null ||
+        season is! num ||
+        season <= 0 ||
+        number is! num ||
+        number <= 0) {
       continue;
     }
     final cutoff = known ? now : DateTime(now.year, now.month, now.day);
@@ -746,18 +750,34 @@ class TmdbClient {
     for (final episode in [...dated, ...exact]) {
       final key = '${episode.seasonNumber}:${episode.episodeNumber}';
       final previous = merged[key];
-      if (previous == null || episode.timeKnown) {
-        merged[key] = TmdbUpcomingEpisode(
-          seasonNumber: episode.seasonNumber,
-          episodeNumber: episode.episodeNumber,
-          title: episode.title.isEmpty ? previous?.title ?? '' : episode.title,
-          airDate: episode.airDate,
-          timeKnown: episode.timeKnown,
-          source: episode.source,
-          network: episode.network ?? previous?.network,
-          stillPath: episode.stillPath ?? previous?.stillPath,
-        );
+      if (previous == null) {
+        merged[key] = episode;
+        continue;
       }
+      // TMDB (zh-CN) 是本应用的主元数据源，优先保留它的季集号与中文标题；
+      // TVmaze 只额外提供精确播出时刻，因此仅当它带具体时间时才采用它的时间。
+      // 之前 TVmaze（timeKnown=true）会整体覆盖 TMDB 条目，导致季集号与中文
+      // 标题被英文数据顶替 —— 追剧日历显示出来的剧集信息因此错乱。
+      final primary = previous.source == 'TMDB' ? previous : episode;
+      final timing =
+          episode.timeKnown
+              ? episode
+              : (previous.timeKnown ? previous : episode);
+      merged[key] = TmdbUpcomingEpisode(
+        seasonNumber: primary.seasonNumber,
+        episodeNumber: primary.episodeNumber,
+        title:
+            primary.title.isNotEmpty
+                ? primary.title
+                : (previous.title.isNotEmpty
+                      ? previous.title
+                      : episode.title),
+        airDate: timing.airDate,
+        timeKnown: timing.timeKnown,
+        source: primary.source,
+        network: primary.network ?? episode.network ?? previous.network,
+        stillPath: primary.stillPath ?? previous.stillPath,
+      );
     }
     final result = merged.values.toList()
       ..sort((a, b) => a.airDate.compareTo(b.airDate));
@@ -904,6 +924,13 @@ class TmdbClient {
     return 'yingji.tmdb.cache.$stableKey';
   }
 
+  /// TMDB 响应缓存上限：超过后按「最后刷新时间」淘汰最旧的条目。
+  ///
+  /// 这些缓存都写在 `shared_preferences` 里，而它会在启动时把整份偏好文件一次性
+  /// 读进内存，条目越多常驻内存与启动耗时越高，所以必须给一个上限，不能无限累积。
+  static const int _tmdbCacheCapacity = 800;
+  static int _rememberWrites = 0;
+
   /// 写入缓存正文并记下时间戳；只有正文真的变了才通知列表页替换内容。
   ///
   /// 第一次写入不算「变化」：那一刻页面刚拿到同一份数据，没有需要替换的东西，
@@ -920,6 +947,55 @@ class TmdbClient {
       DateTime.now().toIso8601String(),
     );
     if (previous != null && previous != body) yingjiMetadataRevision.value++;
+    // 每 16 次写入顺带修剪一次缓存，平摊开销，避免 shared_preferences 无限膨胀。
+    if ((++_rememberWrites & 15) == 0) await _pruneTmdbCache(prefs);
+  }
+
+  /// 淘汰最旧的 TMDB 缓存条目与过期排期，把常驻规模压在 [_tmdbCacheCapacity] 内。
+  Future<void> _pruneTmdbCache(SharedPreferences prefs) async {
+    final cacheKeys = prefs
+        .getKeys()
+        .where(
+          (key) =>
+              key.startsWith('yingji.tmdb.cache.') && !key.endsWith('.savedAt'),
+        )
+        .toList(growable: false);
+    if (cacheKeys.length > _tmdbCacheCapacity) {
+      final byTime = <String, DateTime>{};
+      for (final key in cacheKeys) {
+        final stamp = DateTime.tryParse(prefs.getString('$key.savedAt') ?? '');
+        byTime[key] = stamp ?? DateTime.fromMillisecondsSinceEpoch(0);
+      }
+      final sorted = byTime.entries.toList()
+        ..sort((a, b) => a.value.compareTo(b.value));
+      final excess = sorted.length - _tmdbCacheCapacity;
+      for (var i = 0; i < excess; i++) {
+        final key = sorted[i].key;
+        await prefs.remove(key);
+        await prefs.remove('$key.savedAt');
+      }
+    }
+    // 排期缓存超过 7 天的也清掉，避免另一种缓慢膨胀。
+    final staleSchedule = DateTime.now().subtract(const Duration(days: 7));
+    final scheduleKeys = prefs
+        .getKeys()
+        .where((key) => key.startsWith('yingji.schedule.'))
+        .toList(growable: false);
+    for (final key in scheduleKeys) {
+      final raw = prefs.getString(key);
+      if (raw == null) continue;
+      try {
+        final saved = DateTime.tryParse(
+          '${(jsonDecode(raw) as Map<String, dynamic>)['savedAt']}',
+        );
+        if (saved != null && saved.isBefore(staleSchedule)) {
+          await prefs.remove(key);
+        }
+      } catch (_) {
+        // 解析不出的排期条目直接淘汰，反正已经不可用了。
+        await prefs.remove(key);
+      }
+    }
   }
 
   Future<void> _refresh(

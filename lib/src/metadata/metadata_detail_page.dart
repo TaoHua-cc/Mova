@@ -37,11 +37,24 @@ String _episodeKey(int? season, int? episode) =>
 bool _isGenericEpisodeTitle(String value) =>
     value.trim().isEmpty || RegExp(r'^第\s*\d+\s*集$').hasMatch(value.trim());
 
-String _episodeTitle(MediaItem resource, TmdbEpisode? metadata, int fallback) {
-  final title = metadata?.name.trim() ?? '';
-  return _isGenericEpisodeTitle(resource.title) && title.isNotEmpty
-      ? title
-      : resource.title;
+String _episodeTitle(
+  MediaItem resource,
+  TmdbEpisode? metadata,
+  int fallback, {
+  String? seriesTitle,
+}) {
+  final tmdbName = metadata?.name.trim() ?? '';
+  final serverTitle = resource.title.trim();
+  // 部分服务器的单集条目会直接以剧名命名（单集标题 == 剧名），或者只给
+  // 「第 N 集」这种序号 —— 这两种名字当副标题都没有信息量，TMDB 有集名时
+  // 优先采用；只有服务器给的是真集名时才沿用服务器的。
+  final uninformative =
+      _isGenericEpisodeTitle(serverTitle) ||
+      (seriesTitle != null && serverTitle == seriesTitle.trim());
+  if (uninformative && tmdbName.isNotEmpty) return tmdbName;
+  if (serverTitle.isNotEmpty && !uninformative) return serverTitle;
+  if (tmdbName.isNotEmpty) return tmdbName;
+  return '第 $fallback 集';
 }
 
 Uri? _episodeImage(MediaItem resource, TmdbEpisode? metadata) =>
@@ -1185,11 +1198,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                         fadeOutDuration: Duration.zero,
                         // 全屏窗口下 backdrop 原图可能上千像素：按窗口实际物理宽度
                         // 解码，省内存也省每帧纹理带宽。
-                        memCacheWidth:
-                            (MediaQuery.sizeOf(context).width *
-                                    MediaQuery.devicePixelRatioOf(context))
-                                .clamp(1.0, 2560.0)
-                                .round(),
+                        memCacheWidth: 1280,
                         errorWidget: (_, _, _) => const SizedBox.shrink(),
                       ),
                     const DecoratedBox(
@@ -1479,7 +1488,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           url: episode.playbackUrl.toString(),
           title: episode.title,
           headers: episode.headers,
-          imageUrl: episode.imageUrl?.toString(),
+          // 单集剧照缺失是常态：TMDB 剧照优先（与详情页同一套规则），
+          // 再退到剧集海报，避免继续观看卡片沦为字母占位块。
+          imageUrl: (_episodeImage(episode, metadata) ?? item.posterUrl)
+              ?.toString(),
           sourceId: episode.source.id,
           serverItemId: episode.id,
           tmdbId: item.id,
@@ -1487,6 +1499,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             episode,
             metadata,
             episode.episodeNumber ?? 1,
+            seriesTitle: item.title,
           ),
           seasonNumber: episode.seasonNumber,
           episodeNumber: episode.episodeNumber,
@@ -1513,6 +1526,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   : episode,
             )
             .toList(growable: false);
+        final activeMetadata = _episodeMetadata[_episodeKey(
+          activeResource.seasonNumber,
+          activeResource.episodeNumber,
+        )];
         try {
           final result = await WindowsNativePlayer.play(
             WindowsNativePlaybackRequest(
@@ -1520,18 +1537,19 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               title: item.title,
               headers: activeResource.headers,
               initialPosition: startAt,
-              imageUrl: activeResource.imageUrl?.toString(),
+              imageUrl:
+                  (_episodeImage(activeResource, activeMetadata) ??
+                      item.posterUrl)
+                  ?.toString(),
               seriesLogoUrl: item.logoUrl?.toString(),
               sourceId: activeResource.source.id,
               serverItemId: activeResource.id,
               tmdbId: item.id,
               episodeTitle: _episodeTitle(
                 activeResource,
-                _episodeMetadata[_episodeKey(
-                  activeResource.seasonNumber,
-                  activeResource.episodeNumber,
-                )],
+                activeMetadata,
                 activeResource.episodeNumber ?? 1,
+                seriesTitle: item.title,
               ),
               seasonNumber: activeResource.seasonNumber,
               episodeNumber: activeResource.episodeNumber,
@@ -1611,13 +1629,16 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   url: episode.playbackUrl!.toString(),
                   title: item.title,
                   headers: episode.headers,
-                  imageUrl: _episodeImage(
-                    episode,
-                    _episodeMetadata[_episodeKey(
-                      episode.seasonNumber,
-                      episode.episodeNumber,
-                    )],
-                  )?.toString(),
+                  imageUrl:
+                      (_episodeImage(
+                        episode,
+                        _episodeMetadata[_episodeKey(
+                          episode.seasonNumber,
+                          episode.episodeNumber,
+                        )],
+                      ) ??
+                      item.posterUrl)
+                  ?.toString(),
                   seriesLogoUrl: item.logoUrl?.toString(),
                   episodeTitle: _episodeTitle(
                     episode,
@@ -1626,6 +1647,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                       episode.episodeNumber,
                     )],
                     episode.episodeNumber ?? 1,
+                    seriesTitle: item.title,
                   ),
                   resourceInfo: [
                     episode.source.name,
@@ -1882,6 +1904,10 @@ class _DetailHeroCopy extends StatelessWidget {
                 imageUrl: item.logoUrl.toString(),
                 alignment: Alignment.centerLeft,
                 fit: BoxFit.contain,
+                // 标题 logo 容器宽 520，按显示分辨率解码。
+                memCacheWidth: (560 * MediaQuery.devicePixelRatioOf(context))
+                    .clamp(1.0, 640.0)
+                    .round(),
                 errorWidget: (_, _, _) => Text(
                   item.title,
                   style: const TextStyle(
@@ -2300,6 +2326,13 @@ class _SeasonRailState extends State<_SeasonRail> {
                                       ),
                                       imageUrl: artwork.toString(),
                                       fit: BoxFit.cover,
+                                      // 季海报显示宽 ~190，按物理像素解码即可，
+                                      // 不必用原图——批量解码卡在进页面转场的最后一帧。
+                                      memCacheWidth: (320 *
+                                              MediaQuery.devicePixelRatioOf(
+                                                  context))
+                                          .clamp(1.0, 512.0)
+                                          .round(),
                                       errorWidget: (_, _, _) => const Center(
                                         child: Icon(YingjiIcons.film),
                                       ),
@@ -2596,14 +2629,21 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                                   image == null
                                       ? const _EpisodeArtworkFallback()
                                       : CachedNetworkImage(
-                                          fadeInDuration: const Duration(
-                                            milliseconds: 150,
-                                          ),
-                                          imageUrl: image.toString(),
-                                          fit: BoxFit.cover,
-                                          errorWidget: (_, _, _) =>
-                                              const _EpisodeArtworkFallback(),
-                                        ),
+                                      fadeInDuration: const Duration(
+                                        milliseconds: 150,
+                                      ),
+                                      imageUrl: image.toString(),
+                                      fit: BoxFit.cover,
+                                      // 剧集静帧显示宽 ~238，按物理像素解码即可，
+                                      // 避免几十张原图在进页面时批量解码卡住转场末帧。
+                                      memCacheWidth: (320 *
+                                              MediaQuery.devicePixelRatioOf(
+                                                  context))
+                                          .clamp(1.0, 512.0)
+                                          .round(),
+                                      errorWidget: (_, _, _) =>
+                                          const _EpisodeArtworkFallback(),
+                                    ),
                                   if (completed)
                                     const Positioned(
                                       right: 10,
@@ -3045,6 +3085,11 @@ class _AllEpisodeCard extends StatelessWidget {
                               fadeInDuration: const Duration(milliseconds: 150),
                               imageUrl: image.toString(),
                               fit: BoxFit.cover,
+                              // 资源/剧集卡封面约 300px 宽，按显示分辨率解码。
+                              memCacheWidth:
+                                  (320 * MediaQuery.devicePixelRatioOf(context))
+                                      .clamp(1.0, 512.0)
+                                      .round(),
                               errorWidget: (_, _, _) =>
                                   const _EpisodeArtworkFallback(),
                             ),
@@ -4497,6 +4542,14 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         ),
                                         imageUrl: person.profileUrl.toString(),
                                         fit: BoxFit.cover,
+                                        // 演员头像 100px，按显示分辨率解码。
+                                        memCacheWidth: (160 *
+                                                MediaQuery
+                                                    .devicePixelRatioOf(
+                                                  context,
+                                                ))
+                                            .clamp(1.0, 512.0)
+                                            .round(),
                                         errorWidget: (_, _, _) =>
                                             const ColoredBox(
                                               color: YingjiColors.elevated,
@@ -4572,6 +4625,11 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                             fadeInDuration: const Duration(milliseconds: 150),
                             imageUrl: artwork.url.toString(),
                             fit: BoxFit.contain,
+                            // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
+                            memCacheWidth: (1280 *
+                                    MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 1280.0)
+                                .round(),
                           ),
                         ),
                       ),
@@ -4585,6 +4643,11 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                           imageUrl: artwork.url.toString(),
                           width: 300,
                           fit: BoxFit.cover,
+                          // 艺术图货架缩略图宽 300，按显示分辨率解码。
+                          memCacheWidth: (320 *
+                                  MediaQuery.devicePixelRatioOf(context))
+                              .clamp(1.0, 512.0)
+                              .round(),
                         ),
                       ),
                     ),
@@ -4646,6 +4709,14 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         ),
                                         imageUrl: item.posterUrl.toString(),
                                         fit: BoxFit.cover,
+                                        // 相似推荐海报 164px 宽，按显示分辨率解码。
+                                        memCacheWidth: (320 *
+                                                MediaQuery
+                                                    .devicePixelRatioOf(
+                                                  context,
+                                                ))
+                                            .clamp(1.0, 512.0)
+                                            .round(),
                                         errorWidget: (_, _, _) =>
                                             const ColoredBox(
                                               color: YingjiColors.elevated,
@@ -4949,6 +5020,11 @@ class _PersonDetailCard extends StatelessWidget {
                         fadeInDuration: const Duration(milliseconds: 150),
                         imageUrl: person.profileUrl.toString(),
                         fit: BoxFit.cover,
+                        // 演员详情卡头像约 110px，按显示分辨率解码。
+                        memCacheWidth: (160 *
+                                MediaQuery.devicePixelRatioOf(context))
+                            .clamp(1.0, 512.0)
+                            .round(),
                         errorWidget: (_, _, _) => const ColoredBox(
                           color: YingjiColors.elevated,
                           child: Icon(YingjiIcons.person_fill, size: 42),
@@ -5011,14 +5087,19 @@ class _ArtworkDetailCard extends StatelessWidget {
           children: [
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 1200, maxHeight: 780),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(16),
-                child: CachedNetworkImage(
-                  fadeInDuration: const Duration(milliseconds: 150),
-                  imageUrl: artwork.url.toString(),
-                  fit: BoxFit.contain,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: CachedNetworkImage(
+                    fadeInDuration: const Duration(milliseconds: 150),
+                    imageUrl: artwork.url.toString(),
+                    fit: BoxFit.contain,
+                    // 艺术图大图弹窗（maxWidth 1200），按显示分辨率解码。
+                    memCacheWidth: (1280 *
+                            MediaQuery.devicePixelRatioOf(context))
+                        .clamp(1.0, 1280.0)
+                        .round(),
+                  ),
                 ),
-              ),
             ),
             Padding(
               padding: const EdgeInsets.all(12),
@@ -5042,6 +5123,10 @@ class _ArtworkDetailCard extends StatelessWidget {
             fadeInDuration: const Duration(milliseconds: 150),
             imageUrl: artwork.url.toString(),
             fit: BoxFit.cover,
+            // 艺术图详情卡缩略图约 320px，按显示分辨率解码。
+            memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
+                .clamp(1.0, 512.0)
+                .round(),
             errorWidget: (_, _, _) => const ColoredBox(
               color: YingjiColors.elevated,
               child: Icon(YingjiIcons.rectangle_stack),
@@ -5104,6 +5189,11 @@ class _RecommendationDetailCard extends StatelessWidget {
                       fadeInDuration: const Duration(milliseconds: 150),
                       imageUrl: item.posterUrl.toString(),
                       fit: BoxFit.cover,
+                      // 相似推荐详情卡海报 146px 宽，按显示分辨率解码。
+                      memCacheWidth: (320 *
+                              MediaQuery.devicePixelRatioOf(context))
+                          .clamp(1.0, 512.0)
+                          .round(),
                       errorWidget: (_, _, _) =>
                           const ColoredBox(color: YingjiColors.elevated),
                     ),
@@ -5311,6 +5401,14 @@ class _PersonPageState extends State<_PersonPage> {
                                             imageUrl: value.person.profileUrl
                                                 .toString(),
                                             fit: BoxFit.cover,
+                                            // 人物页头像 190px 宽，按显示分辨率解码。
+                                            memCacheWidth: (320 *
+                                                    MediaQuery
+                                                        .devicePixelRatioOf(
+                                                      context,
+                                                    ))
+                                                .clamp(1.0, 512.0)
+                                                .round(),
                                           ),
                                   ),
                                 ),
