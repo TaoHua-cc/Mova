@@ -1,8 +1,13 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <gdiplus.h>
+// timeBeginPeriod / timeEndPeriod：把系统时钟粒度提到 1ms，帧定时器才准。
+#pragma comment(lib, "winmm.lib")
+// AlphaBlend：弹幕文字栅格化后每帧只做一次带 alpha 的贴图（见 BlendDanmakuTexture）。
+#pragma comment(lib, "msimg32.lib")
 
 #include <atomic>
 #include <algorithm>
@@ -17,11 +22,14 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <fstream>
+#include <chrono>
 
 namespace {
 
@@ -113,6 +121,20 @@ struct MpvApi {
 constexpr wchar_t kWindowClass[] = L"MovaNativePlayerWindow";
 constexpr UINT kMpvShutdown = WM_APP + 1;
 constexpr UINT kPlayerStateChanged = WM_APP + 2;
+// 弹幕在播放过程中才拉到，stdin 线程收到后投递这条消息，由主线程建窗/重载。
+constexpr UINT kDanmakuReload = WM_APP + 3;
+// keep-open=yes 关掉了 mpv 的自动前进：播完（EOF）时由事件线程投递这条消息，
+// 主线程再执行 playlist-next。这样「读取出错」就不会被当成播完而跳集。
+constexpr UINT kPlaylistAdvance = WM_APP + 4;
+// 同上，出错时停在原地并给一次可见提示（原来的错误分支只改内部标志，
+// 界面上什么都不显示，用户只看到画面卡住然后跳到下一集）。
+constexpr UINT kPlaybackInterrupted = WM_APP + 5;
+// 播放期间应用侧改了设置页里的弹幕 / 片头片尾项：stdin 线程入队后投递这条
+// 消息，主线程逐个应用（见 ApplyLiveOption），不必等下一次起播。
+constexpr UINT kApplyLiveSettings = WM_APP + 6;
+// 判断「是不是真播完了」的容差：正常播完时 time-pos 和 duration 会差一点点，
+// 给几秒余量；差得更多的 EOF 就是中途断流被误报成播完。
+constexpr double kEofGraceSeconds = 3.0;
 constexpr wchar_t kControlsClass[] = L"MovaNativePlayerControls";
 constexpr wchar_t kPanelClass[] = L"MovaNativePlayerPanel";
 constexpr wchar_t kTopBarClass[] = L"MovaNativePlayerTopBar";
@@ -123,7 +145,16 @@ MpvApi g_mpv;
 mpv_handle* g_handle = nullptr;
 std::atomic<bool> g_running{true};
 std::atomic<double> g_position{0};
+// g_position 最后一次被 mpv 回报的时刻（高精度 QPC 毫秒）。弹幕的出现时机与位置
+// 都按「插值后的播放位置」算，不再受属性上报粒度限制（见 DanmakuPlayhead）。
+//
+// 这里**不能**用 GetTickCount64：它的粒度是系统时钟节拍（默认 15.6ms），插值出来
+// 的位置就会一步 15.6ms 地跳，而波动的是「一条弹幕在屏上被画到哪一列」。
+std::atomic<double> g_position_tick{0.0};
 std::atomic<double> g_duration{0};
+// 最后一次有效的播放位置。end-file 时 mpv 可能已经把 time-pos 清成 0/NaN，
+// 那时再读 g_position 判断「有没有播到片尾」就不准了，所以单独留一份。
+std::atomic<double> g_last_valid_position{0};
 std::atomic<bool> g_paused{false};
 std::atomic<double> g_volume{100};
 std::atomic<double> g_speed{1};
@@ -132,9 +163,27 @@ std::atomic<bool> g_muted{false};
 std::atomic<double> g_brightness{0};
 std::atomic<bool> g_buffering{false};
 std::atomic<bool> g_playback_error{false};
+// 中断自动重试：源站在「跳转 / 换段」的那一刻要新建连接，偶发抖动会让 mpv 把
+// 这一集判成结束（ERROR，或者一个离片尾很远的 EOF）。以前这里直接举手投降，
+// 用户看到的是「播放失败 · 请更换资源」，而同一集的地址往往下一秒就能播。
+// 所以同一集内先补一次：位置记在 g_resume_seconds 里，等新文件加载完再 seek
+// 回去。重试预算按「这一集已经稳稳放了十几秒」就复位，免得一次抖动就把整集的
+// 重试机会用光。
+std::atomic<double> g_resume_seconds{0};
+// 重试成功、位置已经补回去：由事件线程置位，主线程在下一帧把「正在重试…」
+// 换成一句「已继续播放」，免得重试成功之后那句提示还挂在那里自相矛盾。
+std::atomic<bool> g_resume_done{false};
+int g_retry_count = 0;          // 只在主线程读写
+uint64_t g_retry_stamp = 0;     // 上次重试的时刻（用来判「已经健康播放多久」）
+constexpr int kMaxInterruptRetries = 1;
+constexpr uint64_t kRetryHealthWindowMs = 15000;
 std::atomic<double> g_cache_fraction{0};
 std::atomic<double> g_network_bytes_per_second{0};
 std::atomic<int64_t> g_playlist_position{0};
+// 整季的播放地址。注意：只有当前这一集会交给 mpv —— 把整季都 loadfile 进去
+// 的话，mpv 在任何 end-file（包括读取出错）之后都会自动前进到下一项，表现
+// 就是「卡一下就跳下一集」。连播与选集一律走 LoadPlaylistEntry()。
+std::vector<std::string> g_media_urls;
 std::atomic<int> g_hover_control{0};
 std::atomic<double> g_seek_hover{-1};
 HWND g_window = nullptr;
@@ -188,8 +237,238 @@ float g_buffer_phase = 0.0f;
 double g_seek_seconds = 10.0;
 double g_volume_step = 5.0;
 std::unordered_map<int, std::string> g_shortcuts;
+// 统一帧率：播放器内的控件动画与弹幕都跑在 60fps 上，与应用（Flutter）界面
+// 的刷新节奏一致。定时器只负责「叫醒」，动画一律按经过时间推进，因此帧率
+// 变化时动画时长不变，只是更平滑。
+constexpr int kFrameIntervalMs = 16;  // ≈62.5fps，对齐 60fps 的显示刷新
+// 上一帧的时刻（QPC 毫秒）。动画按「经过时间」推进，所以这个差值必须是高精度
+// 的：GetTickCount64（粒度 15.6ms）会让每帧的 dt 在 0 / 15.6 / 31.2ms 之间跳，
+// 转圈和淡出看起来就是一下一下顿着走。
+double g_last_frame_ms = 0.0;
 bool g_danmaku_enabled = false;
+// 弹幕由应用侧拉取后写入临时文本文件，原生侧读入并在视频之上叠加渲染。
+std::wstring g_danmaku_path;
+double g_danmaku_opacity = 0.82;
+double g_danmaku_area = 0.65;
+double g_danmaku_font_size = 18.0;
+double g_danmaku_speed = 1.0;
+double g_danmaku_density = 0.55;
+bool g_danmaku_scroll = true;
+bool g_danmaku_top = true;
+bool g_danmaku_bottom = true;
+HWND g_danmaku = nullptr;
+constexpr wchar_t kDanmakuClass[] = L"MovaNativePlayerDanmaku";
+// 弹幕每帧都要重画，位图与字体复用而不是重建。两者都持有 GDI+ 对象，
+// 必须在 GdiplusShutdown 之前释放（见 ReleaseDanmakuSurface）。
+struct PanelSurface;
+PanelSurface* g_danmaku_surface = nullptr;
+Gdiplus::Font* g_danmaku_font = nullptr;
+float g_danmaku_font_px = -1.0f;
+// 面板里要显示的状态：应用侧通过 stdin 把匹配结果一并送过来。
+std::wstring g_danmaku_source;   // 命中的 API 名称
+std::wstring g_danmaku_matched;  // 匹配到的作品 / 集
+int g_danmaku_count = 0;         // 弹幕条数
+bool g_danmaku_loading = false;  // 应用侧还在拉取
+std::wstring g_danmaku_error;    // 失败原因
+
+// 每条弹幕的文字只栅格化一次，画进一张刚好包住它的小位图（32bpp 预乘 ARGB），
+// 之后每帧只做一次 GDI AlphaBlend。逐帧 DrawString 非常贵：实测同屏 162 条时
+// 每帧要 8.9ms（60fps 的预算是 16.7ms），而它的输出对同一条弹幕是不变的 ——
+// 变的只有位置。位图里的透明度按「满不透明」画，整体的不透明度由每帧的
+// SourceConstantAlpha 施加，这样改「不透明度」不必重新栅格化。
+struct DanmakuTexture {
+  HDC dc = nullptr;
+  HBITMAP bitmap = nullptr;
+  HGDIOBJ previous = nullptr;
+  BYTE* bits = nullptr;
+  int width = 0;
+  int height = 0;
+
+  ~DanmakuTexture() { Destroy(); }
+
+  bool Create(int w, int h) {
+    Destroy();
+    if (w <= 0 || h <= 0) return false;
+    dc = CreateCompatibleDC(nullptr);
+    if (!dc) return false;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;  // top-down，与弹幕层一致
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* raw = nullptr;
+    bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &raw, nullptr, 0);
+    if (!bitmap || !raw) {
+      Destroy();
+      return false;
+    }
+    previous = SelectObject(dc, bitmap);
+    bits = static_cast<BYTE*>(raw);
+    width = w;
+    height = h;
+    memset(bits, 0, static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    return true;
+  }
+
+  void Destroy() {
+    if (dc && previous) SelectObject(dc, previous);
+    previous = nullptr;
+    if (bitmap) DeleteObject(bitmap);
+    bitmap = nullptr;
+    if (dc) DeleteDC(dc);
+    dc = nullptr;
+    bits = nullptr;
+    width = 0;
+    height = 0;
+  }
+};
+
+struct DanmakuItem {
+  double time = 0;        // 应出现的播放时间（秒）
+  int mode = 1;           // 1 滚动, 4/5 顶部, 6 底部
+  int color = -1;         // -1 用默认白
+  std::wstring text;
+  bool live = false;      // 是否已在屏幕上
+  double appear = -1.0;   // 出现时刻（steady_clock 秒）
+  int lane = -1;
+  // 这条弹幕「让出自己轨道」的时刻（动画时钟）。占轨时写一次，之后不再变。
+  // 记下来是为了在**局部**回收轨道时能按在屏条目重建占用表：改设置撤掉一类
+  // 弹幕时，只能把那一类占的轨道还回去，不能整体归零 —— 否则还在屏上的那些
+  // 轨道会被当成空的，新条目直接压上去。
+  double free_at = 0.0;
+  bool played = false;    // 已播完（飞出/超时）；seek 跳转检测会重置，允许重播
+  float text_width = -1.0f;  // 缓存 MeasureString 结果（<0 表示未测过）
+  float font_size = -1.0f;   // 该宽度是按哪个字号测的，字号变了要重测
+  // 文字栅格化缓存。离开屏幕时释放（重新出现时重建），这样 GDI 对象数量只与
+  // 「同时在屏的条数」有关，不会随整集的弹幕数增长到 GDI 句柄上限。
+  std::shared_ptr<DanmakuTexture> texture;
+};
+
+std::vector<DanmakuItem> g_danmaku_items;
+// 在屏条目（指向 g_danmaku_items 里的元素）与「下一条待处理」的光标。条目按
+// 时间排好序，所以每帧只需要从光标往前推，整集摊下来是 O(N)。
+std::vector<DanmakuItem*> g_danmaku_live;
+size_t g_danmaku_cursor = 0;
+// 每条轨道「下一次可用」的动画时钟时刻（滚动弹幕是尾巴离开右边缘的时刻，
+// 顶/底弹幕是停留结束的时刻）。按轨道下标查询，见 PaintDanmaku 里的占轨规则。
+// 整层被清空（跳转 / 换字号 / 关掉某一类弹幕）时必须一起归零，否则新条目会被
+// 上一批留下的未来时刻挡住。
+std::vector<double> g_danmaku_lane_free;
+int g_danmaku_dropped = 0;
+
+void ResetDanmakuLaneFree() {
+  std::fill(g_danmaku_lane_free.begin(), g_danmaku_lane_free.end(), 0.0);
+}
+bool g_danmaku_loaded = false;
+double g_danmaku_last_position = -1.0;
+static const double kDanmakuExitSeconds = 4.0;          // 顶/底固定弹幕停留时长
+static const double kDanmakuScrollBaseSeconds = 8.0;    // 滚动弹幕基础穿越时长
+// 跳转之后只补「刚刚过去」的这一小段：以前补的是 600 秒，一次 seek 会把几百条
+// 历史弹幕全放到屏上（连带几百次栅格化），画面上像炸开一样。
+static const double kDanmakuCatchupSeconds = 2.0;
+// 每帧给「栅格化新出现的弹幕」的预算：密集片头一次冒出来几十条时，把它们摊到
+// 几帧里画，宁可晚一两帧显示，也不要卡掉一帧。
+static const double kDanmakuRasterBudgetMs = 2.5;
+// 栅格化时四周留的空边：阴影偏移 1.2px，加上抗锯齿的溢出。
+static const int kDanmakuTexturePad = 2;
+// MOVA_TRACE_PANEL 导出弹幕层的间隔（帧）。起播那一瞬整层只有几条贴在右边缘，
+// 排版问题要等铺满之后才看得出来，所以挑稳态的两帧导。
+static const long long kDanmakuTraceSpacingFrames = 330;
+// 所有轨道都被占满时，最晚允许一条弹幕等这么久再入场；再久就直接丢掉。
+// 真实播放器在「同屏上限」之后也是丢，而不是叠上去 —— 叠上去就是看不清。
+static const double kDanmakuMaxDelaySeconds = 1.5;
+// 同一条轨道上，前一条的**尾巴**再往里让出这么多像素，后一条才允许入场。
+// 只按「尾巴刚离开右边缘」放行是不够的：那一刻两条弹幕的间距正好是 0，浮点
+// 误差会让它们压上几个像素 —— 观感上就是「两句贴在一起、糊成一团」。留一段
+// 固定间距之后，同轨相邻两条永远有肉眼可见的缝。
+static const float kDanmakuLaneGapPx = 32.0f;
+// 弹幕动画时钟（见 DanmakuAnimationClock）与「这一帧有没有东西需要重画」。
+double g_danmaku_clock = 0.0;
+double g_danmaku_clock_tick = 0.0;
+bool g_danmaku_dirty = true;
+
+// 弹幕帧耗时统计（MOVA_TRACE_DANMAKU）。一帧画了多久、两帧之间隔了多久，
+// 比「屏上有几条」更能说明「一顿一顿」的成因：draw 高说明绘制超预算，
+// gap 高说明定时器被别的东西堵住了。
+double g_danmaku_paint_last = 0.0;
+double g_danmaku_draw_ms = 0.0;
+double g_danmaku_post_ms = 0.0;
+double g_danmaku_gap_ms = 0.0;
+// 只报「最大间隔」不足以定性：61 帧里偶尔抖一次，和整段稳定掉到 50fps，最大值
+// 可能一样，观感却完全不同。所以把均值与「超过 20ms / 33ms 的帧数」一起记下来
+// —— 均值贴着 16.7 就是 60fps 正常，只有 late 计数零星跳动。
+double g_danmaku_gap_sum_ms = 0.0;
+int g_danmaku_gap_count = 0;
+int g_danmaku_gap_late20 = 0;
+int g_danmaku_gap_late33 = 0;
+int g_danmaku_frames = 0;
+// 累计贴过多少帧（不受诊断窗口 60 帧的重置影响），用于挑「铺满之后」的稳态时刻
+// 导出弹幕层位图。
+long long g_danmaku_paint_total = 0;
+// 本窗口里「同轨与他条横向相交」的条数峰值。这是「弹幕叠在一起看不清」的直接
+// 度量：轨道分配只要不严密，这个数字就上去了。
+int g_danmaku_overlap_max = 0;
+// 最深的「压进去多少像素」。只数条数不够用：1px 是浮点误差留下的贴边，肉眼
+// 看不出来；几十像素才是真的糊在一起。判缺陷要看这个深度。
+double g_danmaku_overlap_depth = 0.0;
+// 最深那一对的几何（轨道 + 两段的左右边界），跟 depth 一起回报。
+int g_danmaku_overlap_lane = -1;
+float g_danmaku_overlap_a0 = 0.0f;
+float g_danmaku_overlap_a1 = 0.0f;
+float g_danmaku_overlap_b0 = 0.0f;
+float g_danmaku_overlap_b1 = 0.0f;
+// 滚动弹幕穿过顶/底固定弹幕的条数峰值。所有播放器都是这个行为（固定弹幕占住
+// 轨道正中停 4 秒，滚动弹幕从它上面飘过去），只作参考，不算缺陷 —— 但它能解释
+// 「同轨有两拨东西」时 overlap 为什么仍然是 0。
+int g_danmaku_mixed_max = 0;
+int g_danmaku_lanes = 0;
+
+void PositionDanmaku();
+void PaintDanmaku();
+void LoadDanmaku();
+void CreateDanmakuWindow(HINSTANCE instance);
 bool g_auto_skip_segments = true;
+// 自动跳过的「提示停留」秒数，与应用设置里的同一项对应。
+double g_skip_delay_seconds = 5.0;
+
+// ---- 片头片尾 ------------------------------------------------------------
+// 数据由应用侧按设置里勾选的来源拉好，经 stdin 下发（原生不联网、不持有令牌）。
+// 原生只负责：面板里展示、手动跳转、以及按设置执行自动跳过。
+enum class SegmentKind { intro, recap, credits, preview };
+
+struct SegmentItem {
+  SegmentKind kind = SegmentKind::intro;
+  double start = 0;
+  /// 结束秒；< 0 表示来源没给结束点（片尾条目常常只有起点），按总时长处理。
+  double end = -1;
+  std::wstring provider;
+  /// 已跳过 / 本次不跳过：不再重复触发。
+  bool consumed = false;
+};
+
+std::vector<SegmentItem> g_segments;
+/// 一次下发的多条片段先攒在这里，等 MOVA_SEGMENTS_DONE 到了再整体替换 ——
+/// 逐条替换会让面板/自动跳过看到半截数据。
+std::vector<SegmentItem> g_segments_pending;
+bool g_segments_loading = false;
+bool g_segments_ready = false;
+std::wstring g_segments_error;
+/// 正在倒计时的那一段（-1 表示没有），以及它的截止时刻。
+int g_skip_index = -1;
+uint64_t g_skip_deadline = 0;
+uint64_t g_skip_hint_shown = 0;
+/// 片段表由 stdin 线程整体替换、主线程读取（面板与自动跳过），所以替换与
+/// 读取都走这把锁。主线程侧一律用 SegmentsSnapshot() 拿副本，避免读到被
+/// 替换到一半的向量。
+std::mutex g_segments_mutex;
+
+/// 播放期间应用侧改了「设置 → 弹幕显示 / 片头片尾」里的项，经 stdin 推过来。
+/// stdin 线程只负责入队并叫醒主线程：这些设置会动窗口（弹幕层要重新贴合、
+/// 重绘），窗口操作必须留在创建它的线程上。
+std::mutex g_live_mutex;
+std::vector<std::pair<std::string, std::string>> g_live_pending;
 
 enum class PanelRow {
   /// 可选项：图标 + 标题 + 明细 + 末尾状态图标，对齐应用内「预选音轨与字幕」。
@@ -491,11 +770,222 @@ std::wstring Wide(const std::string& value) {
   return output;
 }
 
+// 切到播放列表的第 index 项。mpv 里始终只装着这一项，所以换集必须用
+// loadfile 而不是 playlist-next / playlist-pos —— 后者在单项列表上无效。
+// 索引由我们自己维护，Dart 侧据此跟踪集数、切换缓存与预加载下一集。
+bool LoadPlaylistEntry(int64_t index) {
+  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
+    return false;
+  }
+  g_playlist_position = index;
+  g_cache_fraction = 0;
+  g_playback_error = false;
+  g_last_valid_position = 0;
+  // 换了一集：中断重试的预算重新给（见 kMaxInterruptRetries 的注释）。
+  g_retry_count = 0;
+  g_resume_seconds = 0;
+  const char* args[] = {"loadfile",
+                        g_media_urls[static_cast<size_t>(index)].c_str(),
+                        "replace", nullptr};
+  if (!g_handle) return false;
+  return g_mpv.command(g_handle, args) >= 0;
+}
+
+// 在同一集上重开一次。用于播放中断的自动重试：注意它**不走**
+// LoadPlaylistEntry()——那里会把重试预算清零，一抖就无限重试了。
+// 位置不在这里 seek：文件还没加载完时发 seek 会落空，改在 FILE_LOADED 里补。
+bool RetryCurrentEpisode() {
+  if (!g_handle) return false;
+  const int64_t index = g_playlist_position.load();
+  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
+    return false;
+  }
+  const double resume = g_last_valid_position.load();
+  // 退回最后一次有效位置即可，不用减偏移：这一集本来就是从这里断的。
+  g_resume_seconds = resume > 1.0 ? resume : 0.0;
+  const char* args[] = {"loadfile",
+                        g_media_urls[static_cast<size_t>(index)].c_str(),
+                        "replace", nullptr};
+  if (g_mpv.command(g_handle, args) < 0) {
+    g_resume_seconds = 0;
+    return false;
+  }
+  g_cache_fraction = 0;
+  g_playback_error = false;
+  g_retry_stamp = GetTickCount64();
+  char trace[96]{};
+  std::snprintf(trace, sizeof(trace), "MOVA_RETRY=%lld|%.3f\r\n",
+                static_cast<long long>(index), g_resume_seconds.load());
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (output && output != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(output, trace, static_cast<DWORD>(std::strlen(trace)), &written,
+              nullptr);
+  }
+  return true;
+}
+
 // 一行反馈。以前是 mpv 的 show-text，字体、位置、配色全是 mpv 的；现在和面板
 // 走同一个自绘浮层，位置也固定贴在控件条上方，不再压在画面中间。
 void ShowToast(const std::string& text) {
   if (text.empty()) return;
   ShowHint(Wide(text), std::wstring(), 0, HintMode::Toast, -1.0f, 0);
+}
+
+// ===================== 片头片尾 =====================
+void HideHint();
+
+const wchar_t* SegmentLabel(SegmentKind kind) {
+  switch (kind) {
+    case SegmentKind::recap:
+      return L"前情提要";
+    case SegmentKind::credits:
+      return L"片尾";
+    case SegmentKind::preview:
+      return L"下集预告";
+    default:
+      return L"片头";
+  }
+}
+
+std::wstring SegmentGlyphLabel(SegmentKind kind) {
+  return std::wstring(SegmentLabel(kind));
+}
+
+// 段落的结束秒。来源只给起点时（公共库的片尾大多是这种）退回总时长 ——
+// 播放器里读的总时长比任何推测都可靠。
+double SegmentEnd(const SegmentItem& segment) {
+  if (segment.end > segment.start) return segment.end;
+  const double duration = g_duration.load();
+  return duration > segment.start ? duration : segment.start;
+}
+
+// 一批片段下发完（MOVA_SEGMENTS_DONE）才整体换上去，避免面板和自动跳过
+// 看到「只到了一半」的中间状态。由 stdin 线程调用。
+void ApplyPendingSegments() {
+  {
+    std::lock_guard<std::mutex> guard(g_segments_mutex);
+    g_segments = std::move(g_segments_pending);
+  }
+  g_segments_pending.clear();
+  g_segments_ready = true;
+}
+
+/// 主线程侧的读取入口：拿一份副本，锁只在这个函数里短短持有一瞬间。
+std::vector<SegmentItem> SegmentsSnapshot() {
+  std::lock_guard<std::mutex> guard(g_segments_mutex);
+  return g_segments;
+}
+
+bool SegmentActive(const SegmentItem& segment, double position, double duration) {
+  if (segment.consumed) return false;
+  const double end = SegmentEnd(segment);
+  if (end <= segment.start) return false;
+  if (position < segment.start || position >= end) return false;
+  // 数据体检：片头类的片段必须落在前半段、片尾必须落在后半段。公共库偶尔
+  // 会把整集标成片头、或者把一个错的时间点当片尾，照着跳会直接跳到结尾。
+  if (segment.kind == SegmentKind::credits) {
+    if (duration <= 0 || segment.start < duration * 0.5) return false;
+  } else if (duration > 0 && segment.start > duration * 0.5) {
+    return false;
+  }
+  return true;
+}
+
+int ActiveSegmentIndex(const std::vector<SegmentItem>& segments, double position,
+                       double duration) {
+  for (size_t index = 0; index < segments.size(); ++index) {
+    if (SegmentActive(segments[index], position, duration)) {
+      return static_cast<int>(index);
+    }
+  }
+  return -1;
+}
+
+// 跳过一个片段。片头 / 前情 / 预告跳到它的结束点；片尾则前进到下一集
+// （已经是最后一集时跳到结尾，让「播完」按正常 EOF 处理）。
+void SkipSegment(size_t index, bool automatic) {
+  SegmentItem segment;
+  {
+    std::lock_guard<std::mutex> guard(g_segments_mutex);
+    if (index >= g_segments.size()) return;
+    g_segments[index].consumed = true;
+    segment = g_segments[index];
+  }
+  g_skip_index = -1;
+  HideHint();
+  const std::wstring label = SegmentGlyphLabel(segment.kind);
+  if (segment.kind == SegmentKind::credits) {
+    if (LoadPlaylistEntry(g_playlist_position.load() + 1)) {
+      ShowControls();
+      ShowToast(Utf8(automatic ? label + L"已跳过，正在播放下一集"
+                               : label + L"已跳过"));
+      return;
+    }
+    const double duration = g_duration.load();
+    if (duration > 0) {
+      MpvCommand("seek", std::to_string(duration).c_str(), "absolute");
+    }
+    ShowControls();
+    ShowToast(Utf8(label) + "已跳过");
+    return;
+  }
+  double end = SegmentEnd(segment);
+  const double duration = g_duration.load();
+  // 片段数据来自公共库，结束点偶尔跑到总时长之外（拿错版本，或时长字段是按
+  // 另一个版本算的）。照跳就会 seek 到文件之外：mpv 立刻报到结尾，位置校验
+  // 看到「已经播到片尾」，于是当成正常播完去切下一集 —— 表现就是「自动跳过
+  // 之后直接跳集」。留 1 秒余量，落到文件里才跳。
+  if (duration > 0 && end > duration) end = duration - 1.0;
+  if (end <= segment.start + 0.5) return;
+  // 位置已经越过结束点（重复下发的数据、用户手动拖过）就不必再跳。
+  if (g_position.load() >= end - 0.5) return;
+  MpvCommand("seek", std::to_string(end).c_str(), "absolute");
+  ShowControls();
+  ShowToast(Utf8(automatic ? label + L"已自动跳过" : label + L"已跳过"));
+}
+
+// 自动跳过：位置落进某个片段后先提示、按设置里的秒数倒计时，到点才跳。
+// 倒计时期间用户可以在「片头片尾」面板里点「本次不跳过」取消。
+void UpdateAutoSkip(uint64_t now) {
+  if (!g_auto_skip_segments || g_paused.load()) {
+    g_skip_index = -1;
+    return;
+  }
+  const auto segments = SegmentsSnapshot();
+  if (segments.empty()) {
+    g_skip_index = -1;
+    return;
+  }
+  const int candidate =
+      ActiveSegmentIndex(segments, g_position.load(), g_duration.load());
+  if (candidate < 0) {
+    g_skip_index = -1;
+    return;
+  }
+  if (candidate != g_skip_index) {
+    g_skip_index = candidate;
+    g_skip_deadline = now + static_cast<uint64_t>(
+                                std::max(0.0, g_skip_delay_seconds) * 1000.0);
+    g_skip_hint_shown = 0;
+  }
+  const double remaining = g_skip_deadline > now
+                               ? static_cast<double>(g_skip_deadline - now) / 1000.0
+                               : 0.0;
+  // 每半秒刷一次提示：文案里的剩余秒数要跟着走，进度条也才有推进感。
+  if (g_skip_hint_shown == 0 || now - g_skip_hint_shown >= 500) {
+    g_skip_hint_shown = now;
+    const double total = std::max(0.1, g_skip_delay_seconds);
+    const std::wstring label = SegmentGlyphLabel(segments[candidate].kind);
+    ShowHint(
+        label + L" · " + std::to_wstring(static_cast<int>(remaining + 0.999)) +
+            L" 秒后跳过",
+        L"打开菜单可取消", 0, HintMode::Toast,
+        static_cast<float>(std::clamp(1.0 - remaining / total, 0.0, 1.0)), 0);
+  }
+  if (now >= g_skip_deadline) {
+    SkipSegment(static_cast<size_t>(candidate), true);
+  }
 }
 
 struct MediaTrack {
@@ -771,25 +1261,434 @@ void ShowPictureMenu(PanelAnchor anchor) {
   OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
 
+// ---- 弹幕显示设置 --------------------------------------------------------
+//
+// 与应用「设置 → 弹幕显示」是同一批值、同一批 SharedPreferences 键：
+// 面板里改完立刻作用于已加载的弹幕，并把新值回传应用写盘（MOVA_SETTING），
+// 下次起播直接沿用，两边不会各说各话。
+void EmitSetting(const std::string& key, const std::string& value) {
+  char text[192]{};
+  const int length = std::snprintf(text, sizeof(text), "MOVA_SETTING=%s|%s\r\n",
+                                   key.c_str(), value.c_str());
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+    DWORD written = 0;
+    WriteFile(output, text, static_cast<DWORD>(length), &written, nullptr);
+  }
+}
+
+// 画面比例在设置页里存的是标签（自动 / 16:9 / 4:3 / 21:9），mpv 这边用的是比例
+// 数值 —— 回写时得转回同一套说法，否则设置页那条下拉读不出自己的值。
+std::string AspectPreferenceLabel(const std::string& value) {
+  const double ratio = std::strtod(value.c_str(), nullptr);
+  if (ratio <= 0.0001) return "自动";
+  if (std::abs(ratio - 1.7777778) < 0.01) return "16:9";
+  if (std::abs(ratio - 1.3333333) < 0.01) return "4:3";
+  if (std::abs(ratio - 2.3333333) < 0.01) return "21:9";
+  return "自动";
+}
+
+// 控件菜单里改的播放器偏好要沿用到下一次播放：把 mpv 属性回写成应用偏好，应用
+// 侧起播时再下发回来。以前只在本次播放里生效，下次播又回到设置页里的旧值，
+// 用户会以为「改了没用」。
+//
+// 应用侧对回写有白名单（见 windows_native_player.dart 的 _saveNativeSetting），
+// 这里列出的就是白名单里的那几个键，多发的会被丢掉。
+void EmitPlayerPreference(const std::string& property,
+                          const std::string& value) {
+  if (property == "speed") {
+    EmitSetting("yingji.player.speed", value);
+  } else if (property == "volume") {
+    EmitSetting("yingji.player.volume", value);
+  } else if (property == "brightness") {
+    EmitSetting("yingji.player.brightness", value);
+  } else if (property == "video-aspect-override") {
+    EmitSetting("yingji.player.aspect", AspectPreferenceLabel(value));
+  }
+}
+
+// 音量是连续量：拖一次音量条会连着发出几十个值，逐个回写就是几十次写盘。攒到
+// 手停下来（400ms 没有新值）再回写一次，播放器退出前的那次也会被 TickFrame
+// 收尾时冲掉。
+double g_volume_pending = -1.0;
+uint64_t g_volume_pending_deadline = 0;
+
+void NoteVolumeForPreference(double volume) {
+  g_volume_pending = volume;
+  g_volume_pending_deadline = GetTickCount64() + 400;
+}
+
+void FlushPendingPlayerPreferences() {
+  if (g_volume_pending < 0.0) return;
+  if (GetTickCount64() < g_volume_pending_deadline) return;
+  const double volume = g_volume_pending;
+  g_volume_pending = -1.0;
+  char text[32]{};
+  std::snprintf(text, sizeof(text), "%g", volume);
+  EmitSetting("yingji.player.volume", text);
+}
+
+std::string NumberText(double value) {
+  char text[32]{};
+  std::snprintf(text, sizeof(text), "%g", value);
+  return text;
+}
+
+/// 在当前值之后找下一个档位，到头回到第一个。面板里每点一次前进一档，
+/// 一屏就把所有可调项摆完，不必为每个档位单开一行。
+std::string NextStep(const std::vector<double>& steps, double current) {
+  for (const double step : steps) {
+    if (step > current + 0.001) return NumberText(step);
+  }
+  return NumberText(steps.empty() ? current : steps.front());
+}
+
+std::wstring DanmakuAreaLabel(double value) {
+  return std::to_wstring(static_cast<int>(std::lround(value * 100))) + L"%";
+}
+
+std::wstring DanmakuOpacityLabel(double value) {
+  if (value < 0.7) return L"淡";
+  if (value < 0.95) return L"标准";
+  return L"清晰";
+}
+
+std::wstring DanmakuFontLabel(double value) {
+  if (value < 16.5) return L"小";
+  if (value < 20.5) return L"标准";
+  return L"大";
+}
+
+std::wstring DanmakuSpeedLabel(double value) {
+  if (value < 0.85) return L"慢";
+  if (value < 1.25) return L"标准";
+  return L"快";
+}
+
+std::wstring DanmakuDensityLabel(double value) {
+  if (value < 0.45) return L"稀疏";
+  if (value < 0.7) return L"标准";
+  return L"密集";
+}
+
+void ApplyDanmakuSetting(const std::string& name, const std::string& value) {
+  const double number = std::strtod(value.c_str(), nullptr);
+  std::string emitted = value;
+  if (name == "area") {
+    g_danmaku_area = std::clamp(number, 0.2, 1.0);
+    // 区域变了要把弹幕窗口重新贴合：窗口高度就是这块区域的高度。
+    PositionDanmaku();
+    emitted = NumberText(g_danmaku_area);
+  } else if (name == "opacity") {
+    g_danmaku_opacity = std::clamp(number, 0.15, 1.0);
+    emitted = NumberText(g_danmaku_opacity);
+  } else if (name == "font-size") {
+    g_danmaku_font_size = std::clamp(number, 12.0, 30.0);
+    // 字号变了由绘制侧按缓存里的字号重建字体并重测文本宽度（见 PaintDanmaku）。
+    emitted = NumberText(g_danmaku_font_size);
+  } else if (name == "speed") {
+    g_danmaku_speed = std::clamp(number, 0.5, 2.0);
+    emitted = NumberText(g_danmaku_speed);
+  } else if (name == "density") {
+    g_danmaku_density = std::clamp(number, 0.2, 1.0);
+    emitted = NumberText(g_danmaku_density);
+  } else if (name == "scroll") {
+    g_danmaku_scroll = value == "true";
+    emitted = g_danmaku_scroll ? "true" : "false";
+  } else if (name == "top") {
+    g_danmaku_top = value == "true";
+    emitted = g_danmaku_top ? "true" : "false";
+  } else if (name == "bottom") {
+    g_danmaku_bottom = value == "true";
+    emitted = g_danmaku_bottom ? "true" : "false";
+  } else {
+    return;
+  }
+  // 关掉某一类弹幕时把已经在屏的那些一起撤掉，否则要等它们自己飞出去，
+  // 看起来像「关不掉」。原地置为 played，重新开启时不会又冒出来。
+  //
+  // 只动「正在屏上」的那几条（item.live）。以前这里扫的是整集列表，把还没
+  // 到时间的弹幕也一并写成 played —— 关掉再打开某个开关后，那一类弹幕在
+  // 本集里就再也不出现了（看起来像「改完设置弹幕就没了」）。未来的条目必须
+  // 原样留着，等播放到它们的时间点时照常出现。
+  if (name == "scroll" || name == "top" || name == "bottom") {
+    for (auto& item : g_danmaku_items) {
+      if (!item.live) continue;
+      const bool top = item.mode == 4 || item.mode == 5;
+      const bool bottom = item.mode == 6;
+      const bool hidden = (top && !g_danmaku_top) ||
+                          (bottom && !g_danmaku_bottom) ||
+                          (!top && !bottom && !g_danmaku_scroll);
+      if (hidden) {
+        item.live = false;
+        item.played = true;
+        item.lane = -1;
+      }
+    }
+    // 撤掉了一整类弹幕，只把**它们占的**轨道还回来。不能整体归零：还在屏上的
+    // 那些（比如关了顶弹幕、滚动弹幕照旧在飞）仍然占着自己的轨道，归零会让新
+    // 条目立刻挤进同一条轨道，糊成一片，要等旧的那批飞出去才恢复。
+    ResetDanmakuLaneFree();
+    for (const DanmakuItem* pointer : g_danmaku_live) {
+      const DanmakuItem& item = *pointer;
+      if (item.lane < 0 ||
+          item.lane >= static_cast<int>(g_danmaku_lane_free.size()))
+        continue;
+      double& slot = g_danmaku_lane_free[static_cast<size_t>(item.lane)];
+      slot = std::max(slot, item.free_at);
+    }
+  }
+  EmitSetting("yingji.danmaku." + name, emitted);
+  g_danmaku_dirty = true;
+  if (g_danmaku) InvalidateRect(g_danmaku, nullptr, FALSE);
+}
+
+/// 归一化 yes/no 与 true/false：命令行沿用的是 yes/no（同 mpv 参数风格），
+/// 面板点击回传的是 true/false，热更新两种都可能收到。
+bool LiveFlag(const std::string& value) {
+  return value == "yes" || value == "true";
+}
+
+/// 设置的「热更新」入口：播放期间从设置页改了下面这些项，应用侧经 stdin 推
+/// 过来，就地生效 —— 以前这些值只在起播时以命令行下发一次，播放中改设置页
+/// 要等下一次播放才生效，两边的显示会各说各话。
+///
+/// 返回是否产生了实际变化。命令行解析与 stdin 热更新共用这一份实现，值域与
+/// 副作用（重新贴合弹幕层、重绘、取消倒计时）不会分叉。
+bool ApplyLiveOption(const std::string& name, const std::string& value) {
+  if (name == "mova-danmaku-enabled") {
+    const bool enabled = LiveFlag(value);
+    if (enabled == g_danmaku_enabled) return false;
+    g_danmaku_enabled = enabled;
+    if (!enabled) {
+      // 关掉时把已解析的弹幕一起丢掉，重开由应用侧重新拉一集再推。
+      g_danmaku_items.clear();
+      g_danmaku_loaded = false;
+      g_danmaku_live.clear();
+      g_danmaku_dropped = 0;
+      ResetDanmakuLaneFree();
+      if (g_danmaku) ShowWindow(g_danmaku, SW_HIDE);
+    } else if (!g_danmaku_path.empty()) {
+      PostMessageW(g_window, kDanmakuReload, 0, 0);
+    }
+    if (g_danmaku) InvalidateRect(g_danmaku, nullptr, FALSE);
+    return true;
+  }
+  if (name.rfind("mova-danmaku-", 0) == 0) {
+    const std::string key = name.substr(13);
+    std::string normalized = value;
+    if (key == "scroll" || key == "top" || key == "bottom") {
+      normalized = LiveFlag(value) ? "true" : "false";
+    }
+    ApplyDanmakuSetting(key, normalized);
+    return true;
+  }
+  if (name == "mova-auto-skip-segments") {
+    const bool enabled = LiveFlag(value);
+    if (enabled == g_auto_skip_segments) return false;
+    g_auto_skip_segments = enabled;
+    if (!enabled) {
+      // 设置页里关掉自动跳过时，正在倒计时的那一段也要立刻停手。
+      g_skip_index = -1;
+      HideHint();
+    }
+    return true;
+  }
+  if (name == "mova-skip-delay-seconds") {
+    g_skip_delay_seconds = std::clamp(
+        std::strtod(value.c_str(), nullptr), 0.0, 30.0);
+    return true;
+  }
+  // 快进步长与音量步长同属「播放器设置」，改了立刻生效才符合直觉：设置页把
+  // 方向键快进调成 30 秒，回到播放器还按 10 秒跳就很别扭。
+  if (name == "mova-seek-seconds") {
+    g_seek_seconds = std::max(1.0, std::strtod(value.c_str(), nullptr));
+    return true;
+  }
+  if (name == "mova-volume-step") {
+    g_volume_step = std::max(1.0, std::strtod(value.c_str(), nullptr));
+    return true;
+  }
+  // 播放器偏好（倍速 / 音量 / 亮度 / 画面比例）：设置页里改了要立刻作用到正在
+  // 播放的这一集，走的就是面板点击那条 mpv 属性写入路径，改完的提示与数值回填
+  // 也一致。它们不是 mova- 前缀的参数，所以单列一组（见 IsLiveApplyName）。
+  if (name == "speed" || name == "volume" || name == "brightness" ||
+      name == "video-aspect-override") {
+    MpvCommand("set", name.c_str(), value.c_str());
+    return true;
+  }
+  return false;
+}
+
+/// 哪些参数既能在命令行里给（起播时的初始值），也能在播放期间经 stdin 热更新。
+/// mova-danmaku-file 是例外：那条带的是临时文件路径，由 stdin 单独处理。
+bool IsLiveSettingName(const std::string& name) {
+  return name == "mova-auto-skip-segments" ||
+         name == "mova-skip-delay-seconds" ||
+         name == "mova-seek-seconds" || name == "mova-volume-step" ||
+         (name.rfind("mova-danmaku-", 0) == 0 && name != "mova-danmaku-file");
+}
+
+/// stdin 的 MOVA_APPLY 还接受一组播放器偏好：它们在命令行里走 mpv 自己的参数
+/// （--speed= / --volume= …），不是 mova- 前缀，所以不并进 IsLiveSettingName，
+/// 免得起播时也被当成「热更新」处理一遍。
+bool IsLiveApplyName(const std::string& name) {
+  return IsLiveSettingName(name) || name == "speed" || name == "volume" ||
+         name == "brightness" || name == "video-aspect-override";
+}
+
 void ShowDanmakuMenu(PanelAnchor anchor) {
   std::vector<PanelItem> items;
-  items.push_back(PanelHeader(L'\xED93', L"弹幕", std::wstring()));
-  items.push_back(PanelNote(kGlyphInfo, g_danmaku_enabled
-                                          ? L"弹幕已在设置中开启"
-                                          : L"弹幕未开启"));
-  items.push_back(PanelNote(kGlyphInfo, L"Windows 原生窗口暂不渲染弹幕"));
-  items.push_back(PanelNote(kGlyphInfo, L"请使用应用内播放器查看弹幕"));
+  std::wstring header;
+  if (!g_danmaku_enabled) {
+    header = L"已关闭";
+  } else if (g_danmaku_loading) {
+    header = L"获取中";
+  } else if (g_danmaku_count > 0) {
+    header = std::to_wstring(g_danmaku_count) + L" 条";
+  } else {
+    header = L"无数据";
+  }
+  items.push_back(PanelHeader(L'\xED93', L"弹幕", header));
+
+  if (!g_danmaku_enabled) {
+    items.push_back(PanelNote(kGlyphInfo, L"弹幕已在设置中关闭"));
+    items.push_back(PanelNote(kGlyphInfo, L"开启后播放开始时会自动获取"));
+  } else if (g_danmaku_loading) {
+    items.push_back(PanelNote(kGlyphInfo, L"正在从弹幕服务获取…"));
+    items.push_back(PanelNote(kGlyphInfo, L"获取完成后会自动叠加到画面上"));
+  } else if (!g_danmaku_error.empty()) {
+    items.push_back(PanelNote(kGlyphInfo, L"获取失败：" + g_danmaku_error));
+    items.push_back(PanelNote(kGlyphInfo, L"可检查弹幕 API 地址与网络代理"));
+  } else if (g_danmaku_count > 0) {
+    items.push_back(PanelNote(
+        kGlyphInfo, L"已加载 " + std::to_wstring(g_danmaku_count) + L" 条弹幕"));
+    if (!g_danmaku_matched.empty()) {
+      items.push_back(PanelNote(kGlyphInfo, L"匹配：" + g_danmaku_matched));
+    }
+    if (!g_danmaku_source.empty()) {
+      items.push_back(PanelNote(kGlyphInfo, L"来自：" + g_danmaku_source));
+    }
+    const int area_percent = static_cast<int>(g_danmaku_area * 100);
+    items.push_back(PanelNote(kGlyphInfo, L"显示区域：画面上部 " +
+                                              std::to_wstring(area_percent) +
+                                              L"%"));
+  } else {
+    items.push_back(PanelNote(kGlyphInfo, L"当前片源没有匹配的弹幕"));
+    items.push_back(PanelNote(kGlyphInfo, L"弹幕库未收录该作品时不会有数据"));
+  }
+
+  // 显示设置：与应用「设置 → 弹幕显示」一一对应，即使当前没拉到数据也能调
+  // （改完立刻生效，并回写应用偏好让下次起播沿用）。每项一行、点按前进一档，
+  // 面板不会因为档位多而滚不到底。
+  items.push_back(PanelHeader(kGlyphCrop, L"显示设置", DanmakuAreaLabel(g_danmaku_area)));
+  const double area = g_danmaku_area;
+  items.push_back(PanelOption(
+      kGlyphCrop, L"显示区域",
+      // 四档比其它项多一档，写全「25% / 50% / 75% / 100%」会被行宽截断成
+      // 「10…」，所以省掉每个百分号后的空格。
+      L"当前 " + DanmakuAreaLabel(area) + L" · 可选 25/50/75/100",
+      "mova-danmaku-area", NextStep({0.25, 0.5, 0.75, 1.0}, area), "", false));
+  const double opacity = g_danmaku_opacity;
+  items.push_back(PanelOption(
+      kGlyphSparkles, L"不透明度",
+      L"当前 " + DanmakuOpacityLabel(opacity) + L" · 可选 淡 / 标准 / 清晰",
+      "mova-danmaku-opacity", NextStep({0.55, 0.82, 1.0}, opacity), "", false));
+  const double font = g_danmaku_font_size;
+  items.push_back(PanelOption(
+      kGlyphSubtitle, L"字号",
+      L"当前 " + DanmakuFontLabel(font) + L" · 可选 小 / 标准 / 大",
+      "mova-danmaku-font-size", NextStep({15.0, 18.0, 22.0}, font), "", false));
+  const double speed = g_danmaku_speed;
+  items.push_back(PanelOption(
+      kGlyphGauge, L"滚动速度",
+      L"当前 " + DanmakuSpeedLabel(speed) + L" · 可选 慢 / 标准 / 快",
+      "mova-danmaku-speed", NextStep({0.7, 1.0, 1.5}, speed), "", false));
+  const double density = g_danmaku_density;
+  items.push_back(PanelOption(
+      kGlyphEpisodes, L"同屏密度",
+      L"当前 " + DanmakuDensityLabel(density) + L" · 可选 稀疏 / 标准 / 密集",
+      "mova-danmaku-density", NextStep({0.35, 0.55, 0.8}, density), "", false));
+  items.push_back(PanelOption(
+      kGlyphCheckCircle, L"滚动弹幕",
+      g_danmaku_scroll ? L"已开启 · 点按关闭" : L"已关闭 · 点按开启",
+      "mova-danmaku-scroll", g_danmaku_scroll ? "false" : "true", "",
+      g_danmaku_scroll));
+  items.push_back(PanelOption(
+      kGlyphCheckCircle, L"顶部弹幕",
+      g_danmaku_top ? L"已开启 · 点按关闭" : L"已关闭 · 点按开启",
+      "mova-danmaku-top", g_danmaku_top ? "false" : "true", "",
+      g_danmaku_top));
+  items.push_back(PanelOption(
+      kGlyphCheckCircle, L"底部弹幕",
+      g_danmaku_bottom ? L"已开启 · 点按关闭" : L"已关闭 · 点按开启",
+      "mova-danmaku-bottom", g_danmaku_bottom ? "false" : "true", "",
+      g_danmaku_bottom));
   OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
 
 void ShowSegmentMenu(PanelAnchor anchor) {
   std::vector<PanelItem> items;
-  items.push_back(PanelHeader(L'\xEE3E', L"片头片尾", std::wstring()));
-  items.push_back(PanelNote(kGlyphInfo, g_auto_skip_segments
-                                          ? L"自动跳过已开启"
-                                          : L"自动跳过未开启"));
-  items.push_back(PanelNote(kGlyphInfo, L"当前片源未传入片头片尾时间点"));
-  items.push_back(PanelNote(kGlyphInfo, L"可在应用内播放器中使用片段跳转"));
+  const auto segments = SegmentsSnapshot();
+  std::wstring badge;
+  if (g_segments_loading) {
+    badge = L"获取中";
+  } else if (!segments.empty()) {
+    badge = std::to_wstring(segments.size()) + L" 段";
+  } else {
+    badge = L"无数据";
+  }
+  items.push_back(PanelHeader(kGlyphScissors, L"片头片尾", badge));
+  // 自动跳过做成开关行（而不是只读说明）：这个开关在应用设置页里也有，
+  // 两边都能改、改完互相回写，就不会出现「设置页关了但播放器还在跳」。
+  items.push_back(PanelOption(
+      kGlyphCheckCircle, L"自动跳过",
+      g_auto_skip_segments ? L"已开启 · 进入片段先提示再跳转，点按关闭"
+                           : L"已关闭 · 点按开启",
+      "mova-auto-skip-segments", g_auto_skip_segments ? "false" : "true", "",
+      g_auto_skip_segments));
+  if (g_segments_loading) {
+    items.push_back(PanelNote(kGlyphInfo, L"正在按设置里的来源获取…"));
+  } else if (!g_segments_error.empty()) {
+    items.push_back(PanelNote(kGlyphInfo, g_segments_error));
+  }
+  for (size_t index = 0; index < segments.size(); ++index) {
+    const SegmentItem& segment = segments[index];
+    const std::wstring kind = SegmentGlyphLabel(segment.kind);
+    std::wstring detail;
+    if (!segment.provider.empty()) {
+      detail = L"来源 " + segment.provider + L" · ";
+    }
+    detail += L"点按跳到 " + ClockLabel(SegmentEnd(segment));
+    PanelItem row = PanelOption(
+        kGlyphScissors,
+        kind + L" " + ClockLabel(segment.start) + L" – " +
+            ClockLabel(SegmentEnd(segment)),
+        detail, "mova-seek", std::to_string(index),
+        Utf8(kind) + "已跳过", segment.consumed);
+    // 已经处理过的段落置灰：留一行说明「这段跳过过了」，但不再重复触发。
+    row.enabled = !segment.consumed;
+    items.push_back(std::move(row));
+  }
+  if (segments.empty() && !g_segments_loading && g_segments_error.empty()) {
+    items.push_back(PanelNote(kGlyphInfo, L"当前片源没有可用的片头片尾数据"));
+    items.push_back(PanelNote(kGlyphInfo, L"可在设置里勾选更多来源"));
+  }
+  // 倒计时进行中：给出取消入口（提示浮层上写着的正是「打开菜单可取消」）。
+  if (g_skip_index >= 0 && g_skip_index < static_cast<int>(segments.size()) &&
+      !segments[static_cast<size_t>(g_skip_index)].consumed) {
+    items.push_back(PanelOption(
+        kGlyphInfo, L"本次不跳过",
+        std::wstring(SegmentLabel(segments[static_cast<size_t>(g_skip_index)].kind)) +
+            L" 即将在 " +
+            std::to_wstring(std::max(
+                0, static_cast<int>((g_skip_deadline > GetTickCount64()
+                                         ? g_skip_deadline - GetTickCount64()
+                                         : 0) /
+                                    1000))) +
+            L" 秒后跳过",
+        "mova-skip-cancel", "", "本次不再跳过", false));
+  }
   OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
 
@@ -891,7 +1790,7 @@ void ShowEpisodeMenu(PanelAnchor anchor) {
         index < g_playlist_durations.size() ? g_playlist_durations[index] : 0.0,
         selected,
         index < g_playlist_watched.size() ? g_playlist_watched[index] : false);
-    card.property = "playlist-pos";
+    card.property = "mova-playlist-index";
     card.value = std::to_string(index);
     card.toast = "正在播放 " + Utf8(label);
     items.push_back(std::move(card));
@@ -1012,6 +1911,8 @@ void PositionControls() {
     SetWindowPos(g_panel, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   }
+  // 弹幕层覆盖整块视频区，随窗口尺寸/位置一起贴合。
+  if (g_danmaku) PositionDanmaku();
 }
 
 // 控件条顶边的屏幕 y。底部工具的面板挂在它上方，而不是挂在被点击的像素上 ——
@@ -2079,34 +2980,57 @@ struct PanelSurface {
   HBITMAP bitmap = nullptr;
   HGDIOBJ previous = nullptr;
   Gdiplus::Bitmap* target = nullptr;
+  BYTE* bits = nullptr;
+  int width = 0;
+  int height = 0;
 
   ~PanelSurface() { Destroy(); }
 
-  bool Create(int width, int height) {
-    if (width <= 0 || height <= 0) return false;
+  // 参数不能叫 width/height：会遮蔽同名成员，项目按 /W4 /WX 编译，C4458
+  // 会被当成错误（C2220）直接挂掉构建。
+  bool Create(int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    // 先释放上一块：弹幕层会随「显示区域」改档反复重建，直接覆盖 dc / bitmap /
+    // target 会让旧的 DC 与位图再也回收不了（每调一档漏一块整屏位图）。
+    Destroy();
     dc = CreateCompatibleDC(nullptr);
     if (!dc) return false;
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;  // top-down
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;  // top-down
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bitmap || !bits) return false;
+    void* raw = nullptr;
+    bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &raw, nullptr, 0);
+    if (!bitmap || !raw) return false;
     previous = SelectObject(dc, bitmap);
-    memset(bits, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+    bits = static_cast<BYTE*>(raw);
+    width = w;
+    height = h;
+    Clear();
     target = new Gdiplus::Bitmap(width, height, width * 4,
-                                 PixelFormat32bppPARGB,
-                                 static_cast<BYTE*>(bits));
+                                 PixelFormat32bppPARGB, bits);
     return target->GetLastStatus() == Gdiplus::Ok;
   }
+
+  // 复用同一块 DIB 画下一帧：省掉每帧 CreateDIBSection + new Bitmap。
+  // 弹幕层每帧都要重画整屏，这块开销在 60fps 下非常可观。
+  void Clear() {
+    if (!bits || width <= 0 || height <= 0) return;
+    memset(bits, 0,
+           static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+  }
+
+  bool Matches(int w, int h) const { return w == width && h == height; }
 
   void Destroy() {
     delete target;
     target = nullptr;
+    bits = nullptr;
+    width = 0;
+    height = 0;
     if (dc && previous) SelectObject(dc, previous);
     previous = nullptr;
     if (bitmap) DeleteObject(bitmap);
@@ -2114,7 +3038,54 @@ struct PanelSurface {
     if (dc) DeleteDC(dc);
     dc = nullptr;
   }
+
+  // 诊断用：把这块 DIB 直接导出成 BMP（32bpp，与内存里的 BGRA 顺序一致）。
+  // 面板是 layered 窗口（UpdateLayeredWindow），像素只存在于这块位图里，抓屏
+  // 抓到的是压在上面的别的窗口、PrintWindow 也拿不到 —— 想离线核对面板长什么
+  // 样，只能从这里导出（见 MOVA_TRACE_PANEL）。
+  bool SaveBmp(const std::wstring& path) const {
+    if (!bits || width <= 0 || height <= 0) return false;
+    BITMAPFILEHEADER file{};
+    BITMAPINFOHEADER info{};
+    info.biSize = sizeof(BITMAPINFOHEADER);
+    info.biWidth = width;
+    info.biHeight = -height;  // top-down，和 DIB 的内存顺序一致
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    info.biCompression = BI_RGB;
+    info.biSizeImage = static_cast<DWORD>(width) * 4u * static_cast<DWORD>(height);
+    file.bfType = 0x4D42;
+    file.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    file.bfSize = file.bfOffBits + info.biSizeImage;
+    FILE* handle = nullptr;
+    if (_wfopen_s(&handle, path.c_str(), L"wb") != 0 || !handle) return false;
+    std::fwrite(&file, sizeof(file), 1, handle);
+    std::fwrite(&info, sizeof(info), 1, handle);
+    std::fwrite(bits, info.biSizeImage, 1, handle);
+    std::fclose(handle);
+    return true;
+  }
 };
+
+// 诊断开关：设 MOVA_TRACE_PANEL=<目录> 后，面板每次重绘都把同一块位图备份成
+// panel_NN.bmp（最多 40 张）。正常运行时环境变量不存在，一次查询后直接返回。
+void TracePanelSurface(const PanelSurface& surface,
+                       const wchar_t* prefix = L"panel") {
+  static const std::wstring directory = []() -> std::wstring {
+    wchar_t buffer[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"MOVA_TRACE_PANEL", buffer, MAX_PATH) > 0) {
+      return std::wstring(buffer);
+    }
+    return std::wstring();
+  }();
+  if (directory.empty()) return;
+  static std::unordered_map<std::wstring, int> sequences;
+  int& sequence = sequences[prefix];
+  if (sequence >= 40) return;
+  wchar_t name[48]{};
+  swprintf_s(name, L"\\%s_%02d.bmp", prefix, sequence++);
+  surface.SaveBmp(directory + name);
+}
 
 void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                        float width, float height) {
@@ -2209,6 +3180,7 @@ void PresentPanel(HWND window, int width, int height) {
   blend.AlphaFormat = AC_SRC_ALPHA;
   UpdateLayeredWindow(window, nullptr, nullptr, &size, surface.dc, &source, 0,
                       &blend, ULW_ALPHA);
+  TracePanelSurface(surface);
 }
 
 LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
@@ -2262,8 +3234,52 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
           EmitResourceChoice(std::atoi(item.value.c_str()));
           ShowWindow(window, SW_HIDE);
           SendMessageW(g_window, WM_CLOSE, 0, 0);
+        } else if (item.enabled && item.property == "mova-playlist-index") {
+          // 剧集面板选集：mpv 里只有当前一集，换集必须显式 loadfile。
+          LoadPlaylistEntry(std::atoi(item.value.c_str()));
+          if (!item.toast.empty()) ShowToast(item.toast);
+          ShowWindow(window, SW_HIDE);
+          SetFocus(g_window);
+          ShowControls();
+        } else if (item.enabled && item.property == "mova-seek") {
+          // 片头片尾面板按段落跳转。走 SkipSegment 而不是直接 seek：那里会
+          // 一并标记「这段处理过了」，免得自动跳过紧接着又跳一次。
+          const int segment_index = std::atoi(item.value.c_str());
+          if (segment_index >= 0) {
+            SkipSegment(static_cast<size_t>(segment_index), false);
+          }
+          ShowWindow(window, SW_HIDE);
+          SetFocus(g_window);
+        } else if (item.enabled && item.property == "mova-skip-cancel") {
+          // 取消这一次的自动跳过。面板原地刷新，用户能看到那一行已经变灰。
+          if (g_skip_index >= 0) {
+            std::lock_guard<std::mutex> guard(g_segments_mutex);
+            if (g_skip_index < static_cast<int>(g_segments.size())) {
+              g_segments[static_cast<size_t>(g_skip_index)].consumed = true;
+            }
+          }
+          g_skip_index = -1;
+          HideHint();
+          ShowSegmentMenu(g_panel_anchor);
+          ShowToast("本次不跳过");
+        } else if (item.enabled &&
+                   item.property == "mova-auto-skip-segments") {
+          // 片头片尾的自动跳过开关：就地生效，并把新值回写应用偏好，
+          // 设置页那边下次读到的就是这里改后的值。
+          ApplyLiveOption(item.property, item.value);
+          EmitSetting("yingji.segment.auto-skip",
+                      g_auto_skip_segments ? "true" : "false");
+          ShowSegmentMenu(g_panel_anchor);
+        } else if (item.enabled &&
+                   item.property.rfind("mova-danmaku-", 0) == 0) {
+          // 弹幕显示设置：改完立刻生效，面板就地刷新（不关闭）方便连续调。
+          ApplyDanmakuSetting(item.property.substr(13), item.value);
+          ShowDanmakuMenu(g_panel_anchor);
         } else if (item.enabled && !item.property.empty()) {
           MpvCommand("set", item.property.c_str(), item.value.c_str());
+          // 倍速 / 亮度 / 画面比例属「播放器偏好」：顺手回写应用偏好，下次起播
+          // 按这里设的来（应用侧白名单只收这几个键，别的会被丢掉）。
+          EmitPlayerPreference(item.property, item.value);
           if (!item.toast.empty()) ShowToast(item.toast);
           ShowWindow(window, SW_HIDE);
           SetFocus(g_window);
@@ -2505,6 +3521,673 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   SetWindowPos(g_hint, HWND_TOP, x, y, width, height,
                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   InvalidateRect(g_hint, nullptr, FALSE);
+}
+
+// ===================== 弹幕叠加层 =====================
+// 应用侧拉取弹幕后写入临时文本文件，原生侧读入并在此分层窗口上按播放时间渲染。
+// 文件每行：<time秒>\t<mode>\t<color>\t<base64文本>
+//   mode: 1 滚动, 4/5 顶部, 6 底部；color: 0xRRGGBB, -1 表示默认白。
+// 高精度毫秒读数（QPC）。定义在本文件下方（见 NowMs）。
+// 弹幕的动画时钟、位置插值与每帧的 dt 都靠它 —— 这三处都要亚毫秒精度，
+// 用 GetTickCount64（粒度 15.6ms）会把动画量化成 15.6ms 一跳的台阶。
+double NowMs();
+
+// 弹幕用的播放位置：在 mpv 最后一次回报的位置上按墙钟往前推。
+//
+// mpv 的 time-pos 属性是按它自己的节拍回报的（实测几十毫秒一次），直接拿它判断
+// 「这条弹幕到点了吗」，会让同一批弹幕在同一个上报点上一起冒出来，出现「一阵
+// 一阵」的观感。按墙钟插值之后，到点误差只剩一帧。
+double DanmakuPlayhead() {
+  const double base = g_position.load();
+  if (g_paused.load() || g_buffering.load()) return base;
+  const double tick = g_position_tick.load();
+  if (tick <= 0.0) return base;
+  const double elapsed = (NowMs() - tick) / 1000.0;
+  // 上报停住时（缓冲 / 卡顿）不要一路推下去，最多补半秒。
+  return base + std::clamp(elapsed, 0.0, 0.5) * g_speed.load();
+}
+// 弹幕动画自己的时间轴：暂停 / 缓冲时停走，所以暂停画面里的弹幕是静止的
+// （以前用墙钟，暂停后弹幕还在飘，位置和画面就对不上了）。它同时决定了「这一帧
+// 需不需要重绘」—— 停走的时候没有东西在动，不必每帧把整层 memset 再合成一遍。
+double DanmakuAnimationClock() {
+  // 时间源必须是高精度计数器（QPC），不能用 GetTickCount64：后者的粒度是系统
+  // 时钟节拍（默认 15.6ms），而弹幕位置正是 (时钟 - 出现时刻) × 速度。以
+  // 240px/s 为例，15.6ms 一跳就是每步 3.75px，可帧间隔只有 16.3ms —— 绝大多数
+  // 帧算出来「一点没动」，偶尔又跳两倍，滚动起来就是「一顿一顿」。
+  // 换成 QPC 之后步长与帧间隔一致，位置误差只剩亚像素。
+  const double tick = NowMs();
+  if (g_danmaku_clock_tick == 0.0) {
+    g_danmaku_clock_tick = tick;
+    return g_danmaku_clock;
+  }
+  const double delta = (tick - g_danmaku_clock_tick) / 1000.0;
+  g_danmaku_clock_tick = tick;
+  // 播放中才推进：暂停与缓冲时画面本来就不动，弹幕也该跟着停。
+  if (!g_paused.load() && !g_buffering.load()) {
+    g_danmaku_clock += std::clamp(delta, 0.0, 0.5);
+  }
+  return g_danmaku_clock;
+}
+
+// 高精度毫秒读数，只用于弹幕帧耗时的量化（见 MOVA_TRACE_DANMAKU）。
+// GetTickCount64 的粒度是 15.6ms，量不出「一帧画了几毫秒」。
+double NowMs() {
+  static const double k_frequency = [] {
+    LARGE_INTEGER value{};
+    QueryPerformanceFrequency(&value);
+    return static_cast<double>(value.QuadPart);
+  }();
+  LARGE_INTEGER counter{};
+  QueryPerformanceCounter(&counter);
+  return static_cast<double>(counter.QuadPart) * 1000.0 / k_frequency;
+}
+
+static int DanmakuBase64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+static std::string DanmakuBase64Decode(const std::string& in) {
+  std::string out;
+  int buf = 0, bits = 0;
+  for (const char c : in) {
+    const int v = DanmakuBase64Value(c);
+    if (v < 0) continue;
+    buf = (buf << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+// 按时间找到第一个不早于 seconds 的条目（条目在 LoadDanmaku 里已排好序）。
+size_t DanmakuLowerBound(double seconds) {
+  size_t low = 0, high = g_danmaku_items.size();
+  while (low < high) {
+    const size_t mid = low + (high - low) / 2;
+    if (g_danmaku_items[mid].time < seconds) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+// 把已解析的条目整体换上去。调用方只在主线程（窗口消息）里用，所以不必加锁。
+void AdoptDanmakuItems(std::vector<DanmakuItem> items) {
+  g_danmaku_items = std::move(items);
+  // 按时间排序：每帧只需要从光标往前推，不必整集扫一遍；跳转后也能二分定位。
+  std::stable_sort(g_danmaku_items.begin(), g_danmaku_items.end(),
+                   [](const DanmakuItem& left, const DanmakuItem& right) {
+                     return left.time < right.time;
+                   });
+  g_danmaku_live.clear();
+  g_danmaku_cursor = 0;
+  g_danmaku_last_position = -1.0;
+  g_danmaku_dropped = 0;
+  ResetDanmakuLaneFree();
+  g_danmaku_loaded = !g_danmaku_items.empty();
+}
+
+void LoadDanmaku() {
+  g_danmaku_items.clear();
+  g_danmaku_live.clear();
+  g_danmaku_cursor = 0;
+  g_danmaku_last_position = -1.0;
+  g_danmaku_dropped = 0;
+  ResetDanmakuLaneFree();
+  g_danmaku_loaded = false;
+  if (g_danmaku_path.empty()) return;
+  std::ifstream file(g_danmaku_path);
+  if (!file) return;
+  std::vector<DanmakuItem> items;
+  std::string line;
+  while (std::getline(file, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+      line.pop_back();
+    if (line.empty()) continue;
+    const size_t t1 = line.find('\t');
+    if (t1 == std::string::npos) continue;
+    const size_t t2 = line.find('\t', t1 + 1);
+    if (t2 == std::string::npos) continue;
+    const size_t t3 = line.find('\t', t2 + 1);
+    if (t3 == std::string::npos) continue;
+    DanmakuItem item;
+    item.time = std::strtod(line.c_str(), nullptr);
+    item.mode = std::atoi(line.c_str() + t1 + 1);
+    item.color = std::atoi(line.c_str() + t2 + 1);
+    const std::string utf8 = DanmakuBase64Decode(line.substr(t3 + 1));
+    item.text = Wide(utf8);
+    items.push_back(std::move(item));
+  }
+  AdoptDanmakuItems(std::move(items));
+}
+
+// 把一条弹幕的文字（连同阴影）栅格化成一张刚好包住它的小位图，只做一次。
+// 返回 false 表示这一帧的预算已经用完，调用方下一帧再试。
+bool EnsureDanmakuTexture(DanmakuItem& item, Gdiplus::Graphics& measure,
+                          const Gdiplus::Font& font, float font_size,
+                          const Gdiplus::StringFormat& format, double deadline) {
+  if (item.texture) return true;
+  if (NowMs() >= deadline) return false;
+  Gdiplus::RectF bounds;
+  measure.MeasureString(item.text.c_str(), -1, &font, Gdiplus::PointF(0, 0),
+                        &format, &bounds);
+  item.text_width = bounds.Width;
+  item.font_size = font_size;
+  const int box_width =
+      static_cast<int>(std::ceil(std::max(1.0f, bounds.Width))) +
+      kDanmakuTexturePad * 2;
+  const int box_height =
+      static_cast<int>(std::ceil(font_size * 1.4f)) + kDanmakuTexturePad * 2;
+  auto texture = std::make_shared<DanmakuTexture>();
+  if (!texture->Create(box_width, box_height)) return false;
+  {
+    Gdiplus::Graphics graphics(texture->dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    // 与图标字形同一个理由：网格拟合会把小字号轮廓拉变形，文字用灰度抗锯齿
+    // （用完即弃，不影响别的绘制）。外观与逐帧 DrawString 的时代保持一致。
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    const Gdiplus::Color color =
+        item.color >= 0
+            ? Gdiplus::Color(255, static_cast<BYTE>((item.color >> 16) & 0xFF),
+                             static_cast<BYTE>((item.color >> 8) & 0xFF),
+                             static_cast<BYTE>(item.color & 0xFF))
+            : Gdiplus::Color(255, 255, 255, 255);
+    Gdiplus::SolidBrush brush(color);
+    // 阴影按 0.55 的不透明度画进位图，整体的「不透明度」设置由贴图时的
+    // SourceConstantAlpha 施加 —— 这样拖不透明度滑块不必重新栅格化。
+    Gdiplus::SolidBrush shadow(Gdiplus::Color(140, 0, 0, 0));
+    const float pad = static_cast<float>(kDanmakuTexturePad);
+    const Gdiplus::PointF origin(pad, pad);
+    graphics.DrawString(item.text.c_str(), -1, &font,
+                        Gdiplus::PointF(origin.X + 1.2f, origin.Y + 1.2f),
+                        &format, &shadow);
+    graphics.DrawString(item.text.c_str(), -1, &font, origin, &format, &brush);
+    graphics.Flush(Gdiplus::FlushIntentionSync);
+  }
+  item.texture = std::move(texture);
+  return true;
+}
+
+// 把栅格化好的弹幕贴到弹幕层上：一次 AlphaBlend 就够。滚动弹幕有一半时间在
+// 屏幕外，所以这里要先和自己的窗口求交，把交给 GDI 的矩形裁掉（别指望内存 DC
+// 帮你裁剪 —— 它的裁剪区是设备面，不是这块 DIB）。
+void BlendDanmakuTexture(const PanelSurface& surface,
+                         const DanmakuTexture& texture, int x, int y, int pad,
+                         BYTE alpha, int layer_width, int layer_height) {
+  int destination_x = x - pad;
+  int destination_y = y - pad;
+  int source_x = 0;
+  int source_y = 0;
+  int copy_width = texture.width;
+  int copy_height = texture.height;
+  if (destination_x < 0) {
+    source_x = -destination_x;
+    copy_width += destination_x;
+    destination_x = 0;
+  }
+  if (destination_y < 0) {
+    source_y = -destination_y;
+    copy_height += destination_y;
+    destination_y = 0;
+  }
+  copy_width = std::min(copy_width, layer_width - destination_x);
+  copy_height = std::min(copy_height, layer_height - destination_y);
+  if (copy_width <= 0 || copy_height <= 0) return;
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = alpha;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  AlphaBlend(surface.dc, destination_x, destination_y, copy_width, copy_height,
+             texture.dc, source_x, source_y, copy_width, copy_height, blend);
+}
+
+void CreateDanmakuWindow(HINSTANCE instance) {
+  if (g_danmaku) return;
+  g_danmaku = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+      kDanmakuClass, L"", WS_POPUP, 0, 0, 1, 1, g_window, nullptr, instance,
+      nullptr);
+}
+
+void PositionDanmaku() {
+  if (!g_window || !g_danmaku) return;
+  RECT client{};
+  GetClientRect(g_window, &client);
+  POINT origin{0, 0};
+  ClientToScreen(g_window, &origin);
+  // 压在视频之上显示。SWP_SHOWWINDOW 不能少：窗口创建时不带 WS_VISIBLE
+  // （与 controls / top_bar / hint 一致），不显式显示就永远是一片空白。
+  // 窗口是 WS_EX_TRANSPARENT（鼠标穿透），且只在上部 g_danmaku_area 区域内
+  // 绘制，因此不会遮挡底部控制条，也不影响鼠标交互。
+  // 窗口只覆盖弹幕区域（画面上部 area），不铺满整个客户区：每帧要清零并
+  // UpdateLayeredWindow 的像素越少，60fps 下越稳。底部控制条区域本来就不画
+  // 弹幕，让它留在窗口外面既省开销，也彻底排除遮挡按钮的可能。
+  SetWindowPos(g_danmaku, HWND_TOP, origin.x, origin.y,
+               client.right - client.left,
+               std::max(1, static_cast<int>((client.bottom - client.top) *
+                                            g_danmaku_area)),
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  InvalidateRect(g_danmaku, nullptr, FALSE);
+}
+
+void PaintDanmaku() {
+  if (!g_danmaku) return;
+  const double paint_start = NowMs();
+  if (g_danmaku_paint_last > 0.0) {
+    const double gap = paint_start - g_danmaku_paint_last;
+    g_danmaku_gap_ms = std::max(g_danmaku_gap_ms, gap);
+    g_danmaku_gap_sum_ms += gap;
+    ++g_danmaku_gap_count;
+    if (gap > 20.0) ++g_danmaku_gap_late20;
+    if (gap > 33.0) ++g_danmaku_gap_late33;
+  }
+  g_danmaku_paint_last = paint_start;
+  RECT rect{};
+  GetClientRect(g_danmaku, &rect);
+  const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return;
+  // 复用位图：每帧 CreateDIBSection + new Bitmap 在 60fps 下是主要开销，
+  // 尺寸没变时只做一次 memset。
+  if (!g_danmaku_surface) g_danmaku_surface = new PanelSurface();
+  if (!g_danmaku_surface->Matches(width, height)) {
+    if (!g_danmaku_surface->Create(width, height)) return;
+  } else {
+    g_danmaku_surface->Clear();
+  }
+  PanelSurface& surface = *g_danmaku_surface;
+  Gdiplus::Graphics graphics(surface.target);
+  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+  graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+  const float ui = UiScale();
+  const float font_size = static_cast<float>(g_danmaku_font_size) * ui;
+  const BYTE alpha =
+      static_cast<BYTE>(std::clamp(g_danmaku_opacity, 0.15, 1.0) * 255);
+  // 字体复用；字号变化时所有栅格化缓存（连同在屏条目的文本宽度）都作废，弹幕
+  // 层从当前位置重新铺一遍。
+  if (!g_danmaku_font || std::abs(g_danmaku_font_px - font_size) > 0.01f) {
+    delete g_danmaku_font;
+    g_danmaku_font =
+        new Gdiplus::Font(MakeInterfaceFont(font_size, Gdiplus::FontStyleBold));
+    g_danmaku_font_px = font_size;
+    for (auto& item : g_danmaku_items) {
+      item.texture.reset();
+      item.text_width = -1.0f;
+      item.font_size = -1.0f;
+      item.live = false;
+      item.lane = -1;
+    }
+    g_danmaku_live.clear();
+    g_danmaku_cursor = 0;
+    g_danmaku_last_position = -1.0;
+    ResetDanmakuLaneFree();
+  }
+  const Gdiplus::Font& font = *g_danmaku_font;
+  const Gdiplus::StringFormat format;
+
+  const double now = DanmakuAnimationClock();
+  const double pos = DanmakuPlayhead();
+  // 窗口高度已经等于弹幕区域高度（见 PositionDanmaku），这里不再二次缩放。
+  const float area_height = static_cast<float>(height);
+  const float lane_h = font_size * 1.5f;
+  const int lanes = std::max(1, static_cast<int>(area_height / lane_h));
+  const int usable_lanes = std::max(
+      1, static_cast<int>(lanes * (0.4 + 0.6 * g_danmaku_density)));
+  if (g_danmaku_lane_free.size() < static_cast<size_t>(usable_lanes))
+    g_danmaku_lane_free.resize(static_cast<size_t>(usable_lanes), 0.0);
+  // 滚动弹幕**统一速度**（像素/秒）。以前写成「速度 = (窗口宽 + 文字宽) / 8」，
+  // 观感上每条都正好 8 秒穿越，代价是同一条轨道上前后的速度不一样 —— 后面那条
+  // 更快就会追上前面的糊在一起。同速之后，同轨两条的间距恒定，永不追尾，轨道
+  // 才能安全地「尾巴一离开右边缘就让给下一条」。
+  const float speed_px = static_cast<float>(width) /
+                         static_cast<float>(kDanmakuScrollBaseSeconds) *
+                         static_cast<float>(g_danmaku_speed);
+
+  const double raster_deadline = NowMs() + kDanmakuRasterBudgetMs;
+
+  // 跳转检测：位置大幅跳变时重置已播标记与在屏弹幕，避免「倒退后旧弹幕仍飘着」，
+  // 也避免快进时把整段历史当成「刚过去」补播出来。
+  if (g_danmaku_last_position >= 0 &&
+      std::abs(pos - g_danmaku_last_position) > 2.0) {
+    for (auto& item : g_danmaku_items) {
+      item.live = false;
+      item.appear = -1;
+      item.lane = -1;
+      item.played = false;
+      item.texture.reset();
+    }
+    g_danmaku_live.clear();
+    g_danmaku_cursor = DanmakuLowerBound(pos - kDanmakuCatchupSeconds);
+    ResetDanmakuLaneFree();
+  } else if (g_danmaku_last_position < 0) {
+    // 刚读入弹幕（或者是断点续播落在中段）：直接把光标挪到当前位置附近。光标
+    // 之前的条目永远不会被光顾，不必逐个标记成「已播」——整集几万条那样扫一遍
+    // 就是起播时的一次卡顿。
+    g_danmaku_cursor = DanmakuLowerBound(pos - kDanmakuCatchupSeconds);
+  }
+  g_danmaku_last_position = pos;
+
+  // 激活：条目按时间排序，光标只会往前走，所以整集摊下来是 O(N)。落在补播
+  // 窗口里的（快进 / 跳转之后刚到的那一批）直接按「本该出现的位置」摆好，而不是
+  // 全部从右边挤进来。栅格化有每帧预算，超了就把条目留到下一帧再激活 —— 晚一
+  // 两帧显示看不出来，卡一帧却很明显。
+  const double catchup = pos - kDanmakuCatchupSeconds;
+  while (g_danmaku_cursor < g_danmaku_items.size()) {
+    DanmakuItem& item = g_danmaku_items[g_danmaku_cursor];
+    if (item.time > pos) break;
+    if (item.live) {
+      // 在屏条目已经在 g_danmaku_live 里，交给下面的绘制循环。
+    } else if (item.time < catchup) {
+      // 早就该过去了：不补播，直接标记掉（否则一次快进就是几百条同屏）。
+      item.played = true;
+    } else if (!item.played) {
+      if (!EnsureDanmakuTexture(item, graphics, font, font_size, format,
+                                raster_deadline)) {
+        break;  // 预算用完，下一帧接着来
+      }
+      // 出现时刻按「它本该出现的播放时间」倒推：补播的条目会直接出现在屏幕
+      // 中间，而不是排成一排从右边涌进来。
+      double appear = now - std::max(0.0, pos - item.time);
+      // 占一条轨道。两条规则缺一条就会重叠：
+      //
+      // 1) 挑「最早能空出来」的那条轨道（不是永远挑 0 号，也不是挑最空的那条）；
+      // 2) 空出来之前不放 —— 何时空出来由 hold 决定。滚动弹幕是**尾巴离开右边缘
+      //    再让开 kDanmakuLaneGapPx** 的时刻（appear + (文字宽 + 间距) / 速度），
+      //    顶/底弹幕是停留结束的时刻。
+      //
+      // 以前的实现把整段「穿越 8 秒」都算成占用（容量只剩每轨 1 条 / 8 秒，16
+      // 条轨道顶不住每秒十几条），而且 lane_free 只在绘制循环里更新 —— 同一帧里
+      // 一起激活的条目看到的都是旧值，并列时就都挑到 0 号轨道。两条叠加，密集
+      // 弹幕必然糊成一片（实测 109 条同屏时 99 条互相叠压）。
+      const bool fixed = item.mode == 4 || item.mode == 5 || item.mode == 6;
+      const double hold =
+          fixed ? kDanmakuExitSeconds
+                : std::max(0.6, static_cast<double>(item.text_width +
+                                                    kDanmakuLaneGapPx) /
+                                    std::max(1.0f, speed_px));
+      int best = 0;
+      double best_free = g_danmaku_lane_free[0];
+      for (int lane = 1; lane < usable_lanes; ++lane) {
+        if (g_danmaku_lane_free[static_cast<size_t>(lane)] < best_free) {
+          best_free = g_danmaku_lane_free[static_cast<size_t>(lane)];
+          best = lane;
+        }
+      }
+      // 顶/底弹幕没有「从右边进入」这个动作：推迟等于提前显示（它会立刻出现在
+      // 轨道正中），所以轨道不空就丢掉，绝不排队。
+      if (fixed && best_free > appear) {
+        item.played = true;
+        ++g_danmaku_dropped;
+      } else if (best_free > appear + kDanmakuMaxDelaySeconds) {
+        // 连最早空出来的那条轨道都要等太久：这一条丢掉。同屏已经满了，叠上去
+        // 只会让两边都看不清；真实播放器到了同屏上限也是丢。
+        item.played = true;
+        ++g_danmaku_dropped;
+      } else {
+        if (best_free > appear) appear = best_free;  // 排队：等这条轨道空出来
+        item.appear = appear;
+        item.lane = best;
+        item.free_at = appear + hold;
+        g_danmaku_lane_free[static_cast<size_t>(best)] = item.free_at;
+        item.live = true;
+        g_danmaku_live.push_back(&item);
+      }
+    }
+    ++g_danmaku_cursor;
+  }
+
+  int live_count = 0;
+  int drawn_count = 0;
+  int overlap = 0;
+  int mixed = 0;
+  // 这一帧压得最深的一对（诊断用）：只数条数分不清「浮点贴边」和「真的糊住」，
+  // 把最深那一对的几何留下来，一次就能定性。
+  float worst_depth = 0.0f;
+  int worst_lane = -1;
+  float worst_a0 = 0.0f;
+  float worst_a1 = 0.0f;
+  float worst_b0 = 0.0f;
+  float worst_b1 = 0.0f;
+  // 轨道占用区间（诊断用），按弹幕**类型**分成两组：
+  //   lane_spans —— 滚动弹幕占的横向区间。滚动弹幕互相压住是**我们能控制的缺陷**，
+  //                 轨道分配只要严密就应该恒为 0；
+  //   lane_fixed —— 顶/底固定弹幕占的横向区间（在轨道正中停 4 秒）。滚动弹幕从它
+  //                 上面飘过去是所有播放器的正常行为，只作参考（mixed），不算 BAD。
+  // 两者必须分开：混在一起的话「滚动穿固定」会被算进 overlap，指标虚高、看不出
+  // 真缺陷到底修好没有。
+  static std::vector<std::vector<std::pair<float, float>>> lane_spans;
+  static std::vector<std::vector<std::pair<float, float>>> lane_fixed;
+  lane_spans.resize(static_cast<size_t>(usable_lanes));
+  lane_fixed.resize(static_cast<size_t>(usable_lanes));
+  for (auto& spans : lane_spans) spans.clear();
+  for (auto& spans : lane_fixed) spans.clear();
+  // 固定弹幕先统一扫一遍：它们都停在轨道正中，位置与「在屏多久」无关，先记下占位
+  // 区间，主循环里的滚动弹幕才能检出「穿过」，而且不受遍历顺序影响（否则同一帧里
+  // 排在后面的固定弹幕就检不出来）。
+  for (const DanmakuItem* pointer : g_danmaku_live) {
+    const DanmakuItem& item = *pointer;
+    const bool top_item = item.mode == 4 || item.mode == 5;
+    const bool bottom_item = item.mode == 6;
+    if (!top_item && !bottom_item) continue;
+    // 底弹幕的 lane 是**从下往上**数的（绘制时 y = 高 - (lane+1)*行高），换算成
+    // 与滚动弹幕同一套「从上往下」的行号才能正确比对，否则会把屏幕另一头、根本
+    // 碰不到的条目算成「穿过」。
+    int row = bottom_item ? usable_lanes - 1 - item.lane : item.lane;
+    if (row < 0 || row >= static_cast<int>(lane_fixed.size())) continue;
+    if (top_item ? !g_danmaku_top : !g_danmaku_bottom) continue;
+    if (now - item.appear > kDanmakuExitSeconds) continue;
+    const float fixed_tw = item.text_width > 0.0f ? item.text_width : 0.0f;
+    const float fixed_x = (width - fixed_tw) / 2.0f;
+    if (fixed_x < static_cast<float>(width) && fixed_x + fixed_tw > 0.0f)
+      lane_fixed[static_cast<size_t>(row)].emplace_back(fixed_x,
+                                                        fixed_x + fixed_tw);
+  }
+  size_t write = 0;
+  for (size_t index = 0; index < g_danmaku_live.size(); ++index) {
+    DanmakuItem* pointer = g_danmaku_live[index];
+    DanmakuItem& item = *pointer;
+    const bool top = item.mode == 4 || item.mode == 5;
+    const bool bottom = item.mode == 6;
+    const float tw = item.text_width > 0.0f ? item.text_width : 0.0f;
+    float x = 0;
+    float y = 0;
+    bool keep = true;
+    if (top || bottom) {
+      keep = top ? g_danmaku_top : g_danmaku_bottom;
+      x = (width - tw) / 2.0f;
+      y = top ? item.lane * lane_h + (lane_h - font_size) / 2.0f
+              : area_height - (item.lane + 1) * lane_h +
+                    (lane_h - font_size) / 2.0f;
+      if (now - item.appear > kDanmakuExitSeconds) keep = false;
+    } else {
+      keep = g_danmaku_scroll;
+      x = width - static_cast<float>((now - item.appear) * speed_px);
+      y = item.lane * lane_h + (lane_h - font_size) / 2.0f;
+      if (x + tw < 0.0f) keep = false;
+    }
+    if (!keep) {
+      item.live = false;
+      item.played = true;
+      item.lane = -1;
+      item.texture.reset();
+      continue;  // 不写回在屏列表：这一条到此结束
+    }
+    ++live_count;
+    // 只统计**真的画在屏上**的条目：排队等轨道的条目此刻还在右边缘之外
+    // （x >= width），它们互相之间不算重叠，否则指标会把「排队」误报成「叠压」。
+    // 固定弹幕的占位已在上面的预扫里收集，这里只判滚动弹幕。
+    if (!top && !bottom && x < static_cast<float>(width) && x + tw > 0.0f &&
+        item.lane >= 0 && item.lane < static_cast<int>(lane_spans.size())) {
+      const size_t lane = static_cast<size_t>(item.lane);
+      for (const auto& span : lane_spans[lane]) {
+        if (x < span.second && span.first < x + tw) {
+          ++overlap;  // 压住同轨另一条滚动弹幕：真缺陷
+          // 压进去多少像素：左右两个交叠边界之差。贴边（<1px）是浮点误差，
+          // 几十像素才是肉眼可见的糊。
+          const float depth =
+              std::min(x + tw, span.second) - std::max(x, span.first);
+          if (depth > worst_depth) {
+            worst_depth = depth;
+            worst_lane = item.lane;
+            worst_a0 = x;
+            worst_a1 = x + tw;
+            worst_b0 = span.first;
+            worst_b1 = span.second;
+          }
+          break;
+        }
+      }
+      lane_spans[lane].emplace_back(x, x + tw);
+      for (const auto& span : lane_fixed[lane]) {
+        if (x < span.second && span.first < x + tw) {
+          ++mixed;  // 从固定弹幕上飘过去：正常行为，只作参考
+          break;
+        }
+      }
+    }
+    if (item.texture) {
+      // 文字已经栅格化好了，这一帧只做一次带 alpha 的贴图。
+      BlendDanmakuTexture(surface, *item.texture, std::lround(x),
+                          std::lround(y), kDanmakuTexturePad, alpha, width,
+                          height);
+      ++drawn_count;
+    }
+    g_danmaku_live[write++] = pointer;
+  }
+  g_danmaku_live.resize(write);
+  graphics.Flush(Gdiplus::FlushIntentionSync);
+  const double draw_end = NowMs();
+  g_danmaku_draw_ms += draw_end - paint_start;
+  POINT source{0, 0};
+  SIZE size{width, height};
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = 255;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  UpdateLayeredWindow(g_danmaku, nullptr, nullptr, &size, surface.dc, &source,
+                      0, &blend, ULW_ALPHA);
+  g_danmaku_post_ms += NowMs() - draw_end;
+  ++g_danmaku_frames;
+  ++g_danmaku_paint_total;
+  g_danmaku_overlap_max = std::max(g_danmaku_overlap_max, overlap);
+  g_danmaku_mixed_max = std::max(g_danmaku_mixed_max, mixed);
+  g_danmaku_lanes = usable_lanes;
+  if (worst_depth > g_danmaku_overlap_depth) {
+    g_danmaku_overlap_depth = worst_depth;
+    g_danmaku_overlap_lane = worst_lane;
+    g_danmaku_overlap_a0 = worst_a0;
+    g_danmaku_overlap_a1 = worst_a1;
+    g_danmaku_overlap_b0 = worst_b0;
+    g_danmaku_overlap_b1 = worst_b1;
+  }
+  // 这一帧要的东西都画完了：下一次重绘由「动画中」或「有变化」来触发
+  // （见 TickFrame 与 DanmakuAnimationClock 的说明）。
+  g_danmaku_dirty = false;
+  // 与面板同一套诊断：弹幕层也是 layered 窗口，抓屏会被压在上面的窗口顶掉，
+  // 需要时就把它自己的位图导出来核对（MOVA_TRACE_PANEL=<目录>）。挑「铺满之后
+  // 的稳态」两帧 —— 起播那一瞬整层只有几条贴在右边缘，看不出排版问题。只导两帧、
+  // 而且层位图一张就好几 MB。
+  static int traced = 0;
+  if (traced < 2 &&
+      g_danmaku_paint_total >= kDanmakuTraceSpacingFrames * (traced + 1)) {
+    ++traced;
+    TracePanelSurface(surface, L"danmaku");
+  }
+  // 诊断开关：设 MOVA_TRACE_DANMAKU=1 后每 60 帧回报一行。
+  //   live / drawn / size / pos：屏上几条、有几条贴上了、层尺寸、播放位置 ——
+  //     分清是数据侧不再激活还是窗口侧没渲染；
+  //   draw / post / gap：文字绘制、清屏+合成、相邻两帧最大间隔 —— 「一顿一顿」
+  //     时看这三个就知道是画得太慢，还是定时器被别的东西堵住；
+  //   avg / late20 / late33：这一窗口（60 帧）的平均帧间隔，以及超过 20ms / 33ms
+  //     的帧数 —— 均值贴 16.7 说明节拍正常，只有最大值高是偶发；均值本身就
+  //     18ms 以上才是系统性掉帧；
+  //   overlap / mixed / lanes：同轨重叠条数、穿过固定弹幕的条数与可用轨道数 ——
+  //     「叠在一起看不清」的直接度量。overlap（滚动压滚动）应恒为 0；mixed（滚动
+  //     穿固定）是正常现象，只作参考；
+  //   depth / olane / orect：最深那一对压进去多少像素、在哪条轨道、两段的左右边界
+  //     —— 只数条数分不清「浮点贴边」和「真的糊住」，深度才说明问题；
+  //   drop：mpv 自己丢掉的解码帧数 —— 和 gap 对照可以分清「弹幕在抖」还是
+  //     「视频本身在抖」。
+  static const bool trace_draw = [] {
+    wchar_t buffer[8]{};
+    return GetEnvironmentVariableW(L"MOVA_TRACE_DANMAKU", buffer, 8) > 0;
+  }();
+  if (trace_draw && g_danmaku_frames >= 60) {
+    const double frames = g_danmaku_frames;
+    const int dropped = std::max(0, std::atoi(MpvString("frame-drop-count").c_str()));
+    char text[480]{};
+    const int length = std::snprintf(
+        text, sizeof(text),
+        "MOVA_DANMAKU_DRAW=live=%d drawn=%d size=%dx%d pos=%.2f "
+        "draw=%.2f post=%.2f gap=%.2f frames=%d"
+        " overlap=%d mixed=%d lanes=%d dropped=%d drop=%d"
+        " depth=%.1f olane=%d orect=%.0f,%.0f,%.0f,%.0f"
+        " avg=%.2f late20=%d late33=%d|\r\n",
+        live_count, drawn_count, width, height, pos, g_danmaku_draw_ms / frames,
+        g_danmaku_post_ms / frames, g_danmaku_gap_ms, g_danmaku_frames,
+        g_danmaku_overlap_max, g_danmaku_mixed_max, g_danmaku_lanes,
+        g_danmaku_dropped, dropped, g_danmaku_overlap_depth,
+        g_danmaku_overlap_lane, g_danmaku_overlap_a0, g_danmaku_overlap_a1,
+        g_danmaku_overlap_b0, g_danmaku_overlap_b1,
+        g_danmaku_gap_count > 0 ? g_danmaku_gap_sum_ms / g_danmaku_gap_count
+                                : 0.0,
+        g_danmaku_gap_late20, g_danmaku_gap_late33);
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+      DWORD written = 0;
+      WriteFile(output, text, static_cast<DWORD>(length), &written, nullptr);
+    }
+    g_danmaku_draw_ms = 0.0;
+    g_danmaku_post_ms = 0.0;
+    g_danmaku_gap_ms = 0.0;
+    g_danmaku_gap_sum_ms = 0.0;
+    g_danmaku_gap_count = 0;
+    g_danmaku_gap_late20 = 0;
+    g_danmaku_gap_late33 = 0;
+    g_danmaku_frames = 0;
+    g_danmaku_overlap_max = 0;
+    g_danmaku_mixed_max = 0;
+    g_danmaku_overlap_depth = 0.0;
+    g_danmaku_overlap_lane = -1;
+  }
+}
+
+// 弹幕位图与字体都是 GDI+ 对象，而 GdiplusShutdown 会卸载 gdiplus.dll。
+// 必须在那之前释放，否则进程收尾时析构会踩到已失效的 Gdip*（0xC0000005）。
+void ReleaseDanmakuSurface() {
+  delete g_danmaku_surface;
+  g_danmaku_surface = nullptr;
+  delete g_danmaku_font;
+  g_danmaku_font = nullptr;
+  g_danmaku_font_px = -1.0f;
+}
+
+LRESULT CALLBACK DanmakuProc(HWND window, UINT message, WPARAM wparam,
+                             LPARAM lparam) {
+  switch (message) {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      BeginPaint(window, &paint);
+      PaintDanmaku();
+      EndPaint(window, &paint);
+      return 0;
+    }
+    default:
+      return DefWindowProcW(window, message, wparam, lparam);
+  }
 }
 
 LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
@@ -3020,8 +4703,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       } else if (x >= center - 28 && x <= center + 28) {
         MpvCommand("cycle", "pause");
       } else if (!compact && x >= center - 166 && x < center - 116) {
-        MpvCommand("playlist-prev", "weak");
-        ShowToast("上一集");
+        if (LoadPlaylistEntry(g_playlist_position.load() - 1)) {
+          ShowToast("上一集");
+        }
       } else if (x >= center - 104 && x < center - 48) {
         MpvCommand("seek", std::to_string(-g_seek_seconds).c_str(), "relative");
         ShowAdjustHint(
@@ -3036,8 +4720,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
                                 g_position.load() + g_seek_seconds)),
             kGlyphGauge, -1.0f);
       } else if (!compact && x > center + 116 && x <= center + 166) {
-        MpvCommand("playlist-next", "weak");
-        ShowToast("下一集");
+        if (LoadPlaylistEntry(g_playlist_position.load() + 1)) {
+          ShowToast("下一集");
+        }
       } else {
         switch (hit) {
           case kMute: {
@@ -3239,6 +4924,137 @@ bool RunShortcut(int key) {
   return true;
 }
 
+// 一帧：控件条的悬停/淡出、缓冲转圈、提示浮层、片头片尾倒计时、弹幕重绘。
+// 由 wWinMain 里的高精度定时器驱动（拿不到时退回 WM_TIMER，两条路走的是
+// 同一份实现）。以前这段直接写在 WM_TIMER 分支里：WM_TIMER 的最小周期被
+// 系统时钟节拍卡在 15.6ms 的整数倍上，请求 16ms 实际拿到 31.25ms ——
+// 弹幕层只有约 32fps，「一顿一顿」就是这么来的。
+void TickFrame() {
+  const double frame_now = NowMs();
+  const double frame_dt =
+      g_last_frame_ms == 0.0
+          ? static_cast<double>(kFrameIntervalMs) / 1000.0
+          : std::min(0.1, (frame_now - g_last_frame_ms) / 1000.0);
+  g_last_frame_ms = frame_now;
+  // 弹幕层：播放中每帧重画；暂停 / 缓冲时只在「设置改了 / 跳转了」之后重画一次
+  // —— 画面本来就停着，每帧 memset 整层再合成一遍是白烧的 CPU。
+  const bool danmaku_animating = !g_paused.load() && !g_buffering.load();
+  if (g_danmaku_loaded && g_danmaku &&
+      (danmaku_animating || g_danmaku_dirty)) {
+    InvalidateRect(g_danmaku, nullptr, FALSE);
+  }
+  // 音量是连续量（拖一次音量条会连出几十个值），回写偏好要等手停下来。
+  FlushPendingPlayerPreferences();
+  // 重试之后已经稳稳放了十几秒：这一集算恢复正常，重试预算放开。
+  // 否则「用掉唯一一次重试」之后哪怕过了半小时，再遇到真断流也不给补了。
+  // g_retry_stamp 是 GetTickCount64 记的（见 ReportPlaybackFailure），这里必须用
+  // 同一个时间源相减 —— 拿 QPC 的 frame_now 去减会得出一个负值，窗口永远不触发。
+  if (g_retry_count > 0 &&
+      GetTickCount64() - g_retry_stamp > kRetryHealthWindowMs) {
+    g_retry_count = 0;
+  }
+  // 位置已经补回去：把「正在重试…」换成实际结果，别让提示自相矛盾。
+  if (g_resume_done.exchange(false)) {
+    ShowToast("连接中断，已从原位置继续");
+    ShowControls();
+  }
+  if (AnimateControlHover() && g_controls) {
+    InvalidateRect(g_controls, nullptr, FALSE);
+  }
+  if (AnimateTopHover() && g_top_bar) {
+    InvalidateRect(g_top_bar, nullptr, FALSE);
+  }
+  // 提示浮层跟着控件条一起进退：控件条淡出时提示留着会更奇怪。
+  // 例外是「N 秒后跳过片头」：它本来就是给「用户没在操作」的场景看的，
+  // 控件条此时多半已经退场，跟着一起隐藏等于没有提示。
+  if (g_hint_mode != HintMode::Hidden) {
+    const bool expired = g_hint_mode == HintMode::Toast &&
+                         GetTickCount64() > g_hint_until;
+    if (expired || (g_controls_alpha == 0 && g_skip_index < 0)) HideHint();
+  }
+  // 片头片尾自动跳过：按当前播放位置判断是否进入片段，并按设置里的秒数
+  // 倒计时（倒计时期间提示浮层就是取消入口的指引）。
+  // 注意这里传的是 GetTickCount64：跳过倒计时的 g_skip_deadline 全流程都建立在
+  // 它上面（提示浮层那边也用 GetTickCount64 比较），换成 QPC 会变成两套时间基准
+  // 相减。它对精度的要求只是「几十毫秒级」，15.6ms 的粒度完全够用。
+  UpdateAutoSkip(GetTickCount64());
+  const float play_target = g_paused.load() ? 1.0f : 0.0f;
+  const float play_delta = play_target - g_play_state_mix;
+  if (std::abs(play_delta) > 0.001f) {
+    const float play_limit = static_cast<float>(4.8 * frame_dt);
+    g_play_state_mix += std::clamp(play_delta, -play_limit, play_limit);
+    if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+  }
+  if (g_buffering.load()) {
+    g_buffer_phase = std::fmod(
+        g_buffer_phase + static_cast<float>(440.0 * frame_dt), 360.0f);
+    if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+  }
+  // 自动隐藏看「光标最后一次在播放器窗口内移动」：轮询光标位置，动了且
+  // 在窗口内就算一次交互；光标停在窗口里任何地方（画面、控件条都算）
+  // 2.6 秒后，控件条、顶栏与光标一起退场。用户在窗口外打字或动鼠标不会
+  // 打扰播放器的计时。
+  POINT cursor{};
+  bool cursor_moved = false;
+  bool cursor_in_window = false;
+  if (GetCursorPos(&cursor)) {
+    const LONG dx = cursor.x - g_last_cursor.x;
+    const LONG dy = cursor.y - g_last_cursor.y;
+    // 3px 死区：光学鼠标静止时常有 ±1px 抖动，手搭在鼠标上不该把控件
+    // 一直钉在屏幕上；参考点只在累计位移过阈值时刷新，缓慢漂移也算移动。
+    if (dx * dx + dy * dy >= 9) {
+      cursor_moved = true;
+      RECT window_rect{};
+      if (g_window && GetWindowRect(g_window, &window_rect) &&
+          PtInRect(&window_rect, cursor)) {
+        cursor_in_window = true;
+        ShowControls();
+      }
+      g_last_cursor = cursor;
+    }
+  }
+  const bool should_hide = GetTickCount64() - g_last_interaction > 2600 &&
+                           !g_paused.load() &&
+                           !(g_panel && IsWindowVisible(g_panel));
+  if (FILE* trace = AutoHideTrace()) {
+    std::fprintf(trace,
+                 "tick=%llu cur=%ld,%ld moved=%d inwin=%d idle=%llu "
+                 "hide=%d paused=%d panelvis=%d alpha=%d\n",
+                 GetTickCount64(), cursor.x, cursor.y,
+                 cursor_moved ? 1 : 0, cursor_in_window ? 1 : 0,
+                 GetTickCount64() - g_last_interaction,
+                 should_hide ? 1 : 0, g_paused.load() ? 1 : 0,
+                 (g_panel && IsWindowVisible(g_panel)) ? 1 : 0,
+                 static_cast<int>(g_controls_alpha));
+    std::fclose(trace);
+  }
+  const BYTE target = should_hide ? 0 : 232;
+  if (g_controls_alpha != target) {
+    // 淡出约 480ms、淡入约 360ms，与改成 60fps 之前的观感一致；
+    // 步长按经过时间算，帧率再变也不会忽快忽慢。
+    const int step = should_hide
+                         ? static_cast<int>(480.0 * frame_dt)
+                         : static_cast<int>(638.0 * frame_dt);
+    const int next = std::clamp(static_cast<int>(g_controls_alpha) +
+                                    (should_hide ? -step : step),
+                                0, 232);
+    g_controls_alpha = static_cast<BYTE>(next);
+    SetLayeredWindowAttributes(g_controls, 0, g_controls_alpha, LWA_ALPHA);
+    if (g_top_bar) {
+      SetLayeredWindowAttributes(g_top_bar, kOverlayColorKey,
+                                 g_controls_alpha,
+                                 LWA_ALPHA | LWA_COLORKEY);
+    }
+    if (g_controls_alpha == 0) {
+      SetCursor(nullptr);
+    } else if (next == 232) {
+      SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    }
+    // 退场后把命中测试也交还给画面（见 SetOverlayHitTest 的说明）。
+    SetOverlayHitTest(g_controls_alpha > 0);
+  }
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
                              LPARAM lparam) {
   switch (message) {
@@ -3310,6 +5126,65 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     case kMpvShutdown:
       DestroyWindow(window);
       return 0;
+    case kDanmakuReload:
+      // 弹幕是播放开始后才拉到的：这里在主线程补建叠加窗口并读入数据。
+      // 窗口必须由创建它的线程处理消息，所以不能在 stdin 线程里建。
+      if (g_danmaku_enabled) {
+        if (!g_danmaku) {
+          CreateDanmakuWindow(
+              reinterpret_cast<HINSTANCE>(GetModuleHandleW(nullptr)));
+        }
+        LoadDanmaku();
+        PositionDanmaku();
+      }
+      return 0;
+    case kApplyLiveSettings: {
+      // 播放期间设置页改的设置（见 stdin 的 MOVA_APPLY）。窗口操作必须在
+      // 创建弹幕层的线程上做，所以排队到这里逐个应用。
+      std::vector<std::pair<std::string, std::string>> pending;
+      {
+        std::lock_guard<std::mutex> guard(g_live_mutex);
+        pending.swap(g_live_pending);
+      }
+      for (const auto& item : pending) {
+        ApplyLiveOption(item.first, item.second);
+        // 回一行给应用侧：出错时「设置没生效」与「播发没送到」能一眼分开。
+        char text[192]{};
+        const int length =
+            std::snprintf(text, sizeof(text), "MOVA_LIVE=%s|%s\r\n",
+                          item.first.c_str(), item.second.c_str());
+        const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+          DWORD written = 0;
+          WriteFile(output, text, static_cast<DWORD>(length), &written,
+                    nullptr);
+        }
+      }
+      return 0;
+    }
+    case kPlaylistAdvance:
+      // 只有确认「真播完了」的 EOF 会走到这里（见 END_FILE 处的位置校验）。
+      // 已经是最后一集时 LoadPlaylistEntry 会直接失败，播放器停在片尾。
+      LoadPlaylistEntry(g_playlist_position.load() + 1);
+      return 0;
+    case kPlaybackInterrupted:
+      // 同一集先补一次再认输：源站在跳转那一刻新建连接，偶发抖动会让 mpv 把
+      // 这一集判成结束，而地址本身通常还是好的。用户报的「自动跳过会存在播放
+      // 失败」就是这条路径——自动跳片头会让播放器去要一段新的字节区间，正好
+      // 撞上抖动的概率比顺放时高得多。
+      if (g_running.load() && g_retry_count < kMaxInterruptRetries &&
+          RetryCurrentEpisode()) {
+        ++g_retry_count;
+        ShowToast("播放中断，正在重试…");
+        if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+        ShowControls();
+        return 0;
+      }
+      g_playback_error = true;
+      ShowToast("播放中断，已停在当前位置");
+      if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+      ShowControls();
+      return 0;
     case kPlayerStateChanged:
       if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
       if (g_top_bar) {
@@ -3344,93 +5219,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     case WM_LBUTTONDBLCLK:
       ToggleFullscreen();
       return 0;
+    case WM_TIMER:
+      // 拿不到高精度可等待定时器时的回退节拍（见 wWinMain 里建定时器的地方）。
+      TickFrame();
+      return 0;
     case WM_KEYDOWN:
       ShowControls();
       if (RunShortcut(static_cast<int>(wparam))) return 0;
       return DefWindowProcW(window, message, wparam, lparam);
-    case WM_TIMER: {
-      if (AnimateControlHover() && g_controls) {
-        InvalidateRect(g_controls, nullptr, FALSE);
-      }
-      if (AnimateTopHover() && g_top_bar) {
-        InvalidateRect(g_top_bar, nullptr, FALSE);
-      }
-      // 提示浮层跟着控件条一起进退：控件条淡出时提示留着会更奇怪。
-      if (g_hint_mode != HintMode::Hidden) {
-        const bool expired = g_hint_mode == HintMode::Toast &&
-                             GetTickCount64() > g_hint_until;
-        if (expired || g_controls_alpha == 0) HideHint();
-      }
-      const float play_target = g_paused.load() ? 1.0f : 0.0f;
-      const float play_delta = play_target - g_play_state_mix;
-      if (std::abs(play_delta) > 0.001f) {
-        g_play_state_mix += std::clamp(play_delta, -0.24f, 0.24f);
-        if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
-      }
-      if (g_buffering.load()) {
-        g_buffer_phase = std::fmod(g_buffer_phase + 22.0f, 360.0f);
-        if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
-      }
-      // 自动隐藏看「光标最后一次在播放器窗口内移动」：轮询光标位置，动了且
-      // 在窗口内就算一次交互；光标停在窗口里任何地方（画面、控件条都算）
-      // 2.6 秒后，控件条、顶栏与光标一起退场。用户在窗口外打字或动鼠标不会
-      // 打扰播放器的计时。
-      POINT cursor{};
-      bool cursor_moved = false;
-      bool cursor_in_window = false;
-      if (GetCursorPos(&cursor)) {
-        const LONG dx = cursor.x - g_last_cursor.x;
-        const LONG dy = cursor.y - g_last_cursor.y;
-        // 3px 死区：光学鼠标静止时常有 ±1px 抖动，手搭在鼠标上不该把控件
-        // 一直钉在屏幕上；参考点只在累计位移过阈值时刷新，缓慢漂移也算移动。
-        if (dx * dx + dy * dy >= 9) {
-          cursor_moved = true;
-          RECT window_rect{};
-          if (g_window && GetWindowRect(g_window, &window_rect) &&
-              PtInRect(&window_rect, cursor)) {
-            cursor_in_window = true;
-            ShowControls();
-          }
-          g_last_cursor = cursor;
-        }
-      }
-      const bool should_hide = GetTickCount64() - g_last_interaction > 2600 &&
-                               !g_paused.load() &&
-                               !(g_panel && IsWindowVisible(g_panel));
-      if (FILE* trace = AutoHideTrace()) {
-        std::fprintf(trace,
-                     "tick=%llu cur=%ld,%ld moved=%d inwin=%d idle=%llu "
-                     "hide=%d paused=%d panelvis=%d alpha=%d\n",
-                     GetTickCount64(), cursor.x, cursor.y,
-                     cursor_moved ? 1 : 0, cursor_in_window ? 1 : 0,
-                     GetTickCount64() - g_last_interaction,
-                     should_hide ? 1 : 0, g_paused.load() ? 1 : 0,
-                     (g_panel && IsWindowVisible(g_panel)) ? 1 : 0,
-                     static_cast<int>(g_controls_alpha));
-        std::fclose(trace);
-      }
-      const BYTE target = should_hide ? 0 : 232;
-      if (g_controls_alpha != target) {
-        const int step = should_hide ? -24 : 32;
-        const int next = std::clamp(static_cast<int>(g_controls_alpha) + step,
-                                    0, 232);
-        g_controls_alpha = static_cast<BYTE>(next);
-        SetLayeredWindowAttributes(g_controls, 0, g_controls_alpha, LWA_ALPHA);
-        if (g_top_bar) {
-          SetLayeredWindowAttributes(g_top_bar, kOverlayColorKey,
-                                     g_controls_alpha,
-                                     LWA_ALPHA | LWA_COLORKEY);
-        }
-        if (g_controls_alpha == 0) {
-          SetCursor(nullptr);
-        } else if (next == 232) {
-          SetCursor(LoadCursor(nullptr, IDC_ARROW));
-        }
-        // 退场后把命中测试也交还给画面（见 SetOverlayHitTest 的说明）。
-        SetOverlayHitTest(g_controls_alpha > 0);
-      }
-      return 0;
-    }
     case WM_DESTROY:
       g_running = false;
       PostQuitMessage(0);
@@ -3490,6 +5286,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   hint_class.lpszClassName = kHintClass;
   hint_class.lpfnWndProc = HintProc;
   RegisterClassW(&hint_class);
+  WNDCLASSW danmaku_class{};
+  danmaku_class.hInstance = instance;
+  danmaku_class.lpszClassName = kDanmakuClass;
+  danmaku_class.lpfnWndProc = DanmakuProc;
+  danmaku_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  RegisterClassW(&danmaku_class);
 
   Gdiplus::GdiplusStartupInput gdiplus_input;
   Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdiplus_input, nullptr);
@@ -3548,8 +5350,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
   const int work_width = static_cast<int>(work_area.right - work_area.left);
   const int work_height = static_cast<int>(work_area.bottom - work_area.top);
-  const int window_width = std::min(1280, work_width);
-  const int window_height = std::min(760, work_height);
+  // 默认窗口按工作区的 92% 开，并夹在 1280×760（旧默认，保证不会缩得比以前还
+  // 小）到 1920×1160 之间。以前固定 1280×760，在 2K / 4K 屏上只占中间一小块，
+  // 画面和逐字弹幕都偏小。
+  const int window_width =
+      std::min(work_width, std::max(1280, std::min(1920, work_width * 92 / 100)));
+  const int window_height =
+      std::min(work_height,
+               std::max(760, std::min(1160, work_height * 92 / 100)));
   const int window_x = static_cast<int>(work_area.left) +
                        (work_width - window_width) / 2;
   const int window_y = static_cast<int>(work_area.top) +
@@ -3609,7 +5417,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // autohide 与它各管各的，会出现「控件退场了光标还亮着」的分裂状态。
   SetOption(g_handle, "cursor-autohide", "no");
 
-  std::vector<std::string> media_urls;
   int playlist_start = 0;
   // 顺序即控件条上的显示顺序：前面几个直接摆在控件条上，放不下的进「更多」。
   // 剧集排在字幕之后，是因为控件条只有四个工具槽（三个直接入口 + 更多），而
@@ -3678,16 +5485,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
               std::atoi(Utf8(argument.substr(equals + 1)).c_str());
         } else if (name == "mova-series-logo") {
           g_series_logo_path = argument.substr(equals + 1);
-        } else if (name == "mova-seek-seconds") {
-          g_seek_seconds = std::max(1.0, std::strtod(
-              Utf8(argument.substr(equals + 1)).c_str(), nullptr));
-        } else if (name == "mova-volume-step") {
-          g_volume_step = std::max(1.0, std::strtod(
-              Utf8(argument.substr(equals + 1)).c_str(), nullptr));
-        } else if (name == "mova-danmaku-enabled") {
-          g_danmaku_enabled = Utf8(argument.substr(equals + 1)) == "yes";
-        } else if (name == "mova-auto-skip-segments") {
-          g_auto_skip_segments = Utf8(argument.substr(equals + 1)) == "yes";
+        } else if (name == "mova-seek-seconds" ||
+                   name == "mova-volume-step") {
+          // 与播放期间的热更新同一份实现（见 ApplyLiveOption）。
+          ApplyLiveOption(name, Utf8(argument.substr(equals + 1)));
+        } else if (name == "mova-danmaku-file") {
+          g_danmaku_path = argument.substr(equals + 1);
+        } else if (IsLiveSettingName(name)) {
+          // 与播放期间的热更新（stdin 的 MOVA_APPLY）共用一份实现：起播是
+          // 「第一次应用」，之后设置页再改就是就地更新。
+          ApplyLiveOption(name, Utf8(argument.substr(equals + 1)));
         } else if (name == "mova-tool-order") {
           if (!g_custom_tool_order) {
             g_tool_order.clear();
@@ -3721,39 +5528,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
         }
       }
     } else {
-      media_urls.push_back(Utf8(argument));
+      g_media_urls.push_back(Utf8(argument));
     }
   }
   LocalFree(argv);
-  while (g_playlist_titles.size() < media_urls.size()) {
+  while (g_playlist_titles.size() < g_media_urls.size()) {
     g_playlist_titles.push_back(g_media_title);
   }
-  while (g_playlist_details.size() < media_urls.size()) {
+  while (g_playlist_details.size() < g_media_urls.size()) {
     g_playlist_details.emplace_back();
   }
   // 并行下发的数组都补齐到同一长度，免得面板里按下标取数据时越界。
-  while (g_playlist_seasons.size() < media_urls.size()) {
+  while (g_playlist_seasons.size() < g_media_urls.size()) {
     g_playlist_seasons.emplace_back();
   }
-  while (g_playlist_episodes.size() < media_urls.size()) {
+  while (g_playlist_episodes.size() < g_media_urls.size()) {
     g_playlist_episodes.emplace_back();
   }
-  while (g_playlist_episode_titles.size() < media_urls.size()) {
+  while (g_playlist_episode_titles.size() < g_media_urls.size()) {
     g_playlist_episode_titles.emplace_back();
   }
-  while (g_playlist_images.size() < media_urls.size()) {
+  while (g_playlist_images.size() < g_media_urls.size()) {
     g_playlist_images.emplace_back();
   }
-  while (g_playlist_meta.size() < media_urls.size()) {
+  while (g_playlist_meta.size() < g_media_urls.size()) {
     g_playlist_meta.emplace_back();
   }
-  while (g_playlist_progress.size() < media_urls.size()) {
+  while (g_playlist_progress.size() < g_media_urls.size()) {
     g_playlist_progress.push_back(-1.0);
   }
-  while (g_playlist_durations.size() < media_urls.size()) {
+  while (g_playlist_durations.size() < g_media_urls.size()) {
     g_playlist_durations.push_back(0.0);
   }
-  while (g_playlist_watched.size() < media_urls.size()) {
+  while (g_playlist_watched.size() < g_media_urls.size()) {
     g_playlist_watched.push_back(false);
   }
   while (g_resource_icons.size() < g_resource_sources.size()) {
@@ -3772,12 +5579,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     }
   }
 
-  if (g_mpv.initialize(g_handle) < 0 || media_urls.empty()) {
+  if (g_mpv.initialize(g_handle) < 0 || g_media_urls.empty()) {
     MessageBoxW(window, L"播放器初始化失败或没有可播放的地址。",
                 L"Mova 原生播放器", MB_ICONERROR);
     g_mpv.terminate_destroy(g_handle);
     g_handle = nullptr;
     return 5;
+  }
+
+  if (g_danmaku_enabled && !g_danmaku_path.empty()) {
+    CreateDanmakuWindow(instance);
+    LoadDanmaku();
+    PositionDanmaku();
   }
 
   g_mpv.observe_property(g_handle, 1, "time-pos", MPV_FORMAT_DOUBLE);
@@ -3787,23 +5600,52 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   g_mpv.observe_property(g_handle, 5, "mute", MPV_FORMAT_FLAG);
   g_mpv.observe_property(g_handle, 6, "speed", MPV_FORMAT_DOUBLE);
   g_mpv.observe_property(g_handle, 7, "paused-for-cache", MPV_FORMAT_FLAG);
-  g_mpv.observe_property(g_handle, 8, "playlist-pos", MPV_FORMAT_INT64);
+  // 不再 observe mpv 的 playlist-pos：列表里只有一项，它恒为 0，会把我们
+  // 自己维护的集索引冲掉（Dart 侧靠这个索引切缓存、预加载下一集）。
   g_mpv.observe_property(g_handle, 9, "brightness", MPV_FORMAT_DOUBLE);
-  const char* load[] = {"loadfile", media_urls.front().c_str(), "replace", nullptr};
-  g_mpv.command(g_handle, load);
-  for (size_t index = 1; index < media_urls.size(); ++index) {
-    const char* append[] = {"loadfile", media_urls[index].c_str(), "append",
-                            nullptr};
-    g_mpv.command(g_handle, append);
-  }
-  if (playlist_start > 0 &&
-      playlist_start < static_cast<int>(media_urls.size())) {
-    const std::string start = std::to_string(playlist_start);
-    MpvCommand("set", "playlist-pos", start.c_str());
+  // 只把当前这一集交给 mpv。整季都塞进播放列表时，mpv 在任何 end-file 之后
+  // （含读取出错）都会自动前进到下一项 —— 实测证实了 keep-open=yes 也拦不住，
+  // 这才是「播到一半突然跳下一集」的根因。换集一律走 LoadPlaylistEntry()。
+  const int start_index =
+      (playlist_start > 0 &&
+       playlist_start < static_cast<int>(g_media_urls.size()))
+          ? playlist_start
+          : 0;
+  g_playlist_position = start_index;
+  if (!g_media_urls.empty()) {
+    const char* load[] = {"loadfile",
+                          g_media_urls[static_cast<size_t>(start_index)].c_str(),
+                          "replace", nullptr};
+    g_mpv.command(g_handle, load);
   }
   ShowWindow(window, show_command);
   UpdateWindow(window);
-  SetTimer(window, 1, 50, nullptr);
+  // 帧节拍：以前用 SetTimer(window, 1, 16) + WM_TIMER，实测每帧间隔稳定在
+  // ~31ms —— SetTimer 会把周期向上取整到系统时钟节拍（15.6ms）的整数倍，请求
+  // 16ms 实际拿到 31.25ms，于是弹幕只有约 32fps，滚动起来就是「一顿一顿」。
+  // 换成可等待定时器（Win10 1803+ 支持高精度模式）后节拍稳定在 16.7ms；
+  // 拿不到高精度定时器时退回 WM_TIMER，两条路都进 TickFrame()。
+  timeBeginPeriod(1);
+  HANDLE frame_timer = nullptr;
+  if (HINSTANCE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
+    using CreateWaitableTimerExW_fn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES,
+                                                      LPCWSTR, DWORD, DWORD);
+    const auto create_timer =
+        reinterpret_cast<CreateWaitableTimerExW_fn>(reinterpret_cast<void*>(
+            GetProcAddress(kernel32, "CreateWaitableTimerExW")));
+    if (create_timer) {
+      // 0x1 = CREATE_WAITABLE_TIMER_MANUAL_RESET 不用；0x2 = HIGH_RESOLUTION。
+      frame_timer = create_timer(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+    }
+  }
+  if (frame_timer) {
+    LARGE_INTEGER due{};
+    due.QuadPart = -10000;  // 100ns 单位：1ms 后第一次触发
+    SetWaitableTimer(frame_timer, &due, kFrameIntervalMs, nullptr, nullptr,
+                     FALSE);
+  } else {
+    SetTimer(window, 1, kFrameIntervalMs, nullptr);
+  }
   PositionControls();
 
   std::thread([] {
@@ -3817,8 +5659,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
       pending.append(buffer, read);
       size_t newline = 0;
       while ((newline = pending.find('\n')) != std::string::npos) {
-        const std::string line = pending.substr(0, newline);
+        // \r 不能留：应用侧 writeln 写的是 \r\n，路径行带 \r 会让文件打不开。
+        // 数值行靠 strtod 忽略尾部垃圾侥幸没事，字符串行就不行了。
+        std::string line = pending.substr(0, newline);
         pending.erase(0, newline + 1);
+        while (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("MOVA_CACHE=", 0) == 0) {
           const auto divider = line.find('|', 11);
           if (divider != std::string::npos) {
@@ -3831,6 +5676,103 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           g_network_bytes_per_second = std::max(
               0.0, std::strtod(line.c_str() + 13, nullptr));
           PostMessageW(g_window, kPlayerStateChanged, 0, 0);
+        } else if (line.rfind("MOVA_DANMAKU_STATUS=", 0) == 0) {
+          const std::string value = line.substr(20);
+          if (value.rfind("loading", 0) == 0) {
+            g_danmaku_loading = true;
+            g_danmaku_error.clear();
+          } else if (value.rfind("error:", 0) == 0) {
+            g_danmaku_loading = false;
+            g_danmaku_error = Wide(value.substr(6));
+          } else {
+            g_danmaku_loading = false;
+          }
+        } else if (line.rfind("MOVA_DANMAKU_INFO=", 0) == 0) {
+          // 条数 \t 命中的 API 名 \t 匹配到的作品 / 集
+          const std::string value = line.substr(18);
+          const size_t t1 = value.find('\t');
+          const size_t t2 = t1 == std::string::npos
+                                ? std::string::npos
+                                : value.find('\t', t1 + 1);
+          g_danmaku_count = std::atoi(value.c_str());
+          if (t1 != std::string::npos) {
+            g_danmaku_source = Wide(value.substr(
+                t1 + 1, t2 == std::string::npos ? std::string::npos
+                                                : t2 - t1 - 1));
+          }
+          if (t2 != std::string::npos) {
+            g_danmaku_matched = Wide(value.substr(t2 + 1));
+          }
+        } else if (line.rfind("MOVA_DANMAKU=", 0) == 0) {
+          // 应用侧在播放开始后把弹幕写到这里，原生侧热加载，不必重开播放器。
+          g_danmaku_path = Wide(line.substr(13));
+          g_danmaku_loading = false;
+          g_danmaku_error.clear();
+          PostMessageW(g_window, kDanmakuReload, 0, 0);
+        } else if (line.rfind("MOVA_SEGMENT_STATUS=", 0) == 0) {
+          const std::string value = line.substr(20);
+          if (value.rfind("loading", 0) == 0) {
+            // 换集时先到的那条 loading 会把上一集的片段清掉：面板里挂着上一集
+            // 的片头时间点比什么都不显示更糟，自动跳过也会跳到错误的位置。
+            g_segments_loading = true;
+            g_segments_error.clear();
+            g_segments_pending.clear();
+            {
+              std::lock_guard<std::mutex> guard(g_segments_mutex);
+              g_segments.clear();
+            }
+          } else if (value.rfind("error:", 0) == 0) {
+            g_segments_loading = false;
+            g_segments_error = Wide(value.substr(6));
+          } else if (value.rfind("note:", 0) == 0) {
+            // 「未找到 / 已在设置里关闭全部来源」这类说明：不算失败，但要如实
+            // 告诉用户为什么面板里是空的。
+            g_segments_loading = false;
+            g_segments_error = Wide(value.substr(5));
+          } else {
+            g_segments_loading = false;
+          }
+        } else if (line.rfind("MOVA_SEGMENT=", 0) == 0) {
+          // <类型>|<开始秒>|<结束秒>|<来源>
+          const std::string value = line.substr(13);
+          const size_t first = value.find('|');
+          const size_t second = first == std::string::npos
+                                    ? std::string::npos
+                                    : value.find('|', first + 1);
+          const size_t third = second == std::string::npos
+                                   ? std::string::npos
+                                   : value.find('|', second + 1);
+          if (third != std::string::npos) {
+            SegmentItem segment;
+            const std::string kind = value.substr(0, first);
+            if (kind == "recap") segment.kind = SegmentKind::recap;
+            else if (kind == "credits") segment.kind = SegmentKind::credits;
+            else if (kind == "preview") segment.kind = SegmentKind::preview;
+            segment.start = std::strtod(value.c_str() + first + 1, nullptr);
+            segment.end = std::strtod(value.c_str() + second + 1, nullptr);
+            segment.provider = Wide(value.substr(third + 1));
+            g_segments_pending.push_back(std::move(segment));
+          }
+        } else if (line.rfind("MOVA_SEGMENTS_DONE=", 0) == 0) {
+          // 一次下发的全部片段到齐了，整体替换（见 ApplyPendingSegments）。
+          g_segments_loading = false;
+          ApplyPendingSegments();
+          PostMessageW(g_window, kPlayerStateChanged, 0, 0);
+        } else if (line.rfind("MOVA_APPLY=", 0) == 0) {
+          // 播放期间设置页改了弹幕 / 片头片尾 / 播放器偏好：<参数名>|<值>。
+          // 入队交给主线程应用 —— 改区域要重新贴合弹幕窗口、重绘也要在窗口
+          // 自己的线程上做，stdin 线程只负责收。
+          const std::string value = line.substr(11);
+          const size_t divider = value.find('|');
+          if (divider != std::string::npos &&
+              IsLiveApplyName(value.substr(0, divider))) {
+            {
+              std::lock_guard<std::mutex> guard(g_live_mutex);
+              g_live_pending.emplace_back(value.substr(0, divider),
+                                          value.substr(divider + 1));
+            }
+            PostMessageW(g_window, kApplyLiveSettings, 0, 0);
+          }
         }
       }
     }
@@ -3847,17 +5789,59 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
       }
       if (event->event_id == MPV_EVENT_END_FILE && event->data) {
         const auto* end = static_cast<mpv_event_end_file*>(event->data);
+        // 结束原因原样吐给应用侧：以后再遇到「播到一半跳集」，看这一行就能
+        // 分清是正常播完（0）还是读取出错（4），不用靠猜。
+        //
+        // 后面几段是给「自动跳过之后报播放失败」准备的证据：光看 reason 分不出
+        // 「真的断流」和「我们自己发起的 seek / loadfile 把当前文件打断了」，
+        // 把当时的播放位置、总时长和 mpv 的错误码一并带出来才判得准。应用侧只
+        // 认 MOVA_POSITION / MOVA_COMPLETED / MOVA_RESOURCE / MOVA_SETTING，
+        // 不认识这一行，加长字段是安全的。
+        std::fprintf(stdout,
+                     "MOVA_ENDFILE=%d|%lld|played=%.3f|duration=%.3f"
+                     "|error=%d|eof=%d|aborted=%d\r\n",
+                     static_cast<int>(end->reason),
+                     static_cast<long long>(g_playlist_position.load()),
+                     g_last_valid_position.load(), g_duration.load(),
+                     static_cast<int>(end->error),
+                     end->reason == MPV_END_FILE_REASON_EOF ? 1 : 0,
+                     end->reason == MPV_END_FILE_REASON_ERROR ? 1 : 0);
         if (end->reason == MPV_END_FILE_REASON_EOF) {
-          std::fprintf(stdout, "MOVA_COMPLETED=%lld\r\n",
-                       static_cast<long long>(g_playlist_position.load()));
-          std::fflush(stdout);
+          // 断流同样可能被报成 EOF：ffmpeg 会把连接中断当成「读到结尾」。
+          // 只认 reason 就连播，就仍然是「卡一下跳下一集」，所以再校验一次
+          // 位置——离片尾太远的 EOF 一律按中断处理，停在原地不前进。
+          const double duration = g_duration.load();
+          const double played = g_last_valid_position.load();
+          const bool reached_end =
+              duration <= 0.0 || played >= duration - kEofGraceSeconds;
+          if (!reached_end) {
+            std::fprintf(stdout, "MOVA_SUSPECT_EOF=%.3f|%.3f\r\n", played,
+                         duration);
+            std::fflush(stdout);
+            PostMessageW(window, kPlaybackInterrupted, 0, 0);
+          } else {
+            std::fprintf(stdout, "MOVA_COMPLETED=%lld\r\n",
+                         static_cast<long long>(g_playlist_position.load()));
+            std::fflush(stdout);
+            // mpv 的自动前进已被 keep-open=yes 关掉，连播由主线程显式推进。
+            PostMessageW(window, kPlaylistAdvance, 0, 0);
+          }
         } else if (end->reason == MPV_END_FILE_REASON_ERROR) {
-          g_playback_error = true;
-          PostMessageW(window, kPlayerStateChanged, 0, 0);
+          // 缓冲耗尽 / 源站报错都会被 mpv 记成 end-file。以前它紧接着就会
+          // 前进到下一集（表现为「卡一下就跳集」），现在停在原地并给出提示。
+          PostMessageW(window, kPlaybackInterrupted, 0, 0);
         }
       }
       if (event->event_id == MPV_EVENT_FILE_LOADED) {
         g_playback_error = false;
+        // 中断重试：文件加载完了才把位置补回去（加载中发 seek 会落空）。
+        const double resume = g_resume_seconds.exchange(0);
+        if (resume > 0 && g_handle) {
+          const std::string target = std::to_string(resume);
+          const char* args[] = {"seek", target.c_str(), "absolute", nullptr};
+          g_mpv.command(g_handle, args);
+          g_resume_done = true;
+        }
         PostMessageW(window, kPlayerStateChanged, 0, 0);
       }
       if (event->event_id == MPV_EVENT_PROPERTY_CHANGE && event->data) {
@@ -3866,10 +5850,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           const double value = *static_cast<double*>(property->data);
           if (property->name && std::string(property->name) == "time-pos") {
             g_position = value;
+            g_position_tick = NowMs();
+            if (value > 0.0) g_last_valid_position = value;
+            // 暂停时位置只会在拖动进度条时动，这时要重画一次动画静止的弹幕层
+            // （播放中每帧都画，用不到这个标记）。
+            if (g_paused.load()) g_danmaku_dirty = true;
           } else if (property->name && std::string(property->name) == "duration") {
-            g_duration = value;
+            // 只认正值：换集时 mpv 会在旧文件卸载的瞬间报一次 duration=0，
+            // 收下它会让「离片尾多远」的判定失去参照（duration<=0 一律当成
+            // 已经播到结尾），那一次 0 就能把断流误判成正常播完。
+            if (value > 0.0) g_duration = value;
           } else if (property->name && std::string(property->name) == "volume") {
             g_volume = value;
+            // 音量从哪改的（面板、快捷键、滚轮、拖音量条）都会走到这里，统一在
+            // 这里记账，改完等手停下来再回写一次偏好。
+            NoteVolumeForPreference(value);
           } else if (property->name && std::string(property->name) == "speed") {
             g_speed = value;
           } else if (property->name &&
@@ -3886,25 +5881,48 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           if (name == "mute") g_muted = value;
           if (name == "paused-for-cache") g_buffering = value;
           PostMessageW(window, kPlayerStateChanged, 0, 0);
-        } else if (property->format == MPV_FORMAT_INT64 && property->data &&
-                   property->name &&
-                   std::string(property->name) == "playlist-pos") {
-          const int64_t next = *static_cast<int64_t*>(property->data);
-          if (g_playlist_position.exchange(next) != next) {
-            g_cache_fraction = 0;
-          }
-          PostMessageW(window, kPlayerStateChanged, 0, 0);
         }
+        // playlist-pos 不再观察：mpv 里始终只有当前一集，它恒为 0，而我们
+        // 自己的集索引由 LoadPlaylistEntry() 维护（见那里的注释）。
       }
     }
   });
 
   MSG message{};
-  while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-    TranslateMessage(&message);
-    DispatchMessageW(&message);
+  bool pumping = true;
+  while (pumping) {
+    if (frame_timer) {
+      // 有帧定时器就阻塞等「定时器到点」或「有消息」，哪边都不落空：以前那种
+      // 纯 GetMessage 的循环要靠 WM_TIMER 才有节拍，而 WM_TIMER 的周期被系统
+      // 时钟节拍限死（见上面建定时器处的说明）。
+      const DWORD wait_result = MsgWaitForMultipleObjects(
+          1, &frame_timer, FALSE, INFINITE, QS_ALLINPUT);
+      if (wait_result == WAIT_OBJECT_0) TickFrame();
+    }
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      if (message.message == WM_QUIT) {
+        pumping = false;
+        break;
+      }
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    if (!frame_timer) {
+      // 回退到 WM_TIMER 节拍的模式：没有消息就阻塞等着。
+      if (PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE)) continue;
+      WaitMessage();
+    }
   }
   g_running = false;
+  if (frame_timer) {
+    CancelWaitableTimer(frame_timer);
+    CloseHandle(frame_timer);
+  } else {
+    KillTimer(window, 1);
+  }
+  // 与 timeBeginPeriod 配对。漏掉它会让系统时钟一直停在 1ms 粒度上，
+  // 本机其他程序的待机电耗会明显上升。
+  timeEndPeriod(1);
   if (events.joinable()) events.join();
   if (g_handle) {
     g_mpv.terminate_destroy(g_handle);
@@ -3913,6 +5931,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // GdiplusShutdown 会卸载 gdiplus.dll；这些全局 GDI+ 对象必须在它之前释放，
   // 否则进程退出时它们的析构函数会调用已失效的 Gdip* 并触发访问冲突（0xC0000005）。
   ReleaseGlyphCache();
+  ReleaseDanmakuSurface();
   // 图片缓存里的 Gdiplus::Bitmap 同样是 GDI+ 对象，必须在 GdiplusShutdown 之前
   // 释放，否则进程退出时会走到已卸载的 Gdip* 上。
   g_image_cache.clear();

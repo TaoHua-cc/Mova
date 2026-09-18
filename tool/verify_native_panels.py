@@ -1,4 +1,4 @@
-"""End-to-end geometry + content regression for the native player's panels.
+r"""End-to-end geometry + content regression for the native player's panels.
 
 Launches the real MovaNativePlayer.exe with a synthetic playlist and servers,
 posts real WM_LBUTTONDOWN clicks to the controls window at the tool slot
@@ -145,6 +145,44 @@ def geometry(hwnd):
     client = wt.RECT()
     user32.GetClientRect(hwnd, ctypes.byref(client))
     return rect, client
+
+
+# 自绘 UI 的缩放：main.cpp 里所有尺寸常量都是 1280x760 的设计稿值，绘制和
+# 命中判定都先除一遍 UiScale()。窗口默认开到工作区的 92%（宽高各自封顶
+# 1920x1160），比设计稿大，所以 UiScale() 会到 1.25 上限——测试里 PostMessage
+# 的坐标是「物理像素」，必须先按设计稿写、再乘系数，否则点不中。
+UI_DESIGN_WIDTH = 1280.0
+UI_DESIGN_HEIGHT = 760.0
+UI_MIN_SCALE = 0.55
+UI_MAX_SCALE = 1.25
+
+
+def ui_scale(main_hwnd):
+    """Mirror UpdateUiScale(): design units -> physical pixels."""
+    _, client = geometry(main_hwnd)
+    return max(UI_MIN_SCALE,
+               min(UI_MAX_SCALE,
+                   min(client.right / UI_DESIGN_WIDTH,
+                       client.bottom / UI_DESIGN_HEIGHT)))
+
+
+def design_size(main_hwnd):
+    """Physical client size -> (design width, design height, ui scale)."""
+    _, client = geometry(main_hwnd)
+    scale = ui_scale(main_hwnd)
+    return client.right / scale, client.bottom / scale, scale
+
+
+def click_design(hwnd, x, y, label, scale=1.0):
+    """Click a point given in *design* coordinates.
+
+    Returns the physical point actually posted, so callers that compare
+    against the panel's on-screen position stay in physical space.
+    """
+    px = int(round(x * scale))
+    py = int(round(y * scale))
+    click(hwnd, px, py, label)
+    return px, py
 
 
 def make_wav(path, seconds=3.0, rate=8000):
@@ -380,15 +418,20 @@ def run_case(exe, workdir, media, name, tool_args, clicks, out_dir,
     if not order:
         order = ["声音", "字幕", "剧集", "弹幕", "画面", "倍速", "章节",
                  "片头片尾", "资源"]
-    centres, overflow, capacity = tool_slots(c_client.right, len(order))
+    # ToolLayout() 吃的是设计稿宽度，控件条的命中判定也把物理坐标除回设计稿，
+    # 所以这里先把 dock 的物理宽度换算成设计宽度再排版。
+    scale = ui_scale(main_hwnd)
+    dock_design = int(round(c_client.right / scale))
+    centres, overflow, capacity = tool_slots(dock_design, len(order))
     lines.append(
-        f"    order={order} dock_width={c_client.right} capacity={capacity}"
+        f"    order={order} dock={dock_design}(design) x "
+        f"{c_client.right}(px) scale={scale:.3f} capacity={capacity}"
         f" overflow={overflow}")
-    lines.append(f"    slot centres={centres}")
+    lines.append(f"    slot centres={centres} (design)")
 
     last_dock_click_x = None
     for click_fn in clicks:
-        screen_x = click_fn(controls, centres)
+        screen_x = click_fn(controls, centres, scale)
         if screen_x is not None:
             last_dock_click_x = screen_x
 
@@ -397,7 +440,7 @@ def run_case(exe, workdir, media, name, tool_args, clicks, out_dir,
         # PostMessage 的点击偶发落空（与被测代码无关的时序毛刺，失败用例
         # 每轮随机分布）：等不到面板就把整串点击重放一遍再等一次。
         for click_fn in clicks:
-            click_fn(controls, centres)
+            click_fn(controls, centres, scale)
         panel = wait_class("MovaNativePlayerPanel", timeout=3.0, visible=True)
     text, ok = measure(controls, panel, last_dock_click_x)
     if not expect_panel:
@@ -438,17 +481,17 @@ def main():
     make_wav(media)
 
     def click_slot(index, label):
-        def run(controls, centres):
+        def run(controls, centres, scale=1.0):
             if index >= len(centres):
                 print(f"    click {label} SKIPPED (no slot {index})")
                 return None
-            click(controls, centres[index], 72, label)
+            px, _ = click_design(controls, centres[index], 72, label, scale)
             c_rect, _ = geometry(controls)
-            return c_rect.left + centres[index]
+            return c_rect.left + px
         return run
 
     def click_panel_row(row_index, label):
-        def run(controls, centres):
+        def run(controls, centres, scale=1.0):
             panel = wait_class("MovaNativePlayerPanel", timeout=3.0,
                                visible=True)
             if not panel:
@@ -458,7 +501,7 @@ def main():
                  PANEL_HEADER_H + PANEL_ROW_GAP +
                  row_index * (PANEL_OPTION_H + PANEL_ROW_GAP) +
                  PANEL_OPTION_H // 2)
-            click(panel, 170, y, label)
+            click_design(panel, 170, y, label, scale)
             # 子面板沿用一级面板的锚点，所以预期的中心 x 仍是一级面板那个按钮。
             return None
         return run

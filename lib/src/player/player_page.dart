@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
 import '../platform/native_video_host.dart';
 import 'playback_progress.dart';
+import 'playback_segments.dart';
 
 import '../brand.dart';
 import '../motion.dart';
@@ -21,7 +22,6 @@ import 'danmaku_client.dart';
 import 'dolby_vision_color.dart';
 import 'native_dolby_vision.dart';
 import 'subtitle_preference.dart';
-import 'segment_client.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
@@ -1300,114 +1300,28 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _loadSegmentData() async {
     final episode = _activeEpisode;
-    var local = _segmentServerSource
-        ? _segmentsFromChapters(episode.chapters)
-        : const <PlaybackSegment>[];
-    final fetched = <PlaybackSegment>[];
-    final failures = <String>[];
-    if (_segmentServerSource && episode.serverItemId != null) {
-      try {
-        final store = await SourceStore.create();
-        final source = store
-            .load()
-            .where((value) => value.id == episode.sourceId)
-            .firstOrNull;
-        final token = source == null ? null : store.tokenFor(source);
-        if (source != null &&
-            source.kind != SourceKind.webdav &&
-            token != null &&
-            token.isNotEmpty) {
-          final server = EmbyClient(
-            proxy: ProxyRouting.serverUsesProxy(source.id),
-          );
-          try {
-            final native = await server.mediaSegments(
-              EmbySession(source: source, token: token),
-              episode.serverItemId!,
-            );
-            if (native.isNotEmpty) {
-              local = [
-                ..._segmentsFromChapters(native, provider: '服务器原生分段'),
-                ...local,
-              ];
-            }
-          } finally {
-            server.dispose();
-          }
-        }
-      } catch (_) {
-        failures.add('服务器分段');
-      }
-    }
-    final client = SegmentClient();
-    try {
-      final tmdbId = episode.tmdbId;
-      if (tmdbId != null) {
-        SegmentIdentifiers? ids;
-        if (_segmentIntroDbSource ||
-            _segmentAniSkipSource ||
-            _segmentChaptersDbSource) {
-          try {
-            ids = await client.identifiers(
-              tmdbId: tmdbId,
-              movie: episode.seasonNumber == null,
-            );
-          } catch (_) {
-            failures.add('外部标识');
-          }
-        }
-        final requests = <Future<List<PlaybackSegment>>>[
-          if (_segmentIntroDbSource &&
-              ids?.imdbId != null &&
-              episode.seasonNumber != null &&
-              episode.episodeNumber != null)
-            client.introDb(
-              imdbId: ids!.imdbId!,
-              season: episode.seasonNumber!,
-              episode: episode.episodeNumber!,
-            ),
-          if (_segmentTheIntroDbSource)
-            client.theIntroDb(
-              tmdbId: tmdbId,
-              season: episode.seasonNumber,
-              episode: episode.episodeNumber,
-              duration: _player.state.duration,
-            ),
-          if (_segmentAniSkipSource &&
-              ids?.malId != null &&
-              episode.episodeNumber != null)
-            client.aniSkip(
-              malId: ids!.malId!,
-              episode: episode.episodeNumber!,
-              duration: _player.state.duration,
-            ),
-          if (_segmentChaptersDbSource &&
-              (ids?.imdbId != null || ids?.tvdbId != null))
-            client.chaptersDb(
-              imdbId: ids?.imdbId,
-              season: episode.seasonNumber,
-              episode: episode.episodeNumber,
-            ),
-        ];
-        final results = await Future.wait(
-          requests.map((request) async {
-            try {
-              return await request;
-            } catch (_) {
-              failures.add('公共来源');
-              return const <PlaybackSegment>[];
-            }
-          }),
-        );
-        for (final result in results) {
-          fetched.addAll(result);
-        }
-      }
-    } finally {
-      client.dispose();
-    }
+    // 片头片尾的取数逻辑与 Windows 原生播放器共用一份（playback_segments.dart）：
+    // 两条链路读同一批来源开关，设置里关掉哪个来源就都不会去查。
+    final result = await loadPlaybackSegments(
+      PlaybackSegmentQuery(
+        tmdbId: episode.tmdbId,
+        seasonNumber: episode.seasonNumber,
+        episodeNumber: episode.episodeNumber,
+        sourceId: episode.sourceId,
+        serverItemId: episode.serverItemId,
+        duration: _player.state.duration,
+        chapters: episode.chapters,
+        sources: SegmentSourceSettings(
+          server: _segmentServerSource,
+          introDb: _segmentIntroDbSource,
+          theIntroDb: _segmentTheIntroDbSource,
+          aniSkip: _segmentAniSkipSource,
+          chaptersDb: _segmentChaptersDbSource,
+        ),
+      ),
+    );
     if (!mounted) return;
-    final segments = _dedupeSegments([...local, ...fetched]);
+    final segments = result.segments;
     final intro = segments
         .where((item) => item.type == PlaybackSegmentType.intro)
         .firstOrNull;
@@ -1416,83 +1330,10 @@ class _PlayerPageState extends State<PlayerPage> {
         .firstOrNull;
     setState(() {
       _segments = segments;
-      _segmentMessage = segments.isEmpty
-          ? failures.isEmpty
-                ? '当前数据源未提供片头片尾信息'
-                : '部分来源暂时不可用，且未找到片头片尾信息'
-          : failures.isEmpty
-          ? null
-          : '已使用可用来源，部分来源暂时不可用';
+      _segmentMessage = result.message;
       _introEnd ??= intro?.end;
       _outroStart ??= credits?.start;
     });
-  }
-
-  List<PlaybackSegment> _dedupeSegments(List<PlaybackSegment> values) {
-    final result = <PlaybackSegment>[];
-    for (final value in values) {
-      final duplicate = result.any(
-        (existing) =>
-            existing.type == value.type &&
-            (existing.start - value.start).abs() < const Duration(seconds: 2),
-      );
-      if (!duplicate) result.add(value);
-    }
-    return result;
-  }
-
-  List<PlaybackSegment> _segmentsFromChapters(
-    List<MediaChapter> chapters, {
-    String provider = '服务器章节',
-  }) {
-    final results = <PlaybackSegment>[];
-    for (var index = 0; index < chapters.length; index++) {
-      final chapter = chapters[index];
-      final name = chapter.title.toLowerCase();
-      final next =
-          chapter.end ??
-          (index + 1 < chapters.length ? chapters[index + 1].start : null);
-      if (name.contains('intro') || name.contains('片头')) {
-        results.add(
-          PlaybackSegment(
-            type: PlaybackSegmentType.intro,
-            start: chapter.start,
-            end: next,
-            provider: provider,
-          ),
-        );
-      } else if (name.contains('recap') || name.contains('前情')) {
-        results.add(
-          PlaybackSegment(
-            type: PlaybackSegmentType.recap,
-            start: chapter.start,
-            end: next,
-            provider: provider,
-          ),
-        );
-      } else if (name.contains('preview') || name.contains('预告')) {
-        results.add(
-          PlaybackSegment(
-            type: PlaybackSegmentType.preview,
-            start: chapter.start,
-            end: next,
-            provider: provider,
-          ),
-        );
-      } else if (name.contains('credit') ||
-          name.contains('outro') ||
-          name.contains('片尾')) {
-        results.add(
-          PlaybackSegment(
-            type: PlaybackSegmentType.credits,
-            start: chapter.start,
-            end: next,
-            provider: provider,
-          ),
-        );
-      }
-    }
-    return results;
   }
 
   Future<void> _setSegment({required bool intro}) async {
@@ -1973,19 +1814,23 @@ class _PlayerPageState extends State<PlayerPage> {
     final state = _player.state;
     if (state.duration <= Duration.zero) return;
     await store.save(
-      WatchState(
-        mediaId: _activeEpisode.url,
-        title: _activeEpisode.title,
-        position: state.position,
-        duration: state.duration,
-        imageUrl: _activeEpisode.imageUrl,
-        sourceId: _activeEpisode.sourceId,
-        serverItemId: _activeEpisode.serverItemId,
-        tmdbId: _activeEpisode.tmdbId,
-        episodeTitle: _activeEpisode.episodeTitle,
-        seasonNumber: _activeEpisode.seasonNumber,
-        episodeNumber: _activeEpisode.episodeNumber,
-        isPlayed: isPlayed,
+      // 与原生播放器的保存循环同一套清洗：集名与剧名同名/通用集名时清空，
+      // 避免副标题出现「S1E2 · 叛逆的女仆」这类自我重复。
+      normalizeWatchState(
+        WatchState(
+          mediaId: _activeEpisode.url,
+          title: _activeEpisode.title,
+          position: state.position,
+          duration: state.duration,
+          imageUrl: _activeEpisode.imageUrl,
+          sourceId: _activeEpisode.sourceId,
+          serverItemId: _activeEpisode.serverItemId,
+          tmdbId: _activeEpisode.tmdbId,
+          episodeTitle: _activeEpisode.episodeTitle,
+          seasonNumber: _activeEpisode.seasonNumber,
+          episodeNumber: _activeEpisode.episodeNumber,
+          isPlayed: isPlayed,
+        ),
       ),
     );
   }

@@ -37,6 +37,10 @@ dist-new*/
 /verify-asar.cjs
 /verify-console.cjs
 /v9-console-handoff/
+# 本地排查时把命令输出重定向到根目录的临时报告（verify/analyze/deploy/…）。
+# 只有根目录这一层会被忽略，windows/CMakeLists.txt 这类真源码不受影响。
+/*.txt
+/tool/__pycache__/
 
 # --- 签名材料：绝不入库 ---
 # 这是发布包的更新凭证，泄露等于别人可以伪造你的更新包。

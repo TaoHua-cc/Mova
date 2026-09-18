@@ -1,11 +1,20 @@
-"""Probe: does the native player UI scale down with a small window?
+"""Probe: the native player's design→physical coordinate mapping.
 
-Shrinks the main window to 720x430 (expected ui scale 0.5625), clicks the
-"剧集" tool slot at its scaled position, then reports the panel's physical
-size (expected ≈ 480*0.5625 + 2*26*0.5625 ≈ 299 px wide) and takes a shot.
+Two things are checked, because both ends have bitten this project:
+
+1. **Default (big) window** — prints the window / dock sizes in both physical
+   and design units plus the resulting ``UiScale()``. Anything that posts
+   clicks into these windows has to work in design units, so this is the line
+   to look at when a click "lands nowhere".
+2. **Shrunk window** — resizes the main window to 720x430 (expected ui scale
+   0.5625), clicks the "剧集" tool slot at its scaled position, then reports
+   the panel's physical size (expected ≈ 480*0.5625 + 2*26*0.5625 ≈ 299 px
+   wide) and takes a shot.
+
+Coordinates here are always written in design units and pushed through
+``v.click_design()`` — never hand-roll ``int(x * scale)``.
 """
 import ctypes
-import ctypes.wintypes as wt
 import os
 import subprocess
 import sys
@@ -16,19 +25,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_native_panels as v  # noqa: E402
 
 user32 = v.user32
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-MK_LBUTTON = 0x0001
 
 
-def click(hwnd, x, y, label):
-    packed = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.15)
-    user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, packed)
-    user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, packed)
-    time.sleep(0.5)
-    print(f"click {label} @({x},{y})", flush=True)
+def report_geometry(main_hwnd, controls, label):
+    """Print window/dock size in physical + design units, and the scale."""
+    m_rect, m_client = v.geometry(main_hwnd)
+    c_rect, c_client = v.geometry(controls)
+    scale = v.ui_scale(main_hwnd)
+    d_w, d_h, _ = v.design_size(main_hwnd)
+    centres = v.tool_slots(int(round(c_client.right / scale)), 1)[0]
+    print(f"[{label}] screen={ctypes.windll.user32.GetSystemMetrics(0)}x"
+          f"{ctypes.windll.user32.GetSystemMetrics(1)} "
+          f"main={m_rect.right-m_rect.left}x{m_rect.bottom-m_rect.top}"
+          f" (client {m_client.right}x{m_client.bottom} -> design "
+          f"{d_w:.0f}x{d_h:.0f}) "
+          f"dock={c_client.right}(px) -> {int(round(c_client.right/scale))}"
+          f"(design) scale={scale:.4f} slot0={centres}", flush=True)
+    return scale, m_rect
 
 
 def main():
@@ -50,12 +63,15 @@ def main():
         print(f"windows {main_hwnd}/{controls}/{panel}", flush=True)
         time.sleep(1.0)
 
+        # 1) 默认（放大后的）窗口：这里就是「按 1.0 算坐标会点空」的来源。
+        report_geometry(main_hwnd, controls, "default")
+
         # Shrink to 720x430: expected ui scale = min(720/1280, 430/760) = 0.5625.
         user32.SetWindowPos(main_hwnd, None, 100, 100, 720, 430,
                             0x0004 | 0x0010)  # NOZORDER | NOACTIVATE
         time.sleep(0.8)
         rect, client = v.geometry(main_hwnd)
-        scale = min(client.right / 1280.0, client.bottom / 760.0)
+        scale = v.ui_scale(main_hwnd)
         print(f"shrunk window client={client.right}x{client.bottom} "
               f"expected scale={scale:.4f}", flush=True)
 
@@ -64,15 +80,13 @@ def main():
               f"(expected ~{int(1040 * scale)}x{int(112 * scale)})", flush=True)
 
         # "剧集" slot at design (ToolAreaStart(1040)+120+20, 72) = (850, 72)
-        # for a single-tool order (slot index 0).
+        # for a single-tool order (slot index 0). Design units → click_design().
         design_x, design_y = 850.0, 72.0
-        click(controls, int(design_x * scale), int(design_y * scale),
-              "剧集 tool (scaled)")
+        v.click_design(controls, design_x, design_y, "剧集 tool (scaled)", scale)
         panel = v.wait_class("MovaNativePlayerPanel", timeout=3.0,
                              visible=True)
         if not panel:
-            click(controls, int(design_x * scale), int(design_y * scale),
-                  "剧集 retry")
+            v.click_design(controls, design_x, design_y, "剧集 retry", scale)
             panel = v.wait_class("MovaNativePlayerPanel", timeout=3.0,
                                  visible=True)
         ok = True

@@ -7,8 +7,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../cache/video_cache.dart';
 import '../history/watch_state_store.dart';
+import 'danmaku_client.dart';
 import 'dolby_vision_color.dart';
 import 'native_dolby_vision.dart';
+import 'playback_segments.dart';
 
 /// 可切换的资源版本。原生播放器只拿到显示用的服务器名、规格摘要与一张**本地
 /// 图标文件**的路径 —— 地址、请求头与视频范围都留在应用侧，因为换资源要靠应用
@@ -101,6 +103,21 @@ class WindowsNativePlaybackRequest {
   final int resourceIndex;
 }
 
+/// 拉取到的弹幕：临时文件路径 + 播放器面板要显示的数据来源信息。
+class _DanmakuPayload {
+  const _DanmakuPayload({
+    required this.path,
+    required this.count,
+    required this.source,
+    required this.matched,
+  });
+
+  final String path;
+  final int count;
+  final String source;
+  final String matched;
+}
+
 class WindowsNativePlaylistEntry {
   const WindowsNativePlaylistEntry({
     required this.url,
@@ -150,8 +167,37 @@ class WindowsNativePlaylistEntry {
   final String? meta;
 }
 
+/// 正在播放的原生会话。设置页在播放期间改了「弹幕显示 / 片头片尾」里的项时，
+/// 靠它把新值就地推给播放器 —— 以前这些值只在起播时以命令行下发一次，播放中
+/// 改设置要等下一次播放才生效，两边的显示会各说各话。
+class _LiveSession {
+  _LiveSession({
+    required this.send,
+    required this.reloadSegments,
+    required this.reloadDanmaku,
+    required this.danmakuEnabled,
+  });
+
+  /// 往播放器 stdin 写一行；播放器已退出时静默忽略。
+  final void Function(String line) send;
+
+  /// 片头片尾来源开关变了：按新来源重拉当前集。
+  final Future<void> Function() reloadSegments;
+
+  /// 弹幕开关 / API 变了：按当前集重新拉一份。
+  final Future<void> Function() reloadDanmaku;
+
+  /// 起播时的弹幕开关，用来分清这次是「从关到开」（要重拉数据）还是只改了
+  /// 显示样式（原生侧自己就够了）。
+  bool danmakuEnabled;
+}
+
 class WindowsNativePlayer {
   WindowsNativePlayer._();
+
+  /// 正在播放的会话；没有播放时为 null（此时设置改动已经落盘，下次起播读到
+  /// 的就是新值，不需要热更新）。
+  static _LiveSession? _live;
 
   /// 启动原生播放器并等待它结束。
   ///
@@ -182,6 +228,15 @@ class WindowsNativePlayer {
     final voiceEnhance =
         preferences.getBool('yingji.player.voice-enhance') ?? false;
     final speed = preferences.getDouble('yingji.player.speed') ?? 1;
+    // 音量与亮度是「控件菜单里改过就沿用」的播放器偏好：菜单里改完会回写到这两个
+    // 键（见原生 EmitPlayerPreference），起播时再按这里下发，否则每次播放都回到
+    // 默认值，用户会以为改的设置没保存。
+    final volume = (preferences.getDouble('yingji.player.volume') ?? 100).clamp(
+      0.0,
+      100.0,
+    );
+    final brightness = (preferences.getDouble('yingji.player.brightness') ?? 0)
+        .clamp(-100.0, 100.0);
     final audioDelay = preferences.getDouble('yingji.player.audio-delay') ?? 0;
     final subtitleDelay =
         preferences.getDouble('yingji.player.subtitle-delay') ?? 0;
@@ -212,6 +267,43 @@ class WindowsNativePlayer {
         preferences.getBool('yingji.danmaku.enabled') ?? false;
     final autoSkipSegments =
         preferences.getBool('yingji.segment.auto-skip') ?? true;
+    final skipDelaySeconds =
+        preferences.getDouble('yingji.segment.skip-delay-seconds') ?? 5;
+    // 片头片尾只在这里下发开关与延迟；来源开关与数据都在起播后现读现拉
+    // （见 pushEpisodeSegments）—— 播放期间设置页改了来源也能立刻重拉。
+    //
+    // 桌面端播放走独立的 MovaNativePlayer.exe，Flutter 的 _DanmakuOverlay 不生效，
+    // 所以弹幕必须在原生覆盖窗口里渲染。做法：应用侧用 DanmakuClient 拉取 -> 序列
+    // 化到临时文本文件 -> 起播后经 stdin 把路径热加载进原生。拉取失败 / 超时都不
+    // 阻塞起播，换集时按新的一集重拉，播放期间改了设置页也走同一条路重来。
+    List<String> danmakuStyleArgs = const [];
+    if (danmakuEnabled) {
+      final danmakuOpacity =
+          preferences.getDouble('yingji.danmaku.opacity') ?? 0.82;
+      final danmakuArea = preferences.getDouble('yingji.danmaku.area') ?? 0.65;
+      final danmakuFontSize =
+          preferences.getDouble('yingji.danmaku.font-size') ?? 18.0;
+      final danmakuSpeed = preferences.getDouble('yingji.danmaku.speed') ?? 1.0;
+      final danmakuDensity =
+          preferences.getDouble('yingji.danmaku.density') ?? 0.55;
+      final danmakuScroll =
+          preferences.getBool('yingji.danmaku.scroll') ?? true;
+      final danmakuTop = preferences.getBool('yingji.danmaku.top') ?? true;
+      final danmakuBottom =
+          preferences.getBool('yingji.danmaku.bottom') ?? true;
+      // 弹幕不在起播路径上等待：等它会在网络不通时把起播拖到超时。播放器先
+      // 起来，数据在 _pushDanmaku 里拉到后再通过 stdin 送进去热加载。
+      danmakuStyleArgs = <String>[
+        '--mova-danmaku-opacity=$danmakuOpacity',
+        '--mova-danmaku-area=$danmakuArea',
+        '--mova-danmaku-font-size=$danmakuFontSize',
+        '--mova-danmaku-speed=$danmakuSpeed',
+        '--mova-danmaku-density=$danmakuDensity',
+        '--mova-danmaku-scroll=${danmakuScroll ? 'yes' : 'no'}',
+        '--mova-danmaku-top=${danmakuTop ? 'yes' : 'no'}',
+        '--mova-danmaku-bottom=${danmakuBottom ? 'yes' : 'no'}',
+      ];
+    }
     final toolOrder =
         preferences.getStringList('yingji.player.tool-order') ??
         const ['声音', '字幕', '剧集', '弹幕', '画面', '倍速', '章节', '片头片尾', '资源'];
@@ -278,7 +370,13 @@ class WindowsNativePlayer {
     final arguments = <String>[
       '--config=no',
       '--force-window=yes',
+      // keep-open 必须为 no：mpv 的播放列表里现在只装当前一集（整季都塞进去
+      // 的话，它在任何 end-file 之后都会自动前进，就是「播到一半跳下一集」），
+      // 而 keep-open=yes 会让 mpv 播完后停在最后一帧、根本不发 END_FILE，
+      // 连播就永远触发不了。改成 no 之后：播完发 EOF，由原生侧判定是否真的
+      // 播到了片尾，确认后才 loadfile 下一集；出错则停在原地并给出提示。
       '--keep-open=no',
+      '--stop-playback-on-init-failure=yes',
       '--vo=gpu-next',
       '--gpu-api=d3d11',
       '--gpu-context=d3d11',
@@ -291,14 +389,19 @@ class WindowsNativePlayer {
       '--autofit-larger=90%x90%',
       '--force-media-title=${request.title}',
       '--speed=$speed',
+      '--volume=$volume',
+      '--brightness=$brightness',
       '--audio-delay=$audioDelay',
       '--sub-delay=$subtitleDelay',
       '--demuxer-readahead-secs=$cacheSeconds',
       '--video-aspect-override=${_aspectValue(aspect)}',
       '--mova-seek-seconds=$seekSeconds',
       '--mova-volume-step=$volumeStep',
+      // 弹幕文件不在这里传：起播时还没拉到，由 _pushDanmaku 通过 stdin 热加载。
       '--mova-danmaku-enabled=${danmakuEnabled ? 'yes' : 'no'}',
+      ...danmakuStyleArgs,
       '--mova-auto-skip-segments=${autoSkipSegments ? 'yes' : 'no'}',
+      '--mova-skip-delay-seconds=$skipDelaySeconds',
       ...toolOrder.map((tool) => '--mova-tool-order=$tool'),
       ...toolHidden.map((tool) => '--mova-tool-hidden=$tool'),
       ...shortcuts.entries.map(
@@ -421,6 +524,91 @@ class WindowsNativePlayer {
       cacheProgress = download.progress.listen(sendCacheProgress);
       unawaited(process.stdin.done.catchError((_) {}));
     }
+    // 弹幕与片头片尾都是「按集」的数据：起播后异步拉当前集，之后每次换集重新
+    // 拉一遍。各自的 generation 用来丢弃过期的结果 —— 网络慢的时候上一集的
+    // 数据晚到，会把当前集的弹幕和片头片尾盖掉；两边分开计数则是因为设置页在
+    // 播放期间改了来源开关只需要重拉片段，不该顺带作废正在进行的弹幕拉取。
+    var segmentGeneration = 0;
+    var danmakuGeneration = 0;
+    var extrasEpisode = request.playlistIndex.clamp(0, entries.length - 1);
+    // 同一时刻只有一个弹幕临时文件在用：换集后新文件一到，旧的就删（原生把它
+    // 读进内存后就不再碰这个文件了），退出时再删一次收尾。
+    String? activeDanmakuFile;
+
+    void sendLine(String line) {
+      try {
+        process.stdin.writeln(line);
+      } catch (_) {
+        // 播放器已经退出，写不进去就算了。
+      }
+    }
+
+    WindowsNativePlaylistEntry? entryAt(int index) =>
+        index >= 0 && index < entries.length ? entries[index] : null;
+
+    /// 按设置里当前勾选的来源，拉当前集的片头片尾并下发。
+    ///
+    /// 来源开关每次现读偏好：播放期间用户可能在设置页里改了它们，用起播时的
+    /// 快照就会「明明勾了来源却还是没有数据」。
+    Future<void> pushEpisodeSegments(int index) async {
+      final generation = ++segmentGeneration;
+      final preferences = await SharedPreferences.getInstance();
+      await _pushSegments(
+        entry: entryAt(index),
+        request: request,
+        send: sendLine,
+        stale: () => generation != segmentGeneration,
+        sources: SegmentSourceSettings.fromPreferences(preferences),
+      );
+    }
+
+    /// 拉当前集的弹幕并热加载进播放器。
+    Future<void> pushEpisodeDanmaku(int index) async {
+      final generation = ++danmakuGeneration;
+      final preferences = await SharedPreferences.getInstance();
+      if (!(preferences.getBool('yingji.danmaku.enabled') ?? false)) return;
+      final config = _danmakuConfig(preferences);
+      if (config.apis.isEmpty) {
+        // 没填 API 时不要让面板一直显示「获取中」。
+        sendLine('MOVA_DANMAKU_STATUS=error:未配置弹幕 API');
+        return;
+      }
+      sendLine('MOVA_DANMAKU_STATUS=loading');
+      final path = await _pushDanmaku(
+        request: request,
+        entry: entryAt(index),
+        apis: config.apis,
+        apiNames: config.names,
+        token: config.token,
+        send: sendLine,
+        stale: () => generation != danmakuGeneration,
+      );
+      if (path == null) return;
+      if (generation != danmakuGeneration) {
+        await _deleteFileQuietly(path);
+        return;
+      }
+      final previous = activeDanmakuFile;
+      activeDanmakuFile = path;
+      if (previous != null) await _deleteFileQuietly(previous);
+    }
+
+    Future<void> loadEpisodeExtras(int index) async {
+      extrasEpisode = index;
+      unawaited(pushEpisodeSegments(index));
+      unawaited(pushEpisodeDanmaku(index));
+    }
+
+    // 播放期间的设置热更新入口：设置页改了弹幕 / 片头片尾设置，直接推到正在
+    // 跑的播放器上（见 pushLiveSettings），不必等下一次起播。
+    _live = _LiveSession(
+      send: sendLine,
+      reloadSegments: () => pushEpisodeSegments(extrasEpisode),
+      reloadDanmaku: () => pushEpisodeDanmaku(extrasEpisode),
+      danmakuEnabled: danmakuEnabled,
+    );
+
+    unawaited(loadEpisodeExtras(extrasEpisode));
     var position = request.initialPosition;
     var duration = Duration.zero;
     var playlistPosition = request.playlistIndex;
@@ -497,6 +685,11 @@ class WindowsNativePlayer {
               sendCacheProgress(download!.state);
               cacheProgress = download!.progress.listen(sendCacheProgress);
             }
+            // 换集了：弹幕与片头片尾都得按新的一集重来，否则面板里显示的还是
+            // 上一集的数据、自动跳过也会对着上一集的片头时间点跳。
+            if (playlistPosition != extrasEpisode) {
+              unawaited(loadEpisodeExtras(playlistPosition));
+            }
           }
           for (final match in RegExp(
             r'MOVA_COMPLETED=([0-9]+)',
@@ -504,13 +697,26 @@ class WindowsNativePlayer {
             final index = int.tryParse(match.group(1) ?? '');
             if (index != null) completedEpisodes.add(index);
           }
+          // 用户在原生弹幕面板里改了显示设置：回写到应用偏好，下次起播沿用。
+          for (final match in RegExp(
+            r'MOVA_SETTING=([A-Za-z0-9._-]+)\|(\S+)',
+          ).allMatches(chunk)) {
+            unawaited(_saveNativeSetting(match.group(1)!, match.group(2)!));
+          }
         });
     await process.stderr.drain<void>();
     final exitCode = await process.exitCode;
     await cacheProgress?.cancel();
     await process.stdin.close();
     await output.cancel();
+    // 播放结束：设置的热更新入口随之失效，再推也没人接了。
+    _live = null;
     download?.cancel();
+    // 收尾：删掉最后一次下发的弹幕临时文件（换集时上一份已经在换集流程里删过）。
+    final lastDanmakuFile = activeDanmakuFile;
+    if (lastDanmakuFile != null) {
+      await _deleteFileQuietly(lastDanmakuFile);
+    }
     nextEpisodePreload?.cancel();
     if (episodeDurations.isNotEmpty) {
       final store = await WatchStateStore.create();
@@ -520,19 +726,26 @@ class WindowsNativePlayer {
         final activePosition = episodePositions[item.key] ?? Duration.zero;
         final activeDuration = item.value;
         await store.save(
-          WatchState(
-            mediaId: activeEntry.url,
-            title: activeEntry.title,
-            position: activePosition,
-            duration: activeDuration,
-            imageUrl: activeEntry.imageUrl,
-            sourceId: activeEntry.sourceId,
-            serverItemId: activeEntry.serverItemId,
-            tmdbId: activeEntry.tmdbId,
-            episodeTitle: activeEntry.episodeTitle ?? activeEntry.title,
-            seasonNumber: activeEntry.seasonNumber,
-            episodeNumber: activeEntry.episodeNumber,
-            isPlayed: completedEpisodes.contains(item.key),
+          // title 必须是剧名（request.title）：播放列表条目的 title 是单集
+          // 条目自己的名字，各来源取名不一致 —— 有的叫「第 1 集」，有的直接
+          // 复用剧名，写成记录标题就会出现「同一个剧两条记录、一条把集名
+          // 当剧名」的脏数据。episodeTitle 只取条目自带的集名，缺了就留空
+          // （卡片回退「第 N 集」），绝不拿剧名/条目名来充数。
+          normalizeWatchState(
+            WatchState(
+              mediaId: activeEntry.url,
+              title: request.title,
+              position: activePosition,
+              duration: activeDuration,
+              imageUrl: activeEntry.imageUrl,
+              sourceId: activeEntry.sourceId,
+              serverItemId: activeEntry.serverItemId,
+              tmdbId: activeEntry.tmdbId,
+              episodeTitle: activeEntry.episodeTitle,
+              seasonNumber: activeEntry.seasonNumber,
+              episodeNumber: activeEntry.episodeNumber,
+              isPlayed: completedEpisodes.contains(item.key),
+            ),
           ),
         );
       }
@@ -575,6 +788,368 @@ class WindowsNativePlayer {
       return (await DefaultCacheManager().getSingleFile(url)).path;
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 拉取弹幕并序列化为原生侧能直接读入的临时文本文件。
+  ///
+  /// 行格式：`<time秒>\t<mode>\t<color>\t<base64文本>`
+  /// - mode：1 滚动 / 5 顶部 / 6 底部（对齐 DanmakuClient 的枚举与原生解析）。
+  /// - color：0xRRGGBB，无颜色时记 -1（原生按默认白渲染）。
+  /// 文本走 base64 是为了避开中文 / 制表符与换行对行解析的干扰，原生侧自带解码。
+  ///
+  /// 依次尝试每个 API，命中「非空结果」即刻返回；全部失败则抛错，由调用方降级为
+  /// 不起用弹幕。单个 API 内部已有 15s 超时，这里再给整体 12s 上限做二次保险。
+  static Future<_DanmakuPayload> _writeDanmakuFile({
+    required WindowsNativePlaybackRequest request,
+    WindowsNativePlaylistEntry? entry,
+    required List<String> apis,
+    required List<String> apiNames,
+    required String token,
+  }) async {
+    if (apis.isEmpty) throw StateError('未配置弹幕 API');
+    List<DanmakuComment>? comments;
+    String source = '';
+    String matched = '';
+    for (var index = 0; index < apis.length; index++) {
+      final api = apis[index];
+      try {
+        final client = DanmakuClient();
+        final result = await client
+            .fetch(
+              template: api,
+              tmdbId: (entry?.tmdbId ?? request.tmdbId)?.toString(),
+              title: request.title,
+              season: entry?.seasonNumber ?? request.seasonNumber,
+              episode: entry?.episodeNumber ?? request.episodeNumber,
+              mediaUrl: request.url,
+              token: token.isEmpty ? null : token,
+            )
+            .timeout(const Duration(seconds: 12));
+        if (result.isEmpty) continue;
+        comments = result;
+        // 命中的线路名优先用用户填的名称，没填就退回地址本身。
+        source = index < apiNames.length && apiNames[index].trim().isNotEmpty
+            ? apiNames[index].trim()
+            : api;
+        matched = client.matchedEpisode ?? '';
+        break;
+      } catch (_) {
+        // 该 API 失败，继续试下一个。
+      }
+    }
+    if (comments == null || comments.isEmpty) {
+      throw StateError('没有匹配的弹幕');
+    }
+    final buffer = StringBuffer();
+    for (final comment in comments) {
+      final mode = switch (comment.mode) {
+        DanmakuMode.top => 5,
+        DanmakuMode.bottom => 6,
+        _ => 1,
+      };
+      final color = comment.color ?? -1;
+      final payload = base64Encode(utf8.encode(comment.content));
+      buffer.writeln(
+        '${comment.time.inMilliseconds / 1000}\t$mode\t$color\t$payload',
+      );
+    }
+    final file = File(
+      '${Directory.systemTemp.path}${Platform.pathSeparator}'
+      'mova_danmaku_${DateTime.now().microsecondsSinceEpoch}.txt',
+    );
+    await file.writeAsString(buffer.toString(), encoding: utf8);
+    return _DanmakuPayload(
+      path: file.path,
+      count: comments.length,
+      source: source,
+      matched: matched,
+    );
+  }
+
+  /// 播放开始后再拉弹幕，拉到就通过 stdin 交给原生播放器热加载。
+  ///
+  /// 放在起播前做会把起播卡住（网络不通时甚至能卡到超时），而且失败会连带
+  /// 拖慢整个播放流程。现在起播不等弹幕，播放器先跑起来，数据到了再叠加。
+  ///
+  /// [stale] 在每次发送前检查：换集之后才回来的上一集结果一律丢弃，不能让它
+  /// 把当前集的弹幕（或状态提示）盖掉。
+  static Future<String?> _pushDanmaku({
+    required WindowsNativePlaybackRequest request,
+    WindowsNativePlaylistEntry? entry,
+    required List<String> apis,
+    required List<String> apiNames,
+    required String token,
+    required void Function(String) send,
+    required bool Function() stale,
+  }) async {
+    try {
+      final payload = await _writeDanmakuFile(
+        request: request,
+        entry: entry,
+        apis: apis,
+        apiNames: apiNames,
+        token: token,
+      ).timeout(const Duration(seconds: 20));
+      if (stale()) {
+        await _deleteFileQuietly(payload.path);
+        return null;
+      }
+      send(
+        'MOVA_DANMAKU_INFO=${payload.count}\t${payload.source}\t'
+        '${payload.matched.replaceAll('\t', ' ').replaceAll('\n', ' ')}',
+      );
+      send('MOVA_DANMAKU=${payload.path}');
+      return payload.path;
+    } catch (error) {
+      if (!stale()) {
+        send('MOVA_DANMAKU_STATUS=error:${_reasonOf(error)}');
+      }
+      return null;
+    }
+  }
+
+  /// 拉取当前集的片头片尾并经 stdin 下发给原生播放器。
+  ///
+  /// 原生不联网、也不持有服务器令牌，所以数据必须在应用侧按设置里勾选的来源
+  /// 取好。整段是尽力而为：拿不到就只发一条状态，面板照实显示原因，不影响播放。
+  static Future<void> _pushSegments({
+    required WindowsNativePlaybackRequest request,
+    required WindowsNativePlaylistEntry? entry,
+    required void Function(String) send,
+    required bool Function() stale,
+    required SegmentSourceSettings sources,
+  }) async {
+    send('MOVA_SEGMENT_STATUS=loading');
+    try {
+      final result = await loadPlaybackSegments(
+        PlaybackSegmentQuery(
+          tmdbId: entry?.tmdbId ?? request.tmdbId,
+          seasonNumber: entry?.seasonNumber ?? request.seasonNumber,
+          episodeNumber: entry?.episodeNumber ?? request.episodeNumber,
+          sourceId: entry?.sourceId ?? request.sourceId,
+          serverItemId: entry?.serverItemId ?? request.serverItemId,
+          sources: sources,
+        ),
+      ).timeout(const Duration(seconds: 20));
+      if (stale()) return;
+      // 行格式：<类型>|<开始秒>|<结束秒>|<来源>；结束点缺失记 -1（片尾常常只有
+      // 起点），原生按当前总时长处理。
+      for (final segment in result.segments) {
+        send(
+          'MOVA_SEGMENT=${segment.type.name}|${_secondLabel(segment.start)}|'
+          '${segment.end == null ? -1 : _secondLabel(segment.end!)}|'
+          '${segment.provider.replaceAll('|', ' ')}',
+        );
+      }
+      send('MOVA_SEGMENTS_DONE=${result.segments.length}');
+      final message = result.message;
+      if (message != null) {
+        send('MOVA_SEGMENT_STATUS=note:${message.replaceAll('\n', ' ')}');
+      }
+    } catch (error) {
+      if (!stale()) send('MOVA_SEGMENT_STATUS=error:${_reasonOf(error)}');
+    }
+  }
+
+  /// 播放期间从设置页改了弹幕 / 片头片尾设置：把新值推给正在跑的播放器。
+  ///
+  /// 起播时的命令行参数只是「第一次应用」，之后所有改动都走这里 —— 否则设置
+  /// 页里把字号调大、播放器还按旧字号渲染，两处显示的就不是同一份设置。
+  ///
+  /// [keys] 是本次真正变动的偏好键（媒体中心保存设置时传进来）；为空表示全部
+  /// 下发。片头片尾的来源开关影响的是数据拉取，会按新来源重拉当前集。
+  static Future<void> pushLiveSettings({Iterable<String>? keys}) async {
+    final session = _live;
+    // 没有在播的会话：改动已经落盘，下次起播自然读到新值，不必做什么。
+    if (session == null) return;
+    final changed = keys?.toSet();
+    bool touched(String key) => changed == null || changed.contains(key);
+    final preferences = await SharedPreferences.getInstance();
+
+    void push(String key, String name, String value) {
+      if (touched(key)) session.send('MOVA_APPLY=$name|$value');
+    }
+
+    push(
+      'yingji.danmaku.area',
+      'mova-danmaku-area',
+      (preferences.getDouble('yingji.danmaku.area') ?? 0.65).toString(),
+    );
+    push(
+      'yingji.danmaku.opacity',
+      'mova-danmaku-opacity',
+      (preferences.getDouble('yingji.danmaku.opacity') ?? 0.82).toString(),
+    );
+    push(
+      'yingji.danmaku.font-size',
+      'mova-danmaku-font-size',
+      (preferences.getDouble('yingji.danmaku.font-size') ?? 18.0).toString(),
+    );
+    push(
+      'yingji.danmaku.speed',
+      'mova-danmaku-speed',
+      (preferences.getDouble('yingji.danmaku.speed') ?? 1.0).toString(),
+    );
+    push(
+      'yingji.danmaku.density',
+      'mova-danmaku-density',
+      (preferences.getDouble('yingji.danmaku.density') ?? 0.55).toString(),
+    );
+    push(
+      'yingji.danmaku.scroll',
+      'mova-danmaku-scroll',
+      (preferences.getBool('yingji.danmaku.scroll') ?? true) ? 'yes' : 'no',
+    );
+    push(
+      'yingji.danmaku.top',
+      'mova-danmaku-top',
+      (preferences.getBool('yingji.danmaku.top') ?? true) ? 'yes' : 'no',
+    );
+    push(
+      'yingji.danmaku.bottom',
+      'mova-danmaku-bottom',
+      (preferences.getBool('yingji.danmaku.bottom') ?? true) ? 'yes' : 'no',
+    );
+    push(
+      'yingji.segment.auto-skip',
+      'mova-auto-skip-segments',
+      (preferences.getBool('yingji.segment.auto-skip') ?? true) ? 'yes' : 'no',
+    );
+    push(
+      'yingji.segment.skip-delay-seconds',
+      'mova-skip-delay-seconds',
+      (preferences.getDouble('yingji.segment.skip-delay-seconds') ?? 5)
+          .toString(),
+    );
+    // 快进步长 / 音量步长：同属播放器设置，改了立刻生效才符合直觉。
+    push(
+      'yingji.player.seek-seconds',
+      'mova-seek-seconds',
+      (preferences.getDouble('yingji.player.seek-seconds') ?? 10).toString(),
+    );
+    push(
+      'yingji.player.volume-step',
+      'mova-volume-step',
+      (preferences.getDouble('yingji.player.volume-step') ?? 5).toString(),
+    );
+    // 播放器偏好：设置页里改了「默认播放速度 / 画面比例」要立刻作用到正在播的
+    // 这一集（改亮度、音量也从这里走）。值域与起播时同源，两边不会各说各话。
+    push(
+      'yingji.player.speed',
+      'speed',
+      (preferences.getDouble('yingji.player.speed') ?? 1).toString(),
+    );
+    push(
+      'yingji.player.volume',
+      'volume',
+      (preferences.getDouble('yingji.player.volume') ?? 100).toString(),
+    );
+    push(
+      'yingji.player.brightness',
+      'brightness',
+      (preferences.getDouble('yingji.player.brightness') ?? 0).toString(),
+    );
+    push(
+      'yingji.player.aspect',
+      'video-aspect-override',
+      _aspectValue(preferences.getString('yingji.player.aspect') ?? '自动'),
+    );
+
+    // 弹幕总开关：关掉时原生会丢掉已解析的弹幕，所以「从关到开」必须重拉一
+    // 份当前集的数据；改 API / 令牌也一样要按新配置重拉。只改显示样式则不必。
+    final danmakuEnabled =
+        preferences.getBool('yingji.danmaku.enabled') ?? false;
+    final danmakuConfigChanged =
+        touched('yingji.danmaku.apis') ||
+        touched('yingji.danmaku.url') ||
+        touched('yingji.danmaku.token');
+    if (touched('yingji.danmaku.enabled')) {
+      session.send(
+        'MOVA_APPLY=mova-danmaku-enabled|${danmakuEnabled ? 'yes' : 'no'}',
+      );
+    }
+    if (!danmakuEnabled) {
+      session.danmakuEnabled = false;
+    } else if (danmakuEnabled != session.danmakuEnabled ||
+        danmakuConfigChanged) {
+      session.danmakuEnabled = true;
+      unawaited(session.reloadDanmaku());
+    }
+
+    // 来源开关变了：数据必须按新来源重拉（原生不联网，只负责显示）。
+    if (changed == null ||
+        changed.any((key) => key.startsWith('yingji.segment.source-'))) {
+      unawaited(session.reloadSegments());
+    }
+  }
+
+  /// 从偏好里取弹幕 API 配置。播放期间设置页可能改过它们，所以每次现读。
+  static ({List<String> apis, List<String> names, String token}) _danmakuConfig(
+    SharedPreferences preferences,
+  ) {
+    final apis =
+        (preferences.getStringList('yingji.danmaku.apis') ??
+                [preferences.getString('yingji.danmaku.url') ?? ''])
+            .where((value) => value.trim().isNotEmpty)
+            .toList();
+    return (
+      apis: apis,
+      names: preferences.getStringList('yingji.danmaku.api-names') ?? const [],
+      token: preferences.getString('yingji.danmaku.token') ?? '',
+    );
+  }
+
+  /// 原生面板里改的设置回写到应用偏好，下次起播沿用。
+  ///
+  /// 只接受「弹幕显示」与「自动跳过」这两组键：原生是另一个进程，回写能力必须
+  /// 收窄到明确的功能，不能让它往任意偏好里写值。
+  /// 原生面板能回写偏好的键：只收「弹幕显示 / 片头片尾 / 播放器偏好」这一组，
+  /// 别的键一律丢弃 —— 原生是另一个进程，回写面必须收窄到明确的功能。
+  static const Set<String> _nativeTextSettingKeys = {'yingji.player.aspect'};
+
+  static const Set<String> _nativeNumberSettingKeys = {
+    'yingji.player.speed',
+    'yingji.player.volume',
+    'yingji.player.brightness',
+  };
+
+  static Future<void> _saveNativeSetting(String key, String raw) async {
+    final boolean = raw == 'true' || raw == 'false';
+    final accepted =
+        key.startsWith('yingji.danmaku.') ||
+        key == 'yingji.segment.auto-skip' ||
+        _nativeTextSettingKeys.contains(key) ||
+        _nativeNumberSettingKeys.contains(key);
+    if (!accepted) return;
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      if (_nativeTextSettingKeys.contains(key)) {
+        // 画面比例在设置页里是标签（自动 / 16:9 / 4:3 / 21:9），原生回传的也是
+        // 同一套说法，直接存字符串。
+        await preferences.setString(key, raw);
+      } else if (boolean) {
+        await preferences.setBool(key, raw == 'true');
+      } else {
+        final value = double.tryParse(raw);
+        if (value != null) await preferences.setDouble(key, value);
+      }
+    } catch (_) {
+      // 偏好写不进去只是下一次起播不会沿用，不影响本次播放。
+    }
+  }
+
+  static String _secondLabel(Duration value) =>
+      (value.inMilliseconds / 1000).toStringAsFixed(3);
+
+  static String _reasonOf(Object error) =>
+      error.toString().replaceFirst('StateError: ', '').replaceAll('\n', ' ');
+
+  static Future<void> _deleteFileQuietly(String path) async {
+    try {
+      await File(path).delete();
+    } catch (_) {
+      // 临时文件删不掉也不影响播放结果。
     }
   }
 

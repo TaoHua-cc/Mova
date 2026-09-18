@@ -250,20 +250,58 @@ class VideoCacheStore {
         return;
       }
 
-      client = HttpClient()..findProxy = findNetworkProxy;
-      final origin = await client.openUrl(
-        request.method,
-        Uri.parse(source.url),
-      );
-      for (final entry in source.headers.entries) {
-        origin.headers.set(entry.key, entry.value);
+      // 源站这一步正是「卡顿之后跳下一集」「跳转之后播放失败」的来源：一次瞬时
+      // 抖动就让 mpv 收到错误码，把当前集判成结束。自动跳片头/片尾会让播放器去
+      // 要一段新的字节区间（新建连接），撞上抖动的概率比顺放时高得多。响应头还
+      // 没写出去之前可以放心重试，代价只是几次建连；一旦把错误码写给 mpv，它就
+      // 直接 end-file 了，后面再怎么补救都晚了一步。
+      //
+      // 408（请求超时）/ 429（限流）与 5xx 一样属于「等一会儿再来」的瞬时故障，
+      // 一并重试；403/404 这类多半是 URL 过期或资源没了，重试没有意义，直接透传。
+      const int attemptLimit = 3;
+      bool transient(int status) =>
+          status >= 500 || status == 408 || status == 429;
+      HttpClientResponse? origin;
+      for (var attempt = 0; attempt < attemptLimit && origin == null; attempt++) {
+        final probe = HttpClient()..findProxy = findNetworkProxy;
+        try {
+          final opened = await probe.openUrl(
+            request.method,
+            Uri.parse(source.url),
+          );
+          for (final entry in source.headers.entries) {
+            opened.headers.set(entry.key, entry.value);
+          }
+          final incomingRange = request.headers.value(HttpHeaders.rangeHeader);
+          if (incomingRange != null) {
+            opened.headers.set(HttpHeaders.rangeHeader, incomingRange);
+          }
+          final response = await opened.close();
+          if (transient(response.statusCode) && attempt < attemptLimit - 1) {
+            await response.drain<void>();
+            probe.close(force: true);
+            await Future<void>.delayed(
+              Duration(milliseconds: 300 * (attempt + 1)),
+            );
+            continue;
+          }
+          origin = response;
+          client = probe;
+        } catch (_) {
+          probe.close(force: true);
+          if (attempt < attemptLimit - 1) {
+            await Future<void>.delayed(
+              Duration(milliseconds: 300 * (attempt + 1)),
+            );
+          }
+        }
       }
-      final incomingRange = request.headers.value(HttpHeaders.rangeHeader);
-      if (incomingRange != null) {
-        origin.headers.set(HttpHeaders.rangeHeader, incomingRange);
+      if (origin == null) {
+        request.response.statusCode = HttpStatus.badGateway;
+        await request.response.close();
+        return;
       }
-      final response = await origin.close();
-      request.response.statusCode = response.statusCode;
+      request.response.statusCode = origin.statusCode;
       for (final name in <String>[
         HttpHeaders.contentTypeHeader,
         HttpHeaders.contentRangeHeader,
@@ -271,13 +309,13 @@ class VideoCacheStore {
         HttpHeaders.etagHeader,
         HttpHeaders.lastModifiedHeader,
       ]) {
-        final value = response.headers.value(name);
+        final value = origin.headers.value(name);
         if (value != null) request.response.headers.set(name, value);
       }
-      if (response.contentLength >= 0) {
-        request.response.contentLength = response.contentLength;
+      if (origin.contentLength >= 0) {
+        request.response.contentLength = origin.contentLength;
       }
-      if (request.method != 'HEAD') await request.response.addStream(response);
+      if (request.method != 'HEAD') await request.response.addStream(origin);
       await request.response.close();
     } catch (_) {
       try {
