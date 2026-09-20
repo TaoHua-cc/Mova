@@ -208,7 +208,7 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
               : rows.take(widget.maxItems!).toList();
           final chips = visibleRows.indexed
               .map(
-                (entry) => Tooltip(
+                (entry) => YingjiGlassTooltip(
                   message: '${entry.$2.label} ${entry.$2.formatted}',
                   child: Container(
                     padding: EdgeInsets.symmetric(
@@ -222,7 +222,6 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
                           ? Colors.white.withValues(alpha: .13)
                           : YingjiGlass.surface(),
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: YingjiGlass.line()),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -253,7 +252,7 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
               .toList();
           if (visibleRows.length < rows.length) {
             chips.add(
-              Tooltip(
+              YingjiGlassTooltip(
                 message: rows
                     .skip(visibleRows.length)
                     .map((r) => '${r.label} ${r.formatted}')
@@ -265,7 +264,6 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
                     decoration: BoxDecoration(
                       color: YingjiGlass.surface(),
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: YingjiGlass.line()),
                     ),
                     child: Center(
                       child: Text(
@@ -285,7 +283,7 @@ class _MediaRatingRowState extends State<MediaRatingRow> {
           }
           if (widget.expanded)
             return Wrap(spacing: 6, runSpacing: 6, children: chips);
-          return Tooltip(
+          return YingjiGlassTooltip(
             message: rows.map((r) => '${r.label} ${r.formatted}').join('\n'),
             child: SizedBox(
               height: 28,

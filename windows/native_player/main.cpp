@@ -190,6 +190,9 @@ HWND g_window = nullptr;
 HWND g_controls = nullptr;
 HWND g_panel = nullptr;
 HWND g_top_bar = nullptr;
+// 提示浮层（跳过倒计时 / 音量亮度回显）。句柄放在这里而不是它自己的绘制函数
+// 旁边：外观里的「玻璃浓度」热更新要给所有浮层发重画，那条路在这一段之前。
+HWND g_hint = nullptr;
 ULONG_PTR g_gdiplus_token = 0;
 std::unique_ptr<Gdiplus::PrivateFontCollection> g_interface_font_collection;
 std::unique_ptr<Gdiplus::FontFamily> g_interface_font_family;
@@ -614,6 +617,187 @@ constexpr int kPanelEpisodeWidth = 480;
 // 装不下，会被省略号截掉末尾的大小。
 constexpr int kPanelResourceWidth = 430;
 
+// ---------------------------------------------------------------- 液态玻璃
+//
+// 原生侧没有背板高斯模糊（GDI+ 没有），所以这里复刻应用侧那套配方的**另一半**：
+//
+//   * 基色 —— 取 `YingjiGlass.frost`（#14141A），而不是此前那块海军蓝
+//     (43,47,57)/(22,24,30)。偏蓝的近黑叠在白字幕上会发青，也是用户说
+//     「菜单是一块黑色背景」的来源之一。
+//   * 浓度 —— 应用侧 HUD 档是 .38（`YingjiGlass.hud()`），面板 / 提示对齐它；
+//     整条曲线由「设置 → 外观 → 模糊程度」驱动（stdin 的
+//     `MOVA_APPLY=mova-glass-blur|<0-40>`）：模糊越大 → 玻璃越薄、越透。
+//   * 厚度 —— `YingjiGlass.depth` 那条「只沉底边」的渐变，**里面没有白色**：
+//     白 = 高光，把材质带向塑料片的就是它。
+//   * 描边 —— 白 .16 的 1px 内描边（与 Dart 侧 `YingjiGlass.line()` 同值）。
+//
+// 默认 30 与 Dart 侧 `YingjiAppearance.glassBlur` 一致。
+double g_glass_blur = 30.0;
+
+/// 玻璃基色：与应用侧 `YingjiGlass.frost` 完全一致。
+constexpr BYTE kGlassFrostRed = 20;
+constexpr BYTE kGlassFrostGreen = 20;
+constexpr BYTE kGlassFrostBlue = 26;
+
+/// 玻璃厚度 0.55 ~ 1.0；1.0 = 最透（模糊拉满）。
+float GlassLevel() {
+  const double blur = std::clamp(g_glass_blur, 0.0, 40.0);
+  return static_cast<float>(0.55 + 0.45 * (blur / 40.0));
+}
+
+/// 面板 / 提示这类大面积玻璃的底色。默认（30）给 97 → 87。
+///
+/// 曾经是 247（97% 不透明）——那就是用户看到的「菜单是一块黑塑料」；后来降到 124
+/// （对齐应用侧 HUD 档再留余量），但真正缺的不是浓度而是**背板模糊**（见
+/// DrawGlassBackdrop）：没有那一层，同一套 frost 与应用里差的就是玻璃与塑料。
+/// 现在背板补上了，浓度就归位到应用侧 `YingjiGlass.hud()` 的 .38（97/255）—— 那
+/// 是应用为「压在视频上的浮层」定下的档，注释里写得很明白：.58 以上看着就是黑板。
+///
+/// 仍然跟着「设置 → 外观 → 模糊程度」走：模糊越弱，玻璃要越实才能压住背后那张
+/// 越来越清晰的画面。
+int GlassPanelAlpha(bool bottom) {
+  const float level = GlassLevel();
+  const double base = 97.0 + (1.0 - level) * 26.0;
+  return static_cast<int>(std::lround(bottom ? base - 10.0 : base));
+}
+
+/// 控件条 / 顶栏上的按钮圆片：面积小、常驻，做得很薄，画面透得最多。
+int GlassDiscAlpha(bool bottom) {
+  const float level = GlassLevel();
+  const double base = 46.0 + (1.0 - level) * 26.0;
+  return static_cast<int>(std::lround(bottom ? base * .42 : base));
+}
+
+/// 小面积但**带字**的玻璃（顶栏的网络胶囊）：比纯按钮圆片实一点，否则上面的
+/// 12px 数字压不住画面。
+int GlassChromeAlpha(bool bottom) {
+  const float level = GlassLevel();
+  const double base = 64.0 + (1.0 - level) * 26.0;
+  return static_cast<int>(std::lround(bottom ? base * .58 : base));
+}
+
+/// 图标阴影：控件条去掉底板之后，白色字形要靠这一层暗影才在亮画面上读得出来。
+constexpr float kGlyphShadowOffset = 1.2f;
+constexpr int kGlyphShadowAlpha = 158;
+
+// 背板模糊（原生侧的 BackdropFilter）—— 三个入口先声明在这里，实现在 PanelSurface
+// 之后（那边才有画板对象可用）：FillGlassSurface 要给玻璃铺背板，位置在这之前。
+void ReleaseGlassBackdrop();
+bool UpdateGlassBackdrop(bool force);
+bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
+                       const Gdiplus::GraphicsPath& path,
+                       const Gdiplus::RectF& rect);
+
+/// 一片玻璃的底色：基色渐变 + 应用侧 `YingjiGlass.depth` 那条「只沉底边」的厚度。
+/// 面板、二级菜单、提示、悬浮气泡全部走它 —— 材质只有这一处定义，改一次全跟着
+/// 变，不会再出现「这个菜单改了、那个提示还是黑塑料」的割裂。
+///
+/// `use_backdrop` 打开时先铺一层「被模糊、被提亮提饱和的背后画面」（见
+/// DrawGlassBackdrop）。这一层是不透明的，于是整块玻璃的合成变成
+/// `blur(背后) × (1−α) + frost × α` —— 与应用侧 `backdrop()` ＋ `surface()` 完全
+/// 同构。它不是「假透明」：真实的分层窗口透明度仍在（背板拿不到时就走原来的路），
+/// 只是换成了「背后画面先糊再混」这种更接近毛玻璃的合成方式。
+void FillGlassSurface(Gdiplus::Graphics& graphics,
+                      const Gdiplus::GraphicsPath& path,
+                      const Gdiplus::RectF& rect, int top_alpha,
+                      int bottom_alpha, bool use_backdrop = false) {
+  if (use_backdrop) DrawGlassBackdrop(graphics, path, rect);
+  Gdiplus::LinearGradientBrush surface(
+      Gdiplus::PointF(rect.X, rect.Y), Gdiplus::PointF(rect.X, rect.GetBottom()),
+      Gdiplus::Color(static_cast<BYTE>(top_alpha), kGlassFrostRed,
+                     kGlassFrostGreen, kGlassFrostBlue),
+      Gdiplus::Color(static_cast<BYTE>(bottom_alpha), kGlassFrostRed,
+                     kGlassFrostGreen, kGlassFrostBlue));
+  graphics.FillPath(&surface, &path);
+  // 厚度：最后三分之一才微微沉下去（0x1C = 28 于最底边），上面全透明。
+  Gdiplus::LinearGradientBrush depth(
+      Gdiplus::PointF(rect.X, rect.Y + rect.Height * .62f),
+      Gdiplus::PointF(rect.X, rect.GetBottom()), Gdiplus::Color(0, 0, 0, 0),
+      Gdiplus::Color(28, 0, 0, 0));
+  graphics.FillPath(&depth, &path);
+}
+
+/// 玻璃的一圈内描边（白 .16）。面板、提示、气泡共用同一个值：以前面板 46、
+/// 控件条 76，同一屏里两圈线亮度不同，看着就不是一套皮肤。
+void StrokeGlassEdge(Gdiplus::Graphics& graphics,
+                     const Gdiplus::GraphicsPath& path) {
+  Gdiplus::Pen edge(Gdiplus::Color(BYTE{kSurfaceEdgeAlpha}, 255, 255, 255),
+                    1.0f);
+  graphics.DrawPath(&edge, &path);
+}
+
+/// 玻璃上的文字：先垫一层 1px 暗影再写字。
+///
+/// 原生没有背板模糊，玻璃一透，白字压到亮画面上就糊了 —— 这层暗影就是应用侧那个
+/// `BackdropFilter` 的替身（控件条去掉底板后给字形垫的也是它）。
+void DrawGlassText(Gdiplus::Graphics& graphics, const wchar_t* text,
+                   const Gdiplus::Font& font, const Gdiplus::RectF& box,
+                   const Gdiplus::StringFormat& format,
+                   const Gdiplus::Brush& brush,
+                   BYTE shadow_alpha = kGlyphShadowAlpha) {
+  Gdiplus::SolidBrush shade(Gdiplus::Color(shadow_alpha, 0, 0, 0));
+  graphics.DrawString(text, -1, &font,
+                      Gdiplus::RectF(box.X, box.Y + kGlyphShadowOffset,
+                                     box.Width, box.Height),
+                      &format, &shade);
+  graphics.DrawString(text, -1, &font, box, &format, &brush);
+}
+
+// ------------------------------------------- 背板模糊（原生侧的 BackdropFilter）
+//
+// 原生没有 `BackdropFilter`：分层窗口只能「透」，不能「糊」。而应用里那层液态玻璃
+// 有一半的质感来自**背后那张被模糊、被提亮、被提饱和的画面**
+// （`YingjiGlass.backdrop()`）—— 少了它，同一支 frost 基色、同一个浓度，在应用里
+// 是玻璃，在播放器里就是一块黑板。这里把缺的那半块补上：抓一帧背后的画面，降采样
+// ＋三次盒式模糊近似高斯＋提亮提饱和，画在 frost 底下。
+//
+// 抓的是 `PrintWindow(播放器窗口)`，不是屏幕 BitBlt：控件条、顶栏、面板、提示都是
+// **独立的顶层 layered 窗口**，PrintWindow 只画播放器窗口本身，所以菜单开着的时候
+// 重抓也不会把自己的玻璃拍进去（屏幕抓屏会），背板因此可以定期刷新 —— 玻璃里的
+// 画面跟着视频动，而不是开菜单那一刻的一张死图。
+//
+// `PW_RENDERFULLCONTENT` 不能省：mpv 的画面是 D3D11 交换链出来的，普通 PrintWindow
+// 只能拿到一块黑（`tool/probe_backdrop_capture.py` 量过：screen BitBlt 与
+// PrintWindow 都拿得到活画面，各约 17ms）。
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
+/// 背板刷新间隔。玻璃里的画面比现实慢一点点没关系（本来就糊了），但不能慢到看得出
+/// 停顿。4Hz 的延迟在一个视频帧的量级，而一次采集＋模糊＋放大约 35ms。
+constexpr ULONGLONG kGlassBackdropRefreshMs = 260;
+/// 模糊在 1/4 尺寸上做：代价降到 1/16，再放大回去。降采样本身（HALFTONE 取的是
+/// 4x4 均值）已经是一层模糊，盒式模糊只负责把半径补到「模糊程度」那一档。
+constexpr int kGlassDownscale = 4;
+/// 盒式模糊的遍数（三次已经足够接近高斯，再多只是更贵）。
+constexpr int kGlassBlurPasses = 3;
+/// 背板的最低平均亮度：低于它就是「后面根本没有画面」（黑屏、还没出帧、窗口被独占
+/// 挡住），这时候不做背板、退回真透明的玻璃。真实影片里最暗的夜景也在 20 以上，
+/// 只有纯黑才够得着这个门槛。
+constexpr double kGlassBackdropMinLuma = 6.0;
+
+struct GlassBackdrop {
+  PanelSurface* full = nullptr;   ///< 全窗尺寸的模糊背板，绘制时 1:1 取子矩形
+  // 成员别叫 small：`rpcndr.h` 里有 `#define small char`，用了会变成
+  // `PanelSurface* char` 直接编译不过（/WX 下 C2238 甩你一屏）。
+  PanelSurface* reduced = nullptr;  ///< 1/4 尺寸的中间图（降采样后在这上面糊）
+  std::vector<BYTE> scratch;        ///< 盒式模糊的中间缓冲
+  int origin_x = 0;               ///< full 的 (0,0) 对应的屏幕坐标
+  int origin_y = 0;
+  ULONGLONG captured_at = 0;   ///< 最后一次「成功」采集的 tick（决定图有多新）
+  // 「最后一次尝试」的 tick，成功失败都记。失败（黑屏 / 抓不动）时如果只看
+  // captured_at，节流条件永远不满足 —— 每个 16ms 的帧都白抓一次 40ms 的整窗截图，
+  // 播放直接卡住。失败也要进节流。
+  ULONGLONG attempted_at = 0;
+  bool ready = false;
+};
+
+GlassBackdrop g_backdrop;
+
+/// 正在绘制的这块玻璃所在窗口的客户区 (0,0) 在屏幕上的位置。设计稿矩形要映射回
+/// 背板的像素就靠它 —— 每个窗口在开画前设一次（面板与提示各一处）。
+POINT g_glass_window_origin{0, 0};
+
 // 弹窗的锚点。此前调用方只传一个 y，且底部控件条也复用顶栏那个客户区 y=40 的
 // 常量，于是「面板底边 = 锚点 y − 内容高 − 8」算出来的位置落在窗口之外，被夹到
 // 工作区顶端 —— 点底部工具时菜单会跳到画面顶部。
@@ -728,10 +912,11 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
 enum class HintMode { Hidden, Toast };
 
 void ShowHint(const std::wstring& text, const std::wstring& detail,
-              wchar_t icon, HintMode mode, float fraction, int anchor_x);
+              wchar_t icon, HintMode mode, float fraction, int anchor_x,
+              bool accent = false);
 void HideHint();
 void ShowAdjustHint(const std::wstring& title, const std::wstring& detail,
-                    wchar_t icon, float fraction);
+                    wchar_t icon, float fraction, bool accent = false);
 
 Gdiplus::Font MakeInterfaceFont(float size, int style) {
   const Gdiplus::FontFamily* family =
@@ -824,6 +1009,29 @@ bool RetryCurrentEpisode() {
   }
   return true;
 }
+
+// 图标与工具栏保持同一套语义：音轨用扬声器、字幕用字幕框、自动用星标。
+//
+// ⚠️ 这一组定义在**片头片尾之前**：跳过提示、工具面板、设置面板都更早就要引用。
+constexpr wchar_t kGlyphSpeaker = L'\xF08F';
+constexpr wchar_t kGlyphSubtitle = L'\xEFCE';
+constexpr wchar_t kGlyphSparkles = L'\xED43';
+constexpr wchar_t kGlyphInfo = L'\xECDD';
+// 二者都取自与应用 YingjiIcons 同一张表：kGlyphEpisodes = document_text（列表）、
+// kGlyphServer = data（应用里 "资源" 用的就是它）。
+constexpr wchar_t kGlyphEpisodes = L'\xEB73';
+constexpr wchar_t kGlyphServer = L'\xEB14';
+// 面板行里用到的其余字形。
+constexpr wchar_t kGlyphCheckCircle = L'\xF006';
+constexpr wchar_t kGlyphRadio = L'\xEEA2';
+constexpr wchar_t kGlyphChevronRight = L'\xE96C';
+constexpr wchar_t kGlyphGauge = L'\xEFAE';
+constexpr wchar_t kGlyphCrop = L'\xEB06';
+constexpr wchar_t kGlyphScissors = L'\xEE3E';
+constexpr wchar_t kGlyphBookmark = L'\xE9EC';
+constexpr wchar_t kGlyphEpisode = L'\xF06E';
+constexpr wchar_t kGlyphDanmaku = L'\xED93';
+constexpr wchar_t kGlyphMore = L'\xEDDF';
 
 // 一行反馈。以前是 mpv 的 show-text，字体、位置、配色全是 mpv 的；现在和面板
 // 走同一个自绘浮层，位置也固定贴在控件条上方，不再压在画面中间。
@@ -977,11 +1185,14 @@ void UpdateAutoSkip(uint64_t now) {
     g_skip_hint_shown = now;
     const double total = std::max(0.1, g_skip_delay_seconds);
     const std::wstring label = SegmentGlyphLabel(segments[candidate].kind);
+    // 跳过是「要发生的事」，用应用侧的成功绿做强调（进度线与图标同色），
+    // 与提示里其它白色信息分开 —— 参考图里那条 +6s 就是这么用的。
     ShowHint(
         label + L" · " + std::to_wstring(static_cast<int>(remaining + 0.999)) +
             L" 秒后跳过",
-        L"打开菜单可取消", 0, HintMode::Toast,
-        static_cast<float>(std::clamp(1.0 - remaining / total, 0.0, 1.0)), 0);
+        L"打开菜单可取消", kGlyphScissors, HintMode::Toast,
+        static_cast<float>(std::clamp(1.0 - remaining / total, 0.0, 1.0)), 0,
+        true);
   }
   if (now >= g_skip_deadline) {
     SkipSegment(static_cast<size_t>(candidate), true);
@@ -1107,29 +1318,6 @@ std::vector<MediaTrack> ReadTracks(const char* wanted_type) {
   }
   return tracks;
 }
-
-// 图标与工具栏保持同一套语义：音轨用扬声器、字幕用字幕框、自动用星标。
-constexpr wchar_t kGlyphSpeaker = L'\xF08F';
-constexpr wchar_t kGlyphSubtitle = L'\xEFCE';
-constexpr wchar_t kGlyphSparkles = L'\xED43';
-constexpr wchar_t kGlyphInfo = L'\xECDD';
-// 剧集与资源面板在 ToolGlyph 之前就要用到这两个字形，所以定义在这一段。
-// 二者都取自与应用 YingjiIcons 同一张表：kGlyphEpisodes = document_text（列表）、
-// kGlyphServer = data（应用里 "资源" 用的就是它）。
-constexpr wchar_t kGlyphEpisodes = L'\xEB73';
-constexpr wchar_t kGlyphServer = L'\xEB14';
-// 面板行里用到的其余字形。定义在这一段而不是面板绘制那一节，是因为「倍速」
-// 「画面」这类只放自己的面板在更早的地方就要引用它们。
-constexpr wchar_t kGlyphCheckCircle = L'\xF006';
-constexpr wchar_t kGlyphRadio = L'\xEEA2';
-constexpr wchar_t kGlyphChevronRight = L'\xE96C';
-constexpr wchar_t kGlyphGauge = L'\xEFAE';
-constexpr wchar_t kGlyphCrop = L'\xEB06';
-constexpr wchar_t kGlyphScissors = L'\xEE3E';
-constexpr wchar_t kGlyphBookmark = L'\xE9EC';
-constexpr wchar_t kGlyphEpisode = L'\xF06E';
-constexpr wchar_t kGlyphDanmaku = L'\xED93';
-constexpr wchar_t kGlyphMore = L'\xEDDF';
 
 void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
   (void)owner;
@@ -1509,6 +1697,20 @@ bool ApplyLiveOption(const std::string& name, const std::string& value) {
     g_volume_step = std::max(1.0, std::strtod(value.c_str(), nullptr));
     return true;
   }
+  // 外观里的「模糊程度」。原生没有高斯背板，能做的是把同一个数值换算成玻璃
+  // 浓度（见 GlassLevel）：拖滑杆时播放器里的控件条、顶栏、菜单、提示会一起
+  // 变透 / 变实，而不是「应用改了、播放器一动不动」。
+  if (name == "mova-glass-blur") {
+    g_glass_blur = std::clamp(std::strtod(value.c_str(), nullptr), 0.0, 40.0);
+    if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+    if (g_top_bar) InvalidateRect(g_top_bar, nullptr, FALSE);
+    if (g_hint) InvalidateRect(g_hint, nullptr, FALSE);
+    if (g_panel && IsWindowVisible(g_panel)) {
+      InvalidateRect(g_panel, nullptr, FALSE);
+    }
+    if (g_danmaku) InvalidateRect(g_danmaku, nullptr, FALSE);
+    return true;
+  }
   // 播放器偏好（倍速 / 音量 / 亮度 / 画面比例）：设置页里改了要立刻作用到正在
   // 播放的这一集，走的就是面板点击那条 mpv 属性写入路径，改完的提示与数值回填
   // 也一致。它们不是 mova- 前缀的参数，所以单列一组（见 IsLiveApplyName）。
@@ -1526,6 +1728,7 @@ bool IsLiveSettingName(const std::string& name) {
   return name == "mova-auto-skip-segments" ||
          name == "mova-skip-delay-seconds" ||
          name == "mova-seek-seconds" || name == "mova-volume-step" ||
+         name == "mova-glass-blur" ||
          (name.rfind("mova-danmaku-", 0) == 0 && name != "mova-danmaku-file");
 }
 
@@ -1872,6 +2075,14 @@ void EmitResourceChoice(int index) {
 // 控件条尺寸与贴边距离。抽成常量是因为弹窗锚点也要用：面板向上展开时贴的正是
 // 控件条的顶边，两处分别硬编码迟早会对不上。
 constexpr int kControlsHeight = 112;
+// 进度条在设计稿里的 y。它现在是通屏的：0 → 窗口宽度。
+constexpr float kSeekLineY = 19.0f;
+// 控件条的「命中带」：铺满整条窗口的极淡底色（6/255 ≈ 2%，肉眼不可见）。
+//
+// 逐像素 alpha 下 alpha=0 的像素会点击穿透，而进度条拖动 / 悬停预览 / 按钮
+// 点击都靠这个窗口收鼠标。以前这个作用由那道 10→124 的 scrim 承担，玩家看到的
+// 「控件背景框」正是它；现在只留这一点点，命中行为不变、画面却干净。
+constexpr int kDockHitBandAlpha = 6;
 constexpr int kControlsBottomMargin = 20;
 constexpr int kTopBarHeight = 58;
 constexpr int kTopBarTopMargin = 14;
@@ -1884,14 +2095,16 @@ void PositionControls() {
   POINT origin{0, 0};
   ClientToScreen(g_window, &origin);
   const int client_width = static_cast<int>(client.right - client.left);
-  const int available_width = std::max(240, client_width - 32);
-  const int width = std::min(Scaled(1040), available_width);
+  // 进度条要「从屏幕最左边到最右边」完整展开，控件条窗口就得铺满整个客户区
+  // 宽度（以前是居中、最宽 1040）。窗口本身已经没有底板，看不见的地方是真的
+  // 透明，所以铺满不会变成一条横幅。
+  const int width = std::max(240, client_width);
   const int height = Scaled(kControlsHeight);
-  SetWindowPos(g_controls, HWND_TOP, origin.x + (client.right - width) / 2,
-               origin.y + client.bottom - height - Scaled(20), width, height,
-               SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  SetWindowRgn(g_controls, CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                                              Scaled(28), Scaled(28)), TRUE);
+  SetWindowPos(g_controls, HWND_TOP, origin.x,
+               origin.y + client.bottom - height - Scaled(kControlsBottomMargin),
+               width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  // 不再 SetWindowRgn：圆角改由离屏面的裁剪路径画出来（逐像素 alpha 下更平滑，
+  // 也顺带让圆角外真正点击穿透）。窗口保持一个普通矩形，形状完全由 alpha 决定。
   InvalidateRect(g_controls, nullptr, FALSE);
   if (g_top_bar) {
     // The title bar belongs to the window edges, unlike the deliberately
@@ -2105,7 +2318,7 @@ const GlyphShape* GlyphShapeFor(wchar_t codepoint) {
 // font only carries the icons the app already references.
 void DrawGlyph(Gdiplus::Graphics& graphics, wchar_t codepoint, float center_x,
                float center_y, float size, Gdiplus::Color color,
-               bool mirror_x = false) {
+               bool mirror_x = false, bool shadow = false) {
   if (size <= 0.0f) return;
   const GlyphShape* shape = GlyphShapeFor(codepoint);
   if (!shape) return;
@@ -2118,6 +2331,21 @@ void DrawGlyph(Gdiplus::Graphics& graphics, wchar_t codepoint, float center_x,
       center_y - ink_center_y * scale);
   Gdiplus::Matrix previous;
   graphics.GetTransform(&previous);
+  if (shadow) {
+    // 控件条已经没有整块底板了：白色图标压在亮画面上会糊成一片。先在同一个
+    // 位形下垫一层向下偏 1.2px 的暗影把图标托起来 —— 比恢复底板轻得多，也不会
+    // 变成「一块背景」。
+    // ⚠️ 不能拷贝 placement：`Gdiplus::Matrix` 的拷贝构造是私有的（C2248）。
+    // 改成「先按位形放置，再在最外层整体下移」，结果与「位形 + 偏移」等价。
+    Gdiplus::Matrix shift;
+    shift.Translate(0.0f, kGlyphShadowOffset);
+    graphics.MultiplyTransform(&placement);
+    graphics.MultiplyTransform(&shift);
+    Gdiplus::SolidBrush shade(Gdiplus::Color(
+        static_cast<BYTE>(kGlyphShadowAlpha), 0, 0, 0));
+    graphics.FillPath(&shade, &shape->path);
+    graphics.SetTransform(&previous);
+  }
   graphics.MultiplyTransform(&placement);
   Gdiplus::SolidBrush brush(color);
   graphics.FillPath(&brush, &shape->path);
@@ -2127,8 +2355,8 @@ void DrawGlyph(Gdiplus::Graphics& graphics, wchar_t codepoint, float center_x,
 // `size` is the Flutter Icon(size:) value; see DrawGlyph.
 void DrawIconsaxGlyph(Gdiplus::Graphics& graphics, wchar_t codepoint, float x,
                       float y, float size, Gdiplus::Color color,
-                      bool mirror_x = false) {
-  DrawGlyph(graphics, codepoint, x, y, size, color, mirror_x);
+                      bool mirror_x = false, bool shadow = false) {
+  DrawGlyph(graphics, codepoint, x, y, size, color, mirror_x, shadow);
 }
 
 void DrawPlayIcon(Gdiplus::Graphics& graphics, float x, float y,
@@ -2141,7 +2369,7 @@ void DrawPlayIcon(Gdiplus::Graphics& graphics, float x, float y,
 void DrawSpeaker(Gdiplus::Graphics& graphics, float x, float y, bool muted,
                  float emphasis) {
   DrawIconsaxGlyph(graphics, muted ? L'\xF097' : L'\xF08F', x, y,
-                   19.0f + emphasis, IconInk(emphasis));
+                   19.0f + emphasis, IconInk(emphasis), false, true);
 }
 
 // 上一集 / 下一集：字体里没有 Iconsax 的 next / previous（图标集在构建时被
@@ -2150,13 +2378,13 @@ void DrawSpeaker(Gdiplus::Graphics& graphics, float x, float y, bool muted,
 void DrawSkipIcon(Gdiplus::Graphics& graphics, float x, float y, bool next,
                   float emphasis) {
   DrawIconsaxGlyph(graphics, L'\xE964', x, y, 22.0f + emphasis,
-                   IconInk(emphasis), next);
+                   IconInk(emphasis), next, true);
 }
 
 void DrawSeekIcon(Gdiplus::Graphics& graphics, float x, float y, bool forward,
                   float emphasis) {
   DrawIconsaxGlyph(graphics, forward ? L'\xEC13' : L'\xE99F', x, y,
-                   19.0f + emphasis, IconInk(emphasis));
+                   19.0f + emphasis, IconInk(emphasis), false, true);
 }
 
 // 工具栏与菜单用同一张图标表（见 ToolGlyph）：以前每个图标各写一个包装函数、
@@ -2327,6 +2555,18 @@ std::vector<ControlId> OverflowTools(int width) {
   return std::vector<ControlId>(tools.begin() + shown, tools.end());
 }
 
+// 控件条上的文字（时间码 / 状态）：控件条已经没有底板，先垫一层暗影再画正文，
+// 免得白色文字压在亮画面上糊掉。
+void DrawDockLabel(Gdiplus::Graphics& graphics, const wchar_t* text,
+                   Gdiplus::Font& font, const Gdiplus::PointF& at,
+                   Gdiplus::Brush& brush) {
+  Gdiplus::SolidBrush shade(
+      Gdiplus::Color(static_cast<BYTE>(kGlyphShadowAlpha), 0, 0, 0));
+  graphics.DrawString(text, -1, &font,
+                      Gdiplus::PointF(at.X, at.Y + kGlyphShadowOffset), &shade);
+  graphics.DrawString(text, -1, &font, at, &brush);
+}
+
 std::vector<std::pair<ControlId, float>> ToolLayout(int width) {
   std::vector<std::pair<ControlId, float>> result;
   const auto tools = ConfiguredTools();
@@ -2358,7 +2598,7 @@ void DrawToolIcon(Gdiplus::Graphics& graphics, ControlId control, float x,
   if (glyph == 0) return;
   const float emphasis = HoverAmount(control);
   DrawIconsaxGlyph(graphics, glyph, x, y, 19.0f + emphasis,
-                   IconInk(emphasis));
+                   IconInk(emphasis), false, true);
 }
 
 std::wstring ToolLabel(ControlId control) {
@@ -2478,24 +2718,34 @@ ControlId HitControl(int x, int y, int width) {
   return kNone;
 }
 
+// 控件条上的按钮底：一片**常驻**的液态玻璃圆片。
+//
+// 之前静止时不画（只有一个图标漂在画面上），悬停才冒出一个蓝圈 —— 拖「模糊
+// 程度」的时候这一整排毫无反应，而且看着不像按钮。现在底片一直在，浓度跟着
+// 外观里的模糊程度走（见 GlassDiscAlpha），悬停只是把它点亮。
 void DrawHover(Gdiplus::Graphics& graphics, ControlId id, float x, float y,
                float size = 38) {
   const float amount = HoverAmount(id);
-  Gdiplus::SolidBrush base(Gdiplus::Color(205, 24, 27, 33));
-  Gdiplus::Pen edge(Gdiplus::Color(72, 104, 112, 128), 1.0f);
-  graphics.FillEllipse(&base, Gdiplus::RectF(x - size / 2, y - size / 2,
-                                              size, size));
-  graphics.DrawEllipse(&edge, Gdiplus::RectF(x - size / 2, y - size / 2,
-                                              size, size));
-  if (amount > 0.001f) {
-    const BYTE alpha = static_cast<BYTE>(amount * 54.0f);
-    Gdiplus::SolidBrush hover(Gdiplus::Color(alpha, 110, 168, 255));
-    const float inset = (1.0f - amount) * 2.0f;
-    graphics.FillEllipse(&hover,
-                         Gdiplus::RectF(x - size / 2 + inset,
-                                        y - size / 2 + inset, size - inset * 2,
-                                        size - inset * 2));
-  }
+  const Gdiplus::RectF disc(x - size / 2, y - size / 2, size, size);
+  Gdiplus::LinearGradientBrush glass(
+      Gdiplus::PointF(disc.X, disc.Y),
+      Gdiplus::PointF(disc.X, disc.Y + disc.Height),
+      Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(false)), kGlassFrostRed,
+                     kGlassFrostGreen, kGlassFrostBlue),
+      Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(true)), kGlassFrostRed,
+                     kGlassFrostGreen, kGlassFrostBlue));
+  graphics.FillEllipse(&glass, disc);
+  if (amount <= 0.001f) return;
+  // 悬停：只是把这层玻璃点亮（叠一层极淡的白），不换形状、不跳位。
+  // 点亮色必须是白：以前这里叠的是 (110,168,255)，于是「鼠标一放上去就泛蓝」，
+  // 而且进度条自己也用了同一支蓝 —— 全屏唯一的强调色不该是蓝。
+  Gdiplus::SolidBrush lit(
+      Gdiplus::Color(static_cast<BYTE>(amount * 96.0f), 255, 255, 255));
+  const float inset = (1.0f - amount) * 3.0f;
+  graphics.FillEllipse(&lit,
+                       Gdiplus::RectF(disc.X + inset, disc.Y + inset,
+                                      disc.Width - inset * 2,
+                                      disc.Height - inset * 2));
 }
 
 // ------------------------------------------------------------ 弹出菜单绘制
@@ -2647,10 +2897,20 @@ struct PanelSkin {
 
 float MeasurePanelText(Gdiplus::Graphics& graphics, const wchar_t* text,
                        const Gdiplus::Font& font) {
-  Gdiplus::StringFormat format;
-  format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+  // GenericTypographic = **紧贴墨迹**的度量：默认格式会按 GDI+ 的老习惯在左右
+  // 各留约 1/6 em 的空白，量"100%"能多出小半行 —— 拿这个数去排「标题 + 值」
+  // 这种左右分栏，多出来的空白就把标题挤掉了（提示的标题一度只剩一个字）。
+  Gdiplus::StringFormat format(Gdiplus::StringFormat::GenericTypographic());
+  format.SetFormatFlags(format.GetFormatFlags() |
+                        Gdiplus::StringFormatFlagsNoWrap);
+  // ⚠️ 同时还要把世界变换复位：面板 / 提示绘制时 graphics 已经按 UiScale 放大
+  // 过，不定标的话量出来是物理像素，而所有布局常量都是设计稿坐标。
+  Gdiplus::Matrix transform;
+  graphics.GetTransform(&transform);
+  graphics.ResetTransform();
   Gdiplus::RectF box;
   graphics.MeasureString(text, -1, &font, Gdiplus::PointF(0, 0), &format, &box);
+  graphics.SetTransform(&transform);
   return box.Width;
 }
 
@@ -2700,7 +2960,8 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
       DrawGlyph(graphics, item.icon, tile_rect.X + tile / 2.0f,
                 tile_rect.Y + tile / 2.0f, 17.0f,
                 item.selected ? Gdiplus::Color(255, 255, 255, 255)
-                              : Gdiplus::Color(236, 236, 238, 245));
+                              : Gdiplus::Color(236, 236, 238, 245),
+                false, true);
     }
   }
   if (item.rank >= 1 && item.rank <= 3) {
@@ -2729,8 +2990,9 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
 
   float title_right = text_right;
   if (!item.badge.empty()) {
+    // +2：度量现在是紧贴墨迹的，盒宽正好等于墨迹宽会把最后一笔切掉半个像素。
     const float badge_width =
-        MeasurePanelText(graphics, item.badge.c_str(), skin.chip);
+        MeasurePanelText(graphics, item.badge.c_str(), skin.chip) + 2.0f;
     const float badge_left = std::max(text_left, text_right - badge_width);
     graphics.DrawString(item.badge.c_str(), -1, &skin.chip,
                         Gdiplus::RectF(badge_left, row.Y + 18.0f,
@@ -2739,12 +3001,13 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     title_right = badge_left - 8.0f;
   }
   const bool single_line = item.detail.empty();
-  graphics.DrawString(item.label.c_str(), -1, &skin.title,
-                      Gdiplus::RectF(text_left, single_line ? row.Y + 19.0f
-                                                            : row.Y + 10.0f,
-                                     std::max(0.0f, title_right - text_left),
-                                     18.0f),
-                      &format, item.enabled ? &skin.ink : &skin.quiet);
+  const Gdiplus::RectF label_box(
+      text_left, single_line ? row.Y + 19.0f : row.Y + 10.0f,
+      std::max(0.0f, title_right - text_left), 18.0f);
+  // 主标题走带暗影的那支：面板透出画面之后，白字全靠这层影子压住对比度。
+  DrawGlassText(graphics, item.label.c_str(), skin.title, label_box, format,
+                item.enabled ? static_cast<const Gdiplus::Brush&>(skin.ink)
+                             : static_cast<const Gdiplus::Brush&>(skin.quiet));
   if (!single_line) {
     graphics.DrawString(item.detail.c_str(), -1, &skin.detail,
                         Gdiplus::RectF(text_left, row.Y + 28.0f,
@@ -2777,11 +3040,10 @@ void DrawPanelHeaderRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
   format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
   format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-  graphics.DrawString(item.label.c_str(), -1, &skin.header,
-                      Gdiplus::RectF(row.X + 30.0f, row.Y,
-                                     std::max(0.0f, row.Width - 90.0f),
-                                     row.Height),
-                      &format, &skin.ink);
+  DrawGlassText(graphics, item.label.c_str(), skin.header,
+                Gdiplus::RectF(row.X + 30.0f, row.Y,
+                               std::max(0.0f, row.Width - 90.0f), row.Height),
+                format, skin.ink);
   if (item.badge.empty()) return;
   const float text_width = MeasurePanelText(graphics, item.badge.c_str(), skin.chip);
   const float chip_width = text_width + 18.0f;
@@ -2816,8 +3078,7 @@ void DrawPanelNoteRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                       Gdiplus::RectF(row.X + 30.0f, row.Y,
                                      std::max(0.0f, row.Width - 40.0f),
                                      row.Height),
-                      &format, &skin.muted);
-}
+                      &format, &skin.muted);}
 
 // 剧集行：一行一集。缩略图在左（16:9），缩略图底部叠观看进度与时间；右侧
 // 两行文字是「第 X 集 · 集名」与「第 X 季 · 日期 · 时长」。正在播的那一集
@@ -2883,7 +3144,7 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     const float fraction =
         static_cast<float>(std::clamp(item.progress, 0.0, 1.0));
     if (has_progress && fraction > 0.0f) {
-      Gdiplus::Pen value(Gdiplus::Color(255, 110, 168, 255), 2.6f);
+      Gdiplus::Pen value(Gdiplus::Color(255, 250, 250, 252), 2.6f);
       ConfigureControlPen(value);
       graphics.DrawLine(&value, bar_left, bar_y,
                         bar_left + bar_width * fraction, bar_y);
@@ -2941,11 +3202,12 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
   format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
   format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-  graphics.DrawString(item.label.c_str(), -1, &skin.title,
-                      Gdiplus::RectF(text_left, box.Y + 24.0f, text_width,
-                                     18.0f),
-                      &format, item.selected ? &skin.icon_bright : &skin.ink);
-  if (!item.detail.empty()) {
+  // 剧集标题也走带暗影的那支：面板透出画面后，白字靠这层影子才压得住。
+  DrawGlassText(graphics, item.label.c_str(), skin.title,
+                Gdiplus::RectF(text_left, box.Y + 24.0f, text_width, 18.0f),
+                format,
+                item.selected ? static_cast<const Gdiplus::Brush&>(skin.icon_bright)
+                              : static_cast<const Gdiplus::Brush&>(skin.ink));  if (!item.detail.empty()) {
     graphics.DrawString(item.detail.c_str(), -1, &skin.detail,
                         Gdiplus::RectF(text_left, box.Y + 48.0f, text_width,
                                        15.0f),
@@ -3068,9 +3330,9 @@ struct PanelSurface {
 };
 
 // 诊断开关：设 MOVA_TRACE_PANEL=<目录> 后，面板每次重绘都把同一块位图备份成
-// panel_NN.bmp（最多 40 张）。正常运行时环境变量不存在，一次查询后直接返回。
-void TracePanelSurface(const PanelSurface& surface,
-                       const wchar_t* prefix = L"panel") {
+// panel_NN.bmp（最多 `limit` 张）。正常运行时环境变量不存在，一次查询后直接返回。
+// 背板那种整窗大图只留 2~3 张，不然光一个临时目录就能塞几百 MB。
+const std::wstring& TraceDirectory() {
   static const std::wstring directory = []() -> std::wstring {
     wchar_t buffer[MAX_PATH]{};
     if (GetEnvironmentVariableW(L"MOVA_TRACE_PANEL", buffer, MAX_PATH) > 0) {
@@ -3078,13 +3340,313 @@ void TracePanelSurface(const PanelSurface& surface,
     }
     return std::wstring();
   }();
+  return directory;
+}
+
+/// 背板不是每次都能拿到（没出画面、抓不动、被独占挡住）。为什么没拿到要能事后查，
+/// 不然现场只剩一句「提示这次没铺上背板」，只能靠猜。写到 backdrop.log。
+void TraceGlassBackdropNote(const std::wstring& note) {
+  const std::wstring& directory = TraceDirectory();
+  if (directory.empty()) return;
+  FILE* handle = nullptr;
+  const std::wstring path = directory + L"\\backdrop.log";
+  if (_wfopen_s(&handle, path.c_str(), L"a, ccs=UTF-8") != 0 || !handle) return;
+  fwprintf(handle, L"%s\n", note.c_str());
+  fclose(handle);
+}
+
+void TracePanelSurface(const PanelSurface& surface, const wchar_t* prefix,
+                       int limit) {
+  const std::wstring& directory = TraceDirectory();
   if (directory.empty()) return;
   static std::unordered_map<std::wstring, int> sequences;
   int& sequence = sequences[prefix];
-  if (sequence >= 40) return;
+  if (sequence >= limit) return;
   wchar_t name[48]{};
   swprintf_s(name, L"\\%s_%02d.bmp", prefix, sequence++);
   surface.SaveBmp(directory + name);
+}
+
+void TracePanelSurface(const PanelSurface& surface,
+                       const wchar_t* prefix = L"panel") {
+  TracePanelSurface(surface, prefix, 40);
+}
+
+// --------------------------------------------------------- 背板模糊的实现
+//
+// 一次采集四步：抓窗口 → 降到 1/4 → 三次盒式模糊＋提亮提饱和 → 放大回全窗尺寸。
+// 放大是一次性的：绘制时按物理像素 1:1 取子矩形，不必每次重绘都重采样一遍。
+
+/// 三次盒式模糊（横向、纵向各一次算一遍，来回做三遍）。
+///
+/// `scratch` 与 `data` 同尺寸，当双缓冲用：每个方向都从一块读、往另一块写，滑窗就
+/// 不会读到自己刚写下的模糊值。三次往返是偶数次，结果最终落回 `data`。
+void BoxBlurPasses(BYTE* data, BYTE* scratch, int width, int height,
+                   int radius) {
+  if (radius < 1) return;
+  const int window = radius * 2 + 1;
+  const size_t stride = static_cast<size_t>(width) * 4u;
+  BYTE* source = data;
+  BYTE* target = scratch;
+  for (int pass = 0; pass < kGlassBlurPasses; ++pass) {
+    for (int y = 0; y < height; ++y) {
+      const BYTE* row = source + static_cast<size_t>(y) * stride;
+      BYTE* out_row = target + static_cast<size_t>(y) * stride;
+      int sum[4] = {0, 0, 0, 0};
+      for (int k = -radius; k <= radius; ++k) {
+        const BYTE* pixel =
+            row + static_cast<size_t>(k < 0 ? 0 : std::min(k, width - 1)) * 4u;
+        for (int channel = 0; channel < 4; ++channel) sum[channel] += pixel[channel];
+      }
+      for (int x = 0; x < width; ++x) {
+        for (int channel = 0; channel < 4; ++channel) {
+          out_row[x * 4 + channel] = static_cast<BYTE>(sum[channel] / window);
+        }
+        const int add = x + radius + 1;
+        const int sub = x - radius;
+        const BYTE* added =
+            row + static_cast<size_t>(add < width ? add : width - 1) * 4u;
+        const BYTE* removed = row + static_cast<size_t>(sub > 0 ? sub : 0) * 4u;
+        for (int channel = 0; channel < 4; ++channel) {
+          sum[channel] += added[channel] - removed[channel];
+        }
+      }
+    }
+    std::swap(source, target);
+    for (int x = 0; x < width; ++x) {
+      const BYTE* column = source + static_cast<size_t>(x) * 4u;
+      BYTE* out_column = target + static_cast<size_t>(x) * 4u;
+      int sum[4] = {0, 0, 0, 0};
+      for (int k = -radius; k <= radius; ++k) {
+        const BYTE* pixel =
+            column +
+            static_cast<size_t>(k < 0 ? 0 : std::min(k, height - 1)) * stride;
+        for (int channel = 0; channel < 4; ++channel) sum[channel] += pixel[channel];
+      }
+      for (int y = 0; y < height; ++y) {
+        for (int channel = 0; channel < 4; ++channel) {
+          out_column[static_cast<size_t>(y) * stride + channel] =
+              static_cast<BYTE>(sum[channel] / window);
+        }
+        const int add = y + radius + 1;
+        const int sub = y - radius;
+        const BYTE* added = column +
+                            static_cast<size_t>(add < height ? add : height - 1) *
+                                stride;
+        const BYTE* removed =
+            column + static_cast<size_t>(sub > 0 ? sub : 0) * stride;
+        for (int channel = 0; channel < 4; ++channel) {
+          sum[channel] += added[channel] - removed[channel];
+        }
+      }
+    }
+    std::swap(source, target);
+  }
+  if (source != data) {
+    memcpy(data, source, stride * static_cast<size_t>(height));
+  }
+}
+
+/// 应用侧 `YingjiGlass.backdrop()` 里那个 colorMatrix 的等价物：饱和度 ×1.22、
+/// 整体提亮 5%。玻璃会聚光 —— 透出来的画面比直接看更亮、更浓，这才是玻璃能从画面
+/// 里「浮起来」的原因（比周围亮一档，而不是压一层黑）。
+///
+/// 顺手把 alpha 补成 255：GDI 不管 alpha 通道，PrintWindow / StretchBlt 留下的第
+/// 4 字节是 0，而绘制端用的是预乘 ARGB —— 不补就是「画了等于没画」。
+void ApplyGlassVibrancy(BYTE* data, size_t pixels) {
+  constexpr double kSaturation = 1.22;
+  constexpr double kLift = 0.05 * 255.0;
+  for (size_t index = 0; index < pixels; ++index) {
+    BYTE* pixel = data + index * 4u;
+    const double luma =
+        0.213 * pixel[2] + 0.715 * pixel[1] + 0.072 * pixel[0];
+    for (int channel = 0; channel < 3; ++channel) {
+      const double value = luma + (pixel[channel] - luma) * kSaturation + kLift;
+      pixel[channel] = static_cast<BYTE>(std::clamp(value, 0.0, 255.0));
+    }
+    pixel[3] = 255;
+  }
+}
+
+// QPC 时钟（定义在后面的帧循环一节）。背板各步的耗时要用它量：GetTickCount64 即使
+// 开了 timeBeginPeriod(1) 也只以 15/16ms 的台阶推进，量单步会有半个节拍的误差。
+double NowMs();
+
+void ReleaseGlassBackdrop() {
+  delete g_backdrop.full;
+  g_backdrop.full = nullptr;
+  delete g_backdrop.reduced;
+  g_backdrop.reduced = nullptr;
+  g_backdrop.scratch.clear();
+  g_backdrop.ready = false;
+  g_backdrop.captured_at = 0;
+}
+
+/// 重抓一帧背后的画面。`force` 为假时按 `kGlassBackdropRefreshMs` 节流（音量键
+/// 连击那种高频调用就靠它挡住，否则每秒十几次 40ms 的采集会拖住主线程）。
+bool UpdateGlassBackdrop(bool force) {
+  if (!g_window) return false;
+  const ULONGLONG now = GetTickCount64();
+  if (!force && now - g_backdrop.attempted_at < kGlassBackdropRefreshMs) {
+    return false;
+  }
+  RECT frame{};
+  if (!GetWindowRect(g_window, &frame)) return false;
+  // 窗口被挪过：背板里记的屏幕原点已经不对，照旧取像素会整块错位。挪窗必须重抓。
+  const bool moved = g_backdrop.ready &&
+                     (frame.left != g_backdrop.origin_x ||
+                      frame.top != g_backdrop.origin_y);
+  // 暂停时画面是静止的：已经有一张背板就等于拿到了最终答案，没必要每 260ms 再抓一
+  // 帧一模一样的。用户在暂停状态下开菜单，玻璃的额外开销直接归零。（挪过窗不算，
+  // 上面那条 moved 要把这次抓帧放行。）
+  if (!force && g_backdrop.ready && g_paused.load() && !moved) {
+    g_backdrop.attempted_at = now;
+    return false;
+  }
+  g_backdrop.attempted_at = now;
+  const double started = NowMs();
+  double mark = started;
+  // 每步耗时：整窗 PrintWindow / 降采样 / 模糊。菜单开着时的额外 CPU 全在这三步里，
+  // 光看总百分比说不清该砍哪一个。
+  auto step = [&mark]() {
+    const double at = NowMs();
+    const double cost = at - mark;
+    mark = at;
+    return cost;
+  };
+  const int width = frame.right - frame.left;
+  const int height = frame.bottom - frame.top;
+  if (width < 64 || height < 64) return false;
+
+  if (!g_backdrop.full) g_backdrop.full = new PanelSurface();
+  if (!g_backdrop.full->Matches(width, height) &&
+      !g_backdrop.full->Create(width, height)) {
+    ReleaseGlassBackdrop();
+    TraceGlassBackdropNote(L"skip: Create(full) failed");
+    return false;
+  }
+  if (!PrintWindow(g_window, g_backdrop.full->dc, PW_RENDERFULLCONTENT)) {
+    ReleaseGlassBackdrop();
+    TraceGlassBackdropNote(L"skip: PrintWindow returned false");
+    return false;
+  }
+  const double capture_ms = step();
+
+  const int reduced_width = (width + kGlassDownscale - 1) / kGlassDownscale;
+  const int reduced_height = (height + kGlassDownscale - 1) / kGlassDownscale;
+  if (!g_backdrop.reduced) g_backdrop.reduced = new PanelSurface();
+  if (!g_backdrop.reduced->Matches(reduced_width, reduced_height) &&
+      !g_backdrop.reduced->Create(reduced_width, reduced_height)) {
+    ReleaseGlassBackdrop();
+    TraceGlassBackdropNote(L"skip: Create(reduced) failed");
+    return false;
+  }
+  // HALFTONE 才会把 4x4 区域取平均（COLORONCOLOR 是直接丢像素，等于没降采样）。
+  SetStretchBltMode(g_backdrop.reduced->dc, HALFTONE);
+  SetBrushOrgEx(g_backdrop.reduced->dc, 0, 0, nullptr);
+  StretchBlt(g_backdrop.reduced->dc, 0, 0, reduced_width, reduced_height,
+             g_backdrop.full->dc, 0, 0, width, height, SRCCOPY);
+  const double downscale_ms = step();
+
+  const size_t reduced_pixels = static_cast<size_t>(reduced_width) *
+                                static_cast<size_t>(reduced_height);
+  g_backdrop.scratch.resize(reduced_pixels * 4u);
+  // 半径跟着「设置 → 外观 → 模糊程度」：那是设计稿单位的高斯 σ，先按 UiScale 换成
+  // 物理像素、再除以降采样倍数；三次盒式模糊的等效 σ≈半径×1.05，这里反着算回去。
+  const double sigma_reduced = g_glass_blur * static_cast<double>(UiScale()) /
+                               static_cast<double>(kGlassDownscale);
+  const int radius = static_cast<int>(std::lround(sigma_reduced / 1.05));
+  BoxBlurPasses(g_backdrop.reduced->bits, g_backdrop.scratch.data(),
+                reduced_width, reduced_height, radius);
+  const double blur_ms = step();
+  // 先判定「抠出来的到底有没有画面」，再提亮。⚠️ 判据必须在**提亮之前**算：vibrancy
+  // 会给每个像素加 5%（+12.75），一块纯黑反而被抬到 13 —— 拿提亮后的图去比，黑屏
+  // 也能过审，玻璃就成了一块不透明的黑板（这个坑真踩过）。
+  //
+  // 没有画面（黑屏、还没出帧、窗口被独占挡住）时宁可退回原来的「真透明」玻璃：
+  // 那种情况下没有东西可糊，硬糊一层只会把面板变成黑塑料。
+  {
+    const BYTE* plane = g_backdrop.reduced->bits;
+    unsigned long long total = 0;
+    for (size_t index = 0; index < reduced_pixels; ++index) {
+      const BYTE* pixel = plane + index * 4u;
+      total += static_cast<unsigned long long>(pixel[0]) + pixel[1] + pixel[2];
+    }
+    const double mean =
+        static_cast<double>(total) / static_cast<double>(reduced_pixels * 3u);
+    if (mean < kGlassBackdropMinLuma) {
+      ReleaseGlassBackdrop();
+      // 把实测均亮记下来：6.0 这个阈值调没调对，全看这个数字。
+      wchar_t note[96]{};
+      swprintf_s(note, L"skip: no picture, mean luma %.2f < %.2f",
+                 mean, kGlassBackdropMinLuma);
+      TraceGlassBackdropNote(note);
+      return false;
+    }
+  }
+  ApplyGlassVibrancy(g_backdrop.reduced->bits, reduced_pixels);
+  TracePanelSurface(*g_backdrop.reduced, L"backdrop", 3);
+
+  // 不再放回全窗尺寸。放大那一步要 StretchBlt 整窗 1920x1160（实测 9.6ms），再加
+  // 一遍 220 万像素的 alpha 补位，是这个管线里最贵的两笔；而玻璃只占窗口的一小块。
+  // 现在保留 1/4 的模糊图，绘制时由 GDI+ 只对玻璃那块矩形做双线性放大 —— 模糊过的
+  // 图本来就是平滑的，放大方式换成双线性肉眼无差，代价却只跟玻璃面积走。
+  // 透明度在 ApplyGlassVibrancy 里已统一补成 255，这里不必再扫一遍。
+  if (!TraceDirectory().empty()) {
+    wchar_t note[160]{};
+    swprintf_s(note,
+               L"ok %dx%d -> %dx%d  capture %.1fms  down %.1fms  blur(%.2fpx) "
+               L"%.1fms  total %.1fms",
+               width, height, reduced_width, reduced_height, capture_ms,
+               downscale_ms, g_glass_blur, blur_ms, NowMs() - started);
+    TraceGlassBackdropNote(note);
+  }
+  g_backdrop.origin_x = frame.left;
+  g_backdrop.origin_y = frame.top;
+  g_backdrop.captured_at = now;
+  g_backdrop.ready = true;
+  return true;
+}
+
+bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
+                       const Gdiplus::GraphicsPath& path,
+                       const Gdiplus::RectF& rect) {
+  if (!g_backdrop.ready || !g_backdrop.reduced || !g_backdrop.reduced->bits) {
+    return false;
+  }
+  const float scale = UiScale();
+  // 设计稿矩形 → 这块玻璃所在窗口的物理像素 → 屏幕坐标 → 背板上的像素。背板是 1/4
+  // 尺寸的，最后再除一次 kGlassDownscale；除数放在最后，免得先整除把半像素丢掉。
+  const float full_x = static_cast<float>(g_glass_window_origin.x -
+                                          g_backdrop.origin_x) +
+                       rect.X * scale;
+  const float full_y = static_cast<float>(g_glass_window_origin.y -
+                                          g_backdrop.origin_y) +
+                       rect.Y * scale;
+  const float full_width = rect.Width * scale;
+  const float full_height = rect.Height * scale;
+  const float full_x1 = full_x + full_width;
+  const float full_y1 = full_y + full_height;
+  // 窗口被挪到背板范围之外（挪窗、换分辨率）时宁可不画：画错位比不画更难看。
+  if (full_width <= 0.0f || full_height <= 0.0f || full_x < 0.0f ||
+      full_y < 0.0f ||
+      full_x1 > static_cast<float>(g_backdrop.full->width) ||
+      full_y1 > static_cast<float>(g_backdrop.full->height)) {
+    return false;
+  }
+  const float divisor = static_cast<float>(kGlassDownscale);
+  const Gdiplus::RectF source(full_x / divisor, full_y / divisor,
+                              full_width / divisor, full_height / divisor);
+  const Gdiplus::GraphicsState state = graphics.Save();
+  graphics.SetClip(&path, Gdiplus::CombineModeIntersect);
+  // 源是已经糊透的 1/4 图，放大用双线性即可 —— 它本来就是平滑的，不会放大出细节，
+  // 也不会像最近邻那样露出块状边缘。
+  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+  graphics.DrawImage(g_backdrop.reduced->target, rect, source.X, source.Y,
+                     source.Width, source.Height, Gdiplus::UnitPixel);
+  graphics.Restore(state);
+  return true;
 }
 
 void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
@@ -3112,15 +3674,13 @@ void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
 
   Gdiplus::GraphicsPath body;
   AddRoundedRectPath(body, body_rect, 16.0f);
-  Gdiplus::LinearGradientBrush surface(
-      Gdiplus::Point(0, kPanelShadowMargin),
-      Gdiplus::Point(0, kPanelShadowMargin + static_cast<int>(body_height)),
-      Gdiplus::Color(BYTE{247}, 43, 47, 57),
-      Gdiplus::Color(BYTE{247}, 22, 24, 30));
-  graphics.FillPath(&surface, &body);
-  Gdiplus::Pen edge(Gdiplus::Color(BYTE{kSurfaceEdgeAlpha}, 255, 255, 255),
-                    1.0f);
-  graphics.DrawPath(&edge, &body);
+  // 面板底是液态玻璃：材质只有 FillGlassSurface 一处定义（基色 = 应用侧
+  // YingjiGlass.frost，厚度 = 只沉底边），浓度跟着「设置 → 外观 → 模糊程度」走
+  // （见 GlassPanelAlpha）。以前这里是一块 168~196 的海军蓝，用户看到的
+  // 「二级菜单还是黑塑料」就是它。
+  FillGlassSurface(graphics, body, body_rect, GlassPanelAlpha(false),
+                   GlassPanelAlpha(true), true);
+  StrokeGlassEdge(graphics, body);
 
   // 行内容裁到「内容视口」而不是整个面板体：body 的上下 padding 区留给面板
   // 底色。以前裁到 body_rect，滚动定位后上方行的下半截（缩略图、时间戳）会悬
@@ -3168,6 +3728,13 @@ void PresentPanel(HWND window, int width, int height) {
     // ScaleTransform 换到设计坐标系，行高、缩略图、字号就都跟着窗口走。
     const float scale = UiScale();
     graphics.ScaleTransform(scale, scale);
+    // 背板是按屏幕坐标抓的，绘制端要先把「设计稿矩形」映射回屏幕 —— 窗口自己的
+    // 位置在这里读一次（每帧重设，挪窗之后立刻就对得上）。
+    RECT rect{};
+    if (GetWindowRect(window, &rect)) {
+      g_glass_window_origin.x = rect.left;
+      g_glass_window_origin.y = rect.top;
+    }
     PaintPanelContent(graphics, skin, static_cast<float>(width) / scale,
                       static_cast<float>(height) / scale);
     graphics.Flush(Gdiplus::FlushIntentionSync);
@@ -3181,6 +3748,60 @@ void PresentPanel(HWND window, int width, int height) {
   UpdateLayeredWindow(window, nullptr, nullptr, &size, surface.dc, &source, 0,
                       &blend, ULW_ALPHA);
   TracePanelSurface(surface);
+}
+
+// 控件条的离屏面。
+//
+// ⚠️ 为什么不能用 `SetLayeredWindowAttributes(g_controls, 0, 232, LWA_ALPHA)`：
+// 常量 alpha 只能把「一整块不透明内容」整体压到 91%，视频只透过 9% —— 于是控件
+// 条必然是一块近黑板，无论里面画多淡的渐变都救不回来（用户看到的「控件背景」就是
+// 它）。要「只显示控件」就必须有逐像素 alpha，也就是和面板同一条路：
+// 32bpp 预乘 ARGB 的 DIB + `UpdateLayeredWindow(ULW_ALPHA)`。
+//
+// 一旦某个窗口用了 ULW，就**再也不能**对它调 SetLayeredWindowAttributes：两者
+// 互斥，混用会让窗口内容直接失效。所以淡入淡出改由 `SourceConstantAlpha` 承担
+// （PresentControlsSurface 里的 g_controls_alpha）。
+PanelSurface* g_controls_surface = nullptr;
+
+void PresentControlsSurface() {
+  if (!g_controls || !g_controls_surface || !g_controls_surface->dc) return;
+  POINT source{0, 0};
+  SIZE size{static_cast<LONG>(g_controls_surface->width),
+            static_cast<LONG>(g_controls_surface->height)};
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = g_controls_alpha;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  UpdateLayeredWindow(g_controls, nullptr, nullptr, &size,
+                      g_controls_surface->dc, &source, 0, &blend, ULW_ALPHA);
+  // 与面板共用抓图通道（MOVA_TRACE_PANEL=<目录>）：控件条的内容只存在于这块
+  // 离屏面里，抓屏/PrintWindow 都拿不到，只能从这里导出 BMP 离线核对。
+  TracePanelSurface(*g_controls_surface, L"controls");
+}
+
+// 顶栏的离屏面。
+//
+// ⚠️ 顶栏原来走 `SetLayeredWindowAttributes(hwnd, kOverlayColorKey, 232,
+// LWA_ALPHA | LWA_COLORKEY)`：键色只能表达「透明 / 不透明」两档，半透明的玻璃
+// 圆片根本画不出来（非键色的像素一律按 232 常量 alpha 呈现）—— 右上角三个窗口
+// 按钮就只能是一块实心深灰。改成和控件条、面板同一条路：32bpp 预乘 ARGB 的 DIB
+// + `UpdateLayeredWindow(ULW_ALPHA)`，于是按钮圆片、网络胶囊都是真的半透明。
+// ⚠️ 与控件条同理：用了 ULW 就不能再对这个窗口调 SetLayeredWindowAttributes，
+// 淡入淡出改由 SourceConstantAlpha 承担。
+PanelSurface* g_top_surface = nullptr;
+
+void PresentTopBarSurface() {
+  if (!g_top_bar || !g_top_surface || !g_top_surface->dc) return;
+  POINT source{0, 0};
+  SIZE size{static_cast<LONG>(g_top_surface->width),
+            static_cast<LONG>(g_top_surface->height)};
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = g_controls_alpha;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  UpdateLayeredWindow(g_top_bar, nullptr, nullptr, &size, g_top_surface->dc,
+                      &source, 0, &blend, ULW_ALPHA);
+  TracePanelSurface(*g_top_surface, L"topbar");
 }
 
 LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
@@ -3336,8 +3957,40 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   // ScaleTransform 一次放大，滚动、命中继续留在设计坐标系，两套坐标不混算。
   const int shadow = Scaled(kPanelShadowMargin);
   const int panel_width = Scaled(g_panel_metrics.width);
-  const int content_design =
-      std::min(g_panel_metrics.max_height, PanelContentHeight());
+  // 面板必须完整落在**播放器窗口**里：以前只夹屏幕工作区，窗口模式下菜单会探出
+  // 播放器边界、压在桌面或别的窗口上 —— 用户看到的「资源面板显示在播放器外面」
+  // 就是这个。边界取「播放器窗口 ∩ 屏幕工作区」，再各收一个阴影边距，保证连
+  // 那圈柔影都不越界。
+  RECT work_area{};
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+  RECT frame{};
+  if (g_window) GetWindowRect(g_window, &frame);
+  if (frame.right <= frame.left) frame = work_area;
+  const int limit_left =
+      std::max(static_cast<int>(work_area.left), static_cast<int>(frame.left)) +
+      shadow;
+  const int limit_right =
+      std::min(static_cast<int>(work_area.right), static_cast<int>(frame.right)) -
+      shadow;
+  const int limit_top =
+      std::max(static_cast<int>(work_area.top), static_cast<int>(frame.top)) +
+      shadow;
+  const int limit_bottom =
+      std::min(static_cast<int>(work_area.bottom),
+               static_cast<int>(frame.bottom)) -
+      shadow;
+  // 高度先按窗口收：面板再高也不可能高过播放器窗口，否则夹不住、必然越界。
+  // 还受锚点方向约束 —— 向上展开的面板最多只能长到锚点上方，否则它的底边会
+  // 压住控件条本身（面板是夹在窗口里了，却盖住了唤出它的那排按钮）。
+  const int anchor_room = anchor.open_above ? anchor.y - limit_top - 8
+                                            : limit_bottom - anchor.y - 8;
+  const int max_content = std::max(
+      Scaled(120),
+      std::min(limit_bottom - limit_top, std::max(Scaled(120), anchor_room)));
+  const int content_design = std::min(
+      g_panel_metrics.max_height,
+      std::min(PanelContentHeight(),
+               static_cast<int>(max_content / std::max(0.1f, g_ui_scale))));
   const int content = Scaled(content_design);
   g_panel_viewport_height = content_design - kPanelPadding * 2;
   // 打开时把指定的行滚进视野：剧集面板要定位到正在播的那一集，而不是永远从
@@ -3350,20 +4003,20 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
     const float target = box.y - static_cast<float>(kPanelPadding);
     g_panel_scroll = std::clamp(static_cast<int>(target), 0, PanelMaxScroll());
   }
-  RECT work_area{};
-  SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
-  const int left_limit = static_cast<int>(work_area.left) + 8;
-  const int right_limit = std::max(
-      left_limit, static_cast<int>(work_area.right) - panel_width - 8);
+  // 横向与纵向都用前面算好的「窗口 ∩ 工作区」边界（已各收一个阴影边距）。
+  const int left_limit = limit_left;
+  const int right_limit = std::max(left_limit, limit_right - panel_width);
   const int body_x =
       std::clamp(anchor.x - panel_width / 2, left_limit, right_limit);
-  const int top_limit = static_cast<int>(work_area.top) + 8;
-  const int bottom_limit =
-      std::max(top_limit, static_cast<int>(work_area.bottom) - content - 8);
+  const int top_limit = limit_top;
+  const int bottom_limit = std::max(top_limit, limit_bottom - content);
   // 贴边方向由调用方给出：底部控件条向上展开，顶栏向下展开。两端各夹一次，
-  // 保证面板完整落在工作区内。
+  // 保证面板连阴影一起完整落在播放器窗口内。
   int body_y = anchor.open_above ? anchor.y - content - 8 : anchor.y + 8;
   body_y = std::min(std::max(body_y, top_limit), bottom_limit);
+  // 开菜单这一刻重抓一次背板（force）：面板一上来就得是玻璃，不能先闪一帧上次
+  // 关门时留下的旧画面。PrintWindow 拍不到我们自己的浮层，所以这里不必等提示先退场。
+  UpdateGlassBackdrop(true);
   SetWindowPos(g_panel, HWND_TOP, body_x - shadow,
                body_y - shadow,
                panel_width + shadow * 2,
@@ -3385,15 +4038,47 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
 
 constexpr wchar_t kHintClass[] = L"MovaNativePlayerHint";
 constexpr int kHintMaxTextWidth = 420;
-constexpr int kHintRadius = 12;
+// 提示是完整胶囊（圆角 = 高/2）：小面积的液态玻璃在应用里就是胶囊与圆片，
+// 方角看起来像第三种皮肤。四周留一圈透明边给柔影 —— 应用侧的浮层靠背景模糊
+// 从画面里浮起来，原生没有模糊，分离感只能靠这层影子。
+constexpr int kHintMargin = 18;
+// 「标题 + 行内值」这一行的分栏尺寸。**量宽与绘制必须共用这三个数**：量的时候替
+// 它们预留，画的时候按它们扣减。
+//
+// ⚠️ 以前 `MeasureHint` 把 gap 算进值的槽宽、`PaintHint` 又从整行里再减一次 gap，
+// 这个 14 被扣了两遍 —— 标题的盒子永远比它自己需要的窄 4~5px，于是 GDI+ 的省略号
+// 修剪每次都生效，两字标题只剩一个字。
+constexpr int kHintValueGap = 14;
+// 紧贴墨迹量出来的宽度，右对齐到边缘时最后一笔会被切掉半个像素，给一点余量。
+constexpr int kHintValueSlack = 2;
+constexpr int kHintTitleSlack = 2;
 constexpr ULONGLONG kToastHoldMilliseconds = 1500;
+// 提示里的强调色：用在「要发生的事」上（跳过片头片尾的倒计时）。取应用侧
+// `YingjiColors.success`（#8EE49C），和 App 里的成功态是同一个绿。
+constexpr BYTE kHintAccentRed = 0x8E;
+constexpr BYTE kHintAccentGreen = 0xE4;
+constexpr BYTE kHintAccentBlue = 0x9C;
 
-HWND g_hint = nullptr;
 HintMode g_hint_mode = HintMode::Hidden;
 std::wstring g_hint_text;
 std::wstring g_hint_detail;
 wchar_t g_hint_icon = 0;
 float g_hint_fraction = -1.0f;
+bool g_hint_accent = false;
+// 行内那个值（"100%"）占的宽度，**设计稿单位**。
+//
+// ⚠️ 必须在 MeasureHint 里量一次就存下来，绘制端不能自己再量：MeasureHint 用的是
+// 一块没有变换的 DC（量出来就是设计稿单位），而 PaintHint 拿到的 graphics 已经
+// 按 UiScale 放大过 —— 同一句话在两处量出的数不一样，绘制端就会多扣一段宽度，
+// 把标题挤到只剩一个字。
+int g_hint_value_width = 0;
+/// 提示标题的**紧贴**宽度（设计稿单位），同样由 MeasureHint 量一次。
+///
+/// 「标题 + 右对齐的值」这一行只能靠这个数来分栏：绘制端如果自己去量，量到的
+/// 是另一套单位；而如果只是把剩下的宽度全给标题、再靠 GDI+ 的省略号修剪兜底，
+/// 一旦盒子正好等于字宽，字符会被整块丢掉（`EllipsisCharacter` 连省略号都放不
+/// 下时只画第一个字）。有了这个数就能提前判断"放得下"，放得下就干脆不修剪。
+int g_hint_title_width = 0;
 ULONGLONG g_hint_until = 0;
 // 拖动音量条 / 进度条时，只在整数百分比变化时重建浮层，否则每个鼠标事件都会
 // 重新排版一次。
@@ -3404,94 +4089,203 @@ Gdiplus::Font MakeHintFont() {
   return MakeInterfaceFont(13.0f, Gdiplus::FontStyleRegular);
 }
 
+/// 提示里的「明细」有两种用法，排版完全不同，必须先分清：
+///
+///   * **数值**（"42%"、"13:37 / 21:21"）—— 放标题行**右侧**、用主字号，
+///     像 App 音量胶囊右边那个百分比（参考图）；
+///   * **说明**（"打开菜单可取消"）—— 另起一行、小一号、灰一档。
+///
+/// 判据是长度而不是调用方多传一个参数：既要 MeasureHint 与 PaintHint 两处一致，
+/// 又不想给十来处调用点都加一个开关。
+bool HintDetailIsValue(const std::wstring& detail) {
+  if (detail.empty() || detail.size() > 12) return false;
+  return detail.find(L' ') == std::wstring::npos;
+}
+
+/// 用**与绘制端完全相同**的 `StringFormat` 量一行字要占多宽。
+///
+/// ⚠️ 不能直接用 `MeasurePanelText`：它走 `GenericTypographic`（紧贴墨迹），而 GDI+
+/// 的**默认** `StringFormat` 会在左右各留约 1/6 em 的空白 —— 绘制端用的正是默认
+/// 格式，于是「量到的 26」拿去画「实际要 30 的字」，差出半个字。拿这个数排
+/// 「标题 + 值」左右分栏，标题就被挤掉一整块（`EllipsisCharacter` 放不下省略号时
+/// 连字一起丢）。两处共用同一套格式，量多少就占多少。
+float MeasureHintText(Gdiplus::Graphics& graphics, const wchar_t* text,
+                      const Gdiplus::Font& font) {
+  Gdiplus::StringFormat format;
+  format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+  format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+  Gdiplus::Matrix transform;
+  graphics.GetTransform(&transform);
+  graphics.ResetTransform();
+  Gdiplus::RectF box;
+  graphics.MeasureString(text, -1, &font, Gdiplus::PointF(0, 0), &format, &box);
+  graphics.SetTransform(&transform);
+  return box.Width;
+}
+
 void MeasureHint(const std::wstring& text, const std::wstring& detail,
                  wchar_t icon, bool progress, int* width, int* height) {
+  const bool inline_value = HintDetailIsValue(detail);
+  const bool second_row = !detail.empty() && !inline_value;
   HDC dc = CreateCompatibleDC(nullptr);
   int text_width = 0;
+  int value_width = 0;
   {
     Gdiplus::Graphics graphics(dc);
     auto font = MakeHintFont();
     auto detail_font = MakeInterfaceFont(11.0f, Gdiplus::FontStyleRegular);
-    const float measured = std::max(
-        MeasurePanelText(graphics, text.c_str(), font),
-        detail.empty() ? 0.0f
-                       : MeasurePanelText(graphics, detail.c_str(), detail_font));
-    text_width = static_cast<int>(
-        std::min(static_cast<float>(kHintMaxTextWidth), measured));
+    g_hint_title_width =
+        static_cast<int>(std::ceil(MeasureHintText(graphics, text.c_str(),
+                                                   font)));
+    if (inline_value) {
+      g_hint_value_width = static_cast<int>(
+          std::ceil(MeasureHintText(graphics, detail.c_str(), font)));
+      // 值的槽 = 间距 + 值本身 + 余量。绘制端拿同一个槽去扣，gap 只算这一次。
+      value_width = kHintValueGap + g_hint_value_width + kHintValueSlack;
+    } else {
+      g_hint_value_width = 0;
+    }
+    // 标题这一栏按**绘制端实际会用的宽度**预留（紧贴宽 + 余量），而不是按原始
+    // 测量值：绘制端的盒子就是「紧贴宽 + 余量」，两边必须完全相等，否则
+    // `tight <= title_width` 这个判断会差几像素、把标题交给省略号修剪。
+    text_width = g_hint_title_width + kHintTitleSlack;
+    if (second_row) {
+      text_width =
+          std::max(text_width, static_cast<int>(MeasureHintText(
+                                   graphics, detail.c_str(), detail_font)));
+    }
+    text_width = std::min(text_width, kHintMaxTextWidth);
   }
   DeleteDC(dc);
-  const int content_height = detail.empty() ? 18 : 32;
-  *width = text_width + 28 + (icon != 0 ? 22 : 0);
-  *height = 20 + content_height + (progress ? 12 : 0);
-  if (*width < 88) *width = 88;
+  // 内容高：单行 44（胶囊），带说明 58；带进度线再加 16。
+  const int content_left = 15 + (icon != 0 ? 26 : 0);
+  const int body_height = second_row ? 58 : 44;
+  *width = content_left + text_width + value_width + 15 + kHintMargin * 2;
+  *height = body_height + (progress ? 16 : 0) + kHintMargin * 2;
+  if (*width < 96 + kHintMargin * 2) *width = 96 + kHintMargin * 2;
 }
 
 void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
                const std::wstring& text, const std::wstring& detail,
-               float fraction) {
+               float fraction, bool accent) {
   graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
   graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
   graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
-  const Gdiplus::RectF body(0.5f, 0.5f, static_cast<float>(width) - 1.0f,
-                            static_cast<float>(height) - 1.0f);
+  const float margin = static_cast<float>(kHintMargin);
+  const Gdiplus::RectF body(margin, margin,
+                            static_cast<float>(width) - margin * 2.0f,
+                            static_cast<float>(height) - margin * 2.0f);
+  const bool inline_value = HintDetailIsValue(detail);
+  const bool second_row = !detail.empty() && !inline_value;
+  const bool has_line = fraction >= 0.0f;
+  const float body_radius = body.Height / 2.0f;
   Gdiplus::GraphicsPath path;
-  AddRoundedRectPath(path, body, static_cast<float>(kHintRadius));
-  Gdiplus::LinearGradientBrush surface(
-      Gdiplus::PointF(0.0f, 0.0f), Gdiplus::PointF(0.0f, static_cast<float>(height)),
-      Gdiplus::Color(BYTE{247}, 43, 47, 57),
-      Gdiplus::Color(BYTE{247}, 22, 24, 30));
-  graphics.FillPath(&surface, &path);
-  Gdiplus::Pen edge(Gdiplus::Color(BYTE{kSurfaceEdgeAlpha}, 255, 255, 255), 1.0f);
-  graphics.DrawPath(&edge, &path);
+  AddRoundedRectPath(path, body, body_radius);
+  for (int step = 5; step >= 1; --step) {
+    const float spread = static_cast<float>(step) * 1.6f;
+    Gdiplus::GraphicsPath ring;
+    AddRoundedRectPath(ring,
+                       Gdiplus::RectF(body.X - spread, body.Y - spread + 2.0f,
+                                      body.Width + spread * 2.0f,
+                                      body.Height + spread * 2.0f),
+                       body_radius + spread);
+    Gdiplus::SolidBrush shadow(Gdiplus::Color(BYTE{9}, 0, 0, 0));
+    graphics.FillPath(&shadow, &ring);
+  }
+  // 与应用侧同一套材质：基色 frost、浓度跟着「外观 → 模糊程度」走、只沉底边的
+  // 厚度渐变、白 .16 的内描边。以前这里是一块 168~196 的海军蓝近黑。
+  // 提示压在画面正中间，是最需要背板模糊的一块：同样的浓度配上被糊过的画面才不是
+  // 一块黑板（用户原话：「还有提示也是这样」）。
+  FillGlassSurface(graphics, path, body, GlassPanelAlpha(false),
+                   GlassPanelAlpha(true), true);
+  StrokeGlassEdge(graphics, path);
 
   const PanelSkin skin;
-  float text_left = 14.0f;
-  if (icon != 0) {
-    DrawGlyph(graphics, static_cast<wchar_t>(icon), 24.0f, height / 2.0f, 16.0f,
-              Gdiplus::Color(BYTE{240}, 236, 238, 245));
-    text_left = 36.0f;
-  }
+  const float pad = 15.0f;
+  const float text_left = body.X + pad + (icon != 0 ? 26.0f : 0.0f);
   const float text_width =
-      std::max(0.0f, static_cast<float>(width) - text_left - 14.0f);
+      std::max(0.0f, body.GetRight() - pad - text_left);
+  // 竖排节奏：单行居中；带说明时标题在 11、说明在 29（行距 18）。
+  const float title_y = second_row || has_line ? body.Y + 11.0f
+                                               : body.Y + (body.Height - 18.0f) / 2.0f;
   Gdiplus::StringFormat format;
   format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
   format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-  if (detail.empty()) {
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    graphics.DrawString(text.c_str(), -1, &skin.title,
-                        Gdiplus::RectF(text_left, 10.0f, text_width, 18.0f),
-                        &format, &skin.ink);
-  } else {
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    graphics.DrawString(text.c_str(), -1, &skin.title,
-                        Gdiplus::RectF(text_left, 8.0f, text_width, 18.0f),
-                        &format, &skin.ink);
-    graphics.DrawString(detail.c_str(), -1, &skin.detail,
-                        Gdiplus::RectF(text_left, 25.0f, text_width, 15.0f),
-                        &format, &skin.muted);
+  format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+  if (icon != 0) {
+    const Gdiplus::Color ink =
+        accent ? Gdiplus::Color(BYTE{250}, kHintAccentRed, kHintAccentGreen,
+                                kHintAccentBlue)
+               : Gdiplus::Color(BYTE{240}, 236, 238, 245);
+    DrawGlyph(graphics, static_cast<wchar_t>(icon), body.X + pad + 8.0f,
+              title_y + 9.0f, 16.0f, ink, true);
   }
-  if (fraction < 0.0f) return;
-  const float bar_left = text_left;
-  const float bar_width = std::max(40.0f, text_width);
-  const float bar_y = static_cast<float>(height) - 13.0f;
-  Gdiplus::Pen track(Gdiplus::Color(BYTE{110}, 255, 255, 255), 3.0f);
+  float title_width = text_width;
+  if (inline_value) {
+    // 值的槽宽来自 MeasureHint（设计稿单位，见 g_hint_value_width 的说明）。
+    const float value_box =
+        std::min(text_width, static_cast<float>(std::max(1, g_hint_value_width) +
+                                                kHintValueSlack));
+    format.SetAlignment(Gdiplus::StringAlignmentFar);
+    DrawGlassText(graphics, detail.c_str(), skin.title,
+                  Gdiplus::RectF(text_left + text_width - value_box, title_y,
+                                 value_box, 18.0f),
+                  format, skin.ink);
+    format.SetAlignment(Gdiplus::StringAlignmentNear);
+    title_width =
+        std::max(0.0f, text_width - value_box - static_cast<float>(kHintValueGap));
+  }
+  // 标题的盒子取「MeasureHint 量出的紧贴宽 + 余量」—— 与 MeasureHint 预留的那一栏
+  // **是同一个数**，所以放得下是必定成立的，可以把省略号修剪关掉让字形原样排出来。
+  // 只有真的超长（被 kHintMaxTextWidth 截住）时才退回修剪。
+  if (g_hint_title_width > 0) {
+    const float tight =
+        static_cast<float>(g_hint_title_width + kHintTitleSlack);
+    if (tight <= title_width) {
+      title_width = tight;
+      format.SetTrimming(Gdiplus::StringTrimmingNone);
+    }
+  }
+  DrawGlassText(graphics, text.c_str(), skin.title,
+                Gdiplus::RectF(text_left, title_y, title_width, 18.0f), format,
+                skin.ink);
+  // 第二行说明还要靠修剪兜底，画完标题就还原。
+  format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+  if (second_row) {
+    DrawGlassText(graphics, detail.c_str(), skin.detail,
+                  Gdiplus::RectF(text_left, body.Y + 29.0f, text_width, 15.0f),
+                  format, skin.muted, BYTE{124});
+  }
+  if (!has_line) return;
+  // 进度线：值与轨道都是**同一条白**的两档 —— 以前值是 (110,168,255) 的蓝，
+  // 整屏唯一的强调色不该是蓝。强调态（跳过倒计时）换成应用侧的成功绿。
+  const float line_left = body.X + pad;
+  const float line_width = std::max(40.0f, body.Width - pad * 2.0f);
+  const float line_y = body.GetBottom() - 11.0f;
+  Gdiplus::Pen track(Gdiplus::Color(BYTE{96}, 255, 255, 255), 4.0f);
   ConfigureControlPen(track);
-  graphics.DrawLine(&track, bar_left, bar_y, bar_left + bar_width, bar_y);
-  Gdiplus::Pen value(Gdiplus::Color(255, 110, 168, 255), 3.0f);
+  graphics.DrawLine(&track, line_left, line_y, line_left + line_width, line_y);
+  const Gdiplus::Color value_ink =
+      accent ? Gdiplus::Color(255, kHintAccentRed, kHintAccentGreen,
+                              kHintAccentBlue)
+             : Gdiplus::Color(255, 250, 250, 252);
+  Gdiplus::Pen value(value_ink, 4.0f);
   ConfigureControlPen(value);
-  graphics.DrawLine(&value, bar_left, bar_y,
-                    bar_left + bar_width * std::clamp(fraction, 0.0f, 1.0f),
-                    bar_y);
+  graphics.DrawLine(&value, line_left, line_y,
+                    line_left + line_width * std::clamp(fraction, 0.0f, 1.0f),
+                    line_y);
 }
 
 void HideHint() {
   g_hint_mode = HintMode::Hidden;
   g_hint_fraction = -1.0f;
+  g_hint_accent = false;
   if (g_hint) ShowWindow(g_hint, SW_HIDE);
 }
 
 void ShowHint(const std::wstring& text, const std::wstring& detail,
-              wchar_t icon, HintMode mode, float fraction, int anchor_x) {
+              wchar_t icon, HintMode mode, float fraction, int anchor_x,
+              bool accent) {
   if (!g_hint || text.empty() || mode == HintMode::Hidden) {
     HideHint();
     return;
@@ -3504,20 +4298,34 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   height = Scaled(height);
   RECT work_area{};
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
-  const int work_left = static_cast<int>(work_area.left) + 8;
-  const int work_right = static_cast<int>(work_area.right) - 8;
+  // 提示挂在**播放器窗口**的水平中心，而不是整个屏幕的中心：窗口模式下播放器
+  // 只占桌面一块，按屏幕居中会让提示飘到窗口外面去。再与屏幕工作区求一次交，
+  // 全屏时两者等价。
+  RECT frame{};
+  if (g_window) GetWindowRect(g_window, &frame);
+  if (frame.right <= frame.left) frame = work_area;
+  const int limit_left =
+      std::max(static_cast<int>(work_area.left), static_cast<int>(frame.left)) + 8;
+  const int limit_right =
+      std::min(static_cast<int>(work_area.right), static_cast<int>(frame.right)) -
+      8;
   const int dock_top = DockTopScreen();
-  int x = work_left + (work_right - work_left - width) / 2;
-  x = std::clamp(x, work_left, std::max(work_left, work_right - width));
+  int x = limit_left + (limit_right - limit_left - width) / 2;
+  x = std::clamp(x, limit_left, std::max(limit_left, limit_right - width));
   const int gap = 16;
   int y = dock_top - height - gap;
-  y = std::max(y, static_cast<int>(work_area.top) + 8);
+  y = std::max(y, std::max(static_cast<int>(work_area.top),
+                           static_cast<int>(frame.top)) + 8);
   g_hint_mode = mode;
   g_hint_text = text;
   g_hint_detail = detail;
   g_hint_icon = icon;
   g_hint_fraction = fraction;
+  g_hint_accent = accent;
   g_hint_until = GetTickCount64() + kToastHoldMilliseconds;
+  // 背板按节流刷新（不是 force）：滚轮连拧音量会一秒叫十几次 ShowHint，每次都强抓
+  // 一发 40ms 的采集会把主线程拖住；节流之后最多 4Hz，玻璃里的画面照样是活的。
+  UpdateGlassBackdrop(false);
   SetWindowPos(g_hint, HWND_TOP, x, y, width, height,
                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   InvalidateRect(g_hint, nullptr, FALSE);
@@ -4206,9 +5014,15 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
         // 与面板同一套做法：物理窗口 + ScaleTransform，内部按设计稿绘制。
         const float scale = UiScale();
         graphics.ScaleTransform(scale, scale);
+        // 同面板：提示窗口自己的屏幕位置，供背板取像素（见 DrawGlassBackdrop）。
+        RECT window_rect{};
+        if (GetWindowRect(window, &window_rect)) {
+          g_glass_window_origin.x = window_rect.left;
+          g_glass_window_origin.y = window_rect.top;
+        }
         PaintHint(graphics, static_cast<int>(rect.right / scale),
                   static_cast<int>(rect.bottom / scale), g_hint_icon,
-                  g_hint_text, g_hint_detail, g_hint_fraction);
+                  g_hint_text, g_hint_detail, g_hint_fraction, g_hint_accent);
         graphics.Flush(Gdiplus::FlushIntentionSync);
         POINT source{0, 0};
         SIZE size{rect.right, rect.bottom};
@@ -4218,6 +5032,9 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
         blend.AlphaFormat = AC_SRC_ALPHA;
         UpdateLayeredWindow(window, nullptr, nullptr, &size, surface.dc,
                             &source, 0, &blend, ULW_ALPHA);
+        // 提示同样是 layered 窗口：抓屏拿不到，导出成 BMP 才能离线核对
+        // 「底色是不是又变回一块黑」。
+        TracePanelSurface(surface, L"hint");
       }
       EndPaint(window, &paint);
       return 0;
@@ -4230,8 +5047,8 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
 // 调整类操作的统一说法：一行标题 + 一行明细 +（可选）一条进度。音量与亮度这
 // 类有量纲的调整，进度条让「现在是多亮、多响」一眼可见。
 void ShowAdjustHint(const std::wstring& title, const std::wstring& detail,
-                    wchar_t icon, float fraction) {
-  ShowHint(title, detail, icon, HintMode::Toast, fraction, 0);
+                    wchar_t icon, float fraction, bool accent) {
+  ShowHint(title, detail, icon, HintMode::Toast, fraction, 0, accent);
 }
 
 void ShowVolumeHint(double volume) {
@@ -4289,20 +5106,29 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
       return 1;
     case WM_PAINT: {
       PAINTSTRUCT paint{};
-      HDC dc = BeginPaint(window, &paint);
+      // 顶栏也用 `UpdateLayeredWindow` 逐像素呈现：键色（LWA_COLORKEY）只有
+      // 「透明 / 不透明」两档，画不出半透明的玻璃圆片 —— 右上角那三个窗口按钮
+      // 永远是实心深灰，和「所有控件都要液态玻璃」对不上。见 PresentTopBarSurface。
+      BeginPaint(window, &paint);
       RECT rect{};
       GetClientRect(window, &rect);
-      HDC buffer_dc = CreateCompatibleDC(dc);
-      HBITMAP bitmap = CreateCompatibleBitmap(dc, rect.right, rect.bottom);
-      HGDIOBJ old_bitmap = SelectObject(buffer_dc, bitmap);
-      // 物理客户区留给 BitBlt；绘制全部换到设计稿坐标系。
-      const int physical_width = rect.right;
-      const int physical_height = rect.bottom;
+      EndPaint(window, &paint);
+      const int pixel_width = rect.right - rect.left;
+      const int pixel_height = rect.bottom - rect.top;
+      if (pixel_width <= 0 || pixel_height <= 0) return 0;
+      if (!g_top_surface) g_top_surface = new PanelSurface();
+      if (g_top_surface->width != pixel_width ||
+          g_top_surface->height != pixel_height) {
+        if (!g_top_surface->Create(pixel_width, pixel_height)) return 0;
+      } else {
+        g_top_surface->Clear();
+      }
       {
-        Gdiplus::Graphics graphics(buffer_dc);
+        Gdiplus::Graphics graphics(g_top_surface->target);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        graphics.Clear(Gdiplus::Color(255, 1, 2, 3));
+        // 整块面从「完全透明」开始：没画到的地方是真的透明（以前靠键色）。
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
         // 顶栏窗口保持全宽，内部按设计稿坐标绘制、ScaleTransform 放大到物理：
         // 窗口变小时字号与按钮等比缩小，相对布局关系不变。
         const float ui_scale = UiScale();
@@ -4378,14 +5204,19 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
             (rect.bottom - chip_height) / 2.0f, chip_width, chip_height);
         Gdiplus::GraphicsPath chip_path;
         AddRoundedRectPath(chip_path, chip, chip_height / 2.0f);
-        Gdiplus::SolidBrush chip_fill(Gdiplus::Color(BYTE{196}, 26, 29, 36));
+        // 网络胶囊也是液态玻璃（原来是 196 的实心深灰）。
+        Gdiplus::LinearGradientBrush chip_fill(
+            Gdiplus::PointF(chip.X, chip.Y),
+            Gdiplus::PointF(chip.X, chip.Y + chip_height),
+            Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(false)), 12, 13,
+                           17),
+            Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(true)), 8, 9, 12));
         graphics.FillPath(&chip_fill, &chip_path);
-        Gdiplus::Pen chip_edge(Gdiplus::Color(BYTE{58}, 255, 255, 255), 1.0f);
-        graphics.DrawPath(&chip_edge, &chip_path);
         DrawGlyph(graphics, L'\xF0C3', chip.X + chip_padding + chip_icon / 2.0f,
                   chip.Y + chip_height / 2.0f, chip_icon,
                   g_buffering.load() ? Gdiplus::Color(BYTE{200}, 255, 255, 255)
-                                     : Gdiplus::Color(BYTE{235}, 255, 255, 255));
+                                     : Gdiplus::Color(BYTE{235}, 255, 255, 255),
+                  false, true);
         Gdiplus::SolidBrush network_brush(Gdiplus::Color(BYTE{226}, 236, 238, 245));
         Gdiplus::StringFormat chip_format;
         chip_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -4399,44 +5230,48 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         for (int button = 1; button <= 3; ++button) {
           const float x = rect.right - (3 - button) * 52.0f - 26.0f;
           const float hover_amount = g_top_hover_mix[button];
-          Gdiplus::SolidBrush button_base(Gdiplus::Color(188, 22, 25, 31));
-          Gdiplus::Pen button_edge(Gdiplus::Color(64, 116, 126, 144), 1.0f);
-          graphics.FillEllipse(&button_base,
-                               Gdiplus::RectF(x - 18, 11, 36, 36));
-          graphics.DrawEllipse(&button_edge,
-                               Gdiplus::RectF(x - 18, 11, 36, 36));
+          // 常驻的液态玻璃圆片：和控件条上的按钮同一套底。以前这里是 188 的实心
+          // 深灰 + 一圈描边，压在画面上就是一排黑点 —— 用户说的「右上角几个控件
+          // 也要液态玻璃」指的就是它们。
+          const Gdiplus::RectF disc(x - 18, 11, 36, 36);
+          Gdiplus::LinearGradientBrush button_base(
+              Gdiplus::PointF(disc.X, disc.Y),
+              Gdiplus::PointF(disc.X, disc.Y + disc.Height),
+              Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(false)), 12, 13,
+                             17),
+              Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(true)), 8, 9,
+                             12));
+          graphics.FillEllipse(&button_base, disc);
           if (hover_amount > 0.001f) {
             const BYTE alpha = static_cast<BYTE>(hover_amount *
-                                                 (button == 3 ? 210 : 54));
+                                                 (button == 3 ? 210 : 74));
             Gdiplus::SolidBrush hover(button == 3
                                           ? Gdiplus::Color(alpha, 255, 69, 58)
                                           : Gdiplus::Color(alpha, 126, 174, 255));
             const float inset = (1.0f - hover_amount) * 3.0f;
-            FillPill(graphics, hover, x - 20 + inset, 9 + inset,
-                     40 - inset * 2, 40 - inset * 2);
+            graphics.FillEllipse(&hover,
+                                 Gdiplus::RectF(disc.X + inset, disc.Y + inset,
+                                                disc.Width - inset * 2,
+                                                disc.Height - inset * 2));
           }
           // 和应用标题栏 YingjiMotionIconButton 同一条规则：图标字号 = 直径 × 0.43。
           constexpr float kWindowIcon = 36.0f * 0.43f;
+          const Gdiplus::Color ink(BYTE{238}, 244, 244, 247);
           if (button == 1) {
-            DrawGlyph(graphics, L'\xEDAD', x, 29.0f, kWindowIcon,
-                      Gdiplus::Color(BYTE{238}, 244, 244, 247));
+            DrawGlyph(graphics, L'\xEDAD', x, 29.0f, kWindowIcon, ink, false,
+                      true);
           } else if (button == 2) {
             const bool zoomed = IsZoomed(g_window) != 0;
-            DrawGlyph(graphics, zoomed ? L'\xE9F6' : L'\xED57', x, 29.0f, kWindowIcon,
-                      Gdiplus::Color(BYTE{238}, 244, 244, 247));
+            DrawGlyph(graphics, zoomed ? L'\xE9F6' : L'\xED57', x, 29.0f,
+                      kWindowIcon, ink, false, true);
           } else {
-            DrawGlyph(graphics, L'\xEAB2', x, 29.0f, kWindowIcon,
-                      Gdiplus::Color(BYTE{238}, 244, 244, 247));
+            DrawGlyph(graphics, L'\xEAB2', x, 29.0f, kWindowIcon, ink, false,
+                      true);
           }
         }
         graphics.Flush(Gdiplus::FlushIntentionSync);
       }
-      BitBlt(dc, 0, 0, physical_width, physical_height, buffer_dc, 0, 0,
-            SRCCOPY);
-      SelectObject(buffer_dc, old_bitmap);
-      DeleteObject(bitmap);
-      DeleteDC(buffer_dc);
-      EndPaint(window, &paint);
+      PresentTopBarSurface();
       return 0;
     }
     case WM_MOUSEMOVE: {
@@ -4493,82 +5328,140 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       return 1;
     case WM_PAINT: {
       PAINTSTRUCT paint{};
-      HDC dc = BeginPaint(window, &paint);
+      // 用 ULW 呈现，绘制目标是自己那块 32bpp 预乘 ARGB 的离屏面，不再画到窗口
+      // DC 上。BeginPaint/EndPaint 仍然要走一遍（负责清掉系统的重绘标记）。
+      BeginPaint(window, &paint);
       RECT rect{};
       GetClientRect(window, &rect);
       const int pixel_width = rect.right - rect.left;
       const int pixel_height = rect.bottom - rect.top;
-      HDC buffer_dc = CreateCompatibleDC(dc);
-      HBITMAP buffer_bitmap =
-          CreateCompatibleBitmap(dc, pixel_width, pixel_height);
-      HGDIOBJ previous_bitmap = SelectObject(buffer_dc, buffer_bitmap);
+      EndPaint(window, &paint);
+      if (pixel_width <= 0 || pixel_height <= 0) return 0;
+      if (!g_controls_surface) g_controls_surface = new PanelSurface();
+      if (g_controls_surface->width != pixel_width ||
+          g_controls_surface->height != pixel_height) {
+        if (!g_controls_surface->Create(pixel_width, pixel_height)) return 0;
+      } else {
+        // 尺寸没变就复用同一块 DIB：省掉每次重画都新建位图 + GDI+ Bitmap。
+        g_controls_surface->Clear();
+      }
       {
-      Gdiplus::Graphics graphics(buffer_dc);
+      Gdiplus::Graphics graphics(g_controls_surface->target);
       graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
       graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+      // 整块面从「完全透明」开始 —— 这就是「控件背景没了」的实现：没画到的地方
+      // 是真的透明，视频原样透出来，而不是被常量 alpha 压成 91% 的黑板。
+      graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
       // 控件条窗口已经是缩放后的物理大小；内部布局仍全部是设计稿坐标，
       // 一次 ScaleTransform 换过去，按钮、字号、进度条就都跟着窗口走。
       const float ui_scale = UiScale();
       graphics.ScaleTransform(ui_scale, ui_scale);
       rect.right = static_cast<LONG>(std::lround(rect.right / ui_scale));
       rect.bottom = static_cast<LONG>(std::lround(rect.bottom / ui_scale));
-      Gdiplus::LinearGradientBrush surface(
-          Gdiplus::Point(0, 0), Gdiplus::Point(0, rect.bottom),
-          Gdiplus::Color(224, 39, 41, 48), Gdiplus::Color(244, 14, 15, 19));
-      graphics.FillRectangle(&surface, 0, 0, rect.right, rect.bottom);
-      Gdiplus::Pen surface_edge(
-          Gdiplus::Color(BYTE{kSurfaceEdgeAlpha}, 255, 255, 255), 1.0f);
-      graphics.DrawLine(&surface_edge, 18.0f, 1.0f, rect.right - 18.0f, 1.0f);
+      // 控件条不再有底板、圆角与描边 —— 它就是「一条通屏进度条 + 一排玻璃圆片」。
+      // 所以这里既不 SetClip，也不铺任何整块压暗（用户看到的「下面的控件背景框」
+      // 就是那道 10→124 的 scrim，已删除）。
+      // ⚠️ 只保留一层 6/255（上下淡出）的全底色，理由见 kDockHitBandAlpha：
+      // 逐像素 alpha 下 alpha=0 的像素会点击穿透，而进度条拖动 / 悬停预览 / 按钮
+      // 点击全靠这个窗口收鼠标。6/255 的压暗肉眼不可见，命中行为与以前完全一致。
+      // ⚠️ 全部走 INT：`Gdiplus::Point` 只收 INT，`FillRectangle` 同时有 INT 与
+      // REAL 两个重载，混着传 float 会 C2666 二义 + C4244，而本工程开了 /WX。
+      const int dock_right = static_cast<int>(rect.right);
+      const int dock_bottom = static_cast<int>(rect.bottom);
+      if (dock_right > 0 && dock_bottom > 0) {
+        // 上下两端各自淡出（而不是一整块平铺的 6/255）：这条带子铺满整个屏幕
+        // 宽度，如果上下留一条硬边，2% 的亮度台阶在亮画面上仍可能被看出来。
+        // 淡出之后整条窗口没有任何可见边界，命中测试却全程有效。
+        const BYTE band = static_cast<BYTE>(kDockHitBandAlpha);
+        const int fade = std::max(1, std::min(dock_bottom / 3, 30));
+        const int tail_top = std::max(fade, dock_bottom - fade);
+        Gdiplus::LinearGradientBrush head(
+            Gdiplus::Point(0, 0), Gdiplus::Point(0, fade),
+            Gdiplus::Color(static_cast<BYTE>(band / 2), 0, 0, 0),
+            Gdiplus::Color(band, 0, 0, 0));
+        graphics.FillRectangle(&head, 0, 0, dock_right, fade);
+        if (tail_top > fade) {
+          Gdiplus::SolidBrush mid(Gdiplus::Color(band, 0, 0, 0));
+          graphics.FillRectangle(&mid, 0, fade, dock_right, tail_top - fade);
+        }
+        Gdiplus::LinearGradientBrush tail(
+            Gdiplus::Point(0, tail_top), Gdiplus::Point(0, dock_bottom),
+            Gdiplus::Color(band, 0, 0, 0), Gdiplus::Color(0, 0, 0, 0));
+        graphics.FillRectangle(&tail, 0, tail_top, dock_right,
+                               dock_bottom - tail_top);
+      }
       const float width = static_cast<float>(rect.right);
       const double duration = g_duration.load();
       const double position = g_position.load();
       const float fraction = duration > 0
                                  ? static_cast<float>(std::min(1.0, position / duration))
                                  : 0.0f;
-      Gdiplus::Pen track(Gdiplus::Color(105, 115, 119, 130), 4);
-      track.SetStartCap(Gdiplus::LineCapRound);
-      track.SetEndCap(Gdiplus::LineCapRound);
-      graphics.DrawLine(&track, 24.0f, 19.0f, width - 24.0f, 19.0f);
+      // 进度条通屏：x 从 0 到窗口宽度（＝屏幕左右边缘），不再有 24px 内缩。
+      //
+      // 三段必须是**同一条白的三档亮度**，一眼能分出「看到哪」和「缓冲到哪」：
+      //   未缓存 34 → 已缓存 96 → 已播放 250。
+      // 以前已播放是 (110,168,255) 的蓝，还和悬停高亮同色 —— 全屏唯一的强调色
+      // 不该是蓝，用户说的「进度条是蓝的、分不清缓存」就是它。未缓存那一档压到
+      // 亮画面上几乎看不见，所以底下垫一层 96 的黑，深浅画面都读得出来。
       const float cached = static_cast<float>(
           std::clamp(g_cache_fraction.load(), 0.0, 1.0));
-      Gdiplus::Pen cache_progress(Gdiplus::Color(210, 139, 174, 224), 4);
-      cache_progress.SetStartCap(Gdiplus::LineCapRound);
-      cache_progress.SetEndCap(Gdiplus::LineCapRound);
-      graphics.DrawLine(&cache_progress, 24.0f, 19.0f,
-                        24.0f + (width - 48.0f) * cached, 19.0f);
-      Gdiplus::Pen progress(Gdiplus::Color(255, 110, 168, 255), 4);
-      progress.SetStartCap(Gdiplus::LineCapRound);
-      progress.SetEndCap(Gdiplus::LineCapRound);
-      graphics.DrawLine(&progress, 24.0f, 19.0f,
-                        24.0f + (width - 48.0f) * fraction, 19.0f);
-      const float played_x = 24.0f + (width - 48.0f) * fraction;
+      const float played = std::clamp(fraction, 0.0f, 1.0f);
+      Gdiplus::Pen base(Gdiplus::Color(BYTE{96}, 0, 0, 0), 5.0f);
+      ConfigureControlPen(base);
+      graphics.DrawLine(&base, 0.0f, kSeekLineY, width, kSeekLineY);
+      // 未缓存一档给 52：34 压在深色画面上几乎看不见（黑底加黑托底＝还是黑），
+      // 52 仍然明显暗于已缓存的 96，三档的区别不会糊在一起。
+      Gdiplus::Pen track(Gdiplus::Color(BYTE{52}, 255, 255, 255), 4.0f);
+      ConfigureControlPen(track);
+      graphics.DrawLine(&track, 0.0f, kSeekLineY, width, kSeekLineY);
+      if (cached > 0.01f) {
+        Gdiplus::Pen cache_progress(Gdiplus::Color(BYTE{96}, 255, 255, 255),
+                                    4.0f);
+        ConfigureControlPen(cache_progress);
+        graphics.DrawLine(&cache_progress, 0.0f, kSeekLineY, width * cached,
+                          kSeekLineY);
+      }
+      if (played > 0.01f) {
+        Gdiplus::Pen progress(Gdiplus::Color(BYTE{250}, 255, 255, 255), 4.0f);
+        ConfigureControlPen(progress);
+        graphics.DrawLine(&progress, 0.0f, kSeekLineY, width * played,
+                          kSeekLineY);
+      }
+      const float played_x = width * fraction;
       const double hover_fraction = g_seek_hover.load();
       const bool hovering_seek = hover_fraction >= 0;
       Gdiplus::SolidBrush thumb(Gdiplus::Color(255, 245, 248, 255));
       const float thumb_size = hovering_seek ? 12.0f : 8.0f;
       graphics.FillEllipse(
           &thumb, Gdiplus::RectF(played_x - thumb_size / 2,
-                                 19.0f - thumb_size / 2, thumb_size,
+                                 kSeekLineY - thumb_size / 2, thumb_size,
                                  thumb_size));
       if (hovering_seek && duration > 0) {
-        const float hover_x =
-            24.0f + (width - 48.0f) * static_cast<float>(hover_fraction);
+        const float hover_x = width * static_cast<float>(hover_fraction);
         Gdiplus::Pen marker(Gdiplus::Color(190, 255, 255, 255), 1.0f);
-        graphics.DrawLine(&marker, hover_x, 15.0f, hover_x, 23.0f);
+        graphics.DrawLine(&marker, hover_x, kSeekLineY - 4.0f, hover_x,
+                          kSeekLineY + 4.0f);
         const int preview_seconds =
             static_cast<int>(duration * hover_fraction);
         wchar_t preview[24]{};
         swprintf_s(preview, L"%02d:%02d", preview_seconds / 60,
                    preview_seconds % 60);
         const float bubble_x = std::clamp(hover_x - 25.0f, 2.0f, width - 52.0f);
-        Gdiplus::SolidBrush bubble(Gdiplus::Color(245, 55, 57, 64));
-        FillPill(graphics, bubble, bubble_x, 0, 50, 16);
+        // 悬浮预览也是玻璃：和面板/提示同一套材质，不再是固定 245 的深灰块。
+        // 同样铺背板（只是从缓存里搬一小块，不触发采集）—— 少铺这一层的话，同一根
+        // 进度条上「气泡」和「面板」会是两种玻璃，正是用户说的「割裂」。
+        Gdiplus::GraphicsPath bubble_path;
+        const Gdiplus::RectF bubble_rect(bubble_x, 0.0f, 50.0f, 17.0f);
+        AddRoundedRectPath(bubble_path, bubble_rect, 8.5f);
+        FillGlassSurface(graphics, bubble_path, bubble_rect,
+                         GlassPanelAlpha(false), GlassPanelAlpha(true), true);
+        StrokeGlassEdge(graphics, bubble_path);
         auto preview_font = MakeInterfaceFont(9, Gdiplus::FontStyleRegular);
         Gdiplus::StringFormat preview_format;
         preview_format.SetAlignment(Gdiplus::StringAlignmentCenter);
         preview_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         graphics.DrawString(preview, -1, &preview_font,
-                            Gdiplus::RectF(bubble_x, 0, 50, 16),
+                            Gdiplus::RectF(bubble_x, 0, 50, 17),
                             &preview_format, &thumb);
       }
 
@@ -4586,7 +5479,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const float play_hover = HoverAmount(kPlayPause);
       if (play_hover > 0.001f) {
         Gdiplus::SolidBrush play_glow(Gdiplus::Color(
-            static_cast<BYTE>(24 + play_hover * 68), 110, 168, 255));
+            static_cast<BYTE>(24 + play_hover * 68), 255, 255, 255));
         const float glow_size = 48.0f + play_hover * 10.0f;
         graphics.FillEllipse(
             &play_glow, Gdiplus::RectF(center - glow_size / 2,
@@ -4621,19 +5514,19 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       if (g_playback_error.load()) {
         Gdiplus::SolidBrush error(Gdiplus::Color(255, 255, 132, 124));
         auto status_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
-        graphics.DrawString(L"播放失败 · 请更换资源", -1, &status_font,
-                            Gdiplus::PointF(24, 63), &error);
+        DrawDockLabel(graphics, L"播放失败 · 请更换资源", status_font,
+                      Gdiplus::PointF(24, 63), error);
       } else if (g_buffering.load()) {
-        Gdiplus::SolidBrush accent(Gdiplus::Color(255, 110, 168, 255));
-        Gdiplus::Pen spinner(Gdiplus::Color(255, 110, 168, 255), 1.8f);
+        Gdiplus::SolidBrush accent(Gdiplus::Color(255, 236, 238, 245));
+        Gdiplus::Pen spinner(Gdiplus::Color(255, 236, 238, 245), 1.8f);
         ConfigureControlPen(spinner);
         graphics.DrawArc(&spinner, Gdiplus::RectF(23, 66, 10, 10),
                          g_buffer_phase, 245);
         auto status_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
-        graphics.DrawString(L"缓冲中", -1, &status_font,
-                            Gdiplus::PointF(37, 63), &accent);
+        DrawDockLabel(graphics, L"缓冲中", status_font,
+                      Gdiplus::PointF(37, 63), accent);
       } else {
-        graphics.DrawString(time, -1, &font, Gdiplus::PointF(24, 64), &quiet);
+        DrawDockLabel(graphics, time, font, Gdiplus::PointF(24, 64), quiet);
       }
       const auto tool_layout = ToolLayout(static_cast<int>(width));
       if (!compact) {
@@ -4666,11 +5559,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       }
       graphics.Flush(Gdiplus::FlushIntentionSync);
       }
-      BitBlt(dc, 0, 0, pixel_width, pixel_height, buffer_dc, 0, 0, SRCCOPY);
-      SelectObject(buffer_dc, previous_bitmap);
-      DeleteObject(buffer_bitmap);
-      DeleteDC(buffer_dc);
-      EndPaint(window, &paint);
+      PresentControlsSurface();
       return 0;
     }
     case WM_LBUTTONDOWN: {
@@ -4686,11 +5575,14 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const bool compact = rect.right < 780;
       const ControlId hit = HitControl(x, y, rect.right);
       if (y <= 34 && g_duration.load() > 0) {
-        const double fraction = std::max(
-            0.0, std::min(1.0, (x - 24.0) / (rect.right - 48.0)));
+        // 进度条通屏：x=0 是屏幕左边缘，x=窗口宽度是右边缘。
+        const double span = std::max(1.0, static_cast<double>(rect.right));
+        const double fraction =
+            std::clamp(static_cast<double>(x) / span, 0.0, 1.0);
         const std::string target = std::to_string(fraction * 100.0);
         MpvCommand("seek", target.c_str(), "absolute-percent");
-        ShowAdjustHint(L"跳到 " + ClockLabel(fraction * g_duration.load()),
+        ShowAdjustHint(ClockLabel(fraction * g_duration.load()) + L" / " +
+                           ClockLabel(g_duration.load()),
                        std::wstring(), kGlyphGauge,
                        static_cast<float>(fraction));
         g_hint_seek_percent = static_cast<int>(fraction * 100.0);
@@ -4769,8 +5661,10 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const int mouse_y = static_cast<int>(GET_Y_LPARAM(lparam) / scale);
       rect.right = static_cast<LONG>(std::lround(rect.right / scale));
       if (mouse_y <= 32) {
+        // 与绘制共用同一条换算：通屏进度条，x=0 是屏幕左边缘。
+        const double span = std::max(1.0, static_cast<double>(rect.right));
         const double fraction = std::clamp(
-            (mouse_x - 24.0) / (rect.right - 48.0), 0.0, 1.0);
+            static_cast<double>(mouse_x) / span, 0.0, 1.0);
         g_seek_hover = fraction;
         if ((wparam & MK_LBUTTON) != 0 && g_duration.load() > 0) {
           const std::string target = std::to_string(fraction * 100.0);
@@ -4779,7 +5673,8 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
           // 拖动时只在整数百分比变化时重画提示，否则每一像素都会重建一次浮层。
           if (percent != g_hint_seek_percent) {
             g_hint_seek_percent = percent;
-            ShowAdjustHint(L"跳到 " + ClockLabel(fraction * g_duration.load()),
+            ShowAdjustHint(ClockLabel(fraction * g_duration.load()) + L" / " +
+                               ClockLabel(g_duration.load()),
                            std::wstring(), kGlyphGauge,
                            static_cast<float>(fraction));
           }
@@ -4943,6 +5838,23 @@ void TickFrame() {
       (danmaku_animating || g_danmaku_dirty)) {
     InvalidateRect(g_danmaku, nullptr, FALSE);
   }
+  // 玻璃里的背板会过期：视频还在放，背板却还是开菜单那一刻的画面。有浮层露着的时候
+  // 按 kGlassBackdropRefreshMs 重抓一次，玻璃里的画面就跟着动 —— 原生没有
+  // BackdropFilter，这是唯一能让它「活」起来的办法（节流在 UpdateGlassBackdrop 里，
+  // 这里每次 tick 调一次也不会有额外开销）。
+  const bool glass_visible = (g_panel && IsWindowVisible(g_panel)) ||
+                             (g_hint && IsWindowVisible(g_hint));
+  if (glass_visible) {
+    const ULONGLONG stamp = g_backdrop.captured_at;
+    if (UpdateGlassBackdrop(false) && g_backdrop.captured_at != stamp) {
+      if (g_panel && IsWindowVisible(g_panel)) {
+        InvalidateRect(g_panel, nullptr, FALSE);
+      }
+      if (g_hint && IsWindowVisible(g_hint)) {
+        InvalidateRect(g_hint, nullptr, FALSE);
+      }
+    }
+  }
   // 音量是连续量（拖一次音量条会连出几十个值），回写偏好要等手停下来。
   FlushPendingPlayerPreferences();
   // 重试之后已经稳稳放了十几秒：这一集算恢复正常，重试预算放开。
@@ -5039,11 +5951,14 @@ void TickFrame() {
                                     (should_hide ? -step : step),
                                 0, 232);
     g_controls_alpha = static_cast<BYTE>(next);
-    SetLayeredWindowAttributes(g_controls, 0, g_controls_alpha, LWA_ALPHA);
+    // 控件条走 ULW，淡入淡出只能靠重新呈现（SourceConstantAlpha），不能再调
+    // SetLayeredWindowAttributes —— 两者互斥。这里复用同一块离屏面，只换 alpha，
+    // 不重跑绘制。
+    PresentControlsSurface();
     if (g_top_bar) {
-      SetLayeredWindowAttributes(g_top_bar, kOverlayColorKey,
-                                 g_controls_alpha,
-                                 LWA_ALPHA | LWA_COLORKEY);
+      // 顶栏同样走 ULW：淡入淡出只能改 SourceConstantAlpha 后重新呈现，不能再
+      // 调 SetLayeredWindowAttributes（两者互斥，调了内容直接失效）。
+      PresentTopBarSurface();
     }
     if (g_controls_alpha == 0) {
       SetCursor(nullptr);
@@ -5082,6 +5997,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       if (right) return HTRIGHT;
       if (top) return HTTOP;
       if (bottom) return HTBOTTOM;
+      // 顶部这条「顶栏带」整条都算标题栏：拖它可以移动窗口、双击最大化。
+      //
+      // 顶栏是独立的分层窗口，改成逐像素透明（ULW）之后它中间那片是**真透明**
+      // —— 逐像素 alpha 下 alpha=0 的像素点击穿透，鼠标落到主窗口上，而主窗口
+      // 此前把客户区一律判成 HTCLIENT，于是「播放器最上面拖不动了」。顶栏上的
+      // 三个窗口按钮仍然不透明，照样收得到点击，不受这里影响。
+      if (y - rect.top < Scaled(kTopBarHeight + kTopBarTopMargin)) {
+        return HTCAPTION;
+      }
       return HTCLIENT;
     }
     case WM_GETMINMAXINFO: {
@@ -5378,12 +6302,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   g_controls = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kControlsClass,
                                L"", WS_POPUP, 0, 0, 1, 1, window, nullptr,
                                instance, nullptr);
-  SetLayeredWindowAttributes(g_controls, 0, 232, LWA_ALPHA);
+  // 控件条刻意**不调** SetLayeredWindowAttributes：它由 UpdateLayeredWindow 呈现
+  // （逐像素 alpha），两者互斥，调了会让窗口内容失效。淡入淡出见 TickOverlay。
   g_top_bar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kTopBarClass,
                               L"", WS_POPUP, 0, 0, 1, 1, window, nullptr,
                               instance, nullptr);
-  SetLayeredWindowAttributes(g_top_bar, kOverlayColorKey, 232,
-                             LWA_ALPHA | LWA_COLORKEY);
+  // 顶栏也刻意**不调** SetLayeredWindowAttributes：它由 UpdateLayeredWindow
+  // 逐像素呈现（右上角那几个按钮要真半透明的玻璃），两者互斥。
+  // 淡入淡出见 TickOverlay 的 PresentTopBarSurface()。
   // 提示浮层要能压在画面上、又绝不能抢鼠标：无激活、透明命中、工具窗口。
   g_hint = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT |
                                WS_EX_NOACTIVATE,
@@ -5932,6 +6858,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // 否则进程退出时它们的析构函数会调用已失效的 Gdip* 并触发访问冲突（0xC0000005）。
   ReleaseGlyphCache();
   ReleaseDanmakuSurface();
+  // 背板那两张全窗位图（各 32bpp，和整屏同量级）里的 Gdiplus::Bitmap 同样是 GDI+
+  // 对象，必须在 GdiplusShutdown 之前释放。
+  ReleaseGlassBackdrop();
+  // 控件条那块 32bpp 面里的 Gdiplus::Bitmap 同样是 GDI+ 对象，必须在
+  // GdiplusShutdown 之前释放（否则收尾时析构踩到已卸载的 Gdip*，0xC0000005）。
+  delete g_controls_surface;
+  g_controls_surface = nullptr;
   // 图片缓存里的 Gdiplus::Bitmap 同样是 GDI+ 对象，必须在 GdiplusShutdown 之前
   // 释放，否则进程退出时会走到已卸载的 Gdip* 上。
   g_image_cache.clear();

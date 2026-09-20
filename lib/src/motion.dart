@@ -267,8 +267,8 @@ class _MovaAppearState extends State<MovaAppear> {
 /// 统一躺成一条 38 高的胶囊：图标 + 进度条 + 数值，横向摆在画面靠上的位置。
 /// 之前是竖条，手机上正好压在人物脸上；横条既薄又靠上，不挡画面也不挡字幕。
 ///
-/// 底色由调用方传 [background]（通常是 `YingjiGlass.hud()`），这样外观设置里
-/// 的玻璃色调 / 不透明度 / 模糊会直接作用到它上面。
+/// 底色由调用方传 [background]（通常是 `YingjiGlass.hud()`），这样外观设置里的
+/// 模糊程度会直接作用到它上面。
 class MovaHud extends StatelessWidget {
   const MovaHud({
     super.key,
@@ -279,7 +279,9 @@ class MovaHud extends StatelessWidget {
     this.trackWidth = 96,
     this.width,
     this.background = const Color(0xA6121216),
-    this.borderColor = const Color(0x24FFFFFF),
+    // 液态玻璃不要描边：白边会让浮层看起来像塑料片，边界靠模糊反差自己显现。
+    this.borderColor = Colors.transparent,
+    this.blur = 22,
   });
 
   final IconData icon;
@@ -301,6 +303,10 @@ class MovaHud extends StatelessWidget {
   final Color background;
   final Color borderColor;
 
+  /// HUD 背后的毛玻璃半径。这里不能引用 [YingjiGlass]（brand 反过来依赖
+  /// motion，再 import 就成环），所以由调用方把外观里的数值传进来。
+  final double blur;
+
   @override
   Widget build(BuildContext context) {
     const radius = 19.0;
@@ -314,7 +320,7 @@ class MovaHud extends StatelessWidget {
     return ClipRRect(
       borderRadius: BorderRadius.circular(radius),
       child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
+        filter: ImageFilter.blur(sigmaX: blur, sigmaY: blur),
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: background,
@@ -421,7 +427,9 @@ class MovaHudPill extends StatelessWidget {
     required this.label,
     this.caption,
     this.background = const Color(0xA6121216),
-    this.borderColor = const Color(0x24FFFFFF),
+    // 液态玻璃不要描边：白边会让浮层看起来像塑料片，边界靠模糊反差自己显现。
+    this.borderColor = Colors.transparent,
+    this.blur = 22,
   });
 
   final IconData icon;
@@ -430,11 +438,14 @@ class MovaHudPill extends StatelessWidget {
   final Color background;
   final Color borderColor;
 
+  /// 同 [MovaHud.blur]。
+  final double blur;
+
   @override
   Widget build(BuildContext context) => ClipRRect(
     borderRadius: BorderRadius.circular(17),
     child: BackdropFilter(
-      filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
+      filter: ImageFilter.blur(sigmaX: blur, sigmaY: blur),
       child: DecoratedBox(
         decoration: BoxDecoration(
           color: background,

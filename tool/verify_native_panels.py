@@ -506,6 +506,29 @@ def main():
             return None
         return run
 
+    def click_panel_header(label):
+        """点面板的标题行。
+
+        标题行不含任何动作（`DrawPanelHeaderRow` 那一行 enabled 为假、property
+        为空），所以点它必须是**空操作**：面板留在原地。这一条把「点到面板里的
+        非操作区就把菜单关掉」这类回归钉住 —— 面板关闭的唯一路径是点到投影或
+        空白（`PanelIndexAt` 返回 -1）。
+
+        它替换了旧的 `05_overflow_subpanel`：那条用例的前提是「工具放不下、出现
+        更多槽」，而在 1920 宽的窗口里槽位容量是 10、工具只有 9 个，溢出永远不会
+        发生，于是点击坐标落到面板的空白处、把面板关掉，用例恒失败。
+        """
+        def run(controls, centres, scale=1.0):
+            panel = wait_class("MovaNativePlayerPanel", timeout=3.0,
+                               visible=True)
+            if not panel:
+                print(f"    click {label} SKIPPED (no panel)")
+                return None
+            y = PANEL_SHADOW + PANEL_PADDING + PANEL_HEADER_H // 2
+            click_design(panel, 170, y, label, scale)
+            return None
+        return run
+
     cases = [
         ("01_episodes", playlist_args() + ["--mova-tool-order=剧集"],
          [click_slot(0, "剧集 tool")], True),
@@ -514,8 +537,8 @@ def main():
         ("03_chapters", ["--mova-tool-order=章节"],
          [click_slot(0, "章节 tool")], True),
         ("04_overflow", [], [click_slot(3, "更多 tool")], True),
-        ("05_overflow_subpanel", [],
-         [click_slot(3, "更多 tool"), click_panel_row(0, "更多首行")], True),
+        ("05_danmaku_panel", ["--mova-tool-order=弹幕"],
+         [click_slot(0, "弹幕 tool"), click_panel_header("弹幕面板标题行")], True),
         ("06_dock_only", [], [], False),
         ("10_episodes_full", full_args(out_dir) + ["--mova-tool-order=剧集"],
          [click_slot(0, "剧集 tool")], True),

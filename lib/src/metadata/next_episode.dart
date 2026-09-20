@@ -47,7 +47,7 @@ class _NextEpisodeLabelState extends State<NextEpisodeLabel> {
         final time = next.timeKnown
             ? ' ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}（当地时间）'
             : '（时分未公布）';
-        return Tooltip(
+        return YingjiGlassTooltip(
           message: '来源：${next.source}；这是播出安排，不代表服务器入库时间。',
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,

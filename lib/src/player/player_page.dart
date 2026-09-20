@@ -2509,7 +2509,8 @@ class _PlayerPageState extends State<PlayerPage> {
         1.0,
       );
       final background = YingjiGlass.hud();
-      final border = YingjiGlass.line(strength: 1.8);
+      // 液态玻璃无描边：HUD 的边界靠「背后模糊、浮层不模糊」的反差自己显现。
+      final border = Colors.transparent;
       return IgnorePointer(
         child: MovaAppear(
           visible: _gestureVisible,
@@ -2527,6 +2528,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     width: 292,
                     background: background,
                     borderColor: border,
+                    blur: YingjiGlass.blur,
                   )
                 : MovaHud(
                     icon: _gestureIcon,
@@ -2535,6 +2537,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     trackWidth: 104,
                     background: background,
                     borderColor: border,
+                    blur: YingjiGlass.blur,
                   ),
           ),
         ),
@@ -3236,7 +3239,6 @@ class _PlayerPageState extends State<PlayerPage> {
       decoration: BoxDecoration(
         color: YingjiGlass.chrome(),
         shape: BoxShape.circle,
-        border: Border.all(color: YingjiGlass.line()),
       ),
       child: const Icon(YingjiIcons.ellipsis, size: 18),
     ),
@@ -3250,7 +3252,7 @@ class _PlayerPageState extends State<PlayerPage> {
     required String Function(T) labelBuilder,
     required ValueChanged<T> onChanged,
     Widget? display,
-  }) => Tooltip(
+  }) => YingjiGlassTooltip(
     message: '$label · ${labelBuilder(value)}',
     child: YingjiGlassMenu(
       borderRadius: 999,
@@ -3484,7 +3486,6 @@ class _StateChip extends StatelessWidget {
     decoration: BoxDecoration(
       color: YingjiGlass.chrome(strength: .92),
       borderRadius: BorderRadius.circular(999),
-      border: Border.all(color: YingjiGlass.line()),
       boxShadow: [
         BoxShadow(
           color: YingjiGlass.chrome(strength: 1.05),

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui';
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
@@ -1189,27 +1189,87 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   fit: StackFit.expand,
                   children: [
                     if (item.backdropUrl != null)
-                      CachedNetworkImage(
-                        imageUrl: item.backdropUrl.toString(),
-                        fit: BoxFit.cover,
-                        // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成（正好压在进
-                        // 页面的转场上），背景直接显示。
-                        fadeInDuration: Duration.zero,
-                        fadeOutDuration: Duration.zero,
-                        // 全屏窗口下 backdrop 原图可能上千像素：按窗口实际物理宽度
-                        // 解码，省内存也省每帧纹理带宽。
-                        memCacheWidth: 1280,
-                        errorWidget: (_, _, _) => const SizedBox.shrink(),
+                      // 详情页背景与首页同一套逻辑：**顶部是清晰的海报，往下滚才
+                      // 逐渐变糊**。以前这里是无条件 `blur(glassBlur * .5)`，一进
+                      // 详情页背景就已经糊死，和首页的观感对不上；现在深度由
+                      // [yingjiScrollDepth] 给出，清晰层与模糊层叠加，模糊层的不
+                      // 透明度就是深度。
+                      AnimatedBuilder(
+                        animation: _pageScroll,
+                        builder: (context, _) {
+                          final depth = _pageScroll.hasClients
+                              ? yingjiScrollDepth(_pageScroll.position)
+                              : 0.0;
+                          return Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              RepaintBoundary(
+                                child: CachedNetworkImage(
+                                  key: ValueKey('detail-clear-${item.backdropUrl}'),
+                                  imageUrl: item.backdropUrl.toString(),
+                                  fit: BoxFit.cover,
+                                  // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成
+                                  // （正好压在进页面的转场上），背景直接显示。
+                                  fadeInDuration: Duration.zero,
+                                  fadeOutDuration: Duration.zero,
+                                  memCacheWidth: 1280,
+                                  errorWidget: (_, _, _) =>
+                                      const SizedBox.shrink(),
+                                ),
+                              ),
+                              Opacity(
+                                opacity: depth,
+                                child: RepaintBoundary(
+                                  child: ImageFiltered(
+                                    imageFilter: ImageFilter.blur(
+                                      sigmaX: YingjiGlass.blur,
+                                      sigmaY: YingjiGlass.blur,
+                                    ),
+                                    child: CachedNetworkImage(
+                                      key: ValueKey(
+                                        'detail-blur-${item.backdropUrl}',
+                                      ),
+                                      imageUrl: item.backdropUrl.toString(),
+                                      fit: BoxFit.cover,
+                                      fadeInDuration: Duration.zero,
+                                      fadeOutDuration: Duration.zero,
+                                      // 反正会被糊掉：模糊拉得很低时这层不再是
+                                      // 「氛围光」，改按原分辨率解码，免得出现一层
+                                      // 低清放大图压在清晰背景上的发虚重影。
+                                      memCacheWidth: YingjiGlass.blur >= 10
+                                          ? 320
+                                          : 1280,
+                                      errorWidget: (_, _, _) =>
+                                          const SizedBox.shrink(),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: RadialGradient(
+                                    center: Alignment.topRight,
+                                    radius: 1.15,
+                                    colors: [
+                                      Color(0x553B6A4D),
+                                      Color(0x9907090D),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              // 下滑时整体再压暗一档，保证滚动进来的卡片、文字
+                              // 始终压得住海报（与首页 depth 驱动压暗同一目的）。
+                              DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withValues(
+                                    alpha: .12 * depth,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
                       ),
-                    const DecoratedBox(
-                      decoration: BoxDecoration(
-                        gradient: RadialGradient(
-                          center: Alignment.topRight,
-                          radius: 1.15,
-                          colors: [Color(0x553B6A4D), Color(0xE807090D)],
-                        ),
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -1969,7 +2029,7 @@ class _DetailHeroCopy extends StatelessWidget {
       const SizedBox(height: 10),
       ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 780),
-        child: YingjiSynopsisTooltip(
+        child: YingjiGlassTooltip(
           message: item.overview?.isNotEmpty == true
               ? item.overview!
               : '暂无剧情简介。',
@@ -2075,7 +2135,7 @@ class _DetailActionSurfaceState extends State<_DetailActionSurface> {
   Widget build(BuildContext context) {
     final active = _hovered && widget.enabled;
     final foreground = widget.primary ? Colors.black : Colors.white;
-    return Tooltip(
+    return YingjiGlassTooltip(
       message: widget.label,
       child: MouseRegion(
         onEnter: (_) => setState(() => _hovered = true),
@@ -2752,7 +2812,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                           ),
                           if (overview?.isNotEmpty == true) ...[
                             const SizedBox(height: 3),
-                            YingjiSynopsisTooltip(
+                            YingjiGlassTooltip(
                               message: overview!,
                               child: Text(
                                 overview,
@@ -3220,7 +3280,7 @@ class _AllEpisodeCard extends StatelessWidget {
                     ),
                     if (overview?.trim().isNotEmpty == true) ...[
                       const SizedBox(height: 6),
-                      YingjiSynopsisTooltip(
+                      YingjiGlassTooltip(
                         message: overview!,
                         child: Text(
                           overview!,
@@ -3582,7 +3642,7 @@ class _FilterChipState extends State<_FilterChip> {
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.only(left: 8),
-    child: Tooltip(
+    child: YingjiGlassTooltip(
       message: widget.label,
       child: MouseRegion(
         onEnter: (_) => setState(() => _hovered = true),
@@ -4138,10 +4198,7 @@ class _ResourceCard extends StatelessWidget {
     child: ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: BackdropFilter(
-        filter: ImageFilter.blur(
-          sigmaX: YingjiGlass.blur,
-          sigmaY: YingjiGlass.blur,
-        ),
+        filter: YingjiGlass.backdrop(),
         child: InkWell(
           onTap: onSelect,
           borderRadius: BorderRadius.circular(16),
@@ -4230,7 +4287,7 @@ class _ResourceCard extends StatelessWidget {
                       ),
                     if (showPicker) ...[
                       const SizedBox(width: 4),
-                      Tooltip(
+                      YingjiGlassTooltip(
                         message: '切换该服务器资源',
                         child: InkResponse(
                           onTap: onPicker,
@@ -5347,7 +5404,6 @@ class _PersonPageState extends State<_PersonPage> {
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
     body: YingjiBackdrop(
-      blur: 24,
       overlay: SafeArea(
         child: Column(
           children: [
@@ -5439,7 +5495,7 @@ class _PersonPageState extends State<_PersonPage> {
                                       ),
                                     ),
                                     const SizedBox(height: 16),
-                                    YingjiSynopsisTooltip(
+                                    YingjiGlassTooltip(
                                       message:
                                           value.biography?.isNotEmpty == true
                                           ? value.biography!
@@ -5545,7 +5601,6 @@ class _ResourceMessage extends StatelessWidget {
     decoration: BoxDecoration(
       color: YingjiGlass.surface(),
       borderRadius: BorderRadius.circular(16),
-      border: Border.all(color: YingjiGlass.line()),
     ),
     child: Row(
       children: [

@@ -56,9 +56,9 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                 begin: Alignment.centerLeft,
                 end: Alignment.centerRight,
                 colors: [
-                  Color(0xF507090D),
-                  Color(0xB007090D),
-                  Color(0xE807090D),
+                  Color(0x6607090D),
+                  Color(0x4D07090D),
+                  Color(0x8007090D),
                 ],
               ),
             ),
@@ -104,7 +104,7 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                                           const SizedBox(width: 16),
                                           ReorderableDragStartListener(
                                             index: index,
-                                            child: const Tooltip(
+                                            child: const YingjiGlassTooltip(
                                               message: '拖动排序',
                                               child: Padding(
                                                 padding: EdgeInsets.all(10),

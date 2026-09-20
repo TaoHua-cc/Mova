@@ -456,12 +456,8 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
 
     // 壳层背景的模糊强度由这里驱动：合并前它由“翻到发现那一页”触发，
     // 现在发现栏目就在首页内部，所以改用滚过一屏的比例还原同样的观感。
-    // 量化成 1/24 步进，避免滚动过程中每帧重建模糊层。
-    final viewport = position.viewportDimension;
-    final raw = viewport <= 0
-        ? 0.0
-        : (position.pixels / viewport).clamp(0.0, 1.0);
-    final depth = (raw * 24).roundToDouble() / 24;
+    // 曲线与详情页共用 [yingjiScrollDepth]。
+    final depth = yingjiScrollDepth(position);
     if (depth != yingjiHomeScrollDepth.value) {
       yingjiHomeScrollDepth.value = depth;
     }
@@ -544,8 +540,8 @@ class _ContinuousShellBackdrop extends StatelessWidget {
             opacity: clarity,
             child: ImageFiltered(
               imageFilter: ImageFilter.blur(
-                sigmaX: (1 - clarity) * 24,
-                sigmaY: (1 - clarity) * 24,
+                sigmaX: (1 - clarity) * YingjiGlass.blur,
+                sigmaY: (1 - clarity) * YingjiGlass.blur,
               ),
               child: child,
             ),
@@ -638,14 +634,19 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                       child: Transform.scale(
                         scale: 1.05,
                         child: ImageFiltered(
-                          imageFilter: ImageFilter.blur(sigmaX: 34, sigmaY: 34),
+                          imageFilter: ImageFilter.blur(
+                            sigmaX: YingjiGlass.blur,
+                            sigmaY: YingjiGlass.blur,
+                          ),
                           child: CachedNetworkImage(
                             key: ValueKey('blur-$imageUrl'),
                             imageUrl: imageUrl,
                             fit: BoxFit.cover,
-                            // 这一层会被 34px 高斯模糊糊掉，原图分辨率纯属浪费：
-                            // 降到 320px 宽再放大，肉眼完全看不出差别，却能少占数 MB。
-                            memCacheWidth: 320,
+                            // 这一层会被高斯模糊糊掉，原图分辨率纯属浪费：降到 320px
+                            // 宽再放大，肉眼完全看不出差别，却能少占数 MB。模糊拉到
+                            // 很低时这层就不再是"氛围光"了，改按 1280 解码，免得出现
+                            // 一层低清放大图压在清晰背景上的发虚重影。
+                            memCacheWidth: YingjiGlass.blur >= 10 ? 320 : 1280,
                             errorWidget: (_, _, _) => const SizedBox.shrink(),
                           ),
                         ),
@@ -658,8 +659,8 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                     gradient: LinearGradient(
                       colors: [
                         Color.lerp(
-                          const Color(0xD607090D),
-                          const Color(0xE807090D),
+                          const Color(0x9907090D),
+                          const Color(0xB307090D),
                           depth,
                         )!,
                         Color.lerp(
@@ -668,8 +669,8 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                           depth,
                         )!,
                         Color.lerp(
-                          const Color(0x9A07090D),
-                          const Color(0xD807090D),
+                          const Color(0x6607090D),
+                          const Color(0x8C07090D),
                           depth,
                         )!,
                       ],
@@ -685,8 +686,8 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                       colors: [
                         const Color(0x0007090D),
                         Color.lerp(
-                          const Color(0x7207090D),
-                          const Color(0xEE07090D),
+                          const Color(0x4D07090D),
+                          const Color(0x9907090D),
                           depth,
                         )!,
                       ],
@@ -1298,7 +1299,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                       const SizedBox(height: 14),
                       ConstrainedBox(
                         constraints: const BoxConstraints(maxWidth: 610),
-                        child: YingjiSynopsisTooltip(
+                        child: YingjiGlassTooltip(
                           message: selected.overview?.isNotEmpty == true
                               ? selected.overview!
                               : '从你的媒体库与可信元数据服务开始，建立属于自己的观影空间。',
@@ -2689,7 +2690,6 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                 decoration: BoxDecoration(
                                   color: YingjiGlass.surface(strength: .72),
                                   borderRadius: BorderRadius.circular(15),
-                                  border: Border.all(color: YingjiGlass.line()),
                                 ),
                                 child: Padding(
                                   padding: const EdgeInsets.all(14),
@@ -4678,13 +4678,14 @@ class _RankingPageState extends State<_RankingPage> {
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
     body: YingjiBackdrop(
-      blur: 22,
       overlay: DecoratedBox(
+        // 遮罩只压 24%~40%：再深就把海报压成纯黑，玻璃再透明也透不出颜色
+        // （此前是 0x99/0xC0，卡片叠上去直接变成黑块）。
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [Color(0x99070A0D), Color(0xC007090D)],
+            colors: [Color(0x3D070A0D), Color(0x6607090D)],
           ),
         ),
         child: SafeArea(
@@ -5178,13 +5179,12 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: YingjiBackdrop(
-        blur: 22,
         overlay: DecoratedBox(
           decoration: const BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xDF07090D), Color(0xCD07090D), Color(0xB807090D)],
+              colors: [Color(0x6607090D), Color(0x5907090D), Color(0x4D07090D)],
               stops: [0, .42, 1],
             ),
           ),
@@ -5404,7 +5404,6 @@ class _RankingPosterCard extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: YingjiGlass.chrome(strength: 1.15),
                       borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: YingjiGlass.line()),
                     ),
                     child: Text(
                       '#$rank',
@@ -8104,7 +8103,7 @@ class _DroppedChip extends StatelessWidget {
   final VoidCallback onRestore;
 
   @override
-  Widget build(BuildContext context) => Tooltip(
+  Widget build(BuildContext context) => YingjiGlassTooltip(
     message: '恢复追剧',
     child: InkWell(
       borderRadius: BorderRadius.circular(999),
@@ -8304,10 +8303,12 @@ class _SettingsPageState extends State<SettingsPage>
   double _homeCarouselSeconds = 6;
   String _homeCarouselSource = 'trending';
   String _homeCarouselEffect = 'blur-dissolve';
-  String _appearanceTheme = 'dark', _appearanceIcon = 'play';
-  double _appearanceGlassOpacity = .58, _appearanceGlassBlur = 24;
-  double _appearanceCardDepth = .62;
-  String _appearanceGlassTint = 'graphite';
+  String _appearanceIcon = 'play';
+  double _appearanceGlassBlur = 30;
+
+  /// 拖动「模糊程度」时的实时预览节流：外观一变整棵树都要重建，逐帧 apply
+  /// 会明显掉帧，所以拖动中每 120ms 才推一次，松手时再落盘。
+  Timer? _appearanceBlurPreview;
   List<String> _playerToolOrder = YingjiPlayerTools.all
       .map((tool) => tool.id)
       .toList(growable: true);
@@ -8385,6 +8386,9 @@ class _SettingsPageState extends State<SettingsPage>
   static const _liveSettingKeys = <String>{
     'yingji.player.seek-seconds',
     'yingji.player.volume-step',
+    // 外观里的「模糊程度」：播放器（独立进程）不在应用里，拖完滑杆要把新值推给
+    // 正在播的那一集，否则「设置改了、播放器不动」。
+    'yingji.appearance.glass-blur',
     // 播放器偏好：改了要立刻作用到正在播放的那一集，同时与控件菜单里改的值
     // 保持同一个来源（改动方向反过来由原生回写这两个键）。
     'yingji.player.speed',
@@ -8479,25 +8483,12 @@ class _SettingsPageState extends State<SettingsPage>
         _homeCarouselEffect = savedEffect == null || savedEffect == 'slide-fade'
             ? 'blur-dissolve'
             : savedEffect;
-        _appearanceTheme = prefs.getString('yingji.appearance.theme') ?? 'dark';
         _appearanceIcon = prefs.getString('yingji.appearance.icon') ?? 'play';
-        _appearanceGlassOpacity =
-            (prefs.getDouble('yingji.appearance.glass-opacity') ?? .58).clamp(
-              0,
-              1,
-            );
         _appearanceGlassBlur =
-            (prefs.getDouble('yingji.appearance.glass-blur') ?? 24).clamp(
+            (prefs.getDouble('yingji.appearance.glass-blur') ?? 30).clamp(
               0,
               40,
             );
-        _appearanceCardDepth =
-            (prefs.getDouble('yingji.appearance.card-depth') ?? .62).clamp(
-              0,
-              1,
-            );
-        _appearanceGlassTint =
-            prefs.getString('yingji.appearance.glass-tint') ?? 'graphite';
         _playerToolOrder = _sanitizePlayerToolOrder(
           prefs.getStringList('yingji.player.tool-order'),
         );
@@ -8642,12 +8633,8 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.home.carousel-seconds': _homeCarouselSeconds,
       'yingji.home.carousel-source': _homeCarouselSource,
       'yingji.home.carousel-effect': _homeCarouselEffect,
-      'yingji.appearance.theme': _appearanceTheme,
       'yingji.appearance.icon': _appearanceIcon,
-      'yingji.appearance.glass-opacity': _appearanceGlassOpacity,
       'yingji.appearance.glass-blur': _appearanceGlassBlur,
-      'yingji.appearance.card-depth': _appearanceCardDepth,
-      'yingji.appearance.glass-tint': _appearanceGlassTint,
       'yingji.player.tool-order': _playerToolOrder,
       'yingji.player.tool-hidden': _playerToolHidden,
       'yingji.player.speed': _defaultSpeed,
@@ -8789,16 +8776,8 @@ class _SettingsPageState extends State<SettingsPage>
 
   void _applyAppearance() {
     yingjiAppearance.apply(
-      themeMode: switch (_appearanceTheme) {
-        'light' => ThemeMode.light,
-        'system' => ThemeMode.system,
-        _ => ThemeMode.dark,
-      },
       iconStyle: _appearanceIcon,
-      glassOpacity: _appearanceGlassOpacity,
       glassBlur: _appearanceGlassBlur,
-      cardDepth: _appearanceCardDepth,
-      glassTint: _appearanceGlassTint,
     );
   }
 
@@ -9201,6 +9180,7 @@ class _SettingsPageState extends State<SettingsPage>
     yingjiSectionFocus.removeListener(_handleSectionFocus);
     _activeSetting.removeListener(_revealActiveSettingChip);
     _settingsScroll.removeListener(_syncActiveSetting);
+    _appearanceBlurPreview?.cancel();
     _chipRevealTimer?.cancel();
     _chipScroll.dispose();
     _settingsScroll.dispose();
@@ -9393,125 +9373,40 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 8),
               const Text(
-                '调整整体明暗、圆润图标与全局玻璃材质；改动会即时应用到每个悬浮卡片。',
+                '全局统一为 Apple 液态玻璃：透光、带镜面高光边与厚度感；这里只调整模糊程度。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
-              ),
-              const SizedBox(height: 8),
-              YingjiGlassDropdownField<String>(
-                initialValue: _appearanceTheme,
-                decoration: InputDecoration(
-                  labelText: '颜色模式',
-                  helperText: WindowHost.isDesktop
-                      ? '系统模式会跟随 Windows 的浅色/深色设置'
-                      : '系统模式会跟随 Android 系统的浅色/深色设置',
-                ),
-                items: const [
-                  DropdownMenuItem(value: 'dark', child: Text('深色模式')),
-                  DropdownMenuItem(value: 'light', child: Text('浅色模式')),
-                  DropdownMenuItem(value: 'system', child: Text('跟随系统')),
-                ],
-                onChanged: (value) {
-                  if (value == null) return;
-                  setState(() => _appearanceTheme = value);
-                  _applyAppearance();
-                  _save();
-                },
               ),
               const SizedBox(height: 14),
               Text(
-                '玻璃不透明度  ${(_appearanceGlassOpacity * 100).round()}%',
+                '模糊程度  ${_appearanceGlassBlur.round()} px',
                 style: const TextStyle(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
               const Text(
-                '左端完全透明，右端完全玻璃化；所有图标与卡片同步使用。',
-                style: TextStyle(color: Color(0xFFABB1BE)),
-              ),
-              Slider(
-                value: _appearanceGlassOpacity,
-                min: 0,
-                max: 1,
-                divisions: 20,
-                label: '${(_appearanceGlassOpacity * 100).round()}%',
-                onChanged: (value) {
-                  setState(() => _appearanceGlassOpacity = value);
-                },
-                onChangeEnd: (_) {
-                  _applyAppearance();
-                  _save();
-                },
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '背景模糊  ${_appearanceGlassBlur.round()} px',
-                style: const TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 2),
-              const Text(
-                '左端完全无模糊，右端为完整毛玻璃；可单独与透明度组合。',
+                '左端完全无模糊，右端为完整毛玻璃；背景大图、卡片、按钮、HUD 与浮层同步使用，拖动时实时预览。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
               ),
               Slider(
                 value: _appearanceGlassBlur,
                 min: 0,
                 max: 40,
-                divisions: 15,
+                divisions: 20,
                 label: '${_appearanceGlassBlur.round()} px',
                 onChanged: (value) {
                   setState(() => _appearanceGlassBlur = value);
+                  _appearanceBlurPreview?.cancel();
+                  _appearanceBlurPreview = Timer(
+                    const Duration(milliseconds: 120),
+                    () {
+                      if (mounted) _applyAppearance();
+                    },
+                  );
                 },
                 onChangeEnd: (_) {
+                  _appearanceBlurPreview?.cancel();
                   _applyAppearance();
                   _save();
                 },
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '背景卡片颜色  ${(_appearanceCardDepth * 100).round()}%',
-                style: const TextStyle(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 2),
-              const Text(
-                '左端更明亮通透，右端更深邃；不会改变海报背景本身。',
-                style: TextStyle(color: Color(0xFFABB1BE)),
-              ),
-              Slider(
-                value: _appearanceCardDepth,
-                min: 0,
-                max: 1,
-                divisions: 20,
-                label: '${(_appearanceCardDepth * 100).round()}%',
-                onChanged: (value) {
-                  setState(() => _appearanceCardDepth = value);
-                },
-                onChangeEnd: (_) {
-                  _applyAppearance();
-                  _save();
-                },
-              ),
-              const SizedBox(height: 10),
-              const Text('玻璃色调', style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 2),
-              const Text(
-                '决定所有按钮、卡片与播放器浮层的底色；与上面的不透明度、模糊叠加生效。',
-                style: TextStyle(color: Color(0xFFABB1BE)),
-              ),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
-                children: [
-                  for (final tint in YingjiGlassTints.all)
-                    _GlassTintSwatch(
-                      tint: tint,
-                      selected: _appearanceGlassTint == tint.key,
-                      onTap: () {
-                        setState(() => _appearanceGlassTint = tint.key);
-                        _applyAppearance();
-                        _save();
-                      },
-                    ),
-                ],
               ),
             ],
           ),
@@ -10673,14 +10568,11 @@ class _SettingsPageState extends State<SettingsPage>
           child: ClipRRect(
             borderRadius: BorderRadius.circular(16),
             child: BackdropFilter(
-              filter: ImageFilter.blur(
-                sigmaX: YingjiGlass.blur + 4,
-                sigmaY: YingjiGlass.blur + 4,
-              ),
+              filter: YingjiGlass.backdrop(),
               child: DecoratedBox(
                 decoration: BoxDecoration(
                   color: YingjiGlass.surface(strength: 1.08),
-                  border: Border.all(color: YingjiGlass.line()),
+                  gradient: YingjiGlass.depth,
                 ),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -11853,14 +11745,12 @@ class _RankHoverPreview extends StatelessWidget {
     child: ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: BackdropFilter(
-        filter: ImageFilter.blur(
-          sigmaX: YingjiGlass.blur,
-          sigmaY: YingjiGlass.blur,
-        ),
+        filter: YingjiGlass.backdrop(),
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: YingjiGlass.surface(strength: 1.14),
             borderRadius: BorderRadius.circular(16),
+            gradient: YingjiGlass.depth,
             boxShadow: const [
               BoxShadow(
                 color: Color(0x80000000),
@@ -12105,13 +11995,12 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
     body: YingjiBackdrop(
-      blur: 22,
       overlay: DecoratedBox(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [Color(0x7A07090D), Color(0xE807090D)],
+            colors: [Color(0x2E07090D), Color(0x8007090D)],
           ),
         ),
         child: SafeArea(
@@ -13220,64 +13109,6 @@ class _HeroProgressDots extends StatelessWidget {
   );
 }
 
-/// 外观设置里的玻璃色调色板。
-class _GlassTintSwatch extends StatelessWidget {
-  const _GlassTintSwatch({
-    required this.tint,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final YingjiGlassTint tint;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => MovaPress(
-    onTap: onTap,
-    scale: .93,
-    semanticLabel: tint.name,
-    child: AnimatedContainer(
-      duration: MovaMotion.quick,
-      curve: MovaMotion.standardEase,
-      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-      decoration: BoxDecoration(
-        color: selected
-            ? tint.light.withValues(alpha: .92)
-            : YingjiGlass.surface(strength: .8),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: selected ? Colors.white70 : YingjiGlass.line(strength: 1.2),
-          width: selected ? 1.4 : 1,
-        ),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 16,
-            height: 16,
-            decoration: BoxDecoration(
-              color: Color.lerp(tint.light, tint.deep, .62),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white.withValues(alpha: .25)),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            tint.name,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: selected ? const Color(0xFF12141A) : Colors.white,
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
 class _FrostSurface extends StatefulWidget {
   const _FrostSurface({
     super.key,
@@ -13328,21 +13159,23 @@ class _FrostSurfaceState extends State<_FrostSurface> {
         child: ClipRRect(
           borderRadius: BorderRadius.circular(widget.borderRadius),
           child: BackdropFilter(
-            filter: ImageFilter.blur(
-              sigmaX: YingjiGlass.blur,
-              sigmaY: YingjiGlass.blur,
-            ),
+            filter: YingjiGlass.backdrop(),
             child: DecoratedBox(
+              // 无描边、无高光：悬停反馈用底色略微加深来表现（玻璃「贴」近了
+              // 一点），任何白色边缘都会把它拉回塑料片。
               decoration: BoxDecoration(
-                color: YingjiGlass.surface(),
                 borderRadius: BorderRadius.circular(widget.borderRadius),
-                border: Border.all(
-                  color: YingjiGlass.line(strength: _hovered ? 1.25 : 1),
-                ),
+                color: YingjiGlass.surface(strength: _hovered ? 1.14 : 1),
               ),
-              child: Material(
-                color: Colors.transparent,
-                child: Padding(padding: widget.padding, child: widget.child),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(widget.borderRadius),
+                  gradient: YingjiGlass.depth,
+                ),
+                child: Material(
+                  color: Colors.transparent,
+                  child: Padding(padding: widget.padding, child: widget.child),
+                ),
               ),
             ),
           ),

@@ -366,7 +366,6 @@ class _SourceFailure extends StatelessWidget {
     decoration: BoxDecoration(
       color: YingjiGlass.surface(),
       borderRadius: BorderRadius.circular(18),
-      border: Border.all(color: YingjiGlass.line()),
     ),
     child: Row(
       children: [

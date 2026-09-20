@@ -394,7 +394,6 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
                   decoration: BoxDecoration(
                     color: YingjiGlass.chrome(strength: .62),
                     borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: YingjiGlass.line()),
                   ),
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),

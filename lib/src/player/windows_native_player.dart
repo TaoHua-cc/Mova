@@ -263,6 +263,14 @@ class WindowsNativePlayer {
     final seekSeconds =
         preferences.getDouble('yingji.player.seek-seconds') ?? 10;
     final volumeStep = preferences.getDouble('yingji.player.volume-step') ?? 5;
+    // 外观 → 模糊程度：播放器的控件条 / 顶栏 / 菜单 / 提示都由它换算成玻璃浓度，
+    // 这样「设置里的那根滑杆」和播放器里的观感是同一份设置（播放中改动走
+    // pushLiveSettings 的 mova-glass-blur 热更新）。
+    final glassBlur =
+        (preferences.getDouble('yingji.appearance.glass-blur') ?? 30).clamp(
+          0,
+          40,
+        );
     final danmakuEnabled =
         preferences.getBool('yingji.danmaku.enabled') ?? false;
     final autoSkipSegments =
@@ -397,6 +405,7 @@ class WindowsNativePlayer {
       '--video-aspect-override=${_aspectValue(aspect)}',
       '--mova-seek-seconds=$seekSeconds',
       '--mova-volume-step=$volumeStep',
+      '--mova-glass-blur=$glassBlur',
       // 弹幕文件不在这里传：起播时还没拉到，由 _pushDanmaku 通过 stdin 热加载。
       '--mova-danmaku-enabled=${danmakuEnabled ? 'yes' : 'no'}',
       ...danmakuStyleArgs,
@@ -1032,6 +1041,14 @@ class WindowsNativePlayer {
       'yingji.player.volume-step',
       'mova-volume-step',
       (preferences.getDouble('yingji.player.volume-step') ?? 5).toString(),
+    );
+    // 外观 → 模糊程度：正在播的这一集也要跟着变。原生没有高斯背板，它把同一个
+    // 数值换算成玻璃浓度（控件条、顶栏、菜单、提示一起变透/变实），详见
+    // native_player/main.cpp 的 GlassLevel。
+    push(
+      'yingji.appearance.glass-blur',
+      'mova-glass-blur',
+      (preferences.getDouble('yingji.appearance.glass-blur') ?? 30).toString(),
     );
     // 播放器偏好：设置页里改了「默认播放速度 / 画面比例」要立刻作用到正在播的
     // 这一集（改亮度、音量也从这里走）。值域与起播时同源，两边不会各说各话。

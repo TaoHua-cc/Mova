@@ -283,8 +283,7 @@ class YingjiApp extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           margin: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: YingjiGlassTints.of(yingjiAppearance.glassTint).deep
-                .withValues(alpha: .96),
+            color: YingjiGlass.frostDeep.withValues(alpha: .96),
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: Colors.white.withValues(alpha: .2)),
             boxShadow: const [
