@@ -103,6 +103,23 @@ class WindowsNativePlaybackRequest {
   final int resourceIndex;
 }
 
+/// 由「观看比例 + 时长」估出这一集该从第几秒起播（null = 没有记录，从头播）。
+///
+/// 原生换集只做一次 `loadfile`，应用侧不会再插手，所以每一集的续播点必须随播放
+/// 列表一起下发。应用侧手上只有「比例」和「时长」两份数据，乘一下就是秒数。
+///
+/// 两条容易搞错的边界：
+///
+/// * **已经看完的**（比例 ≥ 95%）当作没有记录。从片尾接上会立刻触发「播完 →
+///   连播下一集」，用户看到的是「切到这一集，画面闪一下就跳走了」。
+/// * **刚开头几秒的**也当作没有记录：与从头播没有区别，反而多一次 seek。
+double? episodeResumeSeconds({double? progress, int? duration}) {
+  if (progress == null || duration == null || duration <= 0) return null;
+  if (progress >= .95) return null;
+  final seconds = progress * duration;
+  return seconds >= 5 ? seconds : null;
+}
+
 /// 拉取到的弹幕：临时文件路径 + 播放器面板要显示的数据来源信息。
 class _DanmakuPayload {
   const _DanmakuPayload({
@@ -134,6 +151,7 @@ class WindowsNativePlaylistEntry {
     this.progress,
     this.duration,
     this.watched = false,
+    this.resumeSeconds,
     this.meta,
   });
 
@@ -162,6 +180,14 @@ class WindowsNativePlaylistEntry {
   /// 已播完的集：面板画对勾、不画进度条。与 [progress] 分开传 ——
   /// 服务器标记「已播放」但没有任何播放位置的集，progress 是空的。
   final bool watched;
+
+  /// 这一集自己该从第几秒起播（null = 没有记录，从头播）。
+  ///
+  /// 原生换集（上一集 / 下一集 / 自动连播 / 剧集面板选集）只做一次 `loadfile`，
+  /// 应用侧不会再给新集一个起播点，所以每一集的续播位置必须随播放列表一起下发。
+  /// ⚠️ 不能指望 mpv 的命令行 `--start=` 代劳：它是普通（非文件局部）选项，换
+  /// 文件时不会被重置，第 1 集的续播点会被重新应用到第 2 集上。
+  final double? resumeSeconds;
 
   /// 卡片副标题里附在季号之后的补充信息，例如「2023-05-12 · 44 分钟」。
   final String? meta;
@@ -423,8 +449,10 @@ class WindowsNativePlayer {
       if (voiceEnhance || night)
         '--af=lavfi=[${[if (voiceEnhance) 'equalizer=f=1800:t=q:w=1.2:g=4', if (night) 'dynaudnorm'].join(',')}]',
       if (seriesLogoPath != null) '--mova-series-logo=$seriesLogoPath',
-      if (request.initialPosition > Duration.zero)
-        '--start=${request.initialPosition.inMilliseconds / 1000}',
+      // 起播点走自定义参数、而不是 mpv 的 `--start=`：后者是普通选项，换文件时
+      // 不会重置，会把这一集的续播点染到之后每一集上（用户报的「切换上下集都
+      // 从上一集的进度播放」）。原生解析后在首次 loadfile 前 set 进 mpv。
+      '--mova-start=${request.initialPosition.inMilliseconds / 1000}',
       if (request.initialAudioTrack != null)
         '--aid=${request.initialAudioTrack! + 1}',
       if (request.initialSubtitleTrack != null)
@@ -465,6 +493,12 @@ class WindowsNativePlayer {
       ),
       ...entries.map(
         (entry) => '--mova-playlist-duration=${entry.duration ?? ''}',
+      ),
+      // 每一集自己的续播秒数：换集时原生按它设 mpv 的 start。空字符串 =
+      // 这一集没有观看记录，从头播。
+      ...entries.map(
+        (entry) =>
+            '--mova-playlist-resume=${entry.resumeSeconds == null ? '' : entry.resumeSeconds!.toStringAsFixed(3)}',
       ),
       ...entries.map(
         (entry) => '--mova-playlist-watched=${entry.watched ? 1 : 0}',

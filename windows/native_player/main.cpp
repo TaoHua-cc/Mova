@@ -234,6 +234,21 @@ std::vector<std::wstring> g_playlist_meta;
 std::vector<double> g_playlist_progress;
 std::vector<double> g_playlist_durations;
 std::vector<bool> g_playlist_watched;
+// 每一集的续播秒数，与 g_media_urls 同序（0 = 这一集没有记录，从头播）。
+//
+// ⚠️ 这件事**不能**交给 mpv 的命令行 `--start=`：它是普通（非文件局部）选项，
+// mpv 手册 Per-File Options 明说「any option given on the command line usually
+// affects all files」「are not reset when a new file is played」。原生换集走的是
+// `loadfile <url> replace`，于是第 1 集的续播点会被 mpv 重新应用到第 2 集上 ——
+// 每一集都从上一集的位置开始，正是用户报的「切换上下集都是从上一集的进度播放」。
+// 改成每集在 loadfile 之前显式 set 一次 start（没有记录就显式归零）。
+std::vector<double> g_playlist_resumes;
+// 应用侧给「本次起播这一集」的精确续播点（秒）。它可能来自服务器端进度，比
+// playlist 里那份由「观看比例 × 时长」估出来的值准，所以覆盖对应项。
+double g_initial_position = 0.0;
+// 上面那个值是不是由 `--mova-start` 明确给的。`--start=`（mpv 自己的选项）只作
+// 兜底：老调用方、探针与手工调试还在用它指定起播点，但它的优先级更低。
+bool g_initial_position_explicit = false;
 int g_panel_hover = -1;
 float g_play_state_mix = 0.0f;
 float g_buffer_phase = 0.0f;
@@ -955,6 +970,25 @@ std::wstring Wide(const std::string& value) {
   return output;
 }
 
+// 这一集该从第几秒开始（0 = 没有记录）。小于 1 秒的残值当 0：从第 0.4 秒起播
+// 与从头播没有区别，反而多一次 seek。
+double EntryResumeSeconds(int64_t index) {
+  if (index < 0 || index >= static_cast<int64_t>(g_playlist_resumes.size())) {
+    return 0.0;
+  }
+  const double value = g_playlist_resumes[static_cast<size_t>(index)];
+  return value >= 1.0 ? value : 0.0;
+}
+
+// 让「接下来 loadfile 进来的那一集」从它自己的续播点开始。
+//
+// 必须每次 loadfile 之前调一次，而且**没有记录时也要显式归零**：mpv 的 `start`
+// 是普通选项，换文件时不会被清掉，留着上一集的值就让新集从上一集的位置起播。
+void ApplyPlaylistStart(int64_t index) {
+  const std::string value = std::to_string(EntryResumeSeconds(index));
+  MpvCommand("set", "start", value.c_str());
+}
+
 // 切到播放列表的第 index 项。mpv 里始终只装着这一项，所以换集必须用
 // loadfile 而不是 playlist-next / playlist-pos —— 后者在单项列表上无效。
 // 索引由我们自己维护，Dart 侧据此跟踪集数、切换缓存与预加载下一集。
@@ -969,10 +1003,13 @@ bool LoadPlaylistEntry(int64_t index) {
   // 换了一集：中断重试的预算重新给（见 kMaxInterruptRetries 的注释）。
   g_retry_count = 0;
   g_resume_seconds = 0;
+  if (!g_handle) return false;
+  // 换集前先把起播点换成**这一集自己的**：不换的话 mpv 会沿用上一集的值
+  // （见 g_playlist_resumes 的注释）。
+  ApplyPlaylistStart(index);
   const char* args[] = {"loadfile",
                         g_media_urls[static_cast<size_t>(index)].c_str(),
                         "replace", nullptr};
-  if (!g_handle) return false;
   return g_mpv.command(g_handle, args) >= 0;
 }
 
@@ -988,6 +1025,10 @@ bool RetryCurrentEpisode() {
   const double resume = g_last_valid_position.load();
   // 退回最后一次有效位置即可，不用减偏移：这一集本来就是从这里断的。
   g_resume_seconds = resume > 1.0 ? resume : 0.0;
+  // 起播点也要显式设：mpv 会沿用上一次 set 的值（那是这一集最早的续播点），
+  // 不覆盖就会先跳到旧位置、再由 FILE_LOADED 的补 seek 拉回断点，多一次跳动。
+  const std::string start_value = std::to_string(g_resume_seconds.load());
+  MpvCommand("set", "start", start_value.c_str());
   const char* args[] = {"loadfile",
                         g_media_urls[static_cast<size_t>(index)].c_str(),
                         "replace", nullptr};
@@ -1007,6 +1048,39 @@ bool RetryCurrentEpisode() {
     WriteFile(output, trace, static_cast<DWORD>(std::strlen(trace)), &written,
               nullptr);
   }
+  return true;
+}
+
+// 播放失败之后的**显式**恢复：重开当前集，位置等 FILE_LOADED 时再补回来。
+//
+// 与自动重试只差一处，但这一处是关键：它会**清零重试预算**。RetryCurrentEpisode
+// 故意不动预算（防止自动重试变成无限循环），可用户按下按钮是另一回事 —— 不清零
+// 的话，自动补的那一次失败之后，用户再点也只是白发一条 loadfile，界面永远停在
+// 「播放失败」。
+//
+// 返回 true 表示这次动作已经被当成「重新播放」处理了，调用方不要再发 cycle pause：
+// mpv 此刻是 idle，pause 属性根本没有文件可作用。
+bool ReplayAfterPlaybackFailure() {
+  if (!g_playback_error.load()) return false;
+  const int64_t index = g_playlist_position.load();
+  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
+    return false;
+  }
+  g_retry_count = 0;
+  if (!RetryCurrentEpisode()) {
+    ShowToast("重新播放失败");
+    return false;
+  }
+  char trace[96]{};
+  std::snprintf(trace, sizeof(trace), "MOVA_REPLAY=%lld|%.3f\r\n",
+                static_cast<long long>(index), g_resume_seconds.load());
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (output && output != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(output, trace, static_cast<DWORD>(std::strlen(trace)), &written,
+              nullptr);
+  }
+  ShowToast("正在重新播放…");
   return true;
 }
 
@@ -2439,9 +2513,13 @@ enum ControlId {
   kEpisodes,
   kSegments,
   kMore,
+  // 播放失败后的恢复入口（左下状态行变成的那颗胶囊，命中区见 HitControl）。
+  // mpv 中断之后停在 idle，播放键的 cycle pause 是空操作 —— 没有这一项，单集
+  // 影片就只能退出播放页重进，正是用户报的「播放失败就无法恢复」。
+  kReplay,
 };
 
-constexpr size_t kControlCount = static_cast<size_t>(kMore) + 1;
+constexpr size_t kControlCount = static_cast<size_t>(kReplay) + 1;
 
 // 每个工具入口一个图标，取自和应用里同一套 Iconsax 线性图标：工具栏、溢出菜单
 // 和设置页说同一种图形语言，不再出现「同一个功能两三个图标」的情况。
@@ -2698,6 +2776,9 @@ bool AnimateControlHover() {
 
 ControlId HitControl(int x, int y, int width) {
   if (y < 34) return kNone;
+  // 播放失败后的「重新播放」：占住左下时间码那一行。命中区比胶囊本身略宽，
+  // 手抖也点得中。放在 y<34 之后，所以进度条（含拖动）那一带完全不受影响。
+  if (g_playback_error.load() && x >= 20 && x <= 152) return kReplay;
   const bool compact = width < 780;
   const int center = width / 2;
   if (!compact && x >= center - 166 && x < center - 116)
@@ -5514,8 +5595,36 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       if (g_playback_error.load()) {
         Gdiplus::SolidBrush error(Gdiplus::Color(255, 255, 132, 124));
         auto status_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
-        DrawDockLabel(graphics, L"播放失败 · 请更换资源", status_font,
+        DrawDockLabel(graphics, L"播放失败", status_font,
                       Gdiplus::PointF(24, 63), error);
+        // 「重新播放」：失败之后 mpv 停在 idle，播放键发 cycle pause 毫无作用，
+        // 这颗胶囊是界面上唯一说得清的恢复入口（命中区见 HitControl 的 kReplay，
+        // 两者宽度是一份：78 + 74）。材质与控件条其它按钮完全一致 —— frost 渐变
+        // 加悬停叠一层极淡的白，不另起一套观感。
+        const float replay_hover = HoverAmount(kReplay);
+        Gdiplus::GraphicsPath replay_path;
+        const Gdiplus::RectF replay_rect(78.0f, 54.0f, 74.0f, 26.0f);
+        AddRoundedRectPath(replay_path, replay_rect, 13.0f);
+        Gdiplus::LinearGradientBrush replay_glass(
+            Gdiplus::PointF(replay_rect.X, replay_rect.Y),
+            Gdiplus::PointF(replay_rect.X, replay_rect.Y + replay_rect.Height),
+            Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(false)),
+                           kGlassFrostRed, kGlassFrostGreen, kGlassFrostBlue),
+            Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(true)),
+                           kGlassFrostRed, kGlassFrostGreen, kGlassFrostBlue));
+        graphics.FillPath(&replay_glass, &replay_path);
+        if (replay_hover > 0.001f) {
+          Gdiplus::SolidBrush lit(Gdiplus::Color(
+              static_cast<BYTE>(replay_hover * 68), 255, 255, 255));
+          graphics.FillPath(&lit, &replay_path);
+        }
+        Gdiplus::SolidBrush replay_ink(Gdiplus::Color(255, 248, 248, 250));
+        auto replay_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
+        Gdiplus::StringFormat replay_format;
+        replay_format.SetAlignment(Gdiplus::StringAlignmentCenter);
+        replay_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        graphics.DrawString(L"重新播放", -1, &replay_font, replay_rect,
+                            &replay_format, &replay_ink);
       } else if (g_buffering.load()) {
         Gdiplus::SolidBrush accent(Gdiplus::Color(255, 236, 238, 245));
         Gdiplus::Pen spinner(Gdiplus::Color(255, 236, 238, 245), 1.8f);
@@ -5586,6 +5695,10 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
                        std::wstring(), kGlyphGauge,
                        static_cast<float>(fraction));
         g_hint_seek_percent = static_cast<int>(fraction * 100.0);
+      } else if (hit == kReplay) {
+        // 放在工具面板与中央按钮之前：窄窗下这颗胶囊的命中区可能与「后退 10 秒」
+        // 碰上（失败态下 seek 本来就无效），恢复优先。
+        ReplayAfterPlaybackFailure();
       } else if (hit == kAudio || hit == kSubtitle || hit == kDanmaku ||
                  hit == kPicture || hit == kSpeed || hit == kChapters ||
                  hit == kEpisodes || hit == kSegments || hit == kPlaylist) {
@@ -5593,7 +5706,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       } else if (hit == kMore) {
         ShowOverflowMenu(rect.right, DockAnchor(x));
       } else if (x >= center - 28 && x <= center + 28) {
-        MpvCommand("cycle", "pause");
+        // 失败态下这一键是「重新播放」：mpv 已经在 idle，cycle pause 没有任何
+        // 效果 —— 用户报的「播放失败之后无法恢复」正是停在这一步。
+        if (!ReplayAfterPlaybackFailure()) MpvCommand("cycle", "pause");
       } else if (!compact && x >= center - 166 && x < center - 116) {
         if (LoadPlaylistEntry(g_playlist_position.load() - 1)) {
           ShowToast("上一集");
@@ -5771,9 +5886,13 @@ bool RunShortcut(int key) {
   if (shortcut == g_shortcuts.end()) return false;
   const std::string& action = shortcut->second;
   if (action == "playPause") {
-    MpvCommand("cycle", "pause");
-    ShowAdjustHint(g_paused.load() ? L"继续播放" : L"已暂停", std::wstring(),
-                   0, -1.0f);
+    // 失败态下空格也是「重新播放」，与控件条的播放键同一条路；否则 cycle pause
+    // 在 idle 的 mpv 上什么也不做，表现就是「按了没反应」。
+    if (!ReplayAfterPlaybackFailure()) {
+      MpvCommand("cycle", "pause");
+      ShowAdjustHint(g_paused.load() ? L"继续播放" : L"已暂停", std::wstring(),
+                     0, -1.0f);
+    }
   } else if (action == "seekBack") {
     MpvCommand("seek", std::to_string(-g_seek_seconds).c_str(), "relative");
     ShowAdjustHint(
@@ -5890,7 +6009,11 @@ void TickFrame() {
   // 它上面（提示浮层那边也用 GetTickCount64 比较），换成 QPC 会变成两套时间基准
   // 相减。它对精度的要求只是「几十毫秒级」，15.6ms 的粒度完全够用。
   UpdateAutoSkip(GetTickCount64());
-  const float play_target = g_paused.load() ? 1.0f : 0.0f;
+  // 播放失败时中间那颗键是「重新播放」，图标就必须是播放三角：mpv 在 idle 时
+  // pause 属性是 false，光看 g_paused 会画成双竖线（读作「点一下会暂停」），
+  // 与它此刻真正会做的事正好相反。
+  const float play_target =
+      (g_paused.load() || g_playback_error.load()) ? 1.0f : 0.0f;
   const float play_delta = play_target - g_play_state_mix;
   if (std::abs(play_delta) > 0.001f) {
     const float play_limit = static_cast<float>(4.8 * frame_dt);
@@ -6105,7 +6228,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         return 0;
       }
       g_playback_error = true;
-      ShowToast("播放中断，已停在当前位置");
+      // 失败态单独留一条轨迹：只看 MOVA_ENDFILE / MOVA_RETRY 的话，「自动重试
+      // 也用尽」这一步在日志里是隐含的，只能靠数错误次数猜。恢复路径要靠它断言。
+      std::fprintf(stdout, "MOVA_FAILED=%lld|%.3f\r\n",
+                   static_cast<long long>(g_playlist_position.load()),
+                   g_last_valid_position.load());
+      std::fflush(stdout);
+      // 文案要给动作，不能只说状态：原来这里是「已停在当前位置」，用户看完
+      // 不知道该做什么，于是就成了「播放失败之后无法恢复」。
+      ShowToast("播放中断 · 点播放键重新播放");
       if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
       ShowControls();
       return 0;
@@ -6394,6 +6525,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
                             : std::strtod(Utf8(value).c_str(), nullptr));
         } else if (name == "mova-playlist-watched") {
           g_playlist_watched.push_back(argument.substr(equals + 1) == L"1");
+        } else if (name == "mova-playlist-resume") {
+          // 每集一条（可为空 = 这一集没有观看记录）。换集时按它设 mpv 的 start，
+          // 见 g_playlist_resumes 与 ApplyPlaylistStart。
+          const std::wstring value = argument.substr(equals + 1);
+          g_playlist_resumes.push_back(
+              value.empty() ? 0.0 : std::strtod(Utf8(value).c_str(), nullptr));
+        } else if (name == "mova-start") {
+          // 本次起播的续播点。**故意不做成 mpv 的 `--start=`**：那个是普通选项，
+          // 换文件时不会重置，会把这一集的起点染到后面每一集上（见 g_playlist_resumes）。
+          g_initial_position = std::strtod(Utf8(argument.substr(equals + 1)).c_str(),
+                                           nullptr);
+          g_initial_position_explicit = true;
+        } else if (name == "start") {
+          // 兜底：仍然接受 mpv 自己的 `--start=<秒>`（探针、手工调试、旧调用方都
+          // 在用它指定起播点）。只把它记成「本次起播点」，**不再交给 mpv** ——
+          // 交给它就会被应用到之后每一次 loadfile 上，正是这次要修的那个 bug。
+          // `--mova-start` 明确给过值时以它为准。
+          if (!g_initial_position_explicit) {
+            g_initial_position = std::strtod(
+                Utf8(argument.substr(equals + 1)).c_str(), nullptr);
+          }
         } else if (name == "mova-resource-source") {
           g_resource_sources.push_back(argument.substr(equals + 1));
         } else if (name == "mova-resource-detail") {
@@ -6489,6 +6641,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   while (g_playlist_watched.size() < g_media_urls.size()) {
     g_playlist_watched.push_back(false);
   }
+  while (g_playlist_resumes.size() < g_media_urls.size()) {
+    g_playlist_resumes.push_back(0.0);
+  }
   while (g_resource_icons.size() < g_resource_sources.size()) {
     g_resource_icons.emplace_back();
   }
@@ -6538,7 +6693,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           ? playlist_start
           : 0;
   g_playlist_position = start_index;
+  // 起播这一集用应用给的精确位置（可能来自服务器端进度，比「观看比例 × 时长」
+  // 估出来的准），覆盖 playlist 里的那一项。
+  if (!g_playlist_resumes.empty() &&
+      start_index < static_cast<int>(g_playlist_resumes.size())) {
+    g_playlist_resumes[static_cast<size_t>(start_index)] = g_initial_position;
+  }
   if (!g_media_urls.empty()) {
+    // 起播点必须显式设进 mpv：以前这一步是命令行 `--start=` 代劳的，但那个选项
+    // 会一直留到后面每一次 loadfile（见 g_playlist_resumes 的注释）。
+    ApplyPlaylistStart(start_index);
     const char* load[] = {"loadfile",
                           g_media_urls[static_cast<size_t>(start_index)].c_str(),
                           "replace", nullptr};

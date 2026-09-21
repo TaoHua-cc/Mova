@@ -1544,6 +1544,13 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       WindowsNativePlaylistEntry nativeEntry(MediaItem episode) {
         final key = _episodeKey(episode.seasonNumber, episode.episodeNumber);
         final metadata = _episodeMetadata[key];
+        final seconds = _episodeSeconds(episode, metadata);
+        final progress = _episodeProgress[key];
+        // 这一集自己该从哪儿起播（规则见 episodeResumeSeconds 的注释）。
+        final resume = episodeResumeSeconds(
+          progress: progress,
+          duration: seconds,
+        );
         return WindowsNativePlaylistEntry(
           url: episode.playbackUrl.toString(),
           title: episode.title,
@@ -1564,9 +1571,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           seasonNumber: episode.seasonNumber,
           episodeNumber: episode.episodeNumber,
           imagePath: episodeImages[key],
-          progress: _episodeProgress[key],
-          duration: _episodeSeconds(episode, metadata),
+          progress: progress,
+          duration: seconds,
           watched: _completedResourceIds.contains(episode.id),
+          resumeSeconds: resume,
           meta: _episodeMetaLine(episode, metadata),
         );
       }
