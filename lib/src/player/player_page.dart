@@ -329,6 +329,8 @@ class _PlayerPageState extends State<PlayerPage> {
   PlayerEpisode? _resourceOverride;
   Duration? _introEnd;
   Duration? _outroStart;
+  bool _manualIntro = false;
+  bool _manualOutro = false;
   List<PlaybackSegment> _segments = const [];
   String? _segmentMessage;
   bool _autoSkipSegments = true;
@@ -1272,13 +1274,28 @@ class _PlayerPageState extends State<PlayerPage> {
     return '${episode.title}.${episode.seasonNumber ?? 1}';
   }
 
+  PlaybackSegmentQuery get _activeSegmentQuery => PlaybackSegmentQuery(
+    tmdbId: _activeEpisode.tmdbId,
+    seasonNumber: _activeEpisode.seasonNumber,
+    episodeNumber: _activeEpisode.episodeNumber,
+    sourceId: _activeEpisode.sourceId,
+    serverItemId: _activeEpisode.serverItemId,
+  );
+
   Future<void> _loadSegmentPreferences(SharedPreferences prefs) async {
-    final intro = prefs.getInt('yingji.segment.$_segmentKey.intro');
-    final outro = prefs.getInt('yingji.segment.$_segmentKey.outro');
+    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
+    final manualIntro = prefix == null ? null : prefs.getInt('$prefix.intro');
+    final manualOutro = prefix == null ? null : prefs.getInt('$prefix.outro');
+    final intro =
+        manualIntro ?? prefs.getInt('yingji.segment.$_segmentKey.intro');
+    final outro =
+        manualOutro ?? prefs.getInt('yingji.segment.$_segmentKey.outro');
     if (!mounted) return;
     setState(() {
       _introEnd = intro == null ? null : Duration(milliseconds: intro);
       _outroStart = outro == null ? null : Duration(milliseconds: outro);
+      _manualIntro = manualIntro != null;
+      _manualOutro = manualOutro != null;
       _autoSkipSegments =
           prefs.getBool('yingji.segment.$_segmentKey.enabled') ??
           prefs.getBool('yingji.segment.auto-skip') ??
@@ -1340,18 +1357,40 @@ class _PlayerPageState extends State<PlayerPage> {
     // A manual mark intentionally overrides any provider data for this title.
     final value = _player.state.position;
     final prefs = await SharedPreferences.getInstance();
+    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
+    if (prefix == null) return;
     await prefs.setInt(
-      'yingji.segment.$_segmentKey.${intro ? 'intro' : 'outro'}',
+      '$prefix.${intro ? 'intro' : 'outro'}',
       value.inMilliseconds,
     );
     if (!mounted) return;
     setState(() {
       if (intro) {
         _introEnd = value;
+        _manualIntro = true;
       } else {
         _outroStart = value;
+        _manualOutro = true;
       }
     });
+  }
+
+  Future<void> _clearSegment({required bool intro}) async {
+    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
+    if (prefix == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('$prefix.${intro ? 'intro' : 'outro'}');
+    if (!mounted) return;
+    setState(() {
+      if (intro) {
+        _introEnd = null;
+        _manualIntro = false;
+      } else {
+        _outroStart = null;
+        _manualOutro = false;
+      }
+    });
+    await _loadSegmentData();
   }
 
   String? _skipKind;
@@ -2878,11 +2917,23 @@ class _PlayerPageState extends State<PlayerPage> {
           _introEnd == null ? '将当前位置设为片头结束' : '片头结束 · ${_time(_introEnd!)}',
           () => _setSegment(intro: true),
         ),
+        if (_manualIntro)
+          _consoleAction(
+            YingjiIcons.xmark,
+            '清除手动片头结束',
+            () => _clearSegment(intro: true),
+          ),
         _consoleAction(
           YingjiIcons.bookmark,
           _outroStart == null ? '将当前位置设为片尾开始' : '片尾开始 · ${_time(_outroStart!)}',
           () => _setSegment(intro: false),
         ),
+        if (_manualOutro)
+          _consoleAction(
+            YingjiIcons.xmark,
+            '清除手动片尾开始',
+            () => _clearSegment(intro: false),
+          ),
         SwitchListTile.adaptive(
           contentPadding: EdgeInsets.zero,
           title: const Text('自动跳过片头片尾'),

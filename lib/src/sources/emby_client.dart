@@ -420,28 +420,44 @@ class EmbyClient {
   Future<List<MediaItem>> resumeItems(EmbySession session) async {
     final userId = session.source.userId;
     if (userId == null || userId.isEmpty) return const [];
-    final response = await _client
+    final query = {
+      'IncludeItemTypes': 'Movie,Episode',
+      'Recursive': 'true',
+      'Limit': '50',
+      'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,ImageTags,SeriesPrimaryImageTag',
+      'api_key': session.token,
+    };
+    final headers = {
+      'Accept': 'application/json',
+      'X-Emby-Token': session.token,
+    };
+    // Emby / Jellyfin 的专用 Resume 端点会正确应用用户级续播规则；普通
+    // Items + IsResumable 在部分版本上会返回空列表。旧服务器不支持时回退。
+    var response = await _client
         .get(
           session.source.endpoint
-              .resolve('Users/$userId/Items')
-              .replace(
-                queryParameters: {
-                  'Filters': 'IsResumable',
-                  'IncludeItemTypes': 'Movie,Series,Episode',
-                  'Recursive': 'true',
-                  'SortBy': 'DatePlayed',
-                  'SortOrder': 'Descending',
-                  'Limit': '50',
-                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,ImageTags,SeriesPrimaryImageTag',
-                  'api_key': session.token,
-                },
-              ),
-          headers: {
-            'Accept': 'application/json',
-            'X-Emby-Token': session.token,
-          },
+              .resolve('Users/$userId/Items/Resume')
+              .replace(queryParameters: query),
+          headers: headers,
         )
         .timeout(const Duration(seconds: 15));
+    if (response.statusCode == 404 || response.statusCode == 405) {
+      response = await _client
+          .get(
+            session.source.endpoint
+                .resolve('Users/$userId/Items')
+                .replace(
+                  queryParameters: {
+                    ...query,
+                    'Filters': 'IsResumable',
+                    'SortBy': 'DatePlayed',
+                    'SortOrder': 'Descending',
+                  },
+                ),
+            headers: headers,
+          )
+          .timeout(const Duration(seconds: 15));
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_message(response.statusCode, '服务器继续观看读取失败'));
     }

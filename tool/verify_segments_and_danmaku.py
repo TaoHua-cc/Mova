@@ -174,8 +174,9 @@ class Player:
     def draws(self):
         """MOVA_DANMAKU_DRAW=live=N drawn=M size=WxH pos=P [draw=.. post=..
         gap=.. frames=.. [overlap=.. [mixed=..] lanes=.. dropped=.. drop=..
-        [depth=.. olane=.. orect=a0,a1,b0,b1 [avg=.. late20=.. late33=..]]]]|
-        samples."""
+        [depth=.. olane=.. orect=a0,a1,b0,b1 [avg=.. late20=.. late33=..
+        [refresh=.. div=.. [compose=..] dwell=1,2,3,4 [tick=.. / n
+        [tickdwell=1,2,3,4 tkmax=.. ptph=.. ptjit=.. mw=n]]]]]]]| samples."""
         found = []
         for line in list(self.lines):
             match = re.search(
@@ -185,9 +186,16 @@ class Player:
                 r"(?: overlap=(\d+)(?: mixed=(\d+))? lanes=(\d+)"
                 r" dropped=(\d+) drop=(\d+)"
                 r"(?: depth=([0-9.]+) olane=(-?\d+) orect=([0-9.,-]+)"
-                r"(?: avg=([0-9.]+) late20=(\d+) late33=(\d+))?)?)?\|",
+                r"(?: avg=([0-9.]+) late20=(\d+) late33=(\d+)"
+                r"(?: refresh=([0-9.]+) div=(\d+)"
+                r"(?: compose=([0-9.]+))? dwell=([0-9,]+)"
+                r"(?: tick=([0-9.]+)/(\d+)"
+                r"(?: tickdwell=([0-9,]+) tkmax=([0-9.]+) ptph=([0-9.]+)"
+                r" ptjit=([0-9.]+) mw=(\d+))?)?)?)?)?)?\|",
                 line)
             if match:
+                dwell = [int(v) for v in (match.group(24) or "").split(",")
+                         if v]
                 found.append({
                     "live": int(match.group(1)),
                     "drawn": int(match.group(2)),
@@ -209,6 +217,31 @@ class Player:
                     "avg": float(match.group(18) or 0),
                     "late20": int(match.group(19) or 0),
                     "late33": int(match.group(20) or 0),
+                    "refresh": float(match.group(21) or 0),
+                    "div": int(match.group(22) or 0),
+                    # DWM 自报的合成节奏（rateCompose）。它和面板刷新率
+                    # （refresh）不一致时，说明 DWM 自己把合成降频了 ——
+                    # 那种情况下怎么调节拍都没用，先去查合成设置。
+                    "compose": float(match.group(23) or 0),
+                    # 相邻两帧隔了几个刷新周期的分布：下标 0..2 是 1/2/3 拍，
+                    # 下标 3 是「≥4 拍」的兜底档（见 g_danmaku_dwell）。
+                    "dwell": (dwell + [0] * 4)[:4] if dwell else [],
+                    # 实测 tick 间隔（均值 ms / 次数）。正常应与 `avg`（绘制间隔）
+                    # 一致；不一致说明「画的次数」和「节拍的次数」对不上。
+                    "tick": float(match.group(25) or 0),
+                    "ticks": int(match.group(26) or 0),
+                    # 节拍间隔的分布（下标同 dwell）。和绘制 dwell 配对读，才知道
+                    # 该往定时器调度上找问题，还是往「绘制被推迟」上找。
+                    "tickdwell": [
+                        int(v) for v in (match.group(27) or "").split(",") if v
+                    ],
+                    "tickmax": float(match.group(28) or 0),
+                    # 绘制相对本拍 tick 的滞后（均值 / 极差）：极差大 = paint 相位
+                    # 在漂，屏上停留拍数就会在 1/3 之间跳。
+                    "ptphase": float(match.group(29) or 0),
+                    "ptjit": float(match.group(30) or 0),
+                    # 主等待被「消息」唤醒而不是被定时器唤醒的次数。
+                    "msgwakes": int(match.group(31) or 0),
                 })
         return found
 
@@ -870,6 +903,43 @@ def case_danmaku_frame_pacing(exe, workdir, media, out_dir):
                    f" draw={peak_draw:.2f}ms post={peak_post:.2f}ms"
                    f" avg={peak_avg:.2f}ms gap={peak_gap:.1f}ms"
                    f" late20={peak_late20} late33={peak_late33}")
+        # 帧节拍：有了「停留拍数分布」这个直接判据之后，就不再靠 `late20` 这个
+        # 60fps 时代的**绝对**门槛 —— 目标节拍现在是 divisor × 刷新周期
+        # （本机 11.76ms），20ms 只有 1.7 拍，一次调度抖动就能踩线，它拦不住真
+        # 缺陷、只会让用例随机变红。非节拍路径（拿不到刷新率）仍按老门槛判。
+        # 见 docs/specs/2026-09-22-danmaku-frame-pacing.md。
+        paced = [i for i in samples if i["dwell"] and i["refresh"] > 0]
+        div = 0
+        share = 1.0
+        if paced:
+            div = paced[-1]["div"]
+            # 只看稳态（末尾三个窗口）：开头还在铺弹幕、时钟刚对相位。
+            steady = paced[-3:]
+            total_dwell = sum(sum(i["dwell"]) for i in steady)
+            exact = (sum(i["dwell"][div - 1] for i in steady)
+                     if 1 <= div <= 4 else 0)
+            share = exact / total_dwell if total_dwell else 0.0
+            out.append(f"    pacing: refresh={paced[-1]['refresh']:.3f}ms"
+                       f" div={div} tick={paced[-1]['tick']:.2f}ms"
+                       f" paints/tick="
+                       f"{(paced[-1]['frames'] / paced[-1]['ticks']) if paced[-1]['ticks'] else 0:.2f}"
+                       f" -> 稳态停留 {div} 拍的帧占 {share * 100:.1f}%"
+                       f" ({exact}/{total_dwell})")
+            # 节拍本身散不散，和绘制散不散要分开看：前者是定时器/主循环调度，
+            # 后者是 WM_PAINT 派发被推迟。两者的修法完全不同。
+            if paced[-1]["tickdwell"]:
+                tick_steady = sum(sum(i["tickdwell"]) for i in steady)
+                tick_exact = sum(
+                    i["tickdwell"][div - 1] for i in steady
+                    if 1 <= div <= len(i["tickdwell"]))
+                out.append(
+                    f"    tick:   tkmax={paced[-1]['tickmax']:.2f}ms"
+                    f" tickdwell(latest)={paced[-1]['tickdwell']}"
+                    f" -> 稳态 {div} 拍的 tick 占 "
+                    f"{(tick_exact / tick_steady * 100) if tick_steady else 0:.1f}%")
+                out.append(f"    paint:  ptph={paced[-1]['ptphase']:.2f}ms"
+                           f" ptjit={paced[-1]['ptjit']:.2f}ms"
+                           f" mw={paced[-1]['msgwakes']}")
         # 「看不清」和「一顿一顿」是两类缺陷，分别断言：
         #   depth —— 同轨两条弹幕互相压进去多少像素。只数条数会把「正好贴边」
         #     也算上（浮点误差），所以按深度判：>2px 才是真的糊在一起。
@@ -903,7 +973,13 @@ def case_danmaku_frame_pacing(exe, workdir, media, out_dir):
             ok = False
             out.append(f"    VERDICT BAD {peak_late33} frames ran past 33ms"
                        " -- repeated stalls")
-        elif peak_late20 > 6:
+        elif paced and share < 0.85:
+            ok = False
+            out.append(f"    VERDICT BAD only {share * 100:.1f}% of frames dwell"
+                       f" exactly {div} refresh period(s)"
+                       f" (dwell 1/2/3/4+ = {paced[-1]['dwell']})"
+                       " -- frame clock not locked to the panel")
+        elif peak_late20 > 6 and not paced:
             ok = False
             out.append(f"    VERDICT BAD {peak_late20} of 60 frames ran past 20ms")
         elif peak_gap > 40.0:
@@ -1037,6 +1113,14 @@ def main():
         wanted = [part.strip() for part in options.only.split(",") if part.strip()]
         cases = [case for case in cases
                  if any(part in case.__name__ for part in wanted)]
+        # 匹配不到就报错退出。这里不能静默跑 0 个用例：报告会只剩一行
+        # `=== summary ===`，而退出码仍是 0，看起来像「全绿通过」。
+        # 注意 `--only` 比对的是**用例函数名**（`case_danmaku_frame_pacing`），
+        # 不是报告里那一行的序号名（`06_danmaku_frame_pacing`）—— 传后者匹配不上。
+        if not cases:
+            parser.error(f"--only {options.only!r} matched no case; "
+                         "用例名形如 case_danmaku_frame_pacing"
+                         "（不是报告里的 06_danmaku_frame_pacing）")
 
     blocks = []
     results = []

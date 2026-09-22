@@ -190,6 +190,9 @@ final yingjiBackdropUrl = ValueNotifier<String?>(null);
 final yingjiBackdropEffect = ValueNotifier<String>('blur-dissolve');
 final yingjiSectionRequest = ValueNotifier<String?>(null);
 
+/// 兼容旧“发现”入口：发现已合并进首页，收到请求时让首页按需挂载榜单。
+final yingjiHomeDiscoverTick = ValueNotifier<int>(0);
+
 /// 壳层当前展示的分区（'home' / 'calendar' / 'playlists' / 'sources' / ...）。
 ///
 /// 分区页带上 keep-alive 之后，切回来不会重建，也就不会重跑 initState。片单页
@@ -362,83 +365,67 @@ abstract final class YingjiPlayerTools {
 
 /// 液态玻璃（Liquid Glass）材质的唯一来源。
 ///
-/// 关键不在「磨砂」而在两件事：① 底几乎透明，背后画面透得过来；② 玻璃有厚度，
-/// 竖向微微沉底。此前是 `frost #3B3B3B @ .58` 的一层灰底，看着就是块黑塑料 ——
-/// 现在底色降到 .28，亮度交给背后画面自己。
-///
-/// ⚠️ 这里刻意**不做镜面高光**：不要给玻璃加白色描边 / 顶部亮边 / 反光线。
-/// 用户明确要求「不要高光，只要液态玻璃」，任何白色边缘描边都会让面板看起来
-/// 像塑料片，而不是一整块透光的玻璃。
+/// 玻璃直接采样并模糊它后面的内容；白色只是极低浓度的折射色，不承担遮罩职责。
 abstract final class YingjiGlass {
-  /// 玻璃基色：只在背后画面上压一层极淡的深色，用来兜住文字对比度。
-  static const Color frost = Color(0xFF14141A);
+  static const Color frost = Color(0xFFF7FAFF);
 
-  /// 比 [frost] 再深一档，用在按钮、下拉、悬浮提示这类小面积控件上。
-  static const Color frostDeep = Color(0xFF08080C);
+  static const Color frostDeep = Color(0xFFE8EEF8);
 
   /// 面板底色的不透明度。这一项不再开放给用户（设置里只剩「模糊程度」）。
   ///
-  /// ⚠️ 这个值就是「看起来是玻璃还是黑塑料」的分水岭：之前是 .58 的一层灰、
-  /// 后来降到 .28 仍然发黑，原因是页面本身还压着 70%~90% 的近黑遮罩
-  /// （见各页 `YingjiBackdrop(overlay: ...)`），两层一叠就全黑了。
-  /// 现在遮罩降到 20%~36%，这里再降到 .13 —— 玻璃透出的是**带颜色的**背后
-  /// 画面，而不是一层黑。
-  static const double alpha = .13;
+  /// Apple 式玻璃的底色必须保持很薄；清晰度来自实时模糊、边缘折射与文字阴影，
+  /// 不是来自一层黑板。
+  static const double alpha = .10;
 
   /// 选中态 / 高亮态用的实心色：与玻璃同一色系的中性浅灰。
-  static const Color accent = Color(0xFF8A8A8A);
+  static const Color accent = Color(0xFFF3F4F7);
 
   /// 背后画面透过玻璃后的饱和度提升（vibrancy）：玻璃会聚光，透出来的颜色比
   /// 直接看更浓一点 —— 这是液态玻璃「活」起来的关键。
-  static const double vibrancy = 1.22;
+  static const double vibrancy = 1.35;
 
   static Color surface({double strength = 1}) =>
-      frost.withValues(alpha: (alpha * strength).clamp(0, 1));
+      frost.withValues(alpha: (alpha * strength).clamp(.07, .18));
 
-  /// 比卡片再亮一档，用在按钮、下拉这类小面积控件上：面积小，太透会看不清
-  /// 边界，所以给一个下限（也只是 .18，不能再高）。
+  /// 小面积控件需要更稳定的轮廓，因此浓度下限高于大面板。
   static Color chrome({double strength = .82}) => Color.lerp(
     frost,
     frostDeep,
     .38,
-  )!.withValues(alpha: (alpha * strength).clamp(.18, 1));
+  )!.withValues(alpha: (alpha * strength).clamp(.11, .24));
 
   /// 分隔线 / 未选中描边：与底色浓度无关，固定按白透明度给。
   static Color line({double strength = 1}) =>
-      Colors.white.withValues(alpha: (.16 * strength).clamp(0, .34));
+      Colors.white.withValues(alpha: (.30 * strength).clamp(.12, .52));
 
-  /// 播放器里的浮层（HUD、暂停圆钮）。压在视频画面上，背后可能是很亮的画面，
-  /// 所以仍要有能读字的暗度；但 .58 太黑（看着就是一块黑板），降到 .38。
+  /// 播放器里的浮层（HUD、暂停圆钮）直接压在视频上，需要最高的对比度基线。
   static Color hud({double strength = 1.5}) =>
-      frost.withValues(alpha: (alpha * strength).clamp(.38, 1));
+      frost.withValues(alpha: (alpha * strength).clamp(.14, .30));
 
   static double get blur => yingjiAppearance.glassBlur;
 
   /// 玻璃厚度的竖向渐变：只有底部微微沉暗，用来暗示「这是一片有厚度的玻璃」。
   ///
-  /// ⚠️ 渐变里**没有任何白色**（白 = 高光）。之前顶部给 `0x2BFFFFFF` 那档亮部
-  /// 是把材质带向「塑料片」的元凶，已移除。
   static const LinearGradient depth = LinearGradient(
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
     colors: <Color>[
+      Color(0x18FFFFFF),
+      Color(0x08FFFFFF),
       Color(0x00000000),
       Color(0x00000000),
       Color(0x08000000),
-      Color(0x1C000000),
     ],
-    stops: <double>[0, .48, .78, 1],
+    stops: <double>[0, .14, .46, .78, 1],
   );
 
-  /// 液态玻璃的背板滤镜：模糊 + 提亮 + 提饱和（vibrancy）。
+  /// 液态玻璃的背板滤镜：模糊 + 轻微提饱和（vibrancy）。
   ///
-  /// 玻璃会聚光：透过来的画面比直接看**更亮、更浓**，这是它「活」起来的关键，
-  /// 也是卡片能从背景里浮出来的原因（比周围亮一档，而不是压一层黑）。
+  /// 只保留少量色彩活力，不提亮；否则浅色画面会让整块面板过曝。
   /// 用 `ImageFilter.compose` 而不是叠两层 `BackdropFilter`，省一次全屏回读。
   static ImageFilter backdrop({double? sigma}) {
     final value = sigma ?? blur;
     final s = vibrancy;
-    const lift = .05;
     return ImageFilter.compose(
       outer: ImageFilter.blur(sigmaX: value, sigmaY: value),
       inner: ColorFilter.matrix(<double>[
@@ -446,17 +433,17 @@ abstract final class YingjiGlass {
         0.715 - 0.715 * s,
         0.072 - 0.072 * s,
         0,
-        lift,
+        0,
         0.213 - 0.213 * s,
         0.715 + 0.285 * s,
         0.072 - 0.072 * s,
         0,
-        lift,
+        0,
         0.213 - 0.213 * s,
         0.715 - 0.715 * s,
         0.072 + 0.928 * s,
         0,
-        lift,
+        0,
         0,
         0,
         0,
@@ -475,8 +462,7 @@ abstract final class YingjiGlass {
 /// 的控件都没有 `BackdropFilter`，拖滑杆时它一动不动，看着就是「只有一部分
 /// 界面是玻璃，别处还是黑塑料」——这正是之前反复出现的问题。
 ///
-/// ⚠️ 不做镜面高光 / 顶部亮边：玻璃的边界靠「背后被模糊、玻璃内不模糊」的反差
-/// 自己显现，加白边就立刻变回塑料片。
+/// 轮廓仅保留低对比内边和短促顶部反射，不使用刺眼的整圈白边。
 class YingjiGlassSurface extends StatelessWidget {
   const YingjiGlassSurface({
     super.key,
@@ -515,6 +501,7 @@ class YingjiGlassSurface extends StatelessWidget {
   Widget build(BuildContext context) {
     final rounded = BorderRadius.circular(radius);
     final shape = circle ? BoxShape.circle : BoxShape.rectangle;
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
     Widget inner = child ?? const SizedBox.shrink();
     if (padding != null) inner = Padding(padding: padding!, child: inner);
     if (depth) {
@@ -538,9 +525,17 @@ class YingjiGlassSurface extends StatelessWidget {
         child: inner,
       ),
     );
+    final edged = CustomPaint(
+      foregroundPainter: _YingjiGlassEdgePainter(
+        radius: radius,
+        circle: circle,
+        devicePixelRatio: devicePixelRatio,
+      ),
+      child: surface,
+    );
     final clipped = circle
-        ? ClipOval(child: surface)
-        : ClipRRect(borderRadius: rounded, child: surface);
+        ? ClipOval(child: edged)
+        : ClipRRect(borderRadius: rounded, child: edged);
     if (!shadow) return clipped;
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -548,9 +543,9 @@ class YingjiGlassSurface extends StatelessWidget {
         shape: shape,
         boxShadow: const [
           BoxShadow(
-            color: Color(0x66000000),
-            blurRadius: 28,
-            offset: Offset(0, 14),
+            color: Color(0x4D000000),
+            blurRadius: 26,
+            offset: Offset(0, 10),
           ),
         ],
       ),
@@ -559,12 +554,66 @@ class YingjiGlassSurface extends StatelessWidget {
   }
 }
 
+class _YingjiGlassEdgePainter extends CustomPainter {
+  const _YingjiGlassEdgePainter({
+    required this.radius,
+    required this.circle,
+    required this.devicePixelRatio,
+  });
+
+  final double radius;
+  final bool circle;
+  final double devicePixelRatio;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    // Exactly one physical pixel. A 1 logical-pixel stroke becomes 1.25/1.5
+    // pixels at common Windows scaling factors and lands between pixels.
+    final strokeWidth = 1 / devicePixelRatio;
+    final rect = (Offset.zero & size).deflate(strokeWidth / 2);
+    final paint = Paint()
+      ..isAntiAlias = true
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: <Color>[
+          Color(0xA6FFFFFF),
+          Color(0x4DFFF1CC),
+          Color(0x2E9EDBFF),
+          Color(0x70FFFFFF),
+        ],
+        stops: <double>[0, .28, .66, 1],
+      ).createShader(rect);
+    if (circle) {
+      canvas.drawOval(rect, paint);
+    } else {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          rect,
+          Radius.circular(
+            (radius - strokeWidth / 2).clamp(0.0, radius).toDouble(),
+          ),
+        ),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _YingjiGlassEdgePainter oldDelegate) =>
+      oldDelegate.radius != radius ||
+      oldDelegate.circle != circle ||
+      oldDelegate.devicePixelRatio != devicePixelRatio;
+}
+
 /// 一张液态玻璃卡片：模糊背板 + 半透明底 + 极轻微的厚度沉底。
 ///
 /// 所有「浮在内容之上的面板」都应走这里，不要再手写一层灰底。
 ///
-/// ⚠️ 没有描边、没有高光边：边缘的界全靠「背后被模糊、卡片内不模糊」这个
-/// 反差自己显现 —— 加白边就会立刻变回塑料片。
+/// 边缘、阴影和圆角全部委托给 [YingjiGlassSurface]，避免各页面另起一套皮肤。
 class YingjiGlassCard extends StatelessWidget {
   const YingjiGlassCard({
     super.key,
@@ -600,9 +649,9 @@ class YingjiGlassCard extends StatelessWidget {
         borderRadius: rounded,
         boxShadow: const [
           BoxShadow(
-            color: Color(0x73000000),
-            blurRadius: 34,
-            offset: Offset(0, 16),
+            color: Color(0x52000000),
+            blurRadius: 30,
+            offset: Offset(0, 12),
           ),
         ],
       ),
@@ -1156,9 +1205,11 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
             label: widget.tooltip,
             selected: widget.selected,
             child: AnimatedScale(
-              scale: _pressed
-                  ? MovaMotion.pressScaleIcon
-                  : (active ? MovaMotion.hoverScale : 1),
+              // Keep the circular glass edge pixel-aligned while hovering.
+              // Material and shadow already provide hover feedback; scaling
+              // the cached glass layer causes visible stair-stepping on DPI
+              // scales such as 125% and 150%.
+              scale: _pressed ? MovaMotion.pressScaleIcon : 1,
               duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
               curve: _pressed ? MovaMotion.press : MovaMotion.spring,
               child: SizedBox(
@@ -1170,36 +1221,10 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                     // 液态玻璃圆片：静止时也在。这里以前是 `YingjiGlass.chrome()`
                     // 的一层半透明色 —— 没有 BackdropFilter，拖「模糊程度」时它
                     // 一动不动，看着就是一块黑塑料圆片。
-                    if (widget.selected)
-                      const DecoratedBox(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.white,
-                        ),
-                      )
-                    else
-                      YingjiGlassSurface(
-                        circle: true,
-                        strength: active ? 1.3 : .92,
-                      ),
-                    // 边界压到极淡（白 ~10%）：只是给圆片在亮海报上留个边，
-                    // 不是高光 —— 用户要的是液态玻璃，不是塑料片上的反光。
-                    DecoratedBox(
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: YingjiGlass.line(strength: active ? 1.15 : .6),
-                        ),
-                        boxShadow: active
-                            ? const [
-                                BoxShadow(
-                                  color: Color(0x66000000),
-                                  blurRadius: 16,
-                                  offset: Offset(0, 7),
-                                ),
-                              ]
-                            : null,
-                      ),
+                    YingjiGlassSurface(
+                      circle: true,
+                      strength: widget.selected ? 1.8 : (active ? 1.3 : .92),
+                      shadow: active,
                     ),
                     Center(
                       child: Transform.flip(
@@ -1207,9 +1232,7 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                         child: Icon(
                           widget.icon,
                           size: widget.size * .43,
-                          color: widget.selected
-                              ? YingjiColors.canvas
-                              : Colors.white,
+                          color: Colors.white,
                         ),
                       ),
                     ),

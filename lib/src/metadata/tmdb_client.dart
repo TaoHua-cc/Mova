@@ -482,7 +482,17 @@ class TmdbClient {
     String apiKey,
     Map<String, String> query, {
     required String typeHint,
-  }) async => _items(await _get(path, apiKey, query), typeHint: typeHint);
+  }) async => _items(
+    await _get(
+      path,
+      apiKey,
+      query,
+      // 榜单以缓存优先：八小时内直接使用上次结果，不再发后台刷新请求。
+      // 详情、搜索和首页大海报不走 _list，仍保持各自原有的刷新策略。
+      minRefreshInterval: const Duration(hours: 8),
+    ),
+    typeHint: typeHint,
+  );
 
   Future<TmdbItem> details(
     int id, {
@@ -759,19 +769,15 @@ class TmdbClient {
       // 之前 TVmaze（timeKnown=true）会整体覆盖 TMDB 条目，导致季集号与中文
       // 标题被英文数据顶替 —— 追剧日历显示出来的剧集信息因此错乱。
       final primary = previous.source == 'TMDB' ? previous : episode;
-      final timing =
-          episode.timeKnown
-              ? episode
-              : (previous.timeKnown ? previous : episode);
+      final timing = episode.timeKnown
+          ? episode
+          : (previous.timeKnown ? previous : episode);
       merged[key] = TmdbUpcomingEpisode(
         seasonNumber: primary.seasonNumber,
         episodeNumber: primary.episodeNumber,
-        title:
-            primary.title.isNotEmpty
-                ? primary.title
-                : (previous.title.isNotEmpty
-                      ? previous.title
-                      : episode.title),
+        title: primary.title.isNotEmpty
+            ? primary.title
+            : (previous.title.isNotEmpty ? previous.title : episode.title),
         airDate: timing.airDate,
         timeKnown: timing.timeKnown,
         source: primary.source,
@@ -928,7 +934,7 @@ class TmdbClient {
   ///
   /// 这些缓存都写在 `shared_preferences` 里，而它会在启动时把整份偏好文件一次性
   /// 读进内存，条目越多常驻内存与启动耗时越高，所以必须给一个上限，不能无限累积。
-  static const int _tmdbCacheCapacity = 800;
+  static const int _tmdbCacheCapacity = 160;
   static int _rememberWrites = 0;
 
   /// 写入缓存正文并记下时间戳；只有正文真的变了才通知列表页替换内容。
@@ -947,8 +953,11 @@ class TmdbClient {
       DateTime.now().toIso8601String(),
     );
     if (previous != null && previous != body) yingjiMetadataRevision.value++;
-    // 每 16 次写入顺带修剪一次缓存，平摊开销，避免 shared_preferences 无限膨胀。
-    if ((++_rememberWrites & 15) == 0) await _pruneTmdbCache(prefs);
+    // 本次运行首次写入就清理旧版本可能积下的超大缓存；之后每 16 次平摊一次。
+    // SharedPreferences 会在启动时整份解析，保留数百份榜单 JSON 会直接拖慢首屏。
+    if (_rememberWrites++ == 0 || (_rememberWrites & 15) == 0) {
+      await _pruneTmdbCache(prefs);
+    }
   }
 
   /// 淘汰最旧的 TMDB 缓存条目与过期排期，把常驻规模压在 [_tmdbCacheCapacity] 内。

@@ -7,6 +7,74 @@ import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  test('continue watching uses the dedicated server resume endpoint', () async {
+    Uri? requested;
+    final client = EmbyClient(
+      client: MockClient((request) async {
+        requested = request.url;
+        return http.Response(
+          jsonEncode({
+            'Items': [
+              {
+                'Id': 'episode-1',
+                'Name': '第一集',
+                'Type': 'Episode',
+                'RunTimeTicks': 6000000000,
+                'UserData': {'PlaybackPositionTicks': 1200000000},
+              },
+            ],
+          }),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }),
+    );
+    final session = EmbySession(
+      token: 'token',
+      source: MediaSource(
+        id: 'source-1',
+        name: 'Server',
+        kind: SourceKind.emby,
+        endpoint: Uri.parse('https://media.example/'),
+        userId: 'user-1',
+      ),
+    );
+
+    final items = await client.resumeItems(session);
+
+    expect(requested?.path, '/Users/user-1/Items/Resume');
+    expect(items.single.id, 'episode-1');
+    expect(items.single.playbackPosition, const Duration(minutes: 2));
+    client.dispose();
+  });
+
+  test('continue watching falls back for older servers', () async {
+    final paths = <String>[];
+    final client = EmbyClient(
+      client: MockClient((request) async {
+        paths.add(request.url.path);
+        if (request.url.path.endsWith('/Resume')) {
+          return http.Response('not found', 404);
+        }
+        return http.Response(jsonEncode({'Items': <Object>[]}), 200);
+      }),
+    );
+    final session = EmbySession(
+      token: 'token',
+      source: MediaSource(
+        id: 'source-1',
+        name: 'Server',
+        kind: SourceKind.jellyfin,
+        endpoint: Uri.parse('https://media.example/'),
+        userId: 'user-1',
+      ),
+    );
+
+    expect(await client.resumeItems(session), isEmpty);
+    expect(paths, ['/Users/user-1/Items/Resume', '/Users/user-1/Items']);
+    client.dispose();
+  });
+
   test(
     'server identity fails over and discovers published endpoints',
     () async {

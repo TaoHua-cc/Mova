@@ -202,6 +202,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   _CenterSection _section = _CenterSection.home;
   final PageController _pageController = PageController();
   Timer? _wheelResetTimer;
+  Timer? _updateCheckTimer;
   double _wheelDelta = 0;
   double _pageScrollHint = 0;
   DateTime _lastWheelNavigation = DateTime.fromMillisecondsSinceEpoch(0);
@@ -218,7 +219,10 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   void initState() {
     super.initState();
     yingjiSectionRequest.addListener(_handleSectionRequest);
-    unawaited(_checkUpdateOnStart());
+    _updateCheckTimer = Timer(
+      const Duration(seconds: 6),
+      () => unawaited(_checkUpdateOnStart()),
+    );
   }
 
   /// 启动时的版本检查。
@@ -227,7 +231,6 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   /// 提示与否由 [checkMovaUpdate] 决定（本地已知有更新的版本就一定会问，
   /// 「跳过此版本」的那个版本除外）。
   Future<void> _checkUpdateOnStart() async {
-    await Future<void>.delayed(const Duration(milliseconds: 1200));
     if (!mounted) return;
     await checkMovaUpdate(context);
   }
@@ -245,6 +248,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
       _ => null,
     };
     if (target != null) _selectSection(target);
+    if (value == 'discover') yingjiHomeDiscoverTick.value++;
     yingjiSectionRequest.value = null;
   }
 
@@ -350,6 +354,7 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   void dispose() {
     yingjiSectionRequest.removeListener(_handleSectionRequest);
     _wheelResetTimer?.cancel();
+    _updateCheckTimer?.cancel();
     _pageController.dispose();
     super.dispose();
   }
@@ -429,6 +434,9 @@ class _HomeFeedPage extends StatefulWidget {
 class _HomeFeedPageState extends State<_HomeFeedPage>
     with _SectionTopOnTap<_HomeFeedPage> {
   final ScrollController _scroll = ScrollController();
+  bool _showDiscover = false;
+  int _discoverSectionLimit = 1;
+  Timer? _discoverGrowthDebounce;
 
   @override
   ScrollController get sectionTopController => _scroll;
@@ -443,14 +451,46 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
   void initState() {
     super.initState();
     _scroll.addListener(_handleScroll);
+    yingjiHomeDiscoverTick.addListener(_handleDiscoverRequest);
     initSectionTopListener();
     // 首帧之后再测量一次：内容不足一屏时不该显示向下提示。
     WidgetsBinding.instance.addPostFrameCallback((_) => _handleScroll());
   }
 
+  void _handleDiscoverRequest() {
+    if (!mounted) return;
+    if (!_showDiscover) setState(() => _showDiscover = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // 第一帧挂载发现区域，第二帧才能读到扩展后的 maxScrollExtent。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scroll.hasClients) return;
+        _scroll.animateTo(
+          _scroll.position.viewportDimension.clamp(
+            0,
+            _scroll.position.maxScrollExtent,
+          ),
+          duration: const Duration(milliseconds: 420),
+          curve: const Cubic(.22, 1, .36, 1),
+        );
+      });
+    });
+  }
+
   void _handleScroll() {
     if (!mounted || !_scroll.hasClients) return;
     final position = _scroll.position;
+    if (!_showDiscover && position.pixels > 4) {
+      setState(() => _showDiscover = true);
+    } else if (_showDiscover &&
+        position.extentAfter < position.viewportDimension * .8) {
+      // 滚轮滑行期间 maxScrollExtent 还没来得及随新栏目增长；直接 setState 会在
+      // 每一帧都 +2，一次滚动瞬间挂载十几个榜单。等滚动停稳后只追加一批，网络
+      // 与图片解码都留在帧间空档里。
+      _discoverGrowthDebounce?.cancel();
+      _discoverGrowthDebounce = Timer(const Duration(milliseconds: 180), () {
+        if (mounted) setState(() => _discoverSectionLimit += 2);
+      });
+    }
     final more = position.maxScrollExtent - position.pixels > 24;
     if (more != _hasMoreBelow) setState(() => _hasMoreBelow = more);
 
@@ -466,7 +506,9 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
   @override
   void dispose() {
     disposeSectionTopListener();
+    yingjiHomeDiscoverTick.removeListener(_handleDiscoverRequest);
     _scroll.removeListener(_handleScroll);
+    _discoverGrowthDebounce?.cancel();
     _scroll.dispose();
     // 首页销毁时复位，避免下次进入直接停在模糊态。
     yingjiHomeScrollDepth.value = 0;
@@ -493,11 +535,16 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
                 padding: EdgeInsets.zero,
                 children: [
                   SizedBox(height: canvasHeight, child: const _CinematicHome()),
-                  Padding(
-                    // 与原独立“发现”页在壳层中收到的边距保持一致
-                    padding: YingjiLayout.pageInset,
-                    child: const _DiscoverPage(embedded: true),
-                  ),
+                  if (_showDiscover)
+                    Padding(
+                      // 与原独立“发现”页在壳层中收到的边距保持一致
+                      padding: YingjiLayout.pageInset,
+                      child: _DiscoverPage(
+                        embedded: true,
+                        sectionLimit: _discoverSectionLimit,
+                      ),
+                    ),
+                  if (!_showDiscover) SizedBox(height: canvasHeight),
                 ],
               ),
             ),
@@ -1029,8 +1076,8 @@ class _CinematicHomeState extends State<_CinematicHome>
     };
     // 首屏轮播的大图与标题 logo 提前进磁盘缓存：这是最显眼的一屏，
     // 之后每次打开都应该已经躺在本地。
-    YingjiImageWarmup.items(items, backdrop: true, logo: true, maxItems: 4);
-    unawaited(_prefetchHeroDetails(items.take(8).toList(growable: false)));
+    YingjiImageWarmup.items(items, backdrop: true, logo: true, maxItems: 2);
+    unawaited(_prefetchHeroDetails(items.take(2).toList(growable: false)));
     return items;
   }
 
@@ -1138,10 +1185,6 @@ class _CinematicHomeState extends State<_CinematicHome>
       builder: (context, snapshot) {
         final items = snapshot.data ?? const <TmdbItem>[];
         _trendingValue = items;
-        if (items.isEmpty &&
-            snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
         final baseSelected = items.isEmpty
             ? const TmdbItem(
                 id: 0,
@@ -1151,6 +1194,9 @@ class _CinematicHomeState extends State<_CinematicHome>
               )
             : items[_hero.clamp(0, items.length - 1)];
         final selected = _heroDetails[baseSelected.id] ?? baseSelected;
+        final loadingFallback =
+            items.isEmpty &&
+            snapshot.connectionState == ConnectionState.waiting;
         final heroArtwork = selected.backdropUrl ?? selected.posterUrl;
         final heroArtworkValue = heroArtwork?.toString();
         if (yingjiBackdropUrl.value != heroArtworkValue) {
@@ -1220,7 +1266,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                     mainAxisAlignment: MainAxisAlignment.start,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      if (items.isEmpty) ...[
+                      if (items.isEmpty && !loadingFallback) ...[
                         _HomeNetworkNotice(
                           message: _networkError(snapshot.error),
                           onRetry: () =>
@@ -1294,30 +1340,32 @@ class _CinematicHomeState extends State<_CinematicHome>
                           ),
                         ),
                       ),
-                      const SizedBox(height: 14),
-                      _MetaLine(item: selected),
-                      const SizedBox(height: 14),
-                      ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 610),
-                        child: YingjiGlassTooltip(
-                          message: selected.overview?.isNotEmpty == true
-                              ? selected.overview!
-                              : '从你的媒体库与可信元数据服务开始，建立属于自己的观影空间。',
-                          child: Text(
-                            selected.overview?.isNotEmpty == true
+                      if (!loadingFallback) ...[
+                        const SizedBox(height: 14),
+                        _MetaLine(item: selected),
+                        const SizedBox(height: 14),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 610),
+                          child: YingjiGlassTooltip(
+                            message: selected.overview?.isNotEmpty == true
                                 ? selected.overview!
                                 : '从你的媒体库与可信元数据服务开始，建立属于自己的观影空间。',
-                            maxLines: compact ? 2 : 3,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Color(0xFFE6E8ED),
-                              height: 1.5,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w500,
+                            child: Text(
+                              selected.overview?.isNotEmpty == true
+                                  ? selected.overview!
+                                  : '从你的媒体库与可信元数据服务开始，建立属于自己的观影空间。',
+                              maxLines: compact ? 2 : 3,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xFFE6E8ED),
+                                height: 1.5,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w500,
+                              ),
                             ),
                           ),
                         ),
-                      ),
+                      ],
                     ],
                   ),
                 ),
@@ -1700,10 +1748,13 @@ bool _sameWatchStates(List<WatchState> a, List<WatchState> b) {
 }
 
 class _DiscoverPage extends StatefulWidget {
-  const _DiscoverPage({this.embedded = false});
+  const _DiscoverPage({this.embedded = false, this.sectionLimit});
 
   /// 为 true 表示被嵌入首页下半部分：自身不再滚动，改由外层列表统一驱动。
   final bool embedded;
+
+  /// 内嵌首页时只构建用户已经滚到附近的栏目；null 表示独立页面加载全部。
+  final int? sectionLimit;
   @override
   State<_DiscoverPage> createState() => _DiscoverPageState();
 }
@@ -2094,6 +2145,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final Map<String, String> _sectionSources = {};
   final Set<String> _hiddenSections = {};
   late Future<Map<String, List<TmdbItem>>> _items;
+  Map<String, List<TmdbItem>> _visibleItems = const {};
   List<String> _sections = List.of(_defaultSections);
 
   /// 元数据后台刷新后的重读消抖计时器。
@@ -2102,9 +2154,17 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   @override
   void initState() {
     super.initState();
-    _items = _initializeSections();
+    _items = _trackItems(_initializeSections());
     // 后台把某批元数据刷新回来后重读一次缓存，把栏目内容换成新的。
     yingjiMetadataRevision.addListener(_handleMetadataRevision);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DiscoverPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.sectionLimit != oldWidget.sectionLimit) {
+      unawaited(_extendToVisibleLimit());
+    }
   }
 
   /// 每个栏目各自后台刷新，会连着触发好几次；攒到一起只重读一遍。
@@ -2112,8 +2172,64 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _revisionDebounce?.cancel();
     _revisionDebounce = Timer(const Duration(milliseconds: 800), () {
       if (!mounted) return;
-      setState(() => _items = _loadSections());
+      unawaited(_refreshVisibleSections());
     });
+  }
+
+  Future<Map<String, List<TmdbItem>>> _trackItems(
+    Future<Map<String, List<TmdbItem>>> future,
+  ) async {
+    final value = await future;
+    _visibleItems = value;
+    return value;
+  }
+
+  bool _sameItems(List<TmdbItem>? left, List<TmdbItem> right) {
+    if (left == null || left.length != right.length) return false;
+    for (var index = 0; index < right.length; index++) {
+      final a = left[index];
+      final b = right[index];
+      if (a.id != b.id ||
+          a.kind != b.kind ||
+          a.title != b.title ||
+          a.posterPath != b.posterPath ||
+          a.backdropPath != b.backdropPath ||
+          a.rating != b.rating) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _refreshingVisibleSections = false;
+
+  Future<void> _refreshVisibleSections() async {
+    if (_refreshingVisibleSections) return;
+    _refreshingVisibleSections = true;
+    try {
+      final updates = <String, List<TmdbItem>>{};
+      final visible = _sections
+          .where((section) => !_hiddenSections.contains(section))
+          .take(widget.sectionLimit ?? _sections.length)
+          .toList(growable: false);
+      for (final section in visible) {
+        final rows = await _loadSectionFor(section, 1);
+        if (!mounted) return;
+        if (_sameItems(_visibleItems[section], rows)) continue;
+        updates[section] = rows;
+        YingjiImageWarmup.items(rows, maxItems: 6);
+      }
+      if (!mounted || updates.isEmpty) return;
+      final next = {..._visibleItems, ...updates};
+      // 一批后台响应只提交一次布局更新；逐栏 setState 会在滚动过程中制造连续
+      // 几帧的 layout/paint 峰值，看起来正是“一下一下卡”。
+      setState(() {
+        _visibleItems = next;
+        _items = Future.value(next);
+      });
+    } finally {
+      _refreshingVisibleSections = false;
+    }
   }
 
   @override
@@ -2128,7 +2244,51 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 
   Future<Map<String, List<TmdbItem>>> _initializeSections() async {
     await _restoreLayout();
-    return _loadSections();
+    return _loadSections(limit: widget.sectionLimit);
+  }
+
+  bool _extendingSections = false;
+
+  Future<void> _extendToVisibleLimit() async {
+    if (_extendingSections || !mounted) return;
+    _extendingSections = true;
+    final requestedLimit = widget.sectionLimit;
+    try {
+      final current = await _items;
+      if (!mounted) return;
+      final target = widget.sectionLimit;
+      final wanted = (target == null ? _sections : _sections.take(target))
+          .where((section) => !_hiddenSections.contains(section))
+          .where((section) => !current.containsKey(section))
+          .toList(growable: false);
+      if (wanted.isEmpty) return;
+      final entries = await Future.wait(
+        wanted.map((section) async {
+          try {
+            return MapEntry(section, await _loadSectionFor(section, 1));
+          } catch (_) {
+            return MapEntry<String, List<TmdbItem>>(section, const []);
+          }
+        }),
+      );
+      if (!mounted) return;
+      final next = {
+        ...current,
+        ...Map<String, List<TmdbItem>>.fromEntries(entries),
+      };
+      for (final rows in entries.map((entry) => entry.value)) {
+        YingjiImageWarmup.items(rows, maxItems: 8);
+      }
+      setState(() {
+        _visibleItems = next;
+        _items = Future.value(next);
+      });
+    } finally {
+      _extendingSections = false;
+      if (mounted && widget.sectionLimit != requestedLimit) {
+        unawaited(_extendToVisibleLimit());
+      }
+    }
   }
 
   Future<void> _restoreLayout() async {
@@ -2635,6 +2795,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                       shrinkWrap: true,
                       itemCount: _sections.length,
                       buildDefaultDragHandles: false,
+                      // 默认拖拽代理会额外套一层有阴影的 Material，液态玻璃卡片
+                      // 下方因此出现整块黑色矩形。沿用原卡片本身即可。
+                      proxyDecorator: (child, _, _) => child,
                       onReorderItem: (oldIndex, newIndex) {
                         updateDialog(() {
                           final section = _sections.removeAt(oldIndex);
@@ -2934,9 +3097,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     }
   }
 
-  Future<Map<String, List<TmdbItem>>> _loadSections() async {
+  Future<Map<String, List<TmdbItem>>> _loadSections({int? limit}) async {
     final requests = <String, Future<List<TmdbItem>> Function()>{
-      for (final section in _sections)
+      for (final section in limit == null ? _sections : _sections.take(limit))
         if (!_hiddenSections.contains(section))
           section: () => _loadSectionFor(section, 1),
     };
@@ -2950,10 +3113,10 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       }),
     );
     final charts = Map<String, List<TmdbItem>>.fromEntries(entries);
-    // 第一次打开就把所有栏目的海报写进磁盘缓存 —— 之后每次打开都是先命中
-    // 本地图片，再逐栏替换成刚刷新到的内容，不会一屏一屏地边滚边下载。
+    // 只预热一屏能看到的海报。把每栏 20 张一起解码会和纵向滚动争用 UI/GPU；
+    // 后面的图片由横向列表真正滚到附近时按 CachedNetworkImage 的缓存自然加载。
     for (final rows in charts.values) {
-      YingjiImageWarmup.items(rows);
+      YingjiImageWarmup.items(rows, maxItems: 6);
     }
     return charts;
   }
@@ -3385,101 +3548,104 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       FutureBuilder<Map<String, List<TmdbItem>>>(
         future: _items,
         builder: (context, snapshot) {
-          final sections = snapshot.data ?? const <String, List<TmdbItem>>{};
-          final items = sections.values.expand((value) => value).toList();
+          final sections = snapshot.data ?? _visibleItems;
           final visibleSections = _sections
               .where((section) => !_hiddenSections.contains(section))
+              .take(widget.sectionLimit ?? _sections.length)
               .toList(growable: false);
-          if (items.isEmpty &&
-              snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
+          Widget buildRow(int index) {
+            if (index == 0) {
+              return Padding(
+                key: const ValueKey('discover-header'),
+                padding: const EdgeInsets.only(bottom: 28),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '发现',
+                            style: TextStyle(
+                              fontSize: 48,
+                              height: 1,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -1.2,
+                            ),
+                          ),
+                          SizedBox(height: 8),
+                          Text(
+                            '浏览影视榜单，自定义每个列表的数据、顺序与卡片样式。',
+                            style: TextStyle(color: Color(0xFFABB1BE)),
+                          ),
+                        ],
+                      ),
+                    ),
+                    YingjiMotionIconButton(
+                      icon: YingjiIcons.line_horizontal_3,
+                      tooltip: '排序与显示栏目',
+                      onPressed: _showCardSettings,
+                      size: 44,
+                    ),
+                    const SizedBox(width: 8),
+                    YingjiMotionIconButton(
+                      icon: YingjiIcons.plus,
+                      tooltip: '添加列表',
+                      onPressed: _addDiscoverSection,
+                      size: 44,
+                    ),
+                  ],
+                ),
+              );
+            }
+            if (visibleSections.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.only(top: 42),
+                child: _EmptyStrip(
+                  icon: YingjiIcons.rectangle_stack,
+                  title: '所有栏目均已隐藏',
+                  detail: '在任意列表右侧打开设置，重新显示需要的栏目。',
+                ),
+              );
+            }
+            final section = visibleSections[index - 1];
+            final block = _DiscoverBlock(
+              title: section,
+              source: _sectionSources[section] ?? section,
+              sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
+              items: sections[section] ?? const [],
+              variant: _cardStyles[section] ?? _sections.indexOf(section) % 4,
+              onConfigure: () => _showSectionSettings(section),
+              loadPage: (page) => _loadSectionFor(section, page),
+              loadSourcePage: _loadSection,
+            );
+            return RepaintBoundary(
+              key: ValueKey(section),
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 36),
+                child: block,
+              ),
+            );
+          }
+
+          final itemCount = visibleSections.isEmpty
+              ? 2
+              : visibleSections.length + 1;
+          if (widget.embedded) {
+            // shrinkWrap ListView 在外层每次滚动时会重新丈量全部榜单；栏目越多越
+            // 慢。内嵌模式直接使用静态 Column，并把每栏隔离成合成层。
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: List.generate(itemCount, buildRow),
+              ),
+            );
           }
           return ListView.builder(
             padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-            // 内嵌在首页时自身不滚动：整页高度由外层列表丈量，滚动也交给外层。
-            shrinkWrap: widget.embedded,
-            physics: widget.embedded
-                ? const NeverScrollableScrollPhysics()
-                : null,
-            itemCount: visibleSections.isEmpty ? 2 : visibleSections.length + 1,
-            itemBuilder: (context, index) {
-              if (index == 0) {
-                return Padding(
-                  key: const ValueKey('discover-header'),
-                  padding: const EdgeInsets.only(bottom: 28),
-                  child: Row(
-                    children: [
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '发现',
-                              style: TextStyle(
-                                fontSize: 48,
-                                height: 1,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: -1.2,
-                              ),
-                            ),
-                            SizedBox(height: 8),
-                            Text(
-                              '浏览影视榜单，自定义每个列表的数据、顺序与卡片样式。',
-                              style: TextStyle(color: Color(0xFFABB1BE)),
-                            ),
-                          ],
-                        ),
-                      ),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.line_horizontal_3,
-                        tooltip: '排序与显示栏目',
-                        onPressed: _showCardSettings,
-                        size: 44,
-                      ),
-                      const SizedBox(width: 8),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.plus,
-                        tooltip: '添加列表',
-                        onPressed: _addDiscoverSection,
-                        size: 44,
-                      ),
-                    ],
-                  ),
-                );
-              }
-              if (visibleSections.isEmpty) {
-                return const Padding(
-                  padding: EdgeInsets.only(top: 42),
-                  child: _EmptyStrip(
-                    icon: YingjiIcons.rectangle_stack,
-                    title: '所有栏目均已隐藏',
-                    detail: '在任意列表右侧打开设置，重新显示需要的栏目。',
-                  ),
-                );
-              }
-              final section = visibleSections[index - 1];
-              final block = _DiscoverBlock(
-                title: section,
-                source: _sectionSources[section] ?? section,
-                sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
-                items: sections[section] ?? const [],
-                variant: _cardStyles[section] ?? _sections.indexOf(section) % 4,
-                onConfigure: () => _showSectionSettings(section),
-                loadPage: (page) => _loadSectionFor(section, page),
-                loadSourcePage: _loadSection,
-              );
-              return KeyedSubtree(
-                key: ValueKey(section),
-                child: AnimatedOpacity(
-                  opacity: 1,
-                  duration: const Duration(milliseconds: 160),
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 36),
-                    child: block,
-                  ),
-                ),
-              );
-            },
+            itemCount: itemCount,
+            itemBuilder: (context, index) => buildRow(index),
           );
         },
       );
@@ -5198,148 +5364,156 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                   },
                 ),
                 Expanded(
-                  child: CustomScrollView(
+                  child: YingjiSmoothWheel(
                     controller: _controller,
-                    scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
-                    slivers: [
-                      SliverPadding(
-                        padding: EdgeInsets.fromLTRB(
-                          YingjiLayout.pageLeft,
-                          32,
-                          YingjiLayout.pageRight,
-                          24,
-                        ),
-                        sliver: SliverToBoxAdapter(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                widget.title,
-                                style: const TextStyle(
-                                  fontSize: 48,
-                                  height: 1,
-                                  fontWeight: FontWeight.w900,
-                                  letterSpacing: -1.2,
-                                  shadows: [
-                                    Shadow(
-                                      color: Color(0xC0000000),
-                                      blurRadius: 18,
-                                      offset: Offset(0, 4),
+                    child: CustomScrollView(
+                      controller: _controller,
+                      physics: yingjiWheelPhysics,
+                      scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
+                      slivers: [
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            32,
+                            YingjiLayout.pageRight,
+                            24,
+                          ),
+                          sliver: SliverToBoxAdapter(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  widget.title,
+                                  style: const TextStyle(
+                                    fontSize: 48,
+                                    height: 1,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: -1.2,
+                                    shadows: [
+                                      Shadow(
+                                        color: Color(0xC0000000),
+                                        blurRadius: 18,
+                                        offset: Offset(0, 4),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  '${_hasMore ? '持续加载' : '已加载全部'} · 当前 ${rows.length} 部',
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                  ),
+                                ),
+                                const SizedBox(height: 18),
+                                Wrap(
+                                  spacing: 22,
+                                  runSpacing: 12,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: [
+                                    _DiscoverListFilterGroup(
+                                      label: '影视题材',
+                                      child: YingjiGlassChoiceButton<String>(
+                                        value: _genre,
+                                        items: _genres.keys.toList(),
+                                        labelBuilder: (value) =>
+                                            _genres[value] ?? value,
+                                        onChanged: (value) =>
+                                            unawaited(_selectGenre(value)),
+                                      ),
                                     ),
+                                    _DiscoverListFilterGroup(
+                                      label: '排序',
+                                      child: Wrap(
+                                        spacing: 8,
+                                        runSpacing: 8,
+                                        children: [
+                                          for (final label in _sorts)
+                                            _RankingFilter(
+                                              label: label,
+                                              selected: _sort == label,
+                                              trailingIcon: _sort == label
+                                                  ? (_sortDescending
+                                                        ? YingjiIcons
+                                                              .chevron_down
+                                                        : YingjiIcons
+                                                              .chevron_up)
+                                                  : null,
+                                              onTap: () => _selectSort(label),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                    if (_selection?.provider == 'tmdb')
+                                      FutureBuilder<Map<String, String>>(
+                                        future: _watchProviders(
+                                          _selection!.mediaType,
+                                          _selection!.watchRegion,
+                                        ),
+                                        builder: (context, snapshot) {
+                                          final platforms =
+                                              snapshot.data ??
+                                              const {'all': '全部平台'};
+                                          final selected =
+                                              platforms.containsKey(_platform)
+                                              ? _platform
+                                              : 'all';
+                                          return _DiscoverListFilterGroup(
+                                            label: '播放平台',
+                                            child:
+                                                YingjiGlassChoiceButton<String>(
+                                                  value: selected,
+                                                  items: platforms.keys
+                                                      .toList(),
+                                                  labelBuilder: (value) =>
+                                                      platforms[value] ?? value,
+                                                  onChanged: (value) =>
+                                                      unawaited(
+                                                        _selectPlatform(value),
+                                                      ),
+                                                ),
+                                          );
+                                        },
+                                      ),
                                   ],
                                 ),
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                '${_hasMore ? '持续加载' : '已加载全部'} · 当前 ${rows.length} 部',
-                                style: const TextStyle(
-                                  color: YingjiColors.muted,
-                                ),
-                              ),
-                              const SizedBox(height: 18),
-                              Wrap(
-                                spacing: 22,
-                                runSpacing: 12,
-                                crossAxisAlignment: WrapCrossAlignment.center,
-                                children: [
-                                  _DiscoverListFilterGroup(
-                                    label: '影视题材',
-                                    child: YingjiGlassChoiceButton<String>(
-                                      value: _genre,
-                                      items: _genres.keys.toList(),
-                                      labelBuilder: (value) =>
-                                          _genres[value] ?? value,
-                                      onChanged: (value) =>
-                                          unawaited(_selectGenre(value)),
-                                    ),
-                                  ),
-                                  _DiscoverListFilterGroup(
-                                    label: '排序',
-                                    child: Wrap(
-                                      spacing: 8,
-                                      runSpacing: 8,
-                                      children: [
-                                        for (final label in _sorts)
-                                          _RankingFilter(
-                                            label: label,
-                                            selected: _sort == label,
-                                            trailingIcon: _sort == label
-                                                ? (_sortDescending
-                                                      ? YingjiIcons.chevron_down
-                                                      : YingjiIcons.chevron_up)
-                                                : null,
-                                            onTap: () => _selectSort(label),
-                                          ),
-                                      ],
-                                    ),
-                                  ),
-                                  if (_selection?.provider == 'tmdb')
-                                    FutureBuilder<Map<String, String>>(
-                                      future: _watchProviders(
-                                        _selection!.mediaType,
-                                        _selection!.watchRegion,
-                                      ),
-                                      builder: (context, snapshot) {
-                                        final platforms =
-                                            snapshot.data ??
-                                            const {'all': '全部平台'};
-                                        final selected =
-                                            platforms.containsKey(_platform)
-                                            ? _platform
-                                            : 'all';
-                                        return _DiscoverListFilterGroup(
-                                          label: '播放平台',
-                                          child:
-                                              YingjiGlassChoiceButton<String>(
-                                                value: selected,
-                                                items: platforms.keys.toList(),
-                                                labelBuilder: (value) =>
-                                                    platforms[value] ?? value,
-                                                onChanged: (value) => unawaited(
-                                                  _selectPlatform(value),
-                                                ),
-                                              ),
-                                        );
-                                      },
-                                    ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      SliverPadding(
-                        padding: EdgeInsets.fromLTRB(
-                          YingjiLayout.pageLeft,
-                          0,
-                          YingjiLayout.pageRight,
-                          56,
-                        ),
-                        sliver: SliverGrid(
-                          gridDelegate:
-                              const SliverGridDelegateWithMaxCrossAxisExtent(
-                                maxCrossAxisExtent: 224,
-                                mainAxisExtent: 372,
-                                mainAxisSpacing: 20,
-                                crossAxisSpacing: 16,
-                              ),
-                          delegate: SliverChildBuilderDelegate(
-                            (context, index) => _RankingPosterCard(
-                              rank: index + 1,
-                              item: rows[index],
+                              ],
                             ),
-                            childCount: rows.length,
                           ),
                         ),
-                      ),
-                      if (_loading)
-                        const SliverToBoxAdapter(
-                          child: Padding(
-                            padding: EdgeInsets.only(bottom: 32),
-                            child: Center(child: CircularProgressIndicator()),
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            0,
+                            YingjiLayout.pageRight,
+                            56,
+                          ),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                                  maxCrossAxisExtent: 224,
+                                  mainAxisExtent: 372,
+                                  mainAxisSpacing: 20,
+                                  crossAxisSpacing: 16,
+                                ),
+                            delegate: SliverChildBuilderDelegate(
+                              (context, index) => _RankingPosterCard(
+                                rank: index + 1,
+                                item: rows[index],
+                              ),
+                              childCount: rows.length,
+                            ),
                           ),
                         ),
-                    ],
+                        if (_loading)
+                          const SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.only(bottom: 32),
+                              child: Center(child: CircularProgressIndicator()),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ],
@@ -6538,16 +6712,14 @@ class _SourceHubState extends State<_SourceHub>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
-                      '观看记录只保存在本机',
+                      '同步观看记录到服务器',
                       style: TextStyle(fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       _historyLocalOnly
-                          ? '播放进度与“标记已看”只写本机，不再上报给这些服务器和 Trakt；'
-                                '服务器媒体照常播放，上面的记录也照常读取。'
-                          : '播放进度实时上报给这些服务器，退出播放时同步到 Trakt；'
-                                '换设备可以接着看。',
+                          ? '本机仍会保存观看记录；当前不向媒体服务器或 Trakt 回传。'
+                          : '本机始终保存；同时读取服务器继续播放记录，并在播放时回传进度。',
                       style: const TextStyle(
                         color: YingjiColors.muted,
                         fontSize: 12,
@@ -6558,11 +6730,11 @@ class _SourceHubState extends State<_SourceHub>
               ),
               const SizedBox(width: 18),
               Switch.adaptive(
-                value: _historyLocalOnly,
+                value: !_historyLocalOnly,
                 onChanged: (value) async {
-                  setState(() => _historyLocalOnly = value);
+                  setState(() => _historyLocalOnly = !value);
                   final prefs = await SharedPreferences.getInstance();
-                  await prefs.setBool(WatchStateStore.localOnlyKey, value);
+                  await prefs.setBool(WatchStateStore.localOnlyKey, !value);
                 },
               ),
             ],
@@ -10565,80 +10737,70 @@ class _SettingsPageState extends State<SettingsPage>
         }
         return Padding(
           padding: const EdgeInsets.only(bottom: 30),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(16),
-            child: BackdropFilter(
-              filter: YingjiGlass.backdrop(),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: YingjiGlass.surface(strength: 1.08),
-                  gradient: YingjiGlass.depth,
-                ),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    SizedBox(
-                      width: 220,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(18, 40, 18, 24),
-                        child: ValueListenableBuilder<int>(
-                          valueListenable: _activeSetting,
-                          builder: (context, active, _) => Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              for (var i = 0; i < labels.length; i++)
-                                Padding(
-                                  padding: const EdgeInsets.only(bottom: 6),
-                                  child: MovaPress(
-                                    scale: .97,
-                                    visualOnly: true,
-                                    child: TextButton(
-                                      onPressed: () =>
-                                          _jumpToSetting(i, keys[i]),
-                                      style: TextButton.styleFrom(
-                                        alignment: Alignment.centerLeft,
-                                        foregroundColor: active == i
-                                            ? const Color(0xFF111216)
-                                            : const Color(0xFFB8BDC8),
-                                        backgroundColor: active == i
-                                            ? const Color(0xFFF1F1F2)
-                                            : Colors.transparent,
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 14,
-                                          vertical: 12,
-                                        ),
-                                        shape: RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(
-                                            12,
-                                          ),
-                                        ),
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          Icon(labels[i].$2, size: 18),
-                                          const SizedBox(width: 11),
-                                          Text(labels[i].$1),
-                                        ],
-                                      ),
+          child: YingjiGlassSurface(
+            radius: 16,
+            strength: 1.08,
+            shadow: true,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 220,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 40, 18, 24),
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: _activeSetting,
+                      builder: (context, active, _) => Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var i = 0; i < labels.length; i++)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 6),
+                              child: MovaPress(
+                                scale: .97,
+                                visualOnly: true,
+                                child: TextButton(
+                                  onPressed: () => _jumpToSetting(i, keys[i]),
+                                  style: TextButton.styleFrom(
+                                    alignment: Alignment.centerLeft,
+                                    foregroundColor: active == i
+                                        ? const Color(0xFF111216)
+                                        : const Color(0xFFB8BDC8),
+                                    backgroundColor: active == i
+                                        ? const Color(0xFFF1F1F2)
+                                        : Colors.transparent,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 14,
+                                      vertical: 12,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
                                     ),
                                   ),
+                                  child: Row(
+                                    children: [
+                                      Icon(labels[i].$2, size: 18),
+                                      const SizedBox(width: 11),
+                                      Text(labels[i].$1),
+                                    ],
+                                  ),
                                 ),
-                            ],
-                          ),
-                        ),
+                              ),
+                            ),
+                        ],
                       ),
                     ),
-                    const VerticalDivider(width: 1, color: Color(0x22FFFFFF)),
-                    Expanded(
-                      child: _settingsScrollView(
-                        context,
-                        content,
-                        padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
-              ),
+                const VerticalDivider(width: 1, color: Color(0x22FFFFFF)),
+                Expanded(
+                  child: _settingsScrollView(
+                    context,
+                    content,
+                    padding: const EdgeInsets.fromLTRB(40, 40, 46, 60),
+                  ),
+                ),
+              ],
             ),
           ),
         );
@@ -11176,19 +11338,17 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
                             child: AnimatedOpacity(
                               opacity: _hovered ? 1 : 0,
                               duration: const Duration(milliseconds: 150),
-                              child: Container(
+                              child: SizedBox(
                                 width: 36,
                                 height: 36,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: Colors.black.withValues(alpha: .58),
-                                  border: Border.all(
-                                    color: Colors.white.withValues(alpha: .28),
+                                child: YingjiGlassSurface(
+                                  circle: true,
+                                  strength: 1.08,
+                                  shadow: true,
+                                  child: const Icon(
+                                    YingjiIcons.chevron_right,
+                                    size: 18,
                                   ),
-                                ),
-                                child: const Icon(
-                                  YingjiIcons.chevron_right,
-                                  size: 18,
                                 ),
                               ),
                             ),

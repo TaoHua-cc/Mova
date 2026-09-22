@@ -12,11 +12,13 @@ class DanmakuCacheEntry {
     required this.comments,
     required this.savedAt,
     this.matchedEpisode,
+    this.source,
   });
 
   final List<DanmakuComment> comments;
   final DateTime savedAt;
   final String? matchedEpisode;
+  final String? source;
 
   /// 超过这个时长就值得再拉一次（弹幕会被后来的观众补充）。
   bool get isStale =>
@@ -30,6 +32,9 @@ class DanmakuCacheEntry {
 /// 超过 [DanmakuCache.refreshAfter] 才在后台补拉一次。
 class DanmakuCache {
   DanmakuCache._(this._root);
+
+  /// 供测试和已有自定义数据目录复用；生产代码通常使用 [tryCreate]。
+  factory DanmakuCache.at(Directory root) => DanmakuCache._(root);
 
   static const String _folder = 'mova-danmaku-cache';
 
@@ -99,10 +104,12 @@ class DanmakuCache {
           ? DateTime.fromMillisecondsSinceEpoch(data['savedAt'] as int)
           : DateTime.now();
       final matched = data['matched'];
+      final source = data['source'];
       return DanmakuCacheEntry(
         comments: comments,
         savedAt: saved,
         matchedEpisode: matched is String ? matched : null,
+        source: source is String ? source : null,
       );
     } catch (_) {
       return null;
@@ -113,6 +120,7 @@ class DanmakuCache {
     String key,
     List<DanmakuComment> comments, {
     String? matchedEpisode,
+    String? source,
   }) async {
     if (comments.isEmpty) return;
     try {
@@ -120,6 +128,7 @@ class DanmakuCache {
         jsonEncode(<String, dynamic>{
           'savedAt': DateTime.now().millisecondsSinceEpoch,
           'matched': matchedEpisode,
+          'source': source,
           'comments': comments.map(_encodeComment).toList(growable: false),
         }),
       );

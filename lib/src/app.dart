@@ -121,6 +121,16 @@ class YingjiApp extends StatelessWidget {
           inactiveTrackColor: Colors.white24,
           thumbColor: Colors.white,
         ),
+        cardTheme: CardThemeData(
+          color: YingjiGlass.surface(),
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          margin: EdgeInsets.zero,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+            side: BorderSide(color: YingjiGlass.line(strength: .72)),
+          ),
+        ),
         filledButtonTheme: FilledButtonThemeData(
           style: FilledButton.styleFrom(
             foregroundColor: YingjiColors.canvas,
@@ -238,7 +248,7 @@ class YingjiApp extends StatelessWidget {
           ),
         ),
         dialogTheme: DialogThemeData(
-          backgroundColor: YingjiGlass.surface(strength: 1.12),
+          backgroundColor: YingjiGlass.frost.withValues(alpha: .14),
           surfaceTintColor: Colors.transparent,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.all(Radius.circular(20)),
@@ -250,6 +260,26 @@ class YingjiApp extends StatelessWidget {
             fontWeight: FontWeight.w700,
           ),
           contentTextStyle: TextStyle(color: YingjiColors.muted, height: 1.45),
+        ),
+        bottomSheetTheme: BottomSheetThemeData(
+          backgroundColor: YingjiGlass.frost.withValues(alpha: .12),
+          modalBackgroundColor: YingjiGlass.frost.withValues(alpha: .12),
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          modalElevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+            side: BorderSide(color: YingjiGlass.line(strength: .72)),
+          ),
+        ),
+        popupMenuTheme: PopupMenuThemeData(
+          color: YingjiGlass.frost.withValues(alpha: .16),
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(color: YingjiGlass.line(strength: .72)),
+          ),
         ),
         inputDecorationTheme: InputDecorationTheme(
           labelStyle: const TextStyle(color: YingjiColors.muted),

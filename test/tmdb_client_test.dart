@@ -8,6 +8,48 @@ import 'package:yingji/src/metadata/tmdb_client.dart';
 
 void main() {
   test(
+    'ranking lists do not refresh a cache younger than eight hours',
+    () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      final uri = Uri.parse('${TmdbClient.managedEndpoint}/tmdb/movie/popular')
+          .replace(
+            queryParameters: {
+              'language': 'zh-CN',
+              'region': 'CN',
+              'client': 'yingji-flutter',
+            },
+          );
+      final stableKey = base64UrlEncode(utf8.encode(uri.toString()))
+          .replaceAll('=', '');
+      final cacheKey = 'yingji.tmdb.cache.$stableKey';
+      SharedPreferences.setMockInitialValues({
+        cacheKey: jsonEncode({
+          'results': [
+            {'id': 1, 'title': '缓存榜单'},
+          ],
+        }),
+        '$cacheKey.savedAt': DateTime.now()
+            .subtract(const Duration(hours: 7))
+            .toIso8601String(),
+      });
+      var requests = 0;
+      final client = TmdbClient(
+        client: MockClient((_) async {
+          requests++;
+          return http.Response(jsonEncode({'results': <Object>[]}), 200);
+        }),
+      );
+
+      final items = await client.popularMovies();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(items.single.title, '缓存榜单');
+      expect(requests, 0);
+      client.dispose();
+    },
+  );
+
+  test(
     'falls back to managed metadata when a saved direct key cannot connect',
     () async {
       TestWidgetsFlutterBinding.ensureInitialized();

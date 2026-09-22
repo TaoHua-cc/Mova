@@ -174,7 +174,12 @@ def run(exe, workdir, media, out_dir, comments, label, density, area,
             ok = False
             lines.append(f"    VERDICT BAD {peak['late33']} frames ran past 33ms"
                          " -- repeated stalls")
-        elif peak["late20"] > 6:
+        elif peak["late20"] > 6 and not (
+                samples and samples[-1]["dwell"] and samples[-1]["refresh"] > 0):
+            # `late20` 是 60fps 时代留下的**绝对**门槛。走节拍时钟之后目标节拍是
+            # divisor × 刷新周期（本机 11.76ms），20ms 只有 1.7 拍，一次调度抖动
+            # 就会踩线 —— 它拦不住真缺陷、只会随机变红。节拍路径改由下面的
+            # 「停留拍数是否集中」直接判（见 specs 2026-09-22）。
             ok = False
             lines.append(f"    VERDICT BAD {peak['late20']} of 60 frames ran"
                          " past 20ms")
@@ -191,6 +196,48 @@ def run(exe, workdir, media, out_dir, comments, label, density, area,
                          f" worst {peak['gap']:.1f}ms)")
         else:
             lines.append("    VERDICT OK  frames stay inside the 60fps budget")
+        # 帧节拍是否与面板刷新同源 —— 判「滚起来匀不匀」的主指标，见
+        # docs/specs/2026-09-22-danmaku-frame-pacing.md。
+        #
+        # 均值 / late20 / late33 只说明「平均出够帧数」：170Hz 面板 + 16ms 定时器
+        # 的老组合给出 avg=16.3ms、late33=0 的漂亮数字，每帧却在屏停留 2.77 个
+        # 刷新周期（77% 停 3 拍、23% 停 2 拍），位移步长 3:2 交替。所以要直接断言
+        # 「停留拍数分布在不在同一个档上」。
+        paced = [i for i in samples if i["dwell"] and i["refresh"] > 0]
+        if paced:
+            last = paced[-1]
+            div = last["div"]
+            # 判「平滑」要看**稳态**：开头两个窗口还在铺弹幕、时钟刚对上相位，
+            # 把它们算进去会把占比拉低十几个百分点（实测 55% vs 稳态 93%），
+            # 于是判据看着红、实际已经达标。取最后三个窗口。
+            steady = paced[-3:]
+            total = sum(sum(i["dwell"]) for i in steady)
+            exact = (sum(i["dwell"][div - 1] for i in steady)
+                     if 1 <= div <= 4 else 0)
+            share = exact / total if total else 0.0
+            lines.append(f"    pacing: refresh={last['refresh']:.3f}ms"
+                         f" div={div} compose={last['compose']:.2f}ms"
+                         f" tick={last['tick']:.2f}ms"
+                         f" paints/tick="
+                         f"{(last['frames'] / last['ticks']) if last['ticks'] else 0:.2f}"
+                         f" -> 稳态停留 {div} 拍的帧占"
+                         f" {share * 100:.1f}% ({exact}/{total})")
+            if share < 0.85:
+                ok = False
+                # 一个 tick 就是 div 拍，所以 dwell 应当**几乎全部**落在 div 上。
+                # 散到别的档 = 节拍时钟（高精度定时器）被系统卡顿打断，或它的
+                # 周期与面板没成精确整数比。这里只报事实、不下成因结论 ——
+                # 曾经的「合成器在漏拍」那套推断依赖已删掉的 DwmFlush 直方图。
+                dominant = max(range(4), key=lambda i: last["dwell"][i]) + 1
+                lines.append(f"    VERDICT BAD only {share * 100:.1f}% of frames"
+                             f" dwell exactly {div} refresh period(s);"
+                             f" dominant bucket = {dominant} period(s),"
+                             f" dwell 1/2/3/4+ = {last['dwell']},"
+                             f" compose={last['compose']:.2f}ms")
+            else:
+                lines.append(f"    VERDICT OK  frame clock locked to the panel"
+                             f" ({1000.0 / last['refresh']:.0f}Hz /"
+                             f" {div})")
         ink, note = suite.shot_danmaku(out_dir, f"layout_{label}", trace_dir)
         lines.append(f"    {note}")
         if ink < 500:

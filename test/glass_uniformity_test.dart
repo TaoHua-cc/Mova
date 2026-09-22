@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:yingji/src/brand.dart';
 
 /// 「液态玻璃保持一致」这条要求没法用截图断言，但它的**结构性前提**可以：
 ///
@@ -75,21 +76,99 @@ void main() {
     expect(native, contains('g_glass_blur'));
   });
 
-  test(
-    'player dock draws a full-bleed progress bar without a backdrop plate',
-    () {
-      final native = File('windows/native_player/main.cpp').readAsStringSync();
-      // 进度条通屏：从 0 画到窗口宽度。
-      expect(
-        native,
-        contains('graphics.DrawLine(&track, 0.0f, kSeekLineY, width'),
-      );
-      // 控件条铺满整个客户区宽度（不再是居中 1040）。
-      expect(native, contains('std::max(240, client_width)'));
-      // 没有那道 10→124 的整块压暗（用户看到的「控件背景框」）。
-      expect(native, isNot(contains('Gdiplus::Color(124, 6, 7, 10)')));
-      // 按钮底是常驻的玻璃圆片。
-      expect(native, contains('GlassDiscAlpha'));
-    },
-  );
+  test('native glass panel routes secondary text through contrast outline', () {
+    final native = File('windows/native_player/main.cpp').readAsStringSync();
+    expect(native, contains('constexpr float outline = 0.7f;'));
+    expect(
+      RegExp(r'DrawGlassText\(graphics, item\.detail\.c_str\(\)')
+          .allMatches(native)
+          .length,
+      greaterThanOrEqualTo(2),
+    );
+    expect(
+      native,
+      contains('DrawGlassText(graphics, item.label.c_str(), skin.note'),
+    );
+  });
+
+  test('shared glass keeps readable contrast over bright artwork', () {
+    expect(YingjiGlass.surface().a, inInclusiveRange(.07, .18));
+    expect(YingjiGlass.chrome().a, inInclusiveRange(.11, .24));
+    expect(YingjiGlass.hud().a, inInclusiveRange(.14, .30));
+    expect(YingjiGlass.vibrancy, inInclusiveRange(1.2, 1.5));
+  });
+
+  test('shared glass edge stays aligned to physical pixels', () {
+    final brand = File('lib/src/brand.dart').readAsStringSync();
+    final shell = File('lib/src/media_center.dart').readAsStringSync();
+    expect(brand, contains('final strokeWidth = 1 / devicePixelRatio;'));
+    expect(brand, contains('..isAntiAlias = true'));
+    expect(brand, contains('scale: _pressed ? MovaMotion.pressScaleIcon : 1'));
+    expect(
+      shell,
+      isNot(contains('color: Colors.black.withValues(alpha: .58)')),
+    );
+  });
+
+  test('player dock draws a full-bleed progress bar without a backdrop plate', () {
+    final native = File('windows/native_player/main.cpp').readAsStringSync();
+    // 进度条通屏：从 0 画到窗口宽度。
+    expect(
+      native,
+      contains('graphics.DrawLine(&track, 0.0f, kSeekLineY, width'),
+    );
+    // 控件条铺满整个客户区宽度（不再是居中 1040）。
+    expect(native, contains('std::max(240, client_width)'));
+    // 没有那道 10→124 的整块压暗（用户看到的「控件背景框」）。
+    expect(native, isNot(contains('Gdiplus::Color(124, 6, 7, 10)')));
+    // 按钮底是常驻的玻璃圆片。
+    expect(native, contains('GlassDiscAlpha'));
+    // 顶栏与控制条是独立 layered window，采样前必须同步各自的屏幕原点；
+    // 否则会从视频错误位置取色，中央按钮就会整排漂成灰白色。
+    expect(native, contains('void SyncGlassWindowOrigin(HWND window)'));
+    expect(
+      RegExp(r'SyncGlassWindowOrigin\(window\);').allMatches(native).length,
+      greaterThanOrEqualTo(2),
+    );
+    expect(native, contains('(g_controls && IsWindowVisible(g_controls))'));
+    expect(native, contains('(g_top_bar && IsWindowVisible(g_top_bar))'));
+    // 中央播放键和失败后的重播入口也必须取实时背板，不能各自画实心圆或静态渐变。
+    expect(native, contains('FillGlassSurface(graphics, play_path'));
+    expect(native, contains('FillGlassSurface(graphics, replay_path'));
+    expect(
+      native,
+      isNot(
+        matches(
+          RegExp(
+            r'graphics\.FillEllipse\(\s*&white,\s*Gdiplus::RectF\(center - 24',
+          ),
+        ),
+      ),
+    );
+    // 背景通过路径抗锯齿填充，避免图片硬裁切与播放键重叠光圈。
+    expect(native, contains('graphics.FillPath(&backdrop, &path)'));
+    expect(native, isNot(contains('const float glow_size')));
+    // 原生降采样已经自带低通，不能再按完整 DPI 强度把视频颜色洗成灰块。
+    expect(native, contains('g_glass_blur.load() * 0.55'));
+    // 弹幕和 mpv 字幕都要避开播放器自己的顶部、底部控制区域。
+    expect(native, contains('origin.y + safe_top'));
+    expect(native, contains('SetOption(g_handle, "sub-pos", "84")'));
+    // 截图和模糊在后台连续产帧，UI 帧循环只消费完成帧，不能再同步调用采集。
+    expect(native, contains('std::thread glass_backdrop'));
+    expect(
+      native,
+      contains('constexpr ULONGLONG kGlassBackdropRefreshMs = 16;'),
+    );
+    expect(native, contains('constexpr int kGlassDownscale = 6;'));
+    expect(native, contains('Sleep(1);'));
+    expect(native, contains('bool CaptureGlassLayer('));
+    expect(native, isNot(contains('HDC screen = GetDC(nullptr);')));
+    expect(native, contains('const std::array<HWND, 4> windows'));
+    expect(native, contains('PrintWindow(g_window'));
+    expect(native, contains('g_backdrop.captured_at.load()'));
+    expect(
+      RegExp(r'UpdateGlassBackdrop\(false\);').allMatches(native).length,
+      1,
+    );
+  });
 }

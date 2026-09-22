@@ -7,7 +7,7 @@ import 'package:yingji/src/brand.dart';
 /// 不允许再出现写死的 sigma（否则拖滑杆时一部分面板不动，看着像坏了）。
 void main() {
   test('appearance blur feeds the glass material', () {
-    addTearDown(() => yingjiAppearance.apply(glassBlur: 24));
+    addTearDown(() => yingjiAppearance.apply(glassBlur: 30));
     yingjiAppearance.apply(glassBlur: 0);
     expect(YingjiGlass.blur, 0);
     yingjiAppearance.apply(glassBlur: 40);
@@ -20,7 +20,7 @@ void main() {
   });
 
   test('changing blur notifies the app shell', () {
-    addTearDown(() => yingjiAppearance.apply(glassBlur: 24));
+    addTearDown(() => yingjiAppearance.apply(glassBlur: 30));
     var calls = 0;
     void listener() => calls++;
     yingjiAppearance.addListener(listener);

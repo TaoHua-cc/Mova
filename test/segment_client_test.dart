@@ -1,11 +1,66 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
-import 'package:yingji/src/player/segment_client.dart';
+import 'package:yingji/src/player/playback_segments.dart';
 import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  test('manual segment marks replace automatic values for the same kind', () {
+    final values = applyManualPlaybackSegments(
+      const [
+        PlaybackSegment(
+          type: PlaybackSegmentType.intro,
+          start: Duration(seconds: 10),
+          end: Duration(seconds: 90),
+          provider: 'IntroDB',
+        ),
+        PlaybackSegment(
+          type: PlaybackSegmentType.recap,
+          start: Duration.zero,
+          end: Duration(seconds: 10),
+          provider: 'server',
+        ),
+        PlaybackSegment(
+          type: PlaybackSegmentType.credits,
+          start: Duration(minutes: 42),
+          provider: 'server',
+        ),
+      ],
+      introEnd: const Duration(seconds: 73),
+      outroStart: const Duration(minutes: 40),
+    );
+
+    expect(
+      values.where((item) => item.type == PlaybackSegmentType.intro),
+      hasLength(1),
+    );
+    expect(values.first.end, const Duration(seconds: 73));
+    expect(values.first.provider, '手动设置');
+    expect(
+      values
+          .singleWhere((item) => item.type == PlaybackSegmentType.credits)
+          .start,
+      const Duration(minutes: 40),
+    );
+    expect(
+      values.any((item) => item.type == PlaybackSegmentType.recap),
+      isTrue,
+    );
+  });
+
+  test('manual segment preference key is stable per episode', () {
+    const query = PlaybackSegmentQuery(
+      tmdbId: 1396,
+      seasonNumber: 2,
+      episodeNumber: 3,
+    );
+    expect(
+      playbackSegmentPreferencePrefix(query),
+      'yingji.segment.manual.tmdb.1396.s2.e3',
+    );
+  });
+
   test('IntroDB parses the documented keyed segment response', () async {
     final client = SegmentClient(
       client: MockClient(

@@ -88,6 +88,59 @@ class PlaybackSegmentResult {
   final String? message;
 }
 
+String? playbackSegmentPreferencePrefix(PlaybackSegmentQuery query) {
+  final tmdbId = query.tmdbId;
+  final season = query.seasonNumber;
+  final episode = query.episodeNumber;
+  if (tmdbId != null && tmdbId > 0 && season != null && episode != null) {
+    return 'yingji.segment.manual.tmdb.$tmdbId.s$season.e$episode';
+  }
+  final source = query.sourceId;
+  final item = query.serverItemId;
+  if (source != null && source.isNotEmpty && item != null && item.isNotEmpty) {
+    return 'yingji.segment.manual.source.${Uri.encodeComponent(source)}.'
+        '${Uri.encodeComponent(item)}';
+  }
+  return null;
+}
+
+List<PlaybackSegment> applyManualPlaybackSegments(
+  List<PlaybackSegment> segments, {
+  Duration? introEnd,
+  Duration? outroStart,
+}) {
+  final result = segments
+      .where(
+        (segment) =>
+            !(introEnd != null && segment.type == PlaybackSegmentType.intro) &&
+            !(outroStart != null &&
+                segment.type == PlaybackSegmentType.credits),
+      )
+      .toList();
+  if (outroStart != null && outroStart > Duration.zero) {
+    result.insert(
+      0,
+      PlaybackSegment(
+        type: PlaybackSegmentType.credits,
+        start: outroStart,
+        provider: '手动设置',
+      ),
+    );
+  }
+  if (introEnd != null && introEnd > Duration.zero) {
+    result.insert(
+      0,
+      PlaybackSegment(
+        type: PlaybackSegmentType.intro,
+        start: Duration.zero,
+        end: introEnd,
+        provider: '手动设置',
+      ),
+    );
+  }
+  return result;
+}
+
 /// 按设置里勾选的来源拉取片头片尾，去重后返回。
 ///
 /// 顺序即优先级：服务器自己的数据（原生分段 / 章节）最可信，公共库只作补充。

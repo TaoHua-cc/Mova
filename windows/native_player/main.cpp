@@ -258,11 +258,24 @@ std::unordered_map<int, std::string> g_shortcuts;
 // 统一帧率：播放器内的控件动画与弹幕都跑在 60fps 上，与应用（Flutter）界面
 // 的刷新节奏一致。定时器只负责「叫醒」，动画一律按经过时间推进，因此帧率
 // 变化时动画时长不变，只是更平滑。
-constexpr int kFrameIntervalMs = 16;  // ≈62.5fps，对齐 60fps 的显示刷新
+//
+// ⚠️ 这个 16ms **只作为拿不到刷新周期时的兜底**，不再是主路径。
+// 它曾经被当成「对齐 60fps 的显示刷新」，而 16ms 是 62.5Hz —— 与 60Hz 的
+// 16.667ms 也差 4%，在 170Hz 面板上（本机）更是差到 2.72 倍。后果不是「帧率
+// 低」，而是**每帧停留的刷新周期数不是整数**：170/61.3 = 2.77 → 77% 的帧停留
+// 3 个周期、23% 停留 2 个 → 屏幕上看得见的位移步长在 3:2 之间交替，约 14 次/秒。
+// 均值 / late20 / late33 都正常，所以这个缺陷以前一直量不出来。
+// 见 docs/specs/2026-09-22-danmaku-frame-pacing.md。
+constexpr int kFrameIntervalMs = 16;
 // 上一帧的时刻（QPC 毫秒）。动画按「经过时间」推进，所以这个差值必须是高精度
 // 的：GetTickCount64（粒度 15.6ms）会让每帧的 dt 在 0 / 15.6 / 31.2ms 之间跳，
 // 转圈和淡出看起来就是一下一下顿着走。
 double g_last_frame_ms = 0.0;
+// 面板一个刷新周期的毫秒数（由 DwmGetCompositionTimingInfo 取，失败退回
+// EnumDisplaySettings 的标称值）。0 = 没拿到，退回 kFrameIntervalMs 的定时器。
+double g_refresh_period_ms = 0.0;
+// 每几个刷新周期出一帧（一个 tick = divisor × 刷新周期）。0 = 未启用节拍时钟。
+int g_frame_divisor = 0;
 bool g_danmaku_enabled = false;
 // 弹幕由应用侧拉取后写入临时文本文件，原生侧读入并在视频之上叠加渲染。
 std::wstring g_danmaku_path;
@@ -295,10 +308,11 @@ std::wstring g_danmaku_error;    // 失败原因
 // 变的只有位置。位图里的透明度按「满不透明」画，整体的不透明度由每帧的
 // SourceConstantAlpha 施加，这样改「不透明度」不必重新栅格化。
 struct DanmakuTexture {
-  HDC dc = nullptr;
-  HBITMAP bitmap = nullptr;
-  HGDIOBJ previous = nullptr;
-  BYTE* bits = nullptr;
+  static constexpr int kPhases = 4;
+  std::array<HDC, kPhases> dc{};
+  std::array<HBITMAP, kPhases> bitmap{};
+  std::array<HGDIOBJ, kPhases> previous{};
+  std::array<BYTE*, kPhases> bits{};
   int width = 0;
   int height = 0;
 
@@ -307,8 +321,6 @@ struct DanmakuTexture {
   bool Create(int w, int h) {
     Destroy();
     if (w <= 0 || h <= 0) return false;
-    dc = CreateCompatibleDC(nullptr);
-    if (!dc) return false;
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = w;
@@ -316,28 +328,39 @@ struct DanmakuTexture {
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
-    void* raw = nullptr;
-    bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &raw, nullptr, 0);
-    if (!bitmap || !raw) {
-      Destroy();
-      return false;
+    for (int phase = 0; phase < kPhases; ++phase) {
+      dc[phase] = CreateCompatibleDC(nullptr);
+      if (!dc[phase]) {
+        Destroy();
+        return false;
+      }
+      void* raw = nullptr;
+      bitmap[phase] =
+          CreateDIBSection(dc[phase], &info, DIB_RGB_COLORS, &raw, nullptr, 0);
+      if (!bitmap[phase] || !raw) {
+        Destroy();
+        return false;
+      }
+      previous[phase] = SelectObject(dc[phase], bitmap[phase]);
+      bits[phase] = static_cast<BYTE*>(raw);
+      memset(bits[phase], 0, static_cast<size_t>(w) *
+                                     static_cast<size_t>(h) * 4);
     }
-    previous = SelectObject(dc, bitmap);
-    bits = static_cast<BYTE*>(raw);
     width = w;
     height = h;
-    memset(bits, 0, static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
     return true;
   }
 
   void Destroy() {
-    if (dc && previous) SelectObject(dc, previous);
-    previous = nullptr;
-    if (bitmap) DeleteObject(bitmap);
-    bitmap = nullptr;
-    if (dc) DeleteDC(dc);
-    dc = nullptr;
-    bits = nullptr;
+    for (int phase = 0; phase < kPhases; ++phase) {
+      if (dc[phase] && previous[phase]) SelectObject(dc[phase], previous[phase]);
+      previous[phase] = nullptr;
+      if (bitmap[phase]) DeleteObject(bitmap[phase]);
+      bitmap[phase] = nullptr;
+      if (dc[phase]) DeleteDC(dc[phase]);
+      dc[phase] = nullptr;
+      bits[phase] = nullptr;
+    }
     width = 0;
     height = 0;
   }
@@ -421,6 +444,89 @@ double g_danmaku_gap_sum_ms = 0.0;
 int g_danmaku_gap_count = 0;
 int g_danmaku_gap_late20 = 0;
 int g_danmaku_gap_late33 = 0;
+// 「相邻两帧之间隔了几个刷新周期」的分布（只在拿到刷新周期时统计）。
+//
+// 这是唯一能直接判「平滑」的指标：均值 / late20 / late33 只说明「平均出够
+// 帧数」，看不出**每帧被显示的时长是否相等**。理想是全部落在同一个整数拍数上
+// （现在恒定 divisor 拍，本机 170Hz/divisor=2 → 全部落 2 拍）。
+// 下标含义：`[1]`=1 拍、`[2]`=2 拍、`[3]`=3 拍、`[4]`=**≥4 拍**（兜底档）。
+int g_danmaku_dwell[5] = {0, 0, 0, 0, 0};
+
+// DWM 自报的合成节奏（rateCompose，毫秒）与它报的刷新周期。
+//
+// `qpcRefreshPeriod` 是**面板能多快**，`rateCompose` 是**DWM 打算跑多快** ——
+// 两者可以不一样：DWM 在合成预算不够时会自行降频。实测过一轮：本机
+// compose=5.88ms（≈169Hz，与面板一致），说明节拍问题**不在 DWM 的目标节奏**，
+// 而在 DwmFlush 的返回本身会漏拍（fhist 实测 [30,29,1,0]）—— 否则会误判成
+// 「DWM 被降到 124Hz」而去调根本没错的合成设置。
+//
+// 注意别再往这里加 `cFrameDisplayed` 算实测 fps：本机这个计数不推进（恒为 0），
+// 算出来永远是 0，看上去像「合成器没在合成」，反而误导。
+double g_dwm_compose_ms = 0.0;
+double g_dwm_refresh_ms = 0.0;
+
+// ---- 节拍时钟：高精度固定周期定时器 ----
+//
+// 见 docs/specs/2026-09-22-danmaku-frame-pacing.md。**不要**改回「每轮 DwmFlush
+// 计满 divisor 拍」：实测 DwmFlush 的返回本身就在 1 拍 / 2 拍之间跳
+// （`fhist=[30,29,1,0]`），把 tick 挂在它上面等于把这份抖动直接搬进 paint 间隔，
+// 落成 2/3/4 拍的不规则混合（`dwell=[6,9,24,21]`，只有 4–8.5% 恰好 1 拍）。
+//
+// 唯一能给出**均匀 dwell** 的是与面板成精确整数比的固定周期时钟：
+// `divisor × 刷新周期`（170Hz、divisor=2 → 11.7647ms）能精确表达成 100ns 的
+// 117647 个单位，配上 CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 就有亚毫秒精度。
+HANDLE g_pacing_timer = nullptr;
+double g_pacing_period_ms = 0.0;  ///< 一个 tick = divisor × 刷新周期
+double g_pacing_anchor_ms = 0.0;  ///< tick 绝对日程的原点
+long long g_pacing_tick = 0;      ///< 已经排到第几个 tick
+// 实测 tick 间隔（均值 / 次数）。
+//
+// `dwell` 量的是**绘制**间隔，正常情况下两者应当一致；一旦不一致，说明
+// 「画的次数」和「节拍的次数」对不上（重复绘制 / 漏 tick），这时只盯 dwell 会查错方向。
+double g_tick_last_ms = 0.0;
+double g_tick_sum_ms = 0.0;
+int g_tick_count = 0;
+
+// 上面那三个只有**均值**，而均值对「每拍时长不等」是全盲的：1 拍 + 3 拍交替，
+// 均值照样是 2 拍。所以再补一份**节拍间隔的分布**，和 `g_danmaku_dwell`（绘制
+// 间隔分布）配对读：
+//
+//   * 两者都塌在 divisor 拍   → 真的锁住了；
+//   * 节拍分布就是散的         → 定时器 / 主循环调度的问题，改绘制没用；
+//   * 节拍整齐、绘制是散的     → tick 没问题，是**绘制被推迟**（WM_PAINT 是低
+//     优先级消息，要等消息队列排空才派发，相位于是跟着消息负载漂）。
+//
+// 2026-09-22 加这一对，正是因为只看到「均值 = 11.76ms 达标」就把 1/3 拍交替
+// 当成正常了。下标同 g_danmaku_dwell：`[1..3]`=1/2/3 拍，`[4]`=≥4 拍。
+int g_tick_dwell[5] = {0, 0, 0, 0, 0};
+double g_tick_gap_max = 0.0;
+// 绘制相对**本拍 tick 时刻**滞后多少（均值 / 极差）。tick 整齐而 dwell 散时，
+// 滞后极差就是「paint 相位在漂」的直接证据。
+double g_paint_phase_sum_ms = 0.0;
+double g_paint_phase_min_ms = 0.0;
+double g_paint_phase_max_ms = 0.0;
+int g_paint_phase_count = 0;
+double g_tick_now_ms = 0.0;  ///< 最近一次 tick 的时刻（算 paint 相位用）
+// 主等待返回「有消息」而不是「定时器到点」的次数。
+//
+// `MsgWaitForMultipleObjects` 返回索引 1 时**不会**复位定时器 —— 定时器保持
+// 已触发状态，下一轮立即再返回一次索引 0，于是出现「一个短间隔 + 一个长间隔」
+// 的交替。这个计数非零且与 tick 数同量级时，就是它。
+int g_msg_wakes = 0;
+
+double QpcToMs(long long qpc) {
+  static const double k_frequency = [] {
+    LARGE_INTEGER value{};
+    QueryPerformanceFrequency(&value);
+    return static_cast<double>(value.QuadPart);
+  }();
+  return k_frequency > 0.0 ? static_cast<double>(qpc) * 1000.0 / k_frequency
+                           : 0.0;
+}
+
+// SampleCompositionTiming 的定义放在文件靠后的 NowMs 旁边 —— 它要用 NowMs，
+// 而两者都在同一个匿名命名空间里。**不要**在这里写一句 `double NowMs();` 了事：
+// 块作用域里的函数声明会落到**全局**命名空间，编译能过、链接必报 LNK2019。
 int g_danmaku_frames = 0;
 // 累计贴过多少帧（不受诊断窗口 60 帧的重置影响），用于挑「铺满之后」的稳态时刻
 // 导出弹幕层位图。
@@ -586,24 +692,24 @@ constexpr float kUiDesignWidth = 1280.0f;
 constexpr float kUiDesignHeight = 760.0f;
 constexpr float kUiMinScale = 0.55f;
 constexpr float kUiMaxScale = 1.25f;
-float g_ui_scale = 1.0f;
+std::atomic<float> g_ui_scale{1.0f};
 
-float UiScale() { return g_ui_scale; }
+float UiScale() { return g_ui_scale.load(); }
 
 int Scaled(int value) {
   return static_cast<int>(std::lround(static_cast<double>(value) *
-                                      g_ui_scale));
+                                      UiScale()));
 }
 
-float ScaledF(float value) { return value * g_ui_scale; }
+float ScaledF(float value) { return value * UiScale(); }
 
 // 由主窗口客户区推导缩放系数，取宽高比例中较小者，保证小维度也放得下。
 void UpdateUiScale(const RECT& client) {
   const float width = static_cast<float>(client.right - client.left);
   const float height = static_cast<float>(client.bottom - client.top);
-  g_ui_scale = std::clamp(std::min(width / kUiDesignWidth,
-                                   height / kUiDesignHeight),
-                          kUiMinScale, kUiMaxScale);
+  g_ui_scale.store(std::clamp(std::min(width / kUiDesignWidth,
+                                       height / kUiDesignHeight),
+                              kUiMinScale, kUiMaxScale));
 }
 
 // 弹出菜单的度量与 Flutter 弹窗对齐：卡片式行、12px 圆角、图标容器 34px。
@@ -618,7 +724,6 @@ constexpr int kPanelShadowMargin = 26;
 // 玻璃表面那圈内描边的不透明度。面板与控件条共用同一个值 —— 此前控件条用的是
 // 76，白线叠在深色底上算出 103 的亮度，在一片 40 左右的深灰里就是一条刺眼的
 // 白条，而且和面板的 46 不同，两处描边看起来不是一套皮肤。
-constexpr BYTE kSurfaceEdgeAlpha = 46;
 // 剧集列表：一行一集，缩略图在左（16:9）、标题与副标题在右。此前是三列网格，
 // 卡片只有 186px 宽，「第 X 集 · 集名」几乎必然截断成省略号；一行一集后
 // 标题有整行可用，信息行也放得下「第 X 季 · 日期 · 时长」全串。
@@ -639,7 +744,7 @@ constexpr int kPanelResourceWidth = 430;
 //   * 基色 —— 取 `YingjiGlass.frost`（#14141A），而不是此前那块海军蓝
 //     (43,47,57)/(22,24,30)。偏蓝的近黑叠在白字幕上会发青，也是用户说
 //     「菜单是一块黑色背景」的来源之一。
-//   * 浓度 —— 应用侧 HUD 档是 .38（`YingjiGlass.hud()`），面板 / 提示对齐它；
+//   * 浓度 —— 与应用侧常规玻璃和 HUD 的两级透明度保持同一范围；
 //     整条曲线由「设置 → 外观 → 模糊程度」驱动（stdin 的
 //     `MOVA_APPLY=mova-glass-blur|<0-40>`）：模糊越大 → 玻璃越薄、越透。
 //   * 厚度 —— `YingjiGlass.depth` 那条「只沉底边」的渐变，**里面没有白色**：
@@ -647,53 +752,50 @@ constexpr int kPanelResourceWidth = 430;
 //   * 描边 —— 白 .16 的 1px 内描边（与 Dart 侧 `YingjiGlass.line()` 同值）。
 //
 // 默认 30 与 Dart 侧 `YingjiAppearance.glassBlur` 一致。
-double g_glass_blur = 30.0;
+std::atomic<double> g_glass_blur{30.0};
 
 /// 玻璃基色：与应用侧 `YingjiGlass.frost` 完全一致。
-constexpr BYTE kGlassFrostRed = 20;
-constexpr BYTE kGlassFrostGreen = 20;
-constexpr BYTE kGlassFrostBlue = 26;
+constexpr BYTE kGlassFrostRed = 247;
+constexpr BYTE kGlassFrostGreen = 250;
+constexpr BYTE kGlassFrostBlue = 255;
 
 /// 玻璃厚度 0.55 ~ 1.0；1.0 = 最透（模糊拉满）。
 float GlassLevel() {
-  const double blur = std::clamp(g_glass_blur, 0.0, 40.0);
+  const double blur = std::clamp(g_glass_blur.load(), 0.0, 40.0);
   return static_cast<float>(0.55 + 0.45 * (blur / 40.0));
 }
 
 /// 面板 / 提示这类大面积玻璃的底色。默认（30）给 97 → 87。
 ///
-/// 曾经是 247（97% 不透明）——那就是用户看到的「菜单是一块黑塑料」；后来降到 124
-/// （对齐应用侧 HUD 档再留余量），但真正缺的不是浓度而是**背板模糊**（见
-/// DrawGlassBackdrop）：没有那一层，同一套 frost 与应用里差的就是玻璃与塑料。
-/// 现在背板补上了，浓度就归位到应用侧 `YingjiGlass.hud()` 的 .38（97/255）—— 那
-/// 是应用为「压在视频上的浮层」定下的档，注释里写得很明白：.58 以上看着就是黑板。
+/// 这里只压一层约 30% 的中性基色；真正的材质来自背板模糊和连续光学曲线，
+/// 而不是把面板做成不透明深色板。
 ///
 /// 仍然跟着「设置 → 外观 → 模糊程度」走：模糊越弱，玻璃要越实才能压住背后那张
 /// 越来越清晰的画面。
 int GlassPanelAlpha(bool bottom) {
   const float level = GlassLevel();
-  const double base = 97.0 + (1.0 - level) * 26.0;
-  return static_cast<int>(std::lround(bottom ? base - 10.0 : base));
+  const double base = 16.0 + (1.0 - level) * 8.0;
+  return static_cast<int>(std::lround(bottom ? base + 3.0 : base));
 }
 
 /// 控件条 / 顶栏上的按钮圆片：面积小、常驻，做得很薄，画面透得最多。
 int GlassDiscAlpha(bool bottom) {
   const float level = GlassLevel();
-  const double base = 46.0 + (1.0 - level) * 26.0;
-  return static_cast<int>(std::lround(bottom ? base * .42 : base));
+  const double base = 9.0 + (1.0 - level) * 6.0;
+  return static_cast<int>(std::lround(bottom ? base + 2.0 : base));
 }
 
 /// 小面积但**带字**的玻璃（顶栏的网络胶囊）：比纯按钮圆片实一点，否则上面的
 /// 12px 数字压不住画面。
 int GlassChromeAlpha(bool bottom) {
   const float level = GlassLevel();
-  const double base = 64.0 + (1.0 - level) * 26.0;
-  return static_cast<int>(std::lround(bottom ? base * .58 : base));
+  const double base = 13.0 + (1.0 - level) * 7.0;
+  return static_cast<int>(std::lround(bottom ? base + 3.0 : base));
 }
 
 /// 图标阴影：控件条去掉底板之后，白色字形要靠这一层暗影才在亮画面上读得出来。
-constexpr float kGlyphShadowOffset = 1.2f;
-constexpr int kGlyphShadowAlpha = 158;
+constexpr float kGlyphShadowOffset = 1.0f;
+constexpr int kGlyphShadowAlpha = 118;
 
 // 背板模糊（原生侧的 BackdropFilter）—— 三个入口先声明在这里，实现在 PanelSurface
 // 之后（那边才有画板对象可用）：FillGlassSurface 要给玻璃铺背板，位置在这之前。
@@ -707,7 +809,7 @@ bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
 /// 面板、二级菜单、提示、悬浮气泡全部走它 —— 材质只有这一处定义，改一次全跟着
 /// 变，不会再出现「这个菜单改了、那个提示还是黑塑料」的割裂。
 ///
-/// `use_backdrop` 打开时先铺一层「被模糊、被提亮提饱和的背后画面」（见
+/// `use_backdrop` 打开时先铺一层「被模糊、轻微提饱和的背后画面」（见
 /// DrawGlassBackdrop）。这一层是不透明的，于是整块玻璃的合成变成
 /// `blur(背后) × (1−α) + frost × α` —— 与应用侧 `backdrop()` ＋ `surface()` 完全
 /// 同构。它不是「假透明」：真实的分层窗口透明度仍在（背板拿不到时就走原来的路），
@@ -716,7 +818,13 @@ void FillGlassSurface(Gdiplus::Graphics& graphics,
                       const Gdiplus::GraphicsPath& path,
                       const Gdiplus::RectF& rect, int top_alpha,
                       int bottom_alpha, bool use_backdrop = false) {
-  if (use_backdrop) DrawGlassBackdrop(graphics, path, rect);
+  const bool has_backdrop = use_backdrop && DrawGlassBackdrop(graphics, path, rect);
+  if (has_backdrop) {
+    // A restrained neutral tint keeps white text legible without washing out
+    // the video colours. Apply once per glass surface.
+    Gdiplus::SolidBrush tint(Gdiplus::Color(78, 12, 13, 15));
+    graphics.FillPath(&tint, &path);
+  }
   Gdiplus::LinearGradientBrush surface(
       Gdiplus::PointF(rect.X, rect.Y), Gdiplus::PointF(rect.X, rect.GetBottom()),
       Gdiplus::Color(static_cast<BYTE>(top_alpha), kGlassFrostRed,
@@ -724,24 +832,36 @@ void FillGlassSurface(Gdiplus::Graphics& graphics,
       Gdiplus::Color(static_cast<BYTE>(bottom_alpha), kGlassFrostRed,
                      kGlassFrostGreen, kGlassFrostBlue));
   graphics.FillPath(&surface, &path);
-  // 厚度：最后三分之一才微微沉下去（0x1C = 28 于最底边），上面全透明。
-  Gdiplus::LinearGradientBrush depth(
-      Gdiplus::PointF(rect.X, rect.Y + rect.Height * .62f),
+  // 一条覆盖完整高度的连续光学曲线。上一版把顶部反射和底部厚度分别限制在
+  // 局部区间，GDI+ 会把区间外颜色钳住，于是圆钮里出现两条硬横纹。
+  Gdiplus::LinearGradientBrush optics(
+      Gdiplus::PointF(rect.X, rect.Y),
       Gdiplus::PointF(rect.X, rect.GetBottom()), Gdiplus::Color(0, 0, 0, 0),
-      Gdiplus::Color(28, 0, 0, 0));
-  graphics.FillPath(&depth, &path);
+      Gdiplus::Color(0, 0, 0, 0));
+  Gdiplus::Color optical_colors[5] = {
+      Gdiplus::Color(13, 255, 255, 255),
+      Gdiplus::Color(5, 255, 247, 224), Gdiplus::Color(0, 255, 255, 255),
+      Gdiplus::Color(2, 130, 205, 255), Gdiplus::Color(4, 0, 0, 0)};
+  Gdiplus::REAL optical_positions[5] = {0.0f, 0.14f, 0.46f, 0.78f, 1.0f};
+  optics.SetInterpolationColors(optical_colors, optical_positions, 5);
+  graphics.FillPath(&optics, &path);
 }
 
 /// 玻璃的一圈内描边（白 .16）。面板、提示、气泡共用同一个值：以前面板 46、
 /// 控件条 76，同一屏里两圈线亮度不同，看着就不是一套皮肤。
 void StrokeGlassEdge(Gdiplus::Graphics& graphics,
                      const Gdiplus::GraphicsPath& path) {
-  Gdiplus::Pen edge(Gdiplus::Color(BYTE{kSurfaceEdgeAlpha}, 255, 255, 255),
-                    1.0f);
+  Gdiplus::RectF bounds;
+  path.GetBounds(&bounds);
+  Gdiplus::LinearGradientBrush light(
+      Gdiplus::PointF(bounds.X, bounds.Y),
+      Gdiplus::PointF(bounds.GetRight(), bounds.GetBottom()),
+      Gdiplus::Color(105, 255, 246, 222), Gdiplus::Color(28, 255, 255, 255));
+  Gdiplus::Pen edge(&light, 0.8f);
   graphics.DrawPath(&edge, &path);
 }
 
-/// 玻璃上的文字：先垫一层 1px 暗影再写字。
+/// 玻璃上的文字：先垫一层轻薄暗色轮廓再写字。
 ///
 /// 原生没有背板模糊，玻璃一透，白字压到亮画面上就糊了 —— 这层暗影就是应用侧那个
 /// `BackdropFilter` 的替身（控件条去掉底板后给字形垫的也是它）。
@@ -751,60 +871,60 @@ void DrawGlassText(Gdiplus::Graphics& graphics, const wchar_t* text,
                    const Gdiplus::Brush& brush,
                    BYTE shadow_alpha = kGlyphShadowAlpha) {
   Gdiplus::SolidBrush shade(Gdiplus::Color(shadow_alpha, 0, 0, 0));
-  graphics.DrawString(text, -1, &font,
-                      Gdiplus::RectF(box.X, box.Y + kGlyphShadowOffset,
-                                     box.Width, box.Height),
-                      &format, &shade);
+  constexpr float outline = 0.7f;
+  for (const Gdiplus::PointF offset :
+       {Gdiplus::PointF(-outline, 0), Gdiplus::PointF(outline, 0),
+        Gdiplus::PointF(0, -outline), Gdiplus::PointF(0, outline)}) {
+    graphics.DrawString(
+        text, -1, &font,
+        Gdiplus::RectF(box.X + offset.X, box.Y + offset.Y, box.Width,
+                       box.Height),
+        &format, &shade);
+  }
   graphics.DrawString(text, -1, &font, box, &format, &brush);
 }
 
 // ------------------------------------------- 背板模糊（原生侧的 BackdropFilter）
 //
 // 原生没有 `BackdropFilter`：分层窗口只能「透」，不能「糊」。而应用里那层液态玻璃
-// 有一半的质感来自**背后那张被模糊、被提亮、被提饱和的画面**
+// 有一半的质感来自**背后那张被模糊、轻微提饱和的画面**
 // （`YingjiGlass.backdrop()`）—— 少了它，同一支 frost 基色、同一个浓度，在应用里
 // 是玻璃，在播放器里就是一块黑板。这里把缺的那半块补上：抓一帧背后的画面，降采样
-// ＋三次盒式模糊近似高斯＋提亮提饱和，画在 frost 底下。
+// ＋三次盒式模糊近似高斯＋轻微提饱和，画在 frost 底下。
 //
-// 抓的是 `PrintWindow(播放器窗口)`，不是屏幕 BitBlt：控件条、顶栏、面板、提示都是
-// **独立的顶层 layered 窗口**，PrintWindow 只画播放器窗口本身，所以菜单开着的时候
-// 重抓也不会把自己的玻璃拍进去（屏幕抓屏会），背板因此可以定期刷新 —— 玻璃里的
-// 画面跟着视频动，而不是开菜单那一刻的一张死图。
+// 从播放器 HWND 获取视频源，再裁切可见玻璃区域；不从桌面抓取自己的浮层，
+// 避免菜单反复进入背板造成白色残影。CPU 采集仍受窗口尺寸与驱动影响。
 //
-// `PW_RENDERFULLCONTENT` 不能省：mpv 的画面是 D3D11 交换链出来的，普通 PrintWindow
-// 只能拿到一块黑（`tool/probe_backdrop_capture.py` 量过：screen BitBlt 与
-// PrintWindow 都拿得到活画面，各约 17ms）。
-#ifndef PW_RENDERFULLCONTENT
-#define PW_RENDERFULLCONTENT 0x00000002
-#endif
-
-/// 背板刷新间隔。玻璃里的画面比现实慢一点点没关系（本来就糊了），但不能慢到看得出
-/// 停顿。4Hz 的延迟在一个视频帧的量级，而一次采集＋模糊＋放大约 35ms。
-constexpr ULONGLONG kGlassBackdropRefreshMs = 260;
-/// 模糊在 1/4 尺寸上做：代价降到 1/16，再放大回去。降采样本身（HALFTONE 取的是
-/// 4x4 均值）已经是一层模糊，盒式模糊只负责把半径补到「模糊程度」那一档。
-constexpr int kGlassDownscale = 4;
+/// 最小采样间隔，不代表实际达到 60 FPS；实际速率受采集耗时限制。
+constexpr ULONGLONG kGlassBackdropRefreshMs = 16;
+/// 模糊在 1/6 尺寸上做：像素量只有原图的 1/36，给 60Hz 采集留出
+/// CPU 预算。HALFTONE 降采样已经提供一层低通，对最终本就需要强模糊的玻璃不会
+/// 损失可见细节。
+constexpr int kGlassDownscale = 6;
 /// 盒式模糊的遍数（三次已经足够接近高斯，再多只是更贵）。
 constexpr int kGlassBlurPasses = 3;
-/// 背板的最低平均亮度：低于它就是「后面根本没有画面」（黑屏、还没出帧、窗口被独占
-/// 挡住），这时候不做背板、退回真透明的玻璃。真实影片里最暗的夜景也在 20 以上，
-/// 只有纯黑才够得着这个门槛。
-constexpr double kGlassBackdropMinLuma = 6.0;
+
+struct GlassLayer {
+  HWND window = nullptr;
+  // 成员别叫 small：`rpcndr.h` 里有 `#define small char`。
+  PanelSurface* reduced = nullptr;       ///< UI 线程只读的最新完成帧
+  PanelSurface* reduced_back = nullptr;  ///< 后台线程写入的下一帧
+  std::vector<BYTE> scratch;
+  int source_width = 0;
+  int source_height = 0;
+  int origin_x = 0;
+  int origin_y = 0;
+  bool ready = false;
+};
 
 struct GlassBackdrop {
-  PanelSurface* full = nullptr;   ///< 全窗尺寸的模糊背板，绘制时 1:1 取子矩形
-  // 成员别叫 small：`rpcndr.h` 里有 `#define small char`，用了会变成
-  // `PanelSurface* char` 直接编译不过（/WX 下 C2238 甩你一屏）。
-  PanelSurface* reduced = nullptr;  ///< 1/4 尺寸的中间图（降采样后在这上面糊）
-  std::vector<BYTE> scratch;        ///< 盒式模糊的中间缓冲
-  int origin_x = 0;               ///< full 的 (0,0) 对应的屏幕坐标
-  int origin_y = 0;
-  ULONGLONG captured_at = 0;   ///< 最后一次「成功」采集的 tick（决定图有多新）
+  PanelSurface* video = nullptr;  ///< 仅播放器窗口的画面，不含独立浮层
+  std::array<GlassLayer, 4> layers{};
+  std::mutex mutex;                      ///< 只保护前后帧交换与读取
+  std::atomic<ULONGLONG> captured_at{0};
   // 「最后一次尝试」的 tick，成功失败都记。失败（黑屏 / 抓不动）时如果只看
-  // captured_at，节流条件永远不满足 —— 每个 16ms 的帧都白抓一次 40ms 的整窗截图，
-  // 播放直接卡住。失败也要进节流。
+  // captured_at，节流条件永远不满足，会在失败时空转。失败也要进节流。
   ULONGLONG attempted_at = 0;
-  bool ready = false;
 };
 
 GlassBackdrop g_backdrop;
@@ -812,6 +932,14 @@ GlassBackdrop g_backdrop;
 /// 正在绘制的这块玻璃所在窗口的客户区 (0,0) 在屏幕上的位置。设计稿矩形要映射回
 /// 背板的像素就靠它 —— 每个窗口在开画前设一次（面板与提示各一处）。
 POINT g_glass_window_origin{0, 0};
+
+void SyncGlassWindowOrigin(HWND window) {
+  RECT frame{};
+  if (window && GetWindowRect(window, &frame)) {
+    g_glass_window_origin.x = frame.left;
+    g_glass_window_origin.y = frame.top;
+  }
+}
 
 // 弹窗的锚点。此前调用方只传一个 y，且底部控件条也复用顶栏那个客户区 y=40 的
 // 常量，于是「面板底边 = 锚点 y − 内容高 − 8」算出来的位置落在窗口之外，被夹到
@@ -1164,12 +1292,13 @@ bool SegmentActive(const SegmentItem& segment, double position, double duration)
   const double end = SegmentEnd(segment);
   if (end <= segment.start) return false;
   if (position < segment.start || position >= end) return false;
-  // 数据体检：片头类的片段必须落在前半段、片尾必须落在后半段。公共库偶尔
-  // 会把整集标成片头、或者把一个错的时间点当片尾，照着跳会直接跳到结尾。
-  if (segment.kind == SegmentKind::credits) {
-    if (duration <= 0 || segment.start < duration * 0.5) return false;
-  } else if (duration > 0 && segment.start > duration * 0.5) {
-    return false;
+  // 公共数据需要体检；用户手动标记是明确指令，不应用启发式规则否决。
+  if (segment.provider != L"手动设置") {
+    if (segment.kind == SegmentKind::credits) {
+      if (duration <= 0 || segment.start < duration * 0.5) return false;
+    } else if (duration > 0 && segment.start > duration * 0.5) {
+      return false;
+    }
   }
   return true;
 }
@@ -1924,6 +2053,35 @@ void ShowSegmentMenu(PanelAnchor anchor) {
                            : L"已关闭 · 点按开启",
       "mova-auto-skip-segments", g_auto_skip_segments ? "false" : "true", "",
       g_auto_skip_segments));
+  const double position = std::max(0.0, g_position.load());
+  items.push_back(PanelOption(
+      kGlyphScissors, L"将当前位置设为片头结束",
+      L"当前 " + ClockLabel(position) + L" · 手动设置优先于自动来源",
+      "mova-segment-mark", "intro", "片头结束已保存", false));
+  items.push_back(PanelOption(
+      kGlyphBookmark, L"将当前位置设为片尾开始",
+      L"当前 " + ClockLabel(position) + L" · 手动设置优先于自动来源",
+      "mova-segment-mark", "outro", "片尾开始已保存", false));
+  const bool manual_intro = std::any_of(
+      segments.begin(), segments.end(), [](const SegmentItem& segment) {
+        return segment.kind == SegmentKind::intro &&
+               segment.provider == L"手动设置";
+      });
+  const bool manual_outro = std::any_of(
+      segments.begin(), segments.end(), [](const SegmentItem& segment) {
+        return segment.kind == SegmentKind::credits &&
+               segment.provider == L"手动设置";
+      });
+  if (manual_intro) {
+    items.push_back(PanelOption(kGlyphInfo, L"清除手动片头结束",
+                                L"恢复使用自动来源", "mova-segment-clear",
+                                "intro", "手动片头已清除", false));
+  }
+  if (manual_outro) {
+    items.push_back(PanelOption(kGlyphInfo, L"清除手动片尾开始",
+                                L"恢复使用自动来源", "mova-segment-clear",
+                                "outro", "手动片尾已清除", false));
+  }
   if (g_segments_loading) {
     items.push_back(PanelNote(kGlyphInfo, L"正在按设置里的来源获取…"));
   } else if (!g_segments_error.empty()) {
@@ -2315,6 +2473,46 @@ void ConfigureControlPen(Gdiplus::Pen& pen) {
   pen.SetLineJoin(Gdiplus::LineJoinRound);
 }
 
+void ApplyManualSegmentMark(const std::string& kind, double seconds) {
+  const SegmentKind target =
+      kind == "outro" ? SegmentKind::credits : SegmentKind::intro;
+  std::lock_guard<std::mutex> guard(g_segments_mutex);
+  g_segments.erase(
+      std::remove_if(g_segments.begin(), g_segments.end(),
+                     [target](const SegmentItem& segment) {
+                       return segment.kind == target;
+                     }),
+      g_segments.end());
+  if (seconds <= 0) return;
+  SegmentItem manual;
+  manual.kind = target;
+  manual.start = target == SegmentKind::intro ? 0.0 : seconds;
+  manual.end = target == SegmentKind::intro ? seconds : -1.0;
+  manual.provider = L"手动设置";
+  g_segments.insert(g_segments.begin(), std::move(manual));
+}
+
+void EmitSegmentMark(const std::string& kind, double seconds) {
+  char text[160]{};
+  const int length = std::snprintf(
+      text, sizeof(text), "MOVA_SEGMENT_MARK=%s|%lld|%.3f\r\n",
+      kind.c_str(), static_cast<long long>(g_playlist_position.load()), seconds);
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+    DWORD written = 0;
+    WriteFile(output, text, static_cast<DWORD>(length), &written, nullptr);
+  }
+}
+
+void ConfigureGlassGraphics(Gdiplus::Graphics& graphics) {
+  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+  // Match sRGB UI alpha compositing; gamma-correct white overlays look milky.
+  graphics.SetCompositingQuality(Gdiplus::CompositingQualityAssumeLinear);
+  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+  graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+}
+
 Gdiplus::Color IconInk(float emphasis = 0.0f, BYTE alpha = 242) {
   const BYTE red = static_cast<BYTE>(245 - emphasis * 18.0f);
   const BYTE green = static_cast<BYTE>(245 - emphasis * 5.0f);
@@ -2437,7 +2635,7 @@ void DrawPlayIcon(Gdiplus::Graphics& graphics, float x, float y,
                   float play_amount, float emphasis) {
   const wchar_t glyph = play_amount > 0.5f ? L'\xEE64' : L'\xEE44';
   DrawIconsaxGlyph(graphics, glyph, x, y, 25.0f + emphasis,
-                   Gdiplus::Color(255, 18, 18, 20));
+                   IconInk(emphasis), false, true);
 }
 
 void DrawSpeaker(Gdiplus::Graphics& graphics, float x, float y, bool muted,
@@ -2799,6 +2997,10 @@ ControlId HitControl(int x, int y, int width) {
   return kNone;
 }
 
+void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect,
+                        float radius);
+Gdiplus::RectF PixelSnapRect(const Gdiplus::RectF& rect, float inset);
+
 // 控件条上的按钮底：一片**常驻**的液态玻璃圆片。
 //
 // 之前静止时不画（只有一个图标漂在画面上），悬停才冒出一个蓝圈 —— 拖「模糊
@@ -2807,26 +3009,21 @@ ControlId HitControl(int x, int y, int width) {
 void DrawHover(Gdiplus::Graphics& graphics, ControlId id, float x, float y,
                float size = 38) {
   const float amount = HoverAmount(id);
-  const Gdiplus::RectF disc(x - size / 2, y - size / 2, size, size);
-  Gdiplus::LinearGradientBrush glass(
-      Gdiplus::PointF(disc.X, disc.Y),
-      Gdiplus::PointF(disc.X, disc.Y + disc.Height),
-      Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(false)), kGlassFrostRed,
-                     kGlassFrostGreen, kGlassFrostBlue),
-      Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(true)), kGlassFrostRed,
-                     kGlassFrostGreen, kGlassFrostBlue));
-  graphics.FillEllipse(&glass, disc);
+  const Gdiplus::RectF disc =
+      PixelSnapRect(Gdiplus::RectF(x - size / 2, y - size / 2, size, size),
+                    0.5f);
+  Gdiplus::GraphicsPath disc_path;
+  AddRoundedRectPath(disc_path, disc, disc.Width / 2.0f);
+  FillGlassSurface(graphics, disc_path, disc, GlassDiscAlpha(false),
+                   GlassDiscAlpha(true), true);
+  StrokeGlassEdge(graphics, disc_path);
   if (amount <= 0.001f) return;
   // 悬停：只是把这层玻璃点亮（叠一层极淡的白），不换形状、不跳位。
   // 点亮色必须是白：以前这里叠的是 (110,168,255)，于是「鼠标一放上去就泛蓝」，
   // 而且进度条自己也用了同一支蓝 —— 全屏唯一的强调色不该是蓝。
   Gdiplus::SolidBrush lit(
-      Gdiplus::Color(static_cast<BYTE>(amount * 96.0f), 255, 255, 255));
-  const float inset = (1.0f - amount) * 3.0f;
-  graphics.FillEllipse(&lit,
-                       Gdiplus::RectF(disc.X + inset, disc.Y + inset,
-                                      disc.Width - inset * 2,
-                                      disc.Height - inset * 2));
+      Gdiplus::Color(static_cast<BYTE>(amount * 22.0f), 255, 255, 255));
+  graphics.FillPath(&lit, &disc_path);
 }
 
 // ------------------------------------------------------------ 弹出菜单绘制
@@ -2845,6 +3042,13 @@ void AddRoundedRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect,
               diameter, 0, 90);
   path.AddArc(rect.X, rect.GetBottom() - diameter, diameter, diameter, 90, 90);
   path.CloseFigure();
+}
+
+Gdiplus::RectF PixelSnapRect(const Gdiplus::RectF& rect,
+                             float inset = 0.5f) {
+  return Gdiplus::RectF(rect.X + inset, rect.Y + inset,
+                        std::max(0.0f, rect.Width - inset * 2.0f),
+                        std::max(0.0f, rect.Height - inset * 2.0f));
 }
 
 // 应用下发的本地图片缓存。缩略图与服务器图标都走这里：同一个路径只解码一次，
@@ -2970,8 +3174,8 @@ struct PanelSkin {
   Gdiplus::Font chip = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
   Gdiplus::Font note = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
   Gdiplus::SolidBrush ink{Gdiplus::Color(248, 247, 247, 250)};
-  Gdiplus::SolidBrush muted{Gdiplus::Color(255, 185, 187, 195)};
-  Gdiplus::SolidBrush quiet{Gdiplus::Color(255, 140, 143, 153)};
+  Gdiplus::SolidBrush muted{Gdiplus::Color(255, 226, 228, 234)};
+  Gdiplus::SolidBrush quiet{Gdiplus::Color(255, 202, 205, 214)};
   Gdiplus::SolidBrush icon{Gdiplus::Color(236, 236, 238, 245)};
   Gdiplus::SolidBrush icon_bright{Gdiplus::Color(255, 255, 255, 255)};
 };
@@ -3005,13 +3209,13 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                                     row.Height - 1.0f),
                      12.0f);
   const BYTE fill_alpha =
-      item.selected ? BYTE{42} : (hovered ? BYTE{30} : BYTE{16});
+      item.selected ? BYTE{22} : (hovered ? BYTE{14} : BYTE{4});
   Gdiplus::SolidBrush card_fill(Gdiplus::Color(fill_alpha, 255, 255, 255));
   graphics.FillPath(&card_fill, &card);
-  const BYTE edge_alpha = item.selected ? BYTE{230}
-                                        : (hovered ? BYTE{54} : BYTE{28});
+  const BYTE edge_alpha = item.selected ? BYTE{105}
+                                        : (hovered ? BYTE{44} : BYTE{22});
   const Gdiplus::Color edge_color(edge_alpha, 255, 255, 255);
-  Gdiplus::Pen card_edge(edge_color, item.selected ? 2.0f : 1.0f);
+  Gdiplus::Pen card_edge(edge_color, item.selected ? 1.25f : 1.0f);
   graphics.DrawPath(&card_edge, &card);
 
   // 前置图标容器与应用弹窗 _TrackPickerOption 逐项对齐：36px 圆角方块、圆角 12、
@@ -3034,7 +3238,7 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   } else if (item.mark != 0) {
     DrawServerMark(graphics, tile_rect, item.mark);
   } else {
-    const BYTE tile_alpha = item.selected ? BYTE{41} : BYTE{16};
+    const BYTE tile_alpha = item.selected ? BYTE{34} : BYTE{12};
     Gdiplus::SolidBrush tile_fill(Gdiplus::Color(tile_alpha, 255, 255, 255));
     graphics.FillPath(&tile_fill, &tile_path);
     if (item.icon != 0) {
@@ -3075,10 +3279,10 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     const float badge_width =
         MeasurePanelText(graphics, item.badge.c_str(), skin.chip) + 2.0f;
     const float badge_left = std::max(text_left, text_right - badge_width);
-    graphics.DrawString(item.badge.c_str(), -1, &skin.chip,
-                        Gdiplus::RectF(badge_left, row.Y + 18.0f,
-                                       text_right - badge_left, 20.0f),
-                        &format, &skin.quiet);
+    DrawGlassText(graphics, item.badge.c_str(), skin.chip,
+                  Gdiplus::RectF(badge_left, row.Y + 18.0f,
+                                 text_right - badge_left, 20.0f),
+                  format, skin.quiet);
     title_right = badge_left - 8.0f;
   }
   const bool single_line = item.detail.empty();
@@ -3090,11 +3294,11 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                 item.enabled ? static_cast<const Gdiplus::Brush&>(skin.ink)
                              : static_cast<const Gdiplus::Brush&>(skin.quiet));
   if (!single_line) {
-    graphics.DrawString(item.detail.c_str(), -1, &skin.detail,
-                        Gdiplus::RectF(text_left, row.Y + 28.0f,
-                                       std::max(0.0f, text_right - text_left),
-                                       16.0f),
-                        &format, &skin.muted);
+    DrawGlassText(graphics, item.detail.c_str(), skin.detail,
+                  Gdiplus::RectF(text_left, row.Y + 28.0f,
+                                 std::max(0.0f, text_right - text_left),
+                                 16.0f),
+                  format, skin.muted);
   }
 
   // 末尾状态：选中的勾、可展开的箭头、其余的圆形单选圈。
@@ -3134,14 +3338,14 @@ void DrawPanelHeaderRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                             chip_height);
   Gdiplus::GraphicsPath chip_path;
   AddRoundedRectPath(chip_path, chip, chip_height / 2.0f);
-  const Gdiplus::Color chip_color(BYTE{24}, 255, 255, 255);
+  const Gdiplus::Color chip_color(BYTE{18}, 255, 255, 255);
   Gdiplus::SolidBrush chip_fill(chip_color);
   graphics.FillPath(&chip_fill, &chip_path);
   Gdiplus::StringFormat centered;
   centered.SetAlignment(Gdiplus::StringAlignmentCenter);
   centered.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-  graphics.DrawString(item.badge.c_str(), -1, &skin.chip, chip, &centered,
-                      &skin.quiet);
+  DrawGlassText(graphics, item.badge.c_str(), skin.chip, chip, centered,
+                skin.quiet);
 }
 
 void DrawPanelNoteRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
@@ -3155,11 +3359,11 @@ void DrawPanelNoteRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
   format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
   format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-  graphics.DrawString(item.label.c_str(), -1, &skin.note,
-                      Gdiplus::RectF(row.X + 30.0f, row.Y,
-                                     std::max(0.0f, row.Width - 40.0f),
-                                     row.Height),
-                      &format, &skin.muted);}
+  DrawGlassText(graphics, item.label.c_str(), skin.note,
+                Gdiplus::RectF(row.X + 30.0f, row.Y,
+                               std::max(0.0f, row.Width - 40.0f), row.Height),
+                format, skin.muted);
+}
 
 // 剧集行：一行一集。缩略图在左（16:9），缩略图底部叠观看进度与时间；右侧
 // 两行文字是「第 X 集 · 集名」与「第 X 季 · 日期 · 时长」。正在播的那一集
@@ -3173,13 +3377,13 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                                     box.Height - 1.0f),
                      12.0f);
   const BYTE fill_alpha =
-      item.selected ? BYTE{40} : (hovered ? BYTE{30} : BYTE{14});
+      item.selected ? BYTE{22} : (hovered ? BYTE{14} : BYTE{4});
   Gdiplus::SolidBrush card_fill(Gdiplus::Color(fill_alpha, 255, 255, 255));
   graphics.FillPath(&card_fill, &card);
-  const BYTE edge_alpha = item.selected ? BYTE{228}
-                                        : (hovered ? BYTE{54} : BYTE{26});
+  const BYTE edge_alpha = item.selected ? BYTE{105}
+                                        : (hovered ? BYTE{44} : BYTE{20});
   Gdiplus::Pen card_edge(Gdiplus::Color(edge_alpha, 255, 255, 255),
-                         item.selected ? 2.0f : 1.0f);
+                         item.selected ? 1.25f : 1.0f);
   graphics.DrawPath(&card_edge, &card);
 
   const Gdiplus::RectF thumb(box.X + kEpisodeRowInset,
@@ -3187,7 +3391,7 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                              kEpisodeRowThumbHeight);
   Gdiplus::GraphicsPath thumb_path;
   AddRoundedRectPath(thumb_path, thumb, 9.0f);
-  Gdiplus::SolidBrush placeholder(Gdiplus::Color(BYTE{30}, 255, 255, 255));
+  Gdiplus::SolidBrush placeholder(Gdiplus::Color(BYTE{22}, 255, 255, 255));
   graphics.FillPath(&placeholder, &thumb_path);
   Gdiplus::Bitmap* image = CachedImage(item.image);
   if (image) {
@@ -3289,10 +3493,9 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                 format,
                 item.selected ? static_cast<const Gdiplus::Brush&>(skin.icon_bright)
                               : static_cast<const Gdiplus::Brush&>(skin.ink));  if (!item.detail.empty()) {
-    graphics.DrawString(item.detail.c_str(), -1, &skin.detail,
-                        Gdiplus::RectF(text_left, box.Y + 48.0f, text_width,
-                                       15.0f),
-                        &format, &skin.muted);
+    DrawGlassText(graphics, item.detail.c_str(), skin.detail,
+                  Gdiplus::RectF(text_left, box.Y + 48.0f, text_width, 15.0f),
+                  format, skin.muted);
   }
 }
 
@@ -3455,7 +3658,7 @@ void TracePanelSurface(const PanelSurface& surface,
 
 // --------------------------------------------------------- 背板模糊的实现
 //
-// 一次采集四步：抓窗口 → 降到 1/4 → 三次盒式模糊＋提亮提饱和 → 放大回全窗尺寸。
+// 一次采集三步：抓窗口 → 降到 1/kGlassDownscale → 三次盒式模糊＋轻微提饱和。
 // 放大是一次性的：绘制时按物理像素 1:1 取子矩形，不必每次重绘都重采样一遍。
 
 /// 三次盒式模糊（横向、纵向各一次算一遍，来回做三遍）。
@@ -3528,21 +3731,19 @@ void BoxBlurPasses(BYTE* data, BYTE* scratch, int width, int height,
   }
 }
 
-/// 应用侧 `YingjiGlass.backdrop()` 里那个 colorMatrix 的等价物：饱和度 ×1.22、
-/// 整体提亮 5%。玻璃会聚光 —— 透出来的画面比直接看更亮、更浓，这才是玻璃能从画面
-/// 里「浮起来」的原因（比周围亮一档，而不是压一层黑）。
+/// 应用侧 `YingjiGlass.backdrop()` 里 colorMatrix 的等价物：只轻微增加饱和度，
+/// 不再提亮。亮色视频本身已经接近白色，再提亮会让菜单和按钮一起过曝。
 ///
 /// 顺手把 alpha 补成 255：GDI 不管 alpha 通道，PrintWindow / StretchBlt 留下的第
 /// 4 字节是 0，而绘制端用的是预乘 ARGB —— 不补就是「画了等于没画」。
 void ApplyGlassVibrancy(BYTE* data, size_t pixels) {
-  constexpr double kSaturation = 1.22;
-  constexpr double kLift = 0.05 * 255.0;
+  constexpr double kSaturation = 1.35;
   for (size_t index = 0; index < pixels; ++index) {
     BYTE* pixel = data + index * 4u;
     const double luma =
         0.213 * pixel[2] + 0.715 * pixel[1] + 0.072 * pixel[0];
     for (int channel = 0; channel < 3; ++channel) {
-      const double value = luma + (pixel[channel] - luma) * kSaturation + kLift;
+      const double value = luma + (pixel[channel] - luma) * kSaturation;
       pixel[channel] = static_cast<BYTE>(std::clamp(value, 0.0, 255.0));
     }
     pixel[3] = 255;
@@ -3554,156 +3755,129 @@ void ApplyGlassVibrancy(BYTE* data, size_t pixels) {
 double NowMs();
 
 void ReleaseGlassBackdrop() {
-  delete g_backdrop.full;
-  g_backdrop.full = nullptr;
-  delete g_backdrop.reduced;
-  g_backdrop.reduced = nullptr;
-  g_backdrop.scratch.clear();
-  g_backdrop.ready = false;
+  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
+  delete g_backdrop.video;
+  g_backdrop.video = nullptr;
+  for (GlassLayer& layer : g_backdrop.layers) {
+    delete layer.reduced;
+    layer.reduced = nullptr;
+    delete layer.reduced_back;
+    layer.reduced_back = nullptr;
+    layer.scratch.clear();
+    layer.ready = false;
+  }
   g_backdrop.captured_at = 0;
 }
 
+bool CaptureGlassLayer(GlassLayer& layer, HWND window, HDC video,
+                       const RECT& video_frame) {
+  RECT frame{};
+  if (!window || !IsWindowVisible(window) || !GetWindowRect(window, &frame)) {
+    return false;
+  }
+  const int width = frame.right - frame.left;
+  const int height = frame.bottom - frame.top;
+  if (width < 8 || height < 8) return false;
+  const int reduced_width = (width + kGlassDownscale - 1) / kGlassDownscale;
+  const int reduced_height = (height + kGlassDownscale - 1) / kGlassDownscale;
+  if (!layer.reduced_back) layer.reduced_back = new PanelSurface();
+  if (!layer.reduced_back->Matches(reduced_width, reduced_height) &&
+      !layer.reduced_back->Create(reduced_width, reduced_height)) {
+    return false;
+  }
+
+  // 从播放器专属画面裁取区域。不能读桌面 DC：现代 DWM 合成下即使没有
+  // CAPTUREBLT，也不能保证排除自己的浮层，反复采集会累积成白色残影。
+  SetStretchBltMode(layer.reduced_back->dc, HALFTONE);
+  SetBrushOrgEx(layer.reduced_back->dc, 0, 0, nullptr);
+  if (!StretchBlt(layer.reduced_back->dc, 0, 0, reduced_width, reduced_height,
+                  video, frame.left - video_frame.left,
+                  frame.top - video_frame.top, width, height, SRCCOPY)) {
+    return false;
+  }
+  // GDI batches writes to DIB sections. Complete them before CPU blur reads
+  // and rewrites these bytes, otherwise a pending blit can overwrite the blur.
+  GdiFlush();
+
+  const size_t pixels = static_cast<size_t>(reduced_width) *
+                        static_cast<size_t>(reduced_height);
+  layer.scratch.resize(pixels * 4u);
+  const double sigma_reduced =
+      g_glass_blur.load() * 0.55 * static_cast<double>(UiScale()) /
+      static_cast<double>(kGlassDownscale);
+  const int radius = static_cast<int>(std::lround(sigma_reduced / 1.05));
+  BoxBlurPasses(layer.reduced_back->bits, layer.scratch.data(), reduced_width,
+                reduced_height, radius);
+
+  // 黑色也是合法视频内容，必须发布；跳过黑帧会留下上一场景的亮色残影。
+  ApplyGlassVibrancy(layer.reduced_back->bits, pixels);
+
+  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
+  std::swap(layer.reduced, layer.reduced_back);
+  layer.window = window;
+  layer.source_width = width;
+  layer.source_height = height;
+  layer.origin_x = frame.left;
+  layer.origin_y = frame.top;
+  layer.ready = true;
+  return true;
+}
+
 /// 重抓一帧背后的画面。`force` 为假时按 `kGlassBackdropRefreshMs` 节流（音量键
-/// 连击那种高频调用就靠它挡住，否则每秒十几次 40ms 的采集会拖住主线程）。
+/// 连击那种高频调用就靠它挡住）。共用播放器源帧，只模糊可见玻璃区域。
 bool UpdateGlassBackdrop(bool force) {
   if (!g_window) return false;
   const ULONGLONG now = GetTickCount64();
   if (!force && now - g_backdrop.attempted_at < kGlassBackdropRefreshMs) {
     return false;
   }
-  RECT frame{};
-  if (!GetWindowRect(g_window, &frame)) return false;
-  // 窗口被挪过：背板里记的屏幕原点已经不对，照旧取像素会整块错位。挪窗必须重抓。
-  const bool moved = g_backdrop.ready &&
-                     (frame.left != g_backdrop.origin_x ||
-                      frame.top != g_backdrop.origin_y);
-  // 暂停时画面是静止的：已经有一张背板就等于拿到了最终答案，没必要每 260ms 再抓一
-  // 帧一模一样的。用户在暂停状态下开菜单，玻璃的额外开销直接归零。（挪过窗不算，
-  // 上面那条 moved 要把这次抓帧放行。）
-  if (!force && g_backdrop.ready && g_paused.load() && !moved) {
-    g_backdrop.attempted_at = now;
-    return false;
-  }
   g_backdrop.attempted_at = now;
   const double started = NowMs();
-  double mark = started;
-  // 每步耗时：整窗 PrintWindow / 降采样 / 模糊。菜单开着时的额外 CPU 全在这三步里，
-  // 光看总百分比说不清该砍哪一个。
-  auto step = [&mark]() {
-    const double at = NowMs();
-    const double cost = at - mark;
-    mark = at;
-    return cost;
-  };
-  const int width = frame.right - frame.left;
-  const int height = frame.bottom - frame.top;
-  if (width < 64 || height < 64) return false;
-
-  if (!g_backdrop.full) g_backdrop.full = new PanelSurface();
-  if (!g_backdrop.full->Matches(width, height) &&
-      !g_backdrop.full->Create(width, height)) {
-    ReleaseGlassBackdrop();
-    TraceGlassBackdropNote(L"skip: Create(full) failed");
-    return false;
+  RECT video_frame{};
+  if (IsIconic(g_window) || !GetWindowRect(g_window, &video_frame)) return false;
+  const int width = video_frame.right - video_frame.left;
+  const int height = video_frame.bottom - video_frame.top;
+  if (width < 1 || height < 1) return false;
+  if (!g_backdrop.video) g_backdrop.video = new PanelSurface();
+  if (!g_backdrop.video->Matches(width, height) &&
+      !g_backdrop.video->Create(width, height)) return false;
+  // PW_RENDERFULLCONTENT includes the D3D video content of this HWND only.
+  if (!PrintWindow(g_window, g_backdrop.video->dc, 0x00000002)) return false;
+  GdiFlush();
+  TracePanelSurface(*g_backdrop.video, L"video-source", 3);
+  const std::array<HWND, 4> windows = {g_controls, g_top_bar, g_panel, g_hint};
+  bool updated = false;
+  for (size_t index = 0; index < windows.size(); ++index) {
+    updated = CaptureGlassLayer(g_backdrop.layers[index], windows[index],
+                                g_backdrop.video->dc, video_frame) || updated;
   }
-  if (!PrintWindow(g_window, g_backdrop.full->dc, PW_RENDERFULLCONTENT)) {
-    ReleaseGlassBackdrop();
-    TraceGlassBackdropNote(L"skip: PrintWindow returned false");
-    return false;
-  }
-  const double capture_ms = step();
-
-  const int reduced_width = (width + kGlassDownscale - 1) / kGlassDownscale;
-  const int reduced_height = (height + kGlassDownscale - 1) / kGlassDownscale;
-  if (!g_backdrop.reduced) g_backdrop.reduced = new PanelSurface();
-  if (!g_backdrop.reduced->Matches(reduced_width, reduced_height) &&
-      !g_backdrop.reduced->Create(reduced_width, reduced_height)) {
-    ReleaseGlassBackdrop();
-    TraceGlassBackdropNote(L"skip: Create(reduced) failed");
-    return false;
-  }
-  // HALFTONE 才会把 4x4 区域取平均（COLORONCOLOR 是直接丢像素，等于没降采样）。
-  SetStretchBltMode(g_backdrop.reduced->dc, HALFTONE);
-  SetBrushOrgEx(g_backdrop.reduced->dc, 0, 0, nullptr);
-  StretchBlt(g_backdrop.reduced->dc, 0, 0, reduced_width, reduced_height,
-             g_backdrop.full->dc, 0, 0, width, height, SRCCOPY);
-  const double downscale_ms = step();
-
-  const size_t reduced_pixels = static_cast<size_t>(reduced_width) *
-                                static_cast<size_t>(reduced_height);
-  g_backdrop.scratch.resize(reduced_pixels * 4u);
-  // 半径跟着「设置 → 外观 → 模糊程度」：那是设计稿单位的高斯 σ，先按 UiScale 换成
-  // 物理像素、再除以降采样倍数；三次盒式模糊的等效 σ≈半径×1.05，这里反着算回去。
-  const double sigma_reduced = g_glass_blur * static_cast<double>(UiScale()) /
-                               static_cast<double>(kGlassDownscale);
-  const int radius = static_cast<int>(std::lround(sigma_reduced / 1.05));
-  BoxBlurPasses(g_backdrop.reduced->bits, g_backdrop.scratch.data(),
-                reduced_width, reduced_height, radius);
-  const double blur_ms = step();
-  // 先判定「抠出来的到底有没有画面」，再提亮。⚠️ 判据必须在**提亮之前**算：vibrancy
-  // 会给每个像素加 5%（+12.75），一块纯黑反而被抬到 13 —— 拿提亮后的图去比，黑屏
-  // 也能过审，玻璃就成了一块不透明的黑板（这个坑真踩过）。
-  //
-  // 没有画面（黑屏、还没出帧、窗口被独占挡住）时宁可退回原来的「真透明」玻璃：
-  // 那种情况下没有东西可糊，硬糊一层只会把面板变成黑塑料。
-  {
-    const BYTE* plane = g_backdrop.reduced->bits;
-    unsigned long long total = 0;
-    for (size_t index = 0; index < reduced_pixels; ++index) {
-      const BYTE* pixel = plane + index * 4u;
-      total += static_cast<unsigned long long>(pixel[0]) + pixel[1] + pixel[2];
-    }
-    const double mean =
-        static_cast<double>(total) / static_cast<double>(reduced_pixels * 3u);
-    if (mean < kGlassBackdropMinLuma) {
-      ReleaseGlassBackdrop();
-      // 把实测均亮记下来：6.0 这个阈值调没调对，全看这个数字。
-      wchar_t note[96]{};
-      swprintf_s(note, L"skip: no picture, mean luma %.2f < %.2f",
-                 mean, kGlassBackdropMinLuma);
-      TraceGlassBackdropNote(note);
-      return false;
-    }
-  }
-  ApplyGlassVibrancy(g_backdrop.reduced->bits, reduced_pixels);
-  TracePanelSurface(*g_backdrop.reduced, L"backdrop", 3);
-
-  // 不再放回全窗尺寸。放大那一步要 StretchBlt 整窗 1920x1160（实测 9.6ms），再加
-  // 一遍 220 万像素的 alpha 补位，是这个管线里最贵的两笔；而玻璃只占窗口的一小块。
-  // 现在保留 1/4 的模糊图，绘制时由 GDI+ 只对玻璃那块矩形做双线性放大 —— 模糊过的
-  // 图本来就是平滑的，放大方式换成双线性肉眼无差，代价却只跟玻璃面积走。
-  // 透明度在 ApplyGlassVibrancy 里已统一补成 255，这里不必再扫一遍。
   if (!TraceDirectory().empty()) {
-    wchar_t note[160]{};
-    swprintf_s(note,
-               L"ok %dx%d -> %dx%d  capture %.1fms  down %.1fms  blur(%.2fpx) "
-               L"%.1fms  total %.1fms",
-               width, height, reduced_width, reduced_height, capture_ms,
-               downscale_ms, g_glass_blur, blur_ms, NowMs() - started);
+    wchar_t note[128]{};
+    swprintf_s(note, L"regions %s  total %.1fms",
+               updated ? L"ok" : L"skip", NowMs() - started);
     TraceGlassBackdropNote(note);
   }
-  g_backdrop.origin_x = frame.left;
-  g_backdrop.origin_y = frame.top;
-  g_backdrop.captured_at = now;
-  g_backdrop.ready = true;
-  return true;
+  if (updated) g_backdrop.captured_at = now;
+  return updated;
 }
 
 bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
                        const Gdiplus::GraphicsPath& path,
                        const Gdiplus::RectF& rect) {
-  if (!g_backdrop.ready || !g_backdrop.reduced || !g_backdrop.reduced->bits) {
-    return false;
+  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
+  GlassLayer* selected = nullptr;
+  for (GlassLayer& layer : g_backdrop.layers) {
+    if (layer.ready && layer.reduced && layer.reduced->bits &&
+        layer.origin_x == g_glass_window_origin.x &&
+        layer.origin_y == g_glass_window_origin.y) {
+      selected = &layer;
+      break;
+    }
   }
+  if (!selected) return false;
   const float scale = UiScale();
-  // 设计稿矩形 → 这块玻璃所在窗口的物理像素 → 屏幕坐标 → 背板上的像素。背板是 1/4
-  // 尺寸的，最后再除一次 kGlassDownscale；除数放在最后，免得先整除把半像素丢掉。
-  const float full_x = static_cast<float>(g_glass_window_origin.x -
-                                          g_backdrop.origin_x) +
-                       rect.X * scale;
-  const float full_y = static_cast<float>(g_glass_window_origin.y -
-                                          g_backdrop.origin_y) +
-                       rect.Y * scale;
+  const float full_x = rect.X * scale;
+  const float full_y = rect.Y * scale;
   const float full_width = rect.Width * scale;
   const float full_height = rect.Height * scale;
   const float full_x1 = full_x + full_width;
@@ -3711,21 +3885,25 @@ bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
   // 窗口被挪到背板范围之外（挪窗、换分辨率）时宁可不画：画错位比不画更难看。
   if (full_width <= 0.0f || full_height <= 0.0f || full_x < 0.0f ||
       full_y < 0.0f ||
-      full_x1 > static_cast<float>(g_backdrop.full->width) ||
-      full_y1 > static_cast<float>(g_backdrop.full->height)) {
+      full_x1 > static_cast<float>(selected->source_width) ||
+      full_y1 > static_cast<float>(selected->source_height)) {
     return false;
   }
-  const float divisor = static_cast<float>(kGlassDownscale);
-  const Gdiplus::RectF source(full_x / divisor, full_y / divisor,
-                              full_width / divisor, full_height / divisor);
   const Gdiplus::GraphicsState state = graphics.Save();
-  graphics.SetClip(&path, Gdiplus::CombineModeIntersect);
-  // 源是已经糊透的 1/4 图，放大用双线性即可 —— 它本来就是平滑的，不会放大出细节，
+  // 源是已经糊透的降采样图，放大用双线性即可 —— 它本来就是平滑的，不会放大出细节，
   // 也不会像最近邻那样露出块状边缘。
   graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
   graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-  graphics.DrawImage(g_backdrop.reduced->target, rect, source.X, source.Y,
-                     source.Width, source.Height, Gdiplus::UnitPixel);
+  // FillPath applies antialias coverage; SetClip(path)+DrawImage cuts a binary
+  // edge and leaves stair steps on the transparent layered-window surface.
+  Gdiplus::TextureBrush backdrop(selected->reduced->target,
+                                 Gdiplus::WrapModeTileFlipXY);
+  backdrop.ScaleTransform(
+      static_cast<float>(selected->source_width) /
+          static_cast<float>(selected->reduced->width) / scale,
+      static_cast<float>(selected->source_height) /
+          static_cast<float>(selected->reduced->height) / scale);
+  graphics.FillPath(&backdrop, &path);
   graphics.Restore(state);
   return true;
 }
@@ -3734,9 +3912,9 @@ void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                        float width, float height) {
   const float body_width = width - kPanelShadowMargin * 2.0f;
   const float body_height = height - kPanelShadowMargin * 2.0f;
-  const Gdiplus::RectF body_rect(static_cast<float>(kPanelShadowMargin),
-                                 static_cast<float>(kPanelShadowMargin),
-                                 body_width, body_height);
+  const Gdiplus::RectF body_rect = PixelSnapRect(Gdiplus::RectF(
+      static_cast<float>(kPanelShadowMargin),
+      static_cast<float>(kPanelShadowMargin), body_width, body_height));
   // 阴影：由外向内叠一圈圈圆角矩形，越靠近面板越深，得到柔和的下投影。
   constexpr int kShadowSteps = 14;
   for (int step = kShadowSteps; step >= 1; --step) {
@@ -3802,8 +3980,7 @@ void PresentPanel(HWND window, int width, int height) {
   {
     const PanelSkin skin;
     Gdiplus::Graphics graphics(surface.target);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    ConfigureGlassGraphics(graphics);
     graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
     // 窗口是缩放后的物理大小，面板内部的布局全是设计稿坐标：一次
     // ScaleTransform 换到设计坐标系，行高、缩略图、字号就都跟着窗口走。
@@ -3964,6 +4141,19 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
           HideHint();
           ShowSegmentMenu(g_panel_anchor);
           ShowToast("本次不跳过");
+        } else if (item.enabled && item.property == "mova-segment-mark") {
+          const double seconds = std::max(0.0, g_position.load());
+          ApplyManualSegmentMark(item.value, seconds);
+          EmitSegmentMark(item.value, seconds);
+          ShowToast(item.toast);
+          ShowWindow(window, SW_HIDE);
+          SetFocus(g_window);
+        } else if (item.enabled && item.property == "mova-segment-clear") {
+          ApplyManualSegmentMark(item.value, -1.0);
+          EmitSegmentMark(item.value, -1.0);
+          ShowToast(item.toast);
+          ShowWindow(window, SW_HIDE);
+          SetFocus(g_window);
         } else if (item.enabled &&
                    item.property == "mova-auto-skip-segments") {
           // 片头片尾的自动跳过开关：就地生效，并把新值回写应用偏好，
@@ -4071,7 +4261,7 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   const int content_design = std::min(
       g_panel_metrics.max_height,
       std::min(PanelContentHeight(),
-               static_cast<int>(max_content / std::max(0.1f, g_ui_scale))));
+               static_cast<int>(max_content / std::max(0.1f, UiScale()))));
   const int content = Scaled(content_design);
   g_panel_viewport_height = content_design - kPanelPadding * 2;
   // 打开时把指定的行滚进视野：剧集面板要定位到正在播的那一集，而不是永远从
@@ -4095,9 +4285,6 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   // 保证面板连阴影一起完整落在播放器窗口内。
   int body_y = anchor.open_above ? anchor.y - content - 8 : anchor.y + 8;
   body_y = std::min(std::max(body_y, top_limit), bottom_limit);
-  // 开菜单这一刻重抓一次背板（force）：面板一上来就得是玻璃，不能先闪一帧上次
-  // 关门时留下的旧画面。PrintWindow 拍不到我们自己的浮层，所以这里不必等提示先退场。
-  UpdateGlassBackdrop(true);
   SetWindowPos(g_panel, HWND_TOP, body_x - shadow,
                body_y - shadow,
                panel_width + shadow * 2,
@@ -4249,13 +4436,12 @@ void MeasureHint(const std::wstring& text, const std::wstring& detail,
 void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
                const std::wstring& text, const std::wstring& detail,
                float fraction, bool accent) {
-  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-  graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+  ConfigureGlassGraphics(graphics);
   graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
   const float margin = static_cast<float>(kHintMargin);
-  const Gdiplus::RectF body(margin, margin,
-                            static_cast<float>(width) - margin * 2.0f,
-                            static_cast<float>(height) - margin * 2.0f);
+  const Gdiplus::RectF body = PixelSnapRect(Gdiplus::RectF(
+      margin, margin, static_cast<float>(width) - margin * 2.0f,
+      static_cast<float>(height) - margin * 2.0f));
   const bool inline_value = HintDetailIsValue(detail);
   const bool second_row = !detail.empty() && !inline_value;
   const bool has_line = fraction >= 0.0f;
@@ -4270,7 +4456,7 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
                                       body.Width + spread * 2.0f,
                                       body.Height + spread * 2.0f),
                        body_radius + spread);
-    Gdiplus::SolidBrush shadow(Gdiplus::Color(BYTE{9}, 0, 0, 0));
+    Gdiplus::SolidBrush shadow(Gdiplus::Color(BYTE{6}, 0, 0, 0));
     graphics.FillPath(&shadow, &ring);
   }
   // 与应用侧同一套材质：基色 frost、浓度跟着「外观 → 模糊程度」走、只沉底边的
@@ -4404,9 +4590,6 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   g_hint_fraction = fraction;
   g_hint_accent = accent;
   g_hint_until = GetTickCount64() + kToastHoldMilliseconds;
-  // 背板按节流刷新（不是 force）：滚轮连拧音量会一秒叫十几次 ShowHint，每次都强抓
-  // 一发 40ms 的采集会把主线程拖住；节流之后最多 4Hz，玻璃里的画面照样是活的。
-  UpdateGlassBackdrop(false);
   SetWindowPos(g_hint, HWND_TOP, x, y, width, height,
                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   InvalidateRect(g_hint, nullptr, FALSE);
@@ -4469,6 +4652,185 @@ double NowMs() {
   LARGE_INTEGER counter{};
   QueryPerformanceCounter(&counter);
   return static_cast<double>(counter.QuadPart) * 1000.0 / k_frequency;
+}
+
+// 采一次合成器时序（见 g_dwm_compose_ms）。跟着 NowMs 放，是因为它要用
+// NowMs 而两者同属一个匿名命名空间。
+void SampleCompositionTiming() {
+  DWM_TIMING_INFO timing{};
+  timing.cbSize = sizeof(timing);
+  if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) return;
+  g_dwm_refresh_ms = QpcToMs(timing.qpcRefreshPeriod);
+  g_dwm_compose_ms = QpcToMs(timing.rateCompose.uiDenominator);
+}
+
+// ---- 帧节拍：让弹幕层的「每一帧在屏停留多久」对齐合成器的整数拍 ----
+//
+// 见 docs/specs/2026-09-22-danmaku-frame-pacing.md。要点：位置算得准（QPC）
+// 不等于像素投到屏幕上的时机均匀；只要帧节拍与刷新率不是整数比，位移步长就会
+// 周期性变长变短。用户选定 1:1（满刷新）。
+
+// 面板一个刷新周期的毫秒数。先问 DWM（`qpcRefreshPeriod` 是合成器真正在用的
+// 值，比分辩率标称值可信：可变刷新率 / 驱动覆盖下两者会不一致），拿不到再退回
+// EnumDisplaySettings 的 dmDisplayFrequency，都没有就返回 0（调用方退回旧路径）。
+double QueryRefreshPeriodMs() {
+  DWM_TIMING_INFO timing{};
+  timing.cbSize = sizeof(timing);
+  if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing)) &&
+      timing.qpcRefreshPeriod > 0) {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    if (frequency.QuadPart > 0) {
+      const double period = static_cast<double>(timing.qpcRefreshPeriod) *
+                            1000.0 / static_cast<double>(frequency.QuadPart);
+      // 1~1000Hz 之外的值当异常（远程桌面 / 驱动没上报），宁可退回标称值。
+      if (period >= 1.0 && period <= 1000.0) return period;
+    }
+  }
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) &&
+      mode.dmDisplayFrequency > 1) {
+    return 1000.0 / static_cast<double>(mode.dmDisplayFrequency);
+  }
+  return 0.0;
+}
+
+// 播放器窗口当前在哪块屏上、那块屏自己报多少 Hz。
+//
+// QueryRefreshPeriodMs 问的是 **主** 显示器（DwmGetCompositionTimingInfo(NULL)
+// 与 EnumDisplaySettings(NULL) 都只看主屏）。窗口被拖到另一块屏上时，「按哪块
+// 面板的周期分频」就会错：拿 170Hz 的节拍去驱动一块 144Hz 的屏，每一帧停留的
+// 拍数又变成非整数，症状和「定时器没对齐刷新率」一模一样。所以把这块信息一起
+// 报出来，免得在错误的刷新率上做推理。
+void FormatPlayerMonitor(char* text, size_t size) {
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  const HMONITOR monitor = MonitorFromWindow(
+      g_window ? g_window : nullptr, MONITOR_DEFAULTTONEAREST);
+  if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+    std::snprintf(text, size, "monitor=? hz=0 primary=?");
+    return;
+  }
+  char name[64]{};
+  WideCharToMultiByte(CP_UTF8, 0, info.szDevice, -1, name, sizeof(name),
+                      nullptr, nullptr);
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  const bool mode_ok =
+      EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode);
+  std::snprintf(text, size, "monitor=%s hz=%u primary=%s", name,
+                mode_ok ? mode.dmDisplayFrequency : 0u,
+                (info.dwFlags & MONITORINFOF_PRIMARY) ? "yes" : "no");
+}
+
+// 每几个刷新周期出一帧。
+//
+// 目标是把每帧的产出周期取成**面板刷新周期的整数倍**，这样每帧在屏停留的拍数
+// 恒定、位移步长均匀。上界取 90Hz：再往上（170Hz 的 1:1）要求一轮循环里 flush
+// 之外的工作量小于一个刷新周期，本机实测 `o ≈ 6.6ms > T = 5.882ms` 做不到
+// （见 docs/specs/2026-09-22-danmaku-frame-pacing.md），硬锁只会得到更抖的结果。
+// 所以 60Hz:1x、120/144/165/170Hz:2x、240Hz:3x。分频必须**固定**：运行中改分频
+// 等于中途换停留时长，本身就会顿一下。
+int FrameDivisorFor(double refresh_hz) {
+  if (!(refresh_hz > 0.0)) return 0;
+  const double divisor = std::ceil(refresh_hz / 90.0);
+  return static_cast<int>(divisor < 1.0 ? 1.0 : divisor);
+}
+
+// 拆掉当前的高精度节拍定时器。
+void DisarmPacingTimer() {
+  if (g_pacing_timer) {
+    CloseHandle(g_pacing_timer);
+    g_pacing_timer = nullptr;
+  }
+  g_pacing_period_ms = 0.0;
+  g_pacing_tick = 0;
+}
+
+// 按**绝对日程**排下一次 tick。
+//
+// 不用 `SetWaitableTimer` 的 `lPeriod`（单位是整毫秒，11.76ms 只能喂 12/11 交替
+// → 又造一个错拍），而是每次都用 100ns 精度的相对到期时间重排；而且目标时刻一律
+// 从锚点算（`anchor + tick × period`）——用「从现在起一个 period」会把每次的唤醒
+// 延迟逐轮累加成漂移。
+void ArmNextPacingTick() {
+  if (!g_pacing_timer || !(g_pacing_period_ms > 0.0)) return;
+  const double target_ms = g_pacing_anchor_ms + g_pacing_tick * g_pacing_period_ms;
+  double delay_ms = target_ms - NowMs();
+  if (delay_ms < 0.05) {
+    // 迟到了就立刻到点。但**只有真的漏了不止半拍**才挪锚点：单纯「刚好压线」也挪，
+    // 等于把这一拍的迟到量固化进后续所有日程，实测周期会变成 11.83ms 而不是
+    // 11.764ms（+0.6%），相位于是缓慢滑过拍边界、部分帧掉到 3 拍。
+    // 不挪的话，下一次的 delay 会自动少一截，把这点迟到补回来。
+    if (delay_ms < -g_pacing_period_ms * 0.5) {
+      // 系统卡顿导致真的漏拍：把日程整体挪到当前这一拍，不补一串已经过去的 tick。
+      g_pacing_anchor_ms = NowMs() - g_pacing_tick * g_pacing_period_ms;
+    }
+    delay_ms = 0.05;
+  }
+  LARGE_INTEGER due{};
+  due.QuadPart = -static_cast<LONGLONG>(delay_ms * 10000.0);  // 负 = 相对时间
+  SetWaitableTimer(g_pacing_timer, &due, 0, nullptr, nullptr, FALSE);
+}
+
+// 建（或重建）节拍定时器，并把相位对到当前合成边界上。
+void RebuildPacingTimer() {
+  DisarmPacingTimer();
+  if (g_frame_divisor <= 0 || !(g_refresh_period_ms > 0.0)) return;
+  // 高精度模式（Win10 1803+）必须有：没有它定时器精度只有系统时钟节拍
+  // （~15.6ms），11.76ms 的周期毫无意义。拿不到就退回普通定时器，至少不比原路径差。
+  g_pacing_timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!g_pacing_timer) {
+    g_pacing_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+  }
+  if (!g_pacing_timer) return;
+  g_pacing_period_ms = g_frame_divisor * g_refresh_period_ms;
+  // 对相位：`DwmFlush` 返回时刚过一个合成边界，从这里起算，之后每一帧都落在
+  // 「边界之后一点点」，于是会在下一个边界被合成，正好停 divisor 拍。
+  DwmFlush();
+  g_pacing_anchor_ms = NowMs();
+  g_pacing_tick = 1;
+  ArmNextPacingTick();
+}
+
+// 重算帧节拍。启动时与 WM_DISPLAYCHANGE（换显示器 / 改刷新率 / 开关全屏）时调。
+void RefreshFramePacing() {
+  g_refresh_period_ms = QueryRefreshPeriodMs();
+  g_frame_divisor =
+      g_refresh_period_ms > 0.0
+          ? FrameDivisorFor(1000.0 / g_refresh_period_ms)
+          : 0;
+  // 拿不到刷新周期就退回定时器路径（g_frame_divisor == 0 / 定时器建不出来），
+  // 行为与本改动之前一致 —— 老系统 / 远程桌面下不会变得更差。
+  RebuildPacingTimer();
+  char monitor[160]{};
+  FormatPlayerMonitor(monitor, sizeof(monitor));
+  char text[320]{};
+  const int length = std::snprintf(
+      text, sizeof(text),
+      "MOVA_FRAME_PACING=refresh=%.3fms divisor=%d hz=%.1f period=%.3fms %s|\r\n",
+      g_refresh_period_ms, g_frame_divisor,
+      g_refresh_period_ms > 0.0 ? 1000.0 / g_refresh_period_ms : 0.0,
+      g_pacing_period_ms, monitor);
+  const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+    DWORD written = 0;
+    WriteFile(output, text, static_cast<DWORD>(length), &written, nullptr);
+  }
+}
+
+// 只有画面真的在动、而且窗口露着的时候才需要按刷新率走。
+//
+// 暂停 / 缓冲时弹幕动画时钟本来就不推进（见 DanmakuAnimationClock），没有东西
+// 需要按 170Hz 重新推进；窗口最小化 / 不可见时同理。这两种情况继续 170Hz 唤醒
+// 只是白烧 CPU 与电，交回 16ms 定时器就够（与改动前的行为一致）。
+bool FramePacingWanted() {
+  if (g_frame_divisor <= 0) return false;
+  if (!g_window || !IsWindowVisible(g_window) || IsIconic(g_window)) return false;
+  if (g_paused.load() || g_buffering.load()) return false;
+  return true;
 }
 
 static int DanmakuBase64Value(char c) {
@@ -4573,15 +4935,15 @@ bool EnsureDanmakuTexture(DanmakuItem& item, Gdiplus::Graphics& measure,
   item.text_width = bounds.Width;
   item.font_size = font_size;
   const int box_width =
-      static_cast<int>(std::ceil(std::max(1.0f, bounds.Width))) +
+      static_cast<int>(std::ceil(std::max(1.0f, bounds.Width))) + 1 +
       kDanmakuTexturePad * 2;
   const int box_height =
       static_cast<int>(std::ceil(font_size * 1.4f)) + kDanmakuTexturePad * 2;
   auto texture = std::make_shared<DanmakuTexture>();
   if (!texture->Create(box_width, box_height)) return false;
   {
-    Gdiplus::Graphics graphics(texture->dc);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Graphics graphics(texture->dc[0]);
+    ConfigureGlassGraphics(graphics);
     // 与图标字形同一个理由：网格拟合会把小字号轮廓拉变形，文字用灰度抗锯齿
     // （用完即弃，不影响别的绘制）。外观与逐帧 DrawString 的时代保持一致。
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
@@ -4603,6 +4965,32 @@ bool EnsureDanmakuTexture(DanmakuItem& item, Gdiplus::Graphics& measure,
     graphics.DrawString(item.text.c_str(), -1, &font, origin, &format, &brush);
     graphics.Flush(Gdiplus::FlushIntentionSync);
   }
+  // GDI+ DrawString 是这条路径里最贵的步骤，不能为了 4 个亚像素相位重复调用
+  // 4 次（密集弹幕持续进入时会挤占 paint 的提交相位）。只栅格化 phase 0，另外
+  // 三张直接对预乘 BGRA 做水平线性移位；每条只是几万次整数运算，且结果仍能被
+  // 后续每帧的单次 AlphaBlend 复用。
+  const size_t stride = static_cast<size_t>(texture->width) * 4;
+  for (int phase = 1; phase < DanmakuTexture::kPhases; ++phase) {
+    const int right_weight = phase;
+    const int left_weight = DanmakuTexture::kPhases - phase;
+    for (int row = 0; row < texture->height; ++row) {
+      const BYTE* source = texture->bits[0] + static_cast<size_t>(row) * stride;
+      BYTE* target = texture->bits[phase] + static_cast<size_t>(row) * stride;
+      for (int column = 0; column < texture->width; ++column) {
+        for (int channel = 0; channel < 4; ++channel) {
+          const int here = source[static_cast<size_t>(column) * 4 + channel];
+          const int before = column == 0
+                                 ? 0
+                                 : source[(static_cast<size_t>(column) - 1) * 4 +
+                                          channel];
+          target[static_cast<size_t>(column) * 4 + channel] =
+              static_cast<BYTE>((here * left_weight + before * right_weight +
+                                 DanmakuTexture::kPhases / 2) /
+                                DanmakuTexture::kPhases);
+        }
+      }
+    }
+  }
   item.texture = std::move(texture);
   return true;
 }
@@ -4611,9 +4999,17 @@ bool EnsureDanmakuTexture(DanmakuItem& item, Gdiplus::Graphics& measure,
 // 屏幕外，所以这里要先和自己的窗口求交，把交给 GDI 的矩形裁掉（别指望内存 DC
 // 帮你裁剪 —— 它的裁剪区是设备面，不是这块 DIB）。
 void BlendDanmakuTexture(const PanelSurface& surface,
-                         const DanmakuTexture& texture, int x, int y, int pad,
+                         const DanmakuTexture& texture, float x, int y, int pad,
                          BYTE alpha, int layer_width, int layer_height) {
-  int destination_x = x - pad;
+  int destination_x = static_cast<int>(std::floor(x));
+  const float fraction = x - static_cast<float>(destination_x);
+  int phase = static_cast<int>(std::lround(
+      fraction * static_cast<float>(DanmakuTexture::kPhases)));
+  if (phase == DanmakuTexture::kPhases) {
+    phase = 0;
+    ++destination_x;
+  }
+  destination_x -= pad;
   int destination_y = y - pad;
   int source_x = 0;
   int source_y = 0;
@@ -4637,7 +5033,8 @@ void BlendDanmakuTexture(const PanelSurface& surface,
   blend.SourceConstantAlpha = alpha;
   blend.AlphaFormat = AC_SRC_ALPHA;
   AlphaBlend(surface.dc, destination_x, destination_y, copy_width, copy_height,
-             texture.dc, source_x, source_y, copy_width, copy_height, blend);
+             texture.dc[phase], source_x, source_y, copy_width, copy_height,
+             blend);
 }
 
 void CreateDanmakuWindow(HINSTANCE instance) {
@@ -4658,13 +5055,17 @@ void PositionDanmaku() {
   // （与 controls / top_bar / hint 一致），不显式显示就永远是一片空白。
   // 窗口是 WS_EX_TRANSPARENT（鼠标穿透），且只在上部 g_danmaku_area 区域内
   // 绘制，因此不会遮挡底部控制条，也不影响鼠标交互。
+  // 顶栏是常驻信息区，弹幕从它下面开始。此前弹幕窗口 y=0，顶部固定弹幕会直接
+  // 压住标题、网速和窗口按钮。
+  const int safe_top = Scaled(kTopBarTopMargin + kTopBarHeight + 8);
   // 窗口只覆盖弹幕区域（画面上部 area），不铺满整个客户区：每帧要清零并
   // UpdateLayeredWindow 的像素越少，60fps 下越稳。底部控制条区域本来就不画
   // 弹幕，让它留在窗口外面既省开销，也彻底排除遮挡按钮的可能。
-  SetWindowPos(g_danmaku, HWND_TOP, origin.x, origin.y,
+  const int area_bottom = static_cast<int>((client.bottom - client.top) *
+                                           g_danmaku_area);
+  SetWindowPos(g_danmaku, HWND_TOP, origin.x, origin.y + safe_top,
                client.right - client.left,
-               std::max(1, static_cast<int>((client.bottom - client.top) *
-                                            g_danmaku_area)),
+               std::max(1, area_bottom - safe_top),
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   InvalidateRect(g_danmaku, nullptr, FALSE);
 }
@@ -4679,8 +5080,31 @@ void PaintDanmaku() {
     ++g_danmaku_gap_count;
     if (gap > 20.0) ++g_danmaku_gap_late20;
     if (gap > 33.0) ++g_danmaku_gap_late33;
+    // 这一帧在屏停留了几个刷新周期（见 g_danmaku_dwell）。>4 归到最后一档。
+    if (g_refresh_period_ms > 0.0) {
+      const long long periods =
+          std::lround(gap / g_refresh_period_ms);
+      const int bucket = static_cast<int>(
+          periods < 1 ? 1 : (periods > 4 ? 4 : periods));
+      ++g_danmaku_dwell[bucket];
+    }
   }
   g_danmaku_paint_last = paint_start;
+  // 相对**本拍 tick 时刻**滞后了多少。tick 整齐而 dwell 散，就是这里在漂：
+  // WM_PAINT 是低优先级消息，要等消息队列排空才派发，滞后量于是跟着消息负载走，
+  // 每帧的「提交相位」相对合成边界来回过线，屏上停留的拍数就在 1/3 之间跳。
+  if (g_tick_now_ms > 0.0) {
+    const double phase = paint_start - g_tick_now_ms;
+    g_paint_phase_sum_ms += phase;
+    if (g_paint_phase_count == 0) {
+      g_paint_phase_min_ms = phase;
+      g_paint_phase_max_ms = phase;
+    } else {
+      g_paint_phase_min_ms = std::min(g_paint_phase_min_ms, phase);
+      g_paint_phase_max_ms = std::max(g_paint_phase_max_ms, phase);
+    }
+    ++g_paint_phase_count;
+  }
   RECT rect{};
   GetClientRect(g_danmaku, &rect);
   const int width = rect.right - rect.left;
@@ -4696,8 +5120,7 @@ void PaintDanmaku() {
   }
   PanelSurface& surface = *g_danmaku_surface;
   Gdiplus::Graphics graphics(surface.target);
-  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-  graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+  ConfigureGlassGraphics(graphics);
 
   const float ui = UiScale();
   const float font_size = static_cast<float>(g_danmaku_font_size) * ui;
@@ -4947,7 +5370,7 @@ void PaintDanmaku() {
     }
     if (item.texture) {
       // 文字已经栅格化好了，这一帧只做一次带 alpha 的贴图。
-      BlendDanmakuTexture(surface, *item.texture, std::lround(x),
+      BlendDanmakuTexture(surface, *item.texture, x,
                           std::lround(y), kDanmakuTexturePad, alpha, width,
                           height);
       ++drawn_count;
@@ -5007,22 +5430,34 @@ void PaintDanmaku() {
   //   depth / olane / orect：最深那一对压进去多少像素、在哪条轨道、两段的左右边界
   //     —— 只数条数分不清「浮点贴边」和「真的糊住」，深度才说明问题；
   //   drop：mpv 自己丢掉的解码帧数 —— 和 gap 对照可以分清「弹幕在抖」还是
-  //     「视频本身在抖」。
+  //     「视频本身在抖」；
+  //   refresh / div：面板刷新周期与分频（一个 tick = div × refresh）—— 判 dwell 的前提；
+  //   compose：DWM 自报的目标合成节奏（rateCompose）。它和 refresh 不一致时说明
+  //     DWM 自己降频了，那时怎么调节拍都没用，先去查合成设置；
+  //   dwell1..4：相邻两帧之间隔了几个刷新周期的分布。**这是判「平滑」的主指标**：
+  //     理想是全部落在同一个整数拍上（本机 170Hz / div=2 → 全部落 2 拍）。
+  //     均值类指标（avg / late20 / late33）对「每帧停留时长不相等」是无感的，
+  //     以前正是因此把「170Hz 面板 + 16ms 定时器」判成了合格。
   static const bool trace_draw = [] {
     wchar_t buffer[8]{};
     return GetEnvironmentVariableW(L"MOVA_TRACE_DANMAKU", buffer, 8) > 0;
   }();
   if (trace_draw && g_danmaku_frames >= 60) {
+    // 就在要打印的这一刻采一次合成器时序：compose 是「此刻」的节奏，早采没意义，
+    // 而放在主循环里周期性采又要多一套节流状态（还没了用处）。
+    SampleCompositionTiming();
     const double frames = g_danmaku_frames;
     const int dropped = std::max(0, std::atoi(MpvString("frame-drop-count").c_str()));
-    char text[480]{};
+    char text[768]{};
     const int length = std::snprintf(
         text, sizeof(text),
         "MOVA_DANMAKU_DRAW=live=%d drawn=%d size=%dx%d pos=%.2f "
         "draw=%.2f post=%.2f gap=%.2f frames=%d"
         " overlap=%d mixed=%d lanes=%d dropped=%d drop=%d"
         " depth=%.1f olane=%d orect=%.0f,%.0f,%.0f,%.0f"
-        " avg=%.2f late20=%d late33=%d|\r\n",
+        " avg=%.2f late20=%d late33=%d"
+        " refresh=%.3f div=%d compose=%.2f dwell=%d,%d,%d,%d tick=%.2f/%d"
+        " tickdwell=%d,%d,%d,%d tkmax=%.2f ptph=%.2f ptjit=%.2f mw=%d|\r\n",
         live_count, drawn_count, width, height, pos, g_danmaku_draw_ms / frames,
         g_danmaku_post_ms / frames, g_danmaku_gap_ms, g_danmaku_frames,
         g_danmaku_overlap_max, g_danmaku_mixed_max, g_danmaku_lanes,
@@ -5031,7 +5466,18 @@ void PaintDanmaku() {
         g_danmaku_overlap_b0, g_danmaku_overlap_b1,
         g_danmaku_gap_count > 0 ? g_danmaku_gap_sum_ms / g_danmaku_gap_count
                                 : 0.0,
-        g_danmaku_gap_late20, g_danmaku_gap_late33);
+        g_danmaku_gap_late20, g_danmaku_gap_late33, g_refresh_period_ms,
+        g_frame_divisor, g_dwm_compose_ms, g_danmaku_dwell[1],
+        g_danmaku_dwell[2], g_danmaku_dwell[3], g_danmaku_dwell[4],
+        g_tick_count > 0 ? g_tick_sum_ms / g_tick_count : 0.0, g_tick_count,
+        g_tick_dwell[1], g_tick_dwell[2], g_tick_dwell[3], g_tick_dwell[4],
+        g_tick_gap_max,
+        g_paint_phase_count > 0 ? g_paint_phase_sum_ms / g_paint_phase_count
+                                : 0.0,
+        g_paint_phase_count > 0
+            ? g_paint_phase_max_ms - g_paint_phase_min_ms
+            : 0.0,
+        g_msg_wakes);
     const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     if (output && output != INVALID_HANDLE_VALUE && length > 0) {
       DWORD written = 0;
@@ -5044,6 +5490,14 @@ void PaintDanmaku() {
     g_danmaku_gap_count = 0;
     g_danmaku_gap_late20 = 0;
     g_danmaku_gap_late33 = 0;
+    for (int& bucket : g_danmaku_dwell) bucket = 0;
+    g_tick_sum_ms = 0.0;
+    g_tick_count = 0;
+    for (int& bucket : g_tick_dwell) bucket = 0;
+    g_tick_gap_max = 0.0;
+    g_paint_phase_sum_ms = 0.0;
+    g_paint_phase_count = 0;
+    g_msg_wakes = 0;
     g_danmaku_frames = 0;
     g_danmaku_overlap_max = 0;
     g_danmaku_mixed_max = 0;
@@ -5205,9 +5659,9 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         g_top_surface->Clear();
       }
       {
+        SyncGlassWindowOrigin(window);
         Gdiplus::Graphics graphics(g_top_surface->target);
-        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        ConfigureGlassGraphics(graphics);
         // 整块面从「完全透明」开始：没画到的地方是真的透明（以前靠键色）。
         graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
         // 顶栏窗口保持全宽，内部按设计稿坐标绘制、ScaleTransform 放大到物理：
@@ -5280,19 +5734,14 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         const float chip_gap = 6.0f;
         const float chip_width = chip_padding * 2.0f + chip_icon + chip_gap +
                                  network_box.Width + 2.0f;
-        const Gdiplus::RectF chip(
+        const Gdiplus::RectF chip = PixelSnapRect(Gdiplus::RectF(
             static_cast<float>(rect.right) - 156.0f - chip_width,
-            (rect.bottom - chip_height) / 2.0f, chip_width, chip_height);
+            (rect.bottom - chip_height) / 2.0f, chip_width, chip_height));
         Gdiplus::GraphicsPath chip_path;
         AddRoundedRectPath(chip_path, chip, chip_height / 2.0f);
-        // 网络胶囊也是液态玻璃（原来是 196 的实心深灰）。
-        Gdiplus::LinearGradientBrush chip_fill(
-            Gdiplus::PointF(chip.X, chip.Y),
-            Gdiplus::PointF(chip.X, chip.Y + chip_height),
-            Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(false)), 12, 13,
-                           17),
-            Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(true)), 8, 9, 12));
-        graphics.FillPath(&chip_fill, &chip_path);
+        FillGlassSurface(graphics, chip_path, chip, GlassChromeAlpha(false),
+                         GlassChromeAlpha(true), true);
+        StrokeGlassEdge(graphics, chip_path);
         DrawGlyph(graphics, L'\xF0C3', chip.X + chip_padding + chip_icon / 2.0f,
                   chip.Y + chip_height / 2.0f, chip_icon,
                   g_buffering.load() ? Gdiplus::Color(BYTE{200}, 255, 255, 255)
@@ -5314,15 +5763,13 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
           // 常驻的液态玻璃圆片：和控件条上的按钮同一套底。以前这里是 188 的实心
           // 深灰 + 一圈描边，压在画面上就是一排黑点 —— 用户说的「右上角几个控件
           // 也要液态玻璃」指的就是它们。
-          const Gdiplus::RectF disc(x - 18, 11, 36, 36);
-          Gdiplus::LinearGradientBrush button_base(
-              Gdiplus::PointF(disc.X, disc.Y),
-              Gdiplus::PointF(disc.X, disc.Y + disc.Height),
-              Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(false)), 12, 13,
-                             17),
-              Gdiplus::Color(static_cast<BYTE>(GlassChromeAlpha(true)), 8, 9,
-                             12));
-          graphics.FillEllipse(&button_base, disc);
+          const Gdiplus::RectF disc =
+              PixelSnapRect(Gdiplus::RectF(x - 18, 11, 36, 36));
+          Gdiplus::GraphicsPath disc_path;
+          AddRoundedRectPath(disc_path, disc, disc.Width / 2.0f);
+          FillGlassSurface(graphics, disc_path, disc, GlassDiscAlpha(false),
+                           GlassDiscAlpha(true), true);
+          StrokeGlassEdge(graphics, disc_path);
           if (hover_amount > 0.001f) {
             const BYTE alpha = static_cast<BYTE>(hover_amount *
                                                  (button == 3 ? 210 : 74));
@@ -5427,12 +5874,12 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         g_controls_surface->Clear();
       }
       {
-      Gdiplus::Graphics graphics(g_controls_surface->target);
-      graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-      graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-      // 整块面从「完全透明」开始 —— 这就是「控件背景没了」的实现：没画到的地方
-      // 是真的透明，视频原样透出来，而不是被常量 alpha 压成 91% 的黑板。
-      graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+        SyncGlassWindowOrigin(window);
+        Gdiplus::Graphics graphics(g_controls_surface->target);
+        ConfigureGlassGraphics(graphics);
+        // 整块面从「完全透明」开始 —— 这就是「控件背景没了」的实现：没画到的地方
+        // 是真的透明，视频原样透出来，而不是被常量 alpha 压成 91% 的黑板。
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
       // 控件条窗口已经是缩放后的物理大小；内部布局仍全部是设计稿坐标，
       // 一次 ScaleTransform 换过去，按钮、字号、进度条就都跟着窗口走。
       const float ui_scale = UiScale();
@@ -5547,7 +5994,6 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       }
 
       const float center = width / 2;
-      Gdiplus::SolidBrush white(Gdiplus::Color(255, 248, 248, 250));
       Gdiplus::SolidBrush quiet(Gdiplus::Color(255, 174, 176, 184));
       const float controls_y = 72.0f;
       const bool compact = width < 780;
@@ -5558,20 +6004,14 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         DrawHover(graphics, kNextEpisode, center + 140, controls_y, 42);
       }
       const float play_hover = HoverAmount(kPlayPause);
-      if (play_hover > 0.001f) {
-        Gdiplus::SolidBrush play_glow(Gdiplus::Color(
-            static_cast<BYTE>(24 + play_hover * 68), 255, 255, 255));
-        const float glow_size = 48.0f + play_hover * 10.0f;
-        graphics.FillEllipse(
-            &play_glow, Gdiplus::RectF(center - glow_size / 2,
-                                       controls_y - glow_size / 2, glow_size,
-                                       glow_size));
-      }
-      graphics.FillEllipse(&white,
-                           Gdiplus::RectF(center - 24 - play_hover,
-                                          controls_y - 24 - play_hover,
-                                          48 + play_hover * 2,
-                                          48 + play_hover * 2));
+      const Gdiplus::RectF play_rect = PixelSnapRect(
+          Gdiplus::RectF(center - 24, controls_y - 24, 48, 48),
+          0.5f);
+      Gdiplus::GraphicsPath play_path;
+      AddRoundedRectPath(play_path, play_rect, play_rect.Width / 2.0f);
+      FillGlassSurface(graphics, play_path, play_rect,
+                       GlassChromeAlpha(false), GlassChromeAlpha(true), true);
+      StrokeGlassEdge(graphics, play_path);
       DrawPlayIcon(graphics, center, controls_y, g_play_state_mix, play_hover);
       auto font = MakeInterfaceFont(13, Gdiplus::FontStyleRegular);
       Gdiplus::StringFormat centered;
@@ -5605,14 +6045,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         Gdiplus::GraphicsPath replay_path;
         const Gdiplus::RectF replay_rect(78.0f, 54.0f, 74.0f, 26.0f);
         AddRoundedRectPath(replay_path, replay_rect, 13.0f);
-        Gdiplus::LinearGradientBrush replay_glass(
-            Gdiplus::PointF(replay_rect.X, replay_rect.Y),
-            Gdiplus::PointF(replay_rect.X, replay_rect.Y + replay_rect.Height),
-            Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(false)),
-                           kGlassFrostRed, kGlassFrostGreen, kGlassFrostBlue),
-            Gdiplus::Color(static_cast<BYTE>(GlassDiscAlpha(true)),
-                           kGlassFrostRed, kGlassFrostGreen, kGlassFrostBlue));
-        graphics.FillPath(&replay_glass, &replay_path);
+        FillGlassSurface(graphics, replay_path, replay_rect,
+                         GlassDiscAlpha(false), GlassDiscAlpha(true), true);
+        StrokeGlassEdge(graphics, replay_path);
         if (replay_hover > 0.001f) {
           Gdiplus::SolidBrush lit(Gdiplus::Color(
               static_cast<BYTE>(replay_hover * 68), 255, 255, 255));
@@ -5657,8 +6092,10 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         graphics.DrawLine(&volume_value, volume_start, controls_y,
                           volume_start + 58.0f * volume_fraction,
                           controls_y);
+        Gdiplus::SolidBrush volume_thumb(
+            Gdiplus::Color(255, 248, 248, 250));
         graphics.FillEllipse(
-            &white,
+            &volume_thumb,
             Gdiplus::RectF(volume_start - 3 + 58 * volume_fraction,
                            controls_y - 3, 6, 6));
       }
@@ -5945,9 +6382,15 @@ bool RunShortcut(int key) {
 // 弹幕层只有约 32fps，「一顿一顿」就是这么来的。
 void TickFrame() {
   const double frame_now = NowMs();
+  // 第一帧没有「上一帧」可比，用一个等于当前节拍的 dt：对齐刷新时是刷新周期 ×
+  // 分频，退回定时器时才是 kFrameIntervalMs。只影响第一帧，但拿错了转圈/淡出会
+  // 在起始那一下跳一下。
   const double frame_dt =
       g_last_frame_ms == 0.0
-          ? static_cast<double>(kFrameIntervalMs) / 1000.0
+          ? (g_frame_divisor > 0 && g_refresh_period_ms > 0.0
+                 ? g_refresh_period_ms * static_cast<double>(g_frame_divisor) /
+                       1000.0
+                 : static_cast<double>(kFrameIntervalMs) / 1000.0)
           : std::min(0.1, (frame_now - g_last_frame_ms) / 1000.0);
   g_last_frame_ms = frame_now;
   // 弹幕层：播放中每帧重画；暂停 / 缓冲时只在「设置改了 / 跳转了」之后重画一次
@@ -5955,22 +6398,37 @@ void TickFrame() {
   const bool danmaku_animating = !g_paused.load() && !g_buffering.load();
   if (g_danmaku_loaded && g_danmaku &&
       (danmaku_animating || g_danmaku_dirty)) {
-    InvalidateRect(g_danmaku, nullptr, FALSE);
+    // WM_PAINT 是低优先级消息：只 InvalidateRect 会让稳定的 tick 在消息繁忙时
+    // 延后 1 个刷新拍，随后又在下一拍追上，形成肉眼可见的 1/3 拍交替。弹幕层
+    // 是独立 layered window，直接在节拍点提交即可；先验证掉可能残留的脏区，
+    // 避免稍后再收到一次 WM_PAINT 而重复画同一帧。
+    ValidateRect(g_danmaku, nullptr);
+    PaintDanmaku();
   }
   // 玻璃里的背板会过期：视频还在放，背板却还是开菜单那一刻的画面。有浮层露着的时候
   // 按 kGlassBackdropRefreshMs 重抓一次，玻璃里的画面就跟着动 —— 原生没有
   // BackdropFilter，这是唯一能让它「活」起来的办法（节流在 UpdateGlassBackdrop 里，
   // 这里每次 tick 调一次也不会有额外开销）。
-  const bool glass_visible = (g_panel && IsWindowVisible(g_panel)) ||
+  const bool glass_visible = (g_controls && IsWindowVisible(g_controls)) ||
+                             (g_top_bar && IsWindowVisible(g_top_bar)) ||
+                             (g_panel && IsWindowVisible(g_panel)) ||
                              (g_hint && IsWindowVisible(g_hint));
   if (glass_visible) {
-    const ULONGLONG stamp = g_backdrop.captured_at;
-    if (UpdateGlassBackdrop(false) && g_backdrop.captured_at != stamp) {
+    static ULONGLONG presented_stamp = 0;
+    const ULONGLONG stamp = g_backdrop.captured_at.load();
+    if (stamp != 0 && stamp != presented_stamp) {
+      presented_stamp = stamp;
       if (g_panel && IsWindowVisible(g_panel)) {
         InvalidateRect(g_panel, nullptr, FALSE);
       }
       if (g_hint && IsWindowVisible(g_hint)) {
         InvalidateRect(g_hint, nullptr, FALSE);
+      }
+      if (g_controls && IsWindowVisible(g_controls)) {
+        InvalidateRect(g_controls, nullptr, FALSE);
+      }
+      if (g_top_bar && IsWindowVisible(g_top_bar)) {
+        InvalidateRect(g_top_bar, nullptr, FALSE);
       }
     }
   }
@@ -6099,6 +6557,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     case WM_NCCALCSIZE:
       if (wparam) return 0;
       return DefWindowProcW(window, message, wparam, lparam);
+    case WM_DISPLAYCHANGE:
+      // 换显示器 / 改刷新率 / 开关全屏 / 显卡驱动切模式：帧节拍要跟着重算，
+      // 否则会拿旧面板的刷新周期去分频，又变成非整数比（见 RefreshFramePacing）。
+      RefreshFramePacing();
+      return 0;
     case WM_NCHITTEST: {
       const LRESULT hit = DefWindowProcW(window, message, wparam, lparam);
       if (hit != HTCLIENT) return hit;
@@ -6470,6 +6933,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   SetOption(g_handle, "input-vo-keyboard", "yes");
   SetOption(g_handle, "keep-open", "no");
   SetOption(g_handle, "vid", "auto");
+  // 给底部播放控件留出字幕安全区。默认 100% 会把内嵌字幕压在控制按钮后面。
+  SetOption(g_handle, "sub-pos", "84");
   // 光标隐藏由窗口的 50ms timer 统一管理（控件条与光标同进退）；mpv 自己的
   // autohide 与它各管各的，会出现「控件退场了光标还亮着」的分裂状态。
   SetOption(g_handle, "cursor-autohide", "no");
@@ -6710,11 +7175,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   }
   ShowWindow(window, show_command);
   UpdateWindow(window);
-  // 帧节拍：以前用 SetTimer(window, 1, 16) + WM_TIMER，实测每帧间隔稳定在
-  // ~31ms —— SetTimer 会把周期向上取整到系统时钟节拍（15.6ms）的整数倍，请求
-  // 16ms 实际拿到 31.25ms，于是弹幕只有约 32fps，滚动起来就是「一顿一顿」。
-  // 换成可等待定时器（Win10 1803+ 支持高精度模式）后节拍稳定在 16.7ms；
-  // 拿不到高精度定时器时退回 WM_TIMER，两条路都进 TickFrame()。
+  // 帧节拍的主路径现在是「对齐合成器的整数拍」（见 RefreshFramePacing 与主循环
+  // 里的 DwmFlush 分支），这一段定时器只在「拿不到刷新周期 / 窗口不可见 / 暂停」
+  // 时兜底。
+  //
+  // 曾经的历史：SetTimer(window, 1, 16) 的周期会被向上取整到系统时钟节拍
+  // （15.6ms）的整数倍，请求 16ms 实际拿到 31.25ms → 弹幕只有约 32fps。换成
+  // 可等待定时器（Win10 1803+ 的高精度模式）之后才稳定在 16.7ms。但 16.7ms 本身
+  // 仍然与面板刷新率无关，在 170Hz 面板上每帧停留 2.77 个周期（非整数）→ 位移
+  // 步长 3:2 交替。这才是「还是不够平滑」的根因。
+  RefreshFramePacing();
   timeBeginPeriod(1);
   HANDLE frame_timer = nullptr;
   if (HINSTANCE kernel32 = GetModuleHandleW(L"kernel32.dll")) {
@@ -6978,16 +7448,77 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     }
   });
 
+  // 背板采集与 CPU 模糊不能跑在 UI 帧循环里。后台线程只处理可见玻璃区域，
+  // 持续产出最新帧，
+  // UI 只在 TickFrame 中发现新时间戳后重绘，不再等待采集完成。
+  std::atomic<bool> glass_backdrop_done{false};
+  std::thread glass_backdrop([&glass_backdrop_done] {
+    while (g_running) {
+      const bool visible =
+          (g_controls && IsWindowVisible(g_controls)) ||
+          (g_top_bar && IsWindowVisible(g_top_bar)) ||
+          (g_panel && IsWindowVisible(g_panel)) ||
+          (g_hint && IsWindowVisible(g_hint));
+      if (visible) UpdateGlassBackdrop(false);
+      // UpdateGlassBackdrop 自己按 16ms 节流。这里只让出一个时间片，
+      // 避免原先的 8ms 睡眠把可达刷新率直接压到 30–40Hz。
+      Sleep(1);
+    }
+    glass_backdrop_done = true;
+  });
+
   MSG message{};
   bool pumping = true;
   while (pumping) {
     if (frame_timer) {
-      // 有帧定时器就阻塞等「定时器到点」或「有消息」，哪边都不落空：以前那种
-      // 纯 GetMessage 的循环要靠 WM_TIMER 才有节拍，而 WM_TIMER 的周期被系统
-      // 时钟节拍限死（见上面建定时器处的说明）。
-      const DWORD wait_result = MsgWaitForMultipleObjects(
-          1, &frame_timer, FALSE, INFINITE, QS_ALLINPUT);
-      if (wait_result == WAIT_OBJECT_0) TickFrame();
+      if (FramePacingWanted()) {
+        // 等自己的高精度节拍时钟到点（一个 tick = divisor × 刷新周期）。
+        //
+        // **不在这里调 DwmFlush**：它的返回本身就在 1 拍/2 拍之间跳，把 tick 挂在
+        // 它上面等于把这份抖动搬进 paint 间隔（实测 dwell 落成 2/3/4 拍不规则混合，
+        // 只有 4–8.5% 恰好 1 拍）。相位只在建表时用一次 DwmFlush 对齐（见
+        // RebuildPacingTimer），之后靠「周期严格等于整数拍」保持同相。
+        //
+        // 同时等消息：定时器（index 0）比消息就绪（index 1）优先，所以不会因为
+        // 一直在处理消息而饿掉 tick；也能让消息一到位就处理，不必等满一个周期。
+        const DWORD wait_result = MsgWaitForMultipleObjects(
+            1, &g_pacing_timer, FALSE, INFINITE, QS_ALLINPUT);
+        if (wait_result == WAIT_OBJECT_0) {
+          const double tick_now = NowMs();
+          if (g_tick_last_ms > 0.0) {
+            const double tick_gap = tick_now - g_tick_last_ms;
+            g_tick_sum_ms += tick_gap;
+            ++g_tick_count;
+            // 节拍间隔的分布：和绘制的 dwell 配对读，才知道该往定时器还是往
+            // 绘制派发路径上找问题（见 g_tick_dwell 的说明）。
+            g_tick_gap_max = std::max(g_tick_gap_max, tick_gap);
+            if (g_refresh_period_ms > 0.0) {
+              const long long periods =
+                  std::lround(tick_gap / g_refresh_period_ms);
+              const int bucket = static_cast<int>(
+                  periods < 1 ? 1 : (periods > 4 ? 4 : periods));
+              ++g_tick_dwell[bucket];
+            }
+          }
+          g_tick_last_ms = tick_now;
+          g_tick_now_ms = tick_now;
+          TickFrame();
+          ++g_pacing_tick;
+          ArmNextPacingTick();
+        } else {
+          // 有消息先处理，但**这一轮没有走 tick**：定时器若已触发就会一直保持
+          // 触发态，下一轮立刻返回，于是量出一个远短于 period 的间隔。计数它。
+          if (wait_result != WAIT_TIMEOUT) ++g_msg_wakes;
+        }
+      } else {
+        // 画面停着 / 窗口不可见 / 拿不到刷新周期：回到定时器节拍。
+        // 有帧定时器就阻塞等「定时器到点」或「有消息」，哪边都不落空：以前那种
+        // 纯 GetMessage 的循环要靠 WM_TIMER 才有节拍，而 WM_TIMER 的周期被系统
+        // 时钟节拍限死（见上面建定时器处的说明）。
+        const DWORD wait_result = MsgWaitForMultipleObjects(
+            1, &frame_timer, FALSE, INFINITE, QS_ALLINPUT);
+        if (wait_result == WAIT_OBJECT_0) TickFrame();
+      }
     }
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
       if (message.message == WM_QUIT) {
@@ -7004,6 +7535,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     }
   }
   g_running = false;
+  // 节拍时钟也是内核对象，退出前要拆掉（DisarmPacingTimer 内部判空）。
+  DisarmPacingTimer();
   if (frame_timer) {
     CancelWaitableTimer(frame_timer);
     CloseHandle(frame_timer);
@@ -7013,6 +7546,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // 与 timeBeginPeriod 配对。漏掉它会让系统时钟一直停在 1ms 粒度上，
   // 本机其他程序的待机电耗会明显上升。
   timeEndPeriod(1);
+  // PrintWindow can synchronously send messages to this thread. Keep servicing
+  // them until capture exits, otherwise joining here can deadlock shutdown.
+  while (!glass_backdrop_done) {
+    MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      if (message.message == WM_QUIT) continue;
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  if (glass_backdrop.joinable()) glass_backdrop.join();
   if (events.joinable()) events.join();
   if (g_handle) {
     g_mpv.terminate_destroy(g_handle);

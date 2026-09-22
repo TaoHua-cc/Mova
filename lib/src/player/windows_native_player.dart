@@ -5,8 +5,13 @@ import 'dart:io';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../cache/danmaku_cache.dart';
 import '../cache/video_cache.dart';
 import '../history/watch_state_store.dart';
+import '../network/proxy_routing.dart';
+import '../sources/emby_client.dart';
+import '../sources/media_source.dart';
+import '../sources/source_store.dart';
 import 'danmaku_client.dart';
 import 'dolby_vision_color.dart';
 import 'native_dolby_vision.dart';
@@ -605,6 +610,31 @@ class WindowsNativePlayer {
       );
     }
 
+    Future<void> saveManualSegment(
+      int index,
+      String kind,
+      double seconds,
+    ) async {
+      final entry = entryAt(index);
+      final query = PlaybackSegmentQuery(
+        tmdbId: entry?.tmdbId ?? request.tmdbId,
+        seasonNumber: entry?.seasonNumber ?? request.seasonNumber,
+        episodeNumber: entry?.episodeNumber ?? request.episodeNumber,
+        sourceId: entry?.sourceId ?? request.sourceId,
+        serverItemId: entry?.serverItemId ?? request.serverItemId,
+      );
+      final prefix = playbackSegmentPreferencePrefix(query);
+      if (prefix == null || (kind != 'intro' && kind != 'outro')) return;
+      final preferences = await SharedPreferences.getInstance();
+      final key = '$prefix.$kind';
+      if (seconds < 0) {
+        await preferences.remove(key);
+      } else {
+        await preferences.setInt(key, (seconds * 1000).round());
+      }
+      if (index == extrasEpisode) await pushEpisodeSegments(index);
+    }
+
     /// 拉当前集的弹幕并热加载进播放器。
     Future<void> pushEpisodeDanmaku(int index) async {
       final generation = ++danmakuGeneration;
@@ -746,6 +776,17 @@ class WindowsNativePlayer {
           ).allMatches(chunk)) {
             unawaited(_saveNativeSetting(match.group(1)!, match.group(2)!));
           }
+          for (final match in RegExp(
+            r'MOVA_SEGMENT_MARK=(intro|outro)\|([0-9]+)\|(-?[0-9.]+)',
+          ).allMatches(chunk)) {
+            unawaited(
+              saveManualSegment(
+                int.parse(match.group(2)!),
+                match.group(1)!,
+                double.parse(match.group(3)!),
+              ),
+            );
+          }
         });
     await process.stderr.drain<void>();
     final exitCode = await process.exitCode;
@@ -761,6 +802,7 @@ class WindowsNativePlayer {
       await _deleteFileQuietly(lastDanmakuFile);
     }
     nextEpisodePreload?.cancel();
+    final savedStates = <WatchState>[];
     if (episodeDurations.isNotEmpty) {
       final store = await WatchStateStore.create();
       for (final item in episodeDurations.entries) {
@@ -768,36 +810,93 @@ class WindowsNativePlayer {
         final activeEntry = entries[index];
         final activePosition = episodePositions[item.key] ?? Duration.zero;
         final activeDuration = item.value;
-        await store.save(
-          // title 必须是剧名（request.title）：播放列表条目的 title 是单集
-          // 条目自己的名字，各来源取名不一致 —— 有的叫「第 1 集」，有的直接
-          // 复用剧名，写成记录标题就会出现「同一个剧两条记录、一条把集名
-          // 当剧名」的脏数据。episodeTitle 只取条目自带的集名，缺了就留空
-          // （卡片回退「第 N 集」），绝不拿剧名/条目名来充数。
-          normalizeWatchState(
-            WatchState(
-              mediaId: activeEntry.url,
-              title: request.title,
-              position: activePosition,
-              duration: activeDuration,
-              imageUrl: activeEntry.imageUrl,
-              sourceId: activeEntry.sourceId,
-              serverItemId: activeEntry.serverItemId,
-              tmdbId: activeEntry.tmdbId,
-              episodeTitle: activeEntry.episodeTitle,
-              seasonNumber: activeEntry.seasonNumber,
-              episodeNumber: activeEntry.episodeNumber,
-              isPlayed: completedEpisodes.contains(item.key),
-            ),
-          ),
-        );
+        final state =
+            // title 必须是剧名（request.title）：播放列表条目的 title 是单集
+            // 条目自己的名字，各来源取名不一致 —— 有的叫「第 1 集」，有的直接
+            // 复用剧名，写成记录标题就会出现「同一个剧两条记录、一条把集名
+            // 当剧名」的脏数据。episodeTitle 只取条目自带的集名，缺了就留空
+            // （卡片回退「第 N 集」），绝不拿剧名/条目名来充数。
+            normalizeWatchState(
+              WatchState(
+                mediaId: activeEntry.url,
+                title: request.title,
+                position: activePosition,
+                duration: activeDuration,
+                imageUrl: activeEntry.imageUrl,
+                sourceId: activeEntry.sourceId,
+                serverItemId: activeEntry.serverItemId,
+                tmdbId: activeEntry.tmdbId,
+                episodeTitle: activeEntry.episodeTitle,
+                seasonNumber: activeEntry.seasonNumber,
+                episodeNumber: activeEntry.episodeNumber,
+                isPlayed: completedEpisodes.contains(item.key),
+              ),
+            );
+        await store.save(state);
+        savedStates.add(state);
       }
     }
+    // Flutter 播放器会持续上报进度；Windows 原生播放器是独立进程，过去只
+    // 写了本机缓存。退出时补一份最终状态，保证服务器与其他设备能继续播放。
+    await _syncServerWatchStates(savedStates);
     if (exitCode != 0) throw StateError('原生播放器异常退出（$exitCode）');
     return WindowsNativePlayResult(
       resourceIndex: requestedResource,
       resourcePosition: requestedResourcePosition,
     );
+  }
+
+  static Future<void> _syncServerWatchStates(List<WatchState> states) async {
+    if (states.isEmpty || await WatchStateStore.localOnly()) return;
+    final store = await SourceStore.create();
+    final sources = {for (final source in store.load()) source.id: source};
+    for (var index = 0; index < states.length; index++) {
+      final state = states[index];
+      final source = sources[state.sourceId];
+      final itemId = state.serverItemId;
+      if (source == null ||
+          source.kind == SourceKind.webdav ||
+          itemId == null ||
+          itemId.isEmpty) {
+        continue;
+      }
+      final token = store.tokenFor(source);
+      if (token == null || token.isEmpty) continue;
+      final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
+      try {
+        final session = await client.resolveSession(
+          EmbySession(source: source, token: token),
+        );
+        final playSessionId =
+            'mova-${DateTime.now().microsecondsSinceEpoch}-$index';
+        final mediaSourceId = Uri.tryParse(state.mediaId)
+            ?.queryParameters['MediaSourceId'];
+        await client.startSession(
+          session: session,
+          itemId: itemId,
+          position: state.position,
+          duration: state.duration,
+          isPaused: false,
+          playSessionId: playSessionId,
+          mediaSourceId: mediaSourceId,
+        );
+        await client.stopSession(
+          session: session,
+          itemId: itemId,
+          position: state.position,
+          duration: state.duration,
+          playSessionId: playSessionId,
+          mediaSourceId: mediaSourceId,
+        );
+        if (state.isCompleted) {
+          await client.setPlayed(session, itemId, played: true);
+        }
+      } catch (_) {
+        // 单个服务器离线不能影响播放器正常退出，也不能阻止其他服务器同步。
+      } finally {
+        client.dispose();
+      }
+    }
   }
 
   static String _shortcutLabel(String saved) =>
@@ -851,20 +950,38 @@ class WindowsNativePlayer {
     required String token,
   }) async {
     if (apis.isEmpty) throw StateError('未配置弹幕 API');
+    final season = entry?.seasonNumber ?? request.seasonNumber;
+    final episode = entry?.episodeNumber ?? request.episodeNumber;
+    final cache = await DanmakuCache.tryCreate();
+    final cacheKey = DanmakuCache.keyFor(
+      apis: apis,
+      title: request.title,
+      season: season,
+      episode: episode,
+    );
+    final cached = await cache?.read(cacheKey);
     List<DanmakuComment>? comments;
     String source = '';
     String matched = '';
-    for (var index = 0; index < apis.length; index++) {
+    if (cached != null && cached.comments.isNotEmpty && !cached.isStale) {
+      comments = cached.comments;
+      source = cached.source?.trim().isNotEmpty == true
+          ? '${cached.source} · 本机缓存'
+          : '本机缓存';
+      matched = cached.matchedEpisode ?? '';
+    }
+    for (var index = 0; comments == null && index < apis.length; index++) {
       final api = apis[index];
+      DanmakuClient? client;
       try {
-        final client = DanmakuClient();
+        client = DanmakuClient();
         final result = await client
             .fetch(
               template: api,
               tmdbId: (entry?.tmdbId ?? request.tmdbId)?.toString(),
               title: request.title,
-              season: entry?.seasonNumber ?? request.seasonNumber,
-              episode: entry?.episodeNumber ?? request.episodeNumber,
+              season: season,
+              episode: episode,
               mediaUrl: request.url,
               token: token.isEmpty ? null : token,
             )
@@ -876,9 +993,17 @@ class WindowsNativePlayer {
             ? apiNames[index].trim()
             : api;
         matched = client.matchedEpisode ?? '';
+        await cache?.write(
+          cacheKey,
+          result,
+          matchedEpisode: matched,
+          source: source,
+        );
         break;
       } catch (_) {
         // 该 API 失败，继续试下一个。
+      } finally {
+        client?.dispose();
       }
     }
     if (comments == null || comments.isEmpty) {
@@ -964,34 +1089,57 @@ class WindowsNativePlayer {
     required SegmentSourceSettings sources,
   }) async {
     send('MOVA_SEGMENT_STATUS=loading');
-    try {
-      final result = await loadPlaybackSegments(
-        PlaybackSegmentQuery(
-          tmdbId: entry?.tmdbId ?? request.tmdbId,
-          seasonNumber: entry?.seasonNumber ?? request.seasonNumber,
-          episodeNumber: entry?.episodeNumber ?? request.episodeNumber,
-          sourceId: entry?.sourceId ?? request.sourceId,
-          serverItemId: entry?.serverItemId ?? request.serverItemId,
-          sources: sources,
-        ),
-      ).timeout(const Duration(seconds: 20));
-      if (stale()) return;
-      // 行格式：<类型>|<开始秒>|<结束秒>|<来源>；结束点缺失记 -1（片尾常常只有
-      // 起点），原生按当前总时长处理。
-      for (final segment in result.segments) {
+    final query = PlaybackSegmentQuery(
+      tmdbId: entry?.tmdbId ?? request.tmdbId,
+      seasonNumber: entry?.seasonNumber ?? request.seasonNumber,
+      episodeNumber: entry?.episodeNumber ?? request.episodeNumber,
+      sourceId: entry?.sourceId ?? request.sourceId,
+      serverItemId: entry?.serverItemId ?? request.serverItemId,
+      sources: sources,
+    );
+    final preferences = await SharedPreferences.getInstance();
+    final prefix = playbackSegmentPreferencePrefix(query);
+    final introMs = prefix == null ? null : preferences.getInt('$prefix.intro');
+    final outroMs = prefix == null ? null : preferences.getInt('$prefix.outro');
+
+    void sendSegments(List<PlaybackSegment> segments) {
+      for (final segment in segments) {
         send(
           'MOVA_SEGMENT=${segment.type.name}|${_secondLabel(segment.start)}|'
           '${segment.end == null ? -1 : _secondLabel(segment.end!)}|'
           '${segment.provider.replaceAll('|', ' ')}',
         );
       }
-      send('MOVA_SEGMENTS_DONE=${result.segments.length}');
+      send('MOVA_SEGMENTS_DONE=${segments.length}');
+    }
+
+    final manual = applyManualPlaybackSegments(
+      const [],
+      introEnd: introMs == null ? null : Duration(milliseconds: introMs),
+      outroStart: outroMs == null ? null : Duration(milliseconds: outroMs),
+    );
+    if (manual.isNotEmpty) sendSegments(manual);
+    try {
+      final result = await loadPlaybackSegments(query)
+          .timeout(const Duration(seconds: 20));
+      if (stale()) return;
+      final segments = applyManualPlaybackSegments(
+        result.segments,
+        introEnd: introMs == null ? null : Duration(milliseconds: introMs),
+        outroStart: outroMs == null ? null : Duration(milliseconds: outroMs),
+      );
+      sendSegments(segments);
       final message = result.message;
       if (message != null) {
         send('MOVA_SEGMENT_STATUS=note:${message.replaceAll('\n', ' ')}');
       }
     } catch (error) {
-      if (!stale()) send('MOVA_SEGMENT_STATUS=error:${_reasonOf(error)}');
+      if (!stale()) {
+        send(
+          'MOVA_SEGMENT_STATUS=${manual.isEmpty ? 'error' : 'note'}:'
+          '${_reasonOf(error)}',
+        );
+      }
     }
   }
 

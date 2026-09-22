@@ -194,6 +194,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('我的电影榜'), findsWidgets);
     expect(find.byTooltip('设置我的电影榜'), findsOneWidget);
+    yingjiSectionRequest.value = 'discover';
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('设置我的电影榜'));
     await tester.pumpAndSettle();
     expect(find.text('列表设置'), findsOneWidget);
