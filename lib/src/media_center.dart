@@ -23,6 +23,7 @@ import 'cache/danmaku_cache.dart';
 import 'cache/image_prefetch.dart';
 import 'cache/media_cache.dart';
 import 'cache/video_cache.dart';
+import 'diagnostics/frame_trace.dart';
 import 'motion.dart';
 import 'network/proxy_routing.dart';
 import 'history/watch_state_store.dart';
@@ -361,41 +362,43 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
 
   @override
   Widget build(BuildContext context) {
-    final shellBody = Stack(
-      fit: StackFit.expand,
-      children: [
-        _ContinuousShellBackdrop(controller: _pageController),
-        PageView.builder(
-          controller: _pageController,
-          scrollDirection: Axis.vertical,
-          allowImplicitScrolling: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: _pageSections.length,
-          onPageChanged: (index) {
-            final section = _pageSections[index];
-            setState(() => _section = section);
-            yingjiSectionFocus.value = _sectionKey(section);
-          },
-          itemBuilder: (context, index) {
-            final section = _pageSections[index];
-            final page = _pageFor(section);
-            if (section == _CenterSection.home) return page;
-            return Padding(padding: YingjiLayout.pageInset, child: page);
-          },
-        ),
-        const _FloatingHomeDragRegion(),
-        _FloatingHomeRail(selected: _section, onChanged: _selectSection),
-        _FloatingHomeTopBar(
-          onSearch: () => _selectSection(_CenterSection.search),
-        ),
-        // 首页自带绑定真实滚动位置的提示，壳层这个按页切换的提示在首页会失真。
-        if (_section != _CenterSection.home)
-          Positioned(
-            right: 28,
-            bottom: 30,
-            child: _PageScrollCue(progress: _pageScrollHint),
+    final shellBody = BackdropGroup(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          _ContinuousShellBackdrop(controller: _pageController),
+          PageView.builder(
+            controller: _pageController,
+            scrollDirection: Axis.vertical,
+            allowImplicitScrolling: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: _pageSections.length,
+            onPageChanged: (index) {
+              final section = _pageSections[index];
+              setState(() => _section = section);
+              yingjiSectionFocus.value = _sectionKey(section);
+            },
+            itemBuilder: (context, index) {
+              final section = _pageSections[index];
+              final page = _pageFor(section);
+              if (section == _CenterSection.home) return page;
+              return Padding(padding: YingjiLayout.pageInset, child: page);
+            },
           ),
-      ],
+          const _FloatingHomeDragRegion(),
+          _FloatingHomeRail(selected: _section, onChanged: _selectSection),
+          _FloatingHomeTopBar(
+            onSearch: () => _selectSection(_CenterSection.search),
+          ),
+          // 首页自带绑定真实滚动位置的提示，壳层这个按页切换的提示在首页会失真。
+          if (_section != _CenterSection.home)
+            Positioned(
+              right: 28,
+              bottom: 30,
+              child: _PageScrollCue(progress: _pageScrollHint),
+            ),
+        ],
+      ),
     );
     return Listener(
       behavior: HitTestBehavior.translucent,
@@ -434,8 +437,8 @@ class _HomeFeedPage extends StatefulWidget {
 class _HomeFeedPageState extends State<_HomeFeedPage>
     with _SectionTopOnTap<_HomeFeedPage> {
   final ScrollController _scroll = ScrollController();
-  bool _showDiscover = false;
-  int _discoverSectionLimit = 1;
+  bool _showDiscover = true;
+  int _discoverSectionLimit = 4;
   Timer? _discoverGrowthDebounce;
 
   @override
@@ -479,17 +482,22 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
   void _handleScroll() {
     if (!mounted || !_scroll.hasClients) return;
     final position = _scroll.position;
-    if (!_showDiscover && position.pixels > 4) {
-      setState(() => _showDiscover = true);
-    } else if (_showDiscover &&
-        position.extentAfter < position.viewportDimension * .8) {
-      // 滚轮滑行期间 maxScrollExtent 还没来得及随新栏目增长；直接 setState 会在
-      // 每一帧都 +2，一次滚动瞬间挂载十几个榜单。等滚动停稳后只追加一批，网络
-      // 与图片解码都留在帧间空档里。
-      _discoverGrowthDebounce?.cancel();
-      _discoverGrowthDebounce = Timer(const Duration(milliseconds: 180), () {
-        if (mounted) setState(() => _discoverSectionLimit += 2);
-      });
+    if (position.viewportDimension <= 0) return;
+    if (_showDiscover) {
+      // 所有栏目从一开始就占好固定高度，避免滚动时 maxScrollExtent 增长把海报
+      // 顶来顶去；这里只在停稳后加载当前位置附近的数据，不改变页面几何结构。
+      final targetLimit =
+          ((position.pixels / position.viewportDimension) * 2).ceil() + 4;
+      if (targetLimit <= _discoverSectionLimit) {
+        _discoverGrowthDebounce?.cancel();
+      } else {
+        _discoverGrowthDebounce?.cancel();
+        _discoverGrowthDebounce = Timer(const Duration(milliseconds: 180), () {
+          if (mounted && targetLimit > _discoverSectionLimit) {
+            setState(() => _discoverSectionLimit = targetLimit);
+          }
+        });
+      }
     }
     final more = position.maxScrollExtent - position.pixels > 24;
     if (more != _hasMoreBelow) setState(() => _hasMoreBelow = more);
@@ -528,23 +536,28 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
           Positioned.fill(
             child: YingjiSmoothWheel(
               controller: _scroll,
-              child: ListView(
+              child: CustomScrollView(
                 controller: _scroll,
                 // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
                 physics: yingjiWheelPhysics,
-                padding: EdgeInsets.zero,
-                children: [
-                  SizedBox(height: canvasHeight, child: const _CinematicHome()),
+                slivers: [
+                  SliverToBoxAdapter(
+                    child: SizedBox(
+                      height: canvasHeight,
+                      child: const _CinematicHome(),
+                    ),
+                  ),
                   if (_showDiscover)
-                    Padding(
+                    SliverPadding(
                       // 与原独立“发现”页在壳层中收到的边距保持一致
                       padding: YingjiLayout.pageInset,
-                      child: _DiscoverPage(
+                      sliver: _DiscoverPage(
                         embedded: true,
                         sectionLimit: _discoverSectionLimit,
                       ),
                     ),
-                  if (!_showDiscover) SizedBox(height: canvasHeight),
+                  if (!_showDiscover)
+                    SliverToBoxAdapter(child: SizedBox(height: canvasHeight)),
                 ],
               ),
             ),
@@ -649,7 +662,7 @@ class _ContinuousShellBackdrop extends StatelessWidget {
               fit: StackFit.expand,
               children: [
                 const ColoredBox(color: YingjiColors.canvas),
-                if (imageUrl != null)
+                if (imageUrl != null && !FrameTrace.skipGlass('clear'))
                   // 隔离成独立图层：翻页 / 滚动时 depth 每帧都在变，只有上面的
                   // 遮罩需要重画，这张全屏底图不必跟着一起重绘。
                   RepaintBoundary(
@@ -674,27 +687,36 @@ class _ContinuousShellBackdrop extends StatelessWidget {
                       ),
                     ),
                   ),
-                if (imageUrl != null)
-                  Opacity(
-                    opacity: depth,
-                    child: RepaintBoundary(
-                      child: Transform.scale(
-                        scale: 1.05,
-                        child: ImageFiltered(
-                          imageFilter: ImageFilter.blur(
-                            sigmaX: YingjiGlass.blur,
-                            sigmaY: YingjiGlass.blur,
-                          ),
-                          child: CachedNetworkImage(
-                            key: ValueKey('blur-$imageUrl'),
-                            imageUrl: imageUrl,
-                            fit: BoxFit.cover,
-                            // 这一层会被高斯模糊糊掉，原图分辨率纯属浪费：降到 320px
-                            // 宽再放大，肉眼完全看不出差别，却能少占数 MB。模糊拉到
-                            // 很低时这层就不再是"氛围光"了，改按 1280 解码，免得出现
-                            // 一层低清放大图压在清晰背景上的发虚重影。
-                            memCacheWidth: YingjiGlass.blur >= 10 ? 320 : 1280,
-                            errorWidget: (_, _, _) => const SizedBox.shrink(),
+                if (imageUrl != null && !FrameTrace.skipGlass('shell'))
+                  ValueListenableBuilder<bool>(
+                    valueListenable: yingjiScrollInProgress,
+                    builder: (context, scrolling, _) => Opacity(
+                      opacity: depth,
+                      child: RepaintBoundary(
+                        child: Transform.scale(
+                          scale: 1.05,
+                          child: ImageFiltered(
+                            imageFilter: ImageFilter.blur(
+                              sigmaX: YingjiGlass.blur,
+                              sigmaY: YingjiGlass.blur,
+                            ),
+                            // 滚轮滑行期间冻结这条全屏离屏模糊。之前只有按钮、卡片
+                            // 的 BackdropFilter 接入滚动态，壳层仍每帧处理整张背景，
+                            // Profile 实测 raster p95 达 25ms。停稳即恢复完整材质。
+                            enabled: !scrolling,
+                            child: CachedNetworkImage(
+                              key: ValueKey('blur-$imageUrl'),
+                              imageUrl: imageUrl,
+                              fit: BoxFit.cover,
+                              // 这一层会被高斯模糊糊掉，原图分辨率纯属浪费：降到 320px
+                              // 宽再放大，肉眼完全看不出差别，却能少占数 MB。模糊拉到
+                              // 很低时这层就不再是"氛围光"了，改按 1280 解码，免得出现
+                              // 一层低清放大图压在清晰背景上的发虚重影。
+                              memCacheWidth: YingjiGlass.blur >= 10
+                                  ? 320
+                                  : 1280,
+                              errorWidget: (_, _, _) => const SizedBox.shrink(),
+                            ),
                           ),
                         ),
                       ),
@@ -2244,6 +2266,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 
   Future<Map<String, List<TmdbItem>>> _initializeSections() async {
     await _restoreLayout();
+    // 本地栏目顺序决定整页几何，不能等网络数据返回后才通过 FutureBuilder 重建；
+    // 否则用户已经开始滚动时 maxScrollExtent 才突然切到保存的栏目数量。
+    if (mounted) setState(() {});
     return _loadSections(limit: widget.sectionLimit);
   }
 
@@ -3551,7 +3576,6 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           final sections = snapshot.data ?? _visibleItems;
           final visibleSections = _sections
               .where((section) => !_hiddenSections.contains(section))
-              .take(widget.sectionLimit ?? _sections.length)
               .toList(growable: false);
           Widget buildRow(int index) {
             if (index == 0) {
@@ -3632,13 +3656,28 @@ class _DiscoverPageState extends State<_DiscoverPage> {
               ? 2
               : visibleSections.length + 1;
           if (widget.embedded) {
-            // shrinkWrap ListView 在外层每次滚动时会重新丈量全部榜单；栏目越多越
-            // 慢。内嵌模式直接使用静态 Column，并把每栏隔离成合成层。
-            return Padding(
+            // 首页直接把发现栏目接进同一个 CustomScrollView。SliverList 只布局、
+            // 构建视口附近的榜单；旧 Column 会让已经加载的所有栏目一直参与每次
+            // 滚动布局，越靠近页面底部帧率越低。
+            return SliverPadding(
               padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: List.generate(itemCount, buildRow),
+              sliver: SliverMainAxisGroup(
+                slivers: [
+                  SliverToBoxAdapter(child: buildRow(0)),
+                  if (visibleSections.isEmpty)
+                    SliverToBoxAdapter(child: buildRow(1))
+                  else
+                    // 所有栏目槽位用同一个确定高度。SliverVariedExtentList 即使
+                    // 提供 itemExtentBuilder，也会在子项首次出现时修正总范围；
+                    // Windows 高刷滚动中该修正会把海报整体推移，肉眼就是抖动。
+                    // 固定槽位让 maxScrollExtent 从首帧起保持不变，较矮卡片留下
+                    // 的少量呼吸空间也比滚动时改变几何更自然。
+                    SliverFixedExtentList.builder(
+                      itemExtent: 396,
+                      itemCount: visibleSections.length,
+                      itemBuilder: (context, index) => buildRow(index + 1),
+                    ),
+                ],
               ),
             );
           }
@@ -4521,11 +4560,15 @@ class _DiscoverBlock extends StatefulWidget {
   State<_DiscoverBlock> createState() => _DiscoverBlockState();
 }
 
-class _DiscoverBlockState extends State<_DiscoverBlock> {
+class _DiscoverBlockState extends State<_DiscoverBlock>
+    with AutomaticKeepAliveClientMixin {
   final _shelf = _ShelfNavigator();
   late List<TmdbItem> _items;
   int _page = 1;
   bool _loadingMore = false;
+
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   void initState() {
@@ -4581,6 +4624,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final title = widget.title;
     final items = _items;
     final variant = widget.variant;
@@ -11236,7 +11280,7 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
         child: SizedBox(
           width: widget.compact ? 520 : 570,
           child: InkWell(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(14),
             onTap: hasPlatform ? widget.onOpen : widget.onConfigure,
             child: MouseRegion(
               onEnter: (_) => setState(() => _hovered = true),
@@ -11738,7 +11782,9 @@ class _RankTileState extends State<_RankTile>
                   alignment: showOnRight
                       ? Alignment.centerLeft
                       : Alignment.centerRight,
-                  widthFactor: .27 + reveal.value * .73,
+                  // 初始 130px 与榜单原海报（166 - left 36）完全重合，
+                  // 再只向详情侧展开；旧值 135px 会在第一帧就露出一条错位边。
+                  widthFactor: .26 + reveal.value * .74,
                   child: Opacity(
                     opacity: .92 + reveal.value * .08,
                     child: child,
@@ -11901,9 +11947,10 @@ class _RankHoverPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) => SizedBox(
     width: 500,
-    height: 226,
+    // 榜单条高 252，扣除上下各 8px padding 后正好 236px。
+    height: 236,
     child: ClipRRect(
-      borderRadius: BorderRadius.circular(16),
+      borderRadius: BorderRadius.circular(14),
       child: BackdropFilter(
         filter: YingjiGlass.backdrop(),
         child: DecoratedBox(
@@ -11928,7 +11975,7 @@ class _RankHoverPreview extends StatelessWidget {
                   child: CachedNetworkImage(
                     imageUrl: item.backdropUrl.toString(),
                     fit: BoxFit.cover,
-                    // 玻璃卡底色背景图宽 135，按显示分辨率解码。
+                    // 玻璃卡底色背景图按显示分辨率解码。
                     memCacheWidth:
                         (160 * MediaQuery.devicePixelRatioOf(context))
                             .clamp(1.0, 512.0)
@@ -11953,14 +12000,14 @@ class _RankHoverPreview extends StatelessWidget {
                 textDirection: reverse ? TextDirection.rtl : TextDirection.ltr,
                 children: [
                   SizedBox(
-                    width: 135,
+                    width: 130,
                     height: double.infinity,
                     child: item.posterUrl == null
                         ? const ColoredBox(color: Color(0xFF1A1D25))
                         : CachedNetworkImage(
                             imageUrl: item.posterUrl.toString(),
                             fit: BoxFit.cover,
-                            // 玻璃卡海报宽 135，按显示分辨率解码。
+                            // 玻璃卡海报宽 130，按显示分辨率解码。
                             memCacheWidth:
                                 (160 * MediaQuery.devicePixelRatioOf(context))
                                     .clamp(1.0, 512.0)
@@ -12071,7 +12118,7 @@ class _RankHoverPreview extends StatelessWidget {
               IgnorePointer(
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
+                    borderRadius: BorderRadius.circular(14),
                     border: Border.all(
                       color: Colors.white.withValues(alpha: .76),
                       width: 2.2,
@@ -13287,6 +13334,12 @@ class _FrostSurface extends StatefulWidget {
 class _FrostSurfaceState extends State<_FrostSurface> {
   bool _hovered = false;
 
+  /// 归因开关命中时直接返回 [child]：**整条**跳过离屏背板模糊（含 layer 与全屏
+  /// 回读），而不只是把 sigma 归零。见 `FrameTrace.skipGlass`。
+  Widget _frosted(Widget child) => FrameTrace.skipGlass('frost')
+      ? child
+      : BackdropFilter(filter: YingjiGlass.backdrop(), child: child);
+
   @override
   Widget build(BuildContext context) => MouseRegion(
     onEnter: (_) => setState(() => _hovered = true),
@@ -13318,9 +13371,8 @@ class _FrostSurfaceState extends State<_FrostSurface> {
         ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(widget.borderRadius),
-          child: BackdropFilter(
-            filter: YingjiGlass.backdrop(),
-            child: DecoratedBox(
+          child: _frosted(
+            DecoratedBox(
               // 无描边、无高光：悬停反馈用底色略微加深来表现（玻璃「贴」近了
               // 一点），任何白色边缘都会把它拉回塑料片。
               decoration: BoxDecoration(

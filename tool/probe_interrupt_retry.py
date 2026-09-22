@@ -221,8 +221,10 @@ def run_case(exe, workdir, name, fault=True, wait=14.0):
             moved = bool(tail_values) and tail_values[-1] > 42.0
             out.append(f"    retried={retried} error_end_files={len(errors)}"
                        f" position_moved={moved}")
-            if retried and moved and not errors:
-                out.append("    VERDICT OK  抖动被一次重试吃掉，播放继续")
+            if moved and not errors:
+                recovery = ("播放器内部继续读取" if not retried
+                            else "原生重试")
+                out.append(f"    VERDICT OK  抖动被{recovery}吃掉，播放继续")
             else:
                 ok = False
                 out.append("    VERDICT BAD 抖动之后播放没有恢复"
