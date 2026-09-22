@@ -176,6 +176,9 @@ std::atomic<bool> g_resume_done{false};
 int g_retry_count = 0;          // 只在主线程读写
 uint64_t g_retry_stamp = 0;     // 上次重试的时刻（用来判「已经健康播放多久」）
 constexpr int kMaxInterruptRetries = 1;
+// seek 会新建 Range 请求，短时间内比顺序播放更容易连续遇到两次瞬时断流。
+// 只在尚未到达目标位置时多给一次恢复机会，普通播放仍保持一次，避免坏源无限重试。
+constexpr int kSeekInterruptRetries = 2;
 constexpr uint64_t kRetryHealthWindowMs = 15000;
 std::atomic<double> g_cache_fraction{0};
 std::atomic<double> g_network_bytes_per_second{0};
@@ -186,6 +189,13 @@ std::atomic<int64_t> g_playlist_position{0};
 std::vector<std::string> g_media_urls;
 std::atomic<int> g_hover_control{0};
 std::atomic<double> g_seek_hover{-1};
+// 进度条拖动只更新预览，松手时才向 mpv 提交一次。网络流每个 seek 都可能
+// 重建 Range 请求；按鼠标移动逐像素 seek 会把正常服务器也打成偶发中断。
+bool g_seek_dragging = false;
+double g_seek_drag_target = -1.0;
+// seek 后如果新 Range 请求中断，自动重开必须回到用户刚选的位置，而不是
+// mpv 尚未来得及更新的旧 time-pos。位置真正到达后由属性事件清零。
+std::atomic<double> g_pending_seek_seconds{-1.0};
 HWND g_window = nullptr;
 HWND g_controls = nullptr;
 HWND g_panel = nullptr;
@@ -1076,6 +1086,22 @@ bool MpvCommand(const char* name, const char* value = nullptr,
   return g_mpv.command(g_handle, command) >= 0;
 }
 
+double SeekTargetForFraction(double fraction) {
+  const double duration = g_duration.load();
+  if (duration <= 0.0) return 0.0;
+  // 进度条最右端保留一秒，避免普通跳转被 mpv 当成播放完成。
+  return std::clamp(fraction * duration, 0.0, std::max(0.0, duration - 1.0));
+}
+
+bool SeekToFraction(double fraction) {
+  const double target = SeekTargetForFraction(fraction);
+  g_pending_seek_seconds = target;
+  const std::string value = std::to_string(target);
+  if (MpvCommand("seek", value.c_str(), "absolute")) return true;
+  g_pending_seek_seconds = -1.0;
+  return false;
+}
+
 void ShowToast(const std::string& text);
 
 std::string MpvString(const std::string& property) {
@@ -1131,6 +1157,7 @@ bool LoadPlaylistEntry(int64_t index) {
   // 换了一集：中断重试的预算重新给（见 kMaxInterruptRetries 的注释）。
   g_retry_count = 0;
   g_resume_seconds = 0;
+  g_pending_seek_seconds = -1.0;
   if (!g_handle) return false;
   // 换集前先把起播点换成**这一集自己的**：不换的话 mpv 会沿用上一集的值
   // （见 g_playlist_resumes 的注释）。
@@ -1150,7 +1177,9 @@ bool RetryCurrentEpisode() {
   if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
     return false;
   }
-  const double resume = g_last_valid_position.load();
+  const double pending_seek = g_pending_seek_seconds.load();
+  const double resume = pending_seek >= 0.0 ? pending_seek
+                                            : g_last_valid_position.load();
   // 退回最后一次有效位置即可，不用减偏移：这一集本来就是从这里断的。
   g_resume_seconds = resume > 1.0 ? resume : 0.0;
   // 起播点也要显式设：mpv 会沿用上一次 set 的值（那是这一集最早的续播点），
@@ -5172,15 +5201,30 @@ void PaintDanmaku() {
   // 也避免快进时把整段历史当成「刚过去」补播出来。
   if (g_danmaku_last_position >= 0 &&
       std::abs(pos - g_danmaku_last_position) > 2.0) {
-    for (auto& item : g_danmaku_items) {
-      item.live = false;
-      item.appear = -1;
-      item.lane = -1;
-      item.played = false;
-      item.texture.reset();
+    const size_t previous_cursor = g_danmaku_cursor;
+    const size_t next_cursor =
+        DanmakuLowerBound(pos - kDanmakuCatchupSeconds);
+    // 跳转只撤下当前在屏条目。文字纹理与播放位置无关，保留它可以避免回退后
+    // 同一批文字集中重新栅格化；之前这里还会遍历并清空整集纹理，弹幕越多，
+    // 松开进度条后的卡顿越明显。
+    for (DanmakuItem* item : g_danmaku_live) {
+      item->live = false;
+      item->appear = -1;
+      item->lane = -1;
+    }
+    // 只有向后跳时，已经越过的区间需要恢复为“未播放”。向前跳过的条目由
+    // cursor 直接略过，不必扫描；下一次向后跳时再按实际区间复位即可。
+    if (next_cursor < previous_cursor) {
+      for (size_t index = next_cursor; index < previous_cursor; ++index) {
+        DanmakuItem& item = g_danmaku_items[index];
+        item.live = false;
+        item.appear = -1;
+        item.lane = -1;
+        item.played = false;
+      }
     }
     g_danmaku_live.clear();
-    g_danmaku_cursor = DanmakuLowerBound(pos - kDanmakuCatchupSeconds);
+    g_danmaku_cursor = next_cursor;
     ResetDanmakuLaneFree();
   } else if (g_danmaku_last_position < 0) {
     // 刚读入弹幕（或者是断点续播落在中段）：直接把光标挪到当前位置附近。光标
@@ -6125,8 +6169,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         const double span = std::max(1.0, static_cast<double>(rect.right));
         const double fraction =
             std::clamp(static_cast<double>(x) / span, 0.0, 1.0);
-        const std::string target = std::to_string(fraction * 100.0);
-        MpvCommand("seek", target.c_str(), "absolute-percent");
+        g_seek_dragging = true;
+        g_seek_drag_target = fraction;
+        SetCapture(window);
         ShowAdjustHint(ClockLabel(fraction * g_duration.load()) + L" / " +
                            ClockLabel(g_duration.load()),
                        std::wstring(), kGlyphGauge,
@@ -6212,15 +6257,15 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const int mouse_x = static_cast<int>(GET_X_LPARAM(lparam) / scale);
       const int mouse_y = static_cast<int>(GET_Y_LPARAM(lparam) / scale);
       rect.right = static_cast<LONG>(std::lround(rect.right / scale));
-      if (mouse_y <= 32) {
+      if (mouse_y <= 32 || g_seek_dragging) {
         // 与绘制共用同一条换算：通屏进度条，x=0 是屏幕左边缘。
         const double span = std::max(1.0, static_cast<double>(rect.right));
         const double fraction = std::clamp(
             static_cast<double>(mouse_x) / span, 0.0, 1.0);
         g_seek_hover = fraction;
-        if ((wparam & MK_LBUTTON) != 0 && g_duration.load() > 0) {
-          const std::string target = std::to_string(fraction * 100.0);
-          MpvCommand("seek", target.c_str(), "absolute-percent");
+        if (g_seek_dragging && (wparam & MK_LBUTTON) != 0 &&
+            g_duration.load() > 0) {
+          g_seek_drag_target = fraction;
           const int percent = static_cast<int>(fraction * 100.0);
           // 拖动时只在整数百分比变化时重画提示，否则每一像素都会重建一次浮层。
           if (percent != g_hint_seek_percent) {
@@ -6256,6 +6301,27 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       InvalidateRect(window, nullptr, FALSE);
       return 0;
     }
+    case WM_LBUTTONUP:
+      if (g_seek_dragging) {
+        RECT rect{};
+        GetClientRect(window, &rect);
+        const float scale = UiScale();
+        const int mouse_x = static_cast<int>(GET_X_LPARAM(lparam) / scale);
+        rect.right = static_cast<LONG>(std::lround(rect.right / scale));
+        const double span = std::max(1.0, static_cast<double>(rect.right));
+        g_seek_drag_target = std::clamp(
+            static_cast<double>(mouse_x) / span, 0.0, 1.0);
+        SeekToFraction(g_seek_drag_target);
+        g_seek_dragging = false;
+        g_seek_drag_target = -1.0;
+        ReleaseCapture();
+        return 0;
+      }
+      return DefWindowProcW(window, message, wparam, lparam);
+    case WM_CAPTURECHANGED:
+      g_seek_dragging = false;
+      g_seek_drag_target = -1.0;
+      return 0;
     case WM_MOUSELEAVE:
       g_seek_hover = -1;
       g_hint_seek_percent = -1;
@@ -6677,12 +6743,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       // 已经是最后一集时 LoadPlaylistEntry 会直接失败，播放器停在片尾。
       LoadPlaylistEntry(g_playlist_position.load() + 1);
       return 0;
-    case kPlaybackInterrupted:
+    case kPlaybackInterrupted: {
       // 同一集先补一次再认输：源站在跳转那一刻新建连接，偶发抖动会让 mpv 把
       // 这一集判成结束，而地址本身通常还是好的。用户报的「自动跳过会存在播放
       // 失败」就是这条路径——自动跳片头会让播放器去要一段新的字节区间，正好
       // 撞上抖动的概率比顺放时高得多。
-      if (g_running.load() && g_retry_count < kMaxInterruptRetries &&
+      const int retry_limit = g_pending_seek_seconds.load() >= 0.0
+                                  ? kSeekInterruptRetries
+                                  : kMaxInterruptRetries;
+      if (g_running.load() && g_retry_count < retry_limit &&
           RetryCurrentEpisode()) {
         ++g_retry_count;
         ShowToast("播放中断，正在重试…");
@@ -6703,6 +6772,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
       ShowControls();
       return 0;
+    }
     case kPlayerStateChanged:
       if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
       if (g_top_bar) {
@@ -7412,6 +7482,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
             g_position = value;
             g_position_tick = NowMs();
             if (value > 0.0) g_last_valid_position = value;
+            const double pending_seek = g_pending_seek_seconds.load();
+            if (pending_seek >= 0.0 && std::abs(value - pending_seek) < 3.0) {
+              g_pending_seek_seconds = -1.0;
+            }
             // 暂停时位置只会在拖动进度条时动，这时要重画一次动画静止的弹幕层
             // （播放中每帧都画，用不到这个标记）。
             if (g_paused.load()) g_danmaku_dirty = true;

@@ -432,6 +432,11 @@ class WindowsNativePlayer {
       '--brightness=$brightness',
       '--audio-delay=$audioDelay',
       '--sub-delay=$subtitleDelay',
+      // 跳转会发起新的 HTTP Range 请求。明确开启 mpv 的读取缓存，并在新请求
+      // 尚未积累到可稳定播放的数据量时保持暂停，避免画面刚恢复就反复饥饿。
+      '--cache=yes',
+      '--cache-pause=yes',
+      '--cache-pause-wait=2',
       '--demuxer-readahead-secs=$cacheSeconds',
       '--video-aspect-override=${_aspectValue(aspect)}',
       '--mova-seek-seconds=$seekSeconds',
