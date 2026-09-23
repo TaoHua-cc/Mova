@@ -298,6 +298,7 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _danmakuScroll = true, _danmakuTop = true, _danmakuBottom = true;
   List<DanmakuComment> _danmakuComments = const [];
   String? _danmakuError;
+  bool _danmakuLoading = false;
   DanmakuClient? _danmakuClient;
 
   /// 视频缓存与弹幕缓存。拿不到目录时保持 null，播放器按「没有缓存」正常播，
@@ -1545,10 +1546,16 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 第二遍时这一步纯属浪费。缓存命中就立刻显示，只有超过
   /// [DanmakuCache.refreshAfter] 才走网络；网络失败而手里有缓存时继续用缓存
   /// 且不报错 —— 用户看到的是「弹幕稍旧」，不是「弹幕加载失败」。
-  Future<void> _loadDanmaku(String token) async {
+  Future<void> _loadDanmaku(String token, {bool forceRefresh = false}) async {
     final request = ++_danmakuRequest;
     _activeDanmakuApi = '';
     _danmakuClient?.dispose();
+    if (mounted) {
+      setState(() {
+        _danmakuLoading = true;
+        _danmakuError = null;
+      });
+    }
     final apis = _danmakuApis.isEmpty ? [_danmakuUrl] : _danmakuApis;
     final cache = _danmakuCache;
     final cacheKey = DanmakuCache.keyFor(
@@ -1566,7 +1573,12 @@ class _PlayerPageState extends State<PlayerPage> {
             '${cached.matchedEpisode ?? '接口未提供匹配名称'} · 本机缓存';
         _danmakuError = null;
       });
-      if (!cached.isStale) return;
+      if (!cached.isStale && !forceRefresh) {
+        if (mounted && request == _danmakuRequest) {
+          setState(() => _danmakuLoading = false);
+        }
+        return;
+      }
     }
     final clients = <DanmakuClient>[];
     final clientsByApi = <String, DanmakuClient>{};
@@ -1589,6 +1601,9 @@ class _PlayerPageState extends State<PlayerPage> {
           })
           .toList(growable: false);
       final comments = await _firstDanmakuResult(futures);
+      if (comments.$2.isEmpty) {
+        throw StateError('没有找到匹配的弹幕');
+      }
       final source = clientsByApi[comments.$1];
       if (mounted && request == _danmakuRequest) {
         setState(() {
@@ -1605,7 +1620,7 @@ class _PlayerPageState extends State<PlayerPage> {
         matchedEpisode: source?.matchedEpisode,
       );
     } catch (error) {
-      if (cached != null && cached.comments.isNotEmpty) return;
+      if (cached != null && cached.comments.isNotEmpty && !forceRefresh) return;
       if (mounted && request == _danmakuRequest) {
         setState(
           () =>
@@ -1614,6 +1629,9 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     } finally {
       for (final client in clients) client.dispose();
+      if (mounted && request == _danmakuRequest) {
+        setState(() => _danmakuLoading = false);
+      }
     }
   }
 
@@ -2760,6 +2778,28 @@ class _PlayerPageState extends State<PlayerPage> {
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Align(
+          alignment: Alignment.centerRight,
+          child: OutlinedButton.icon(
+            onPressed: !_danmakuEnabled || _danmakuLoading
+                ? null
+                : () async {
+                    final preferences = await SharedPreferences.getInstance();
+                    await _loadDanmaku(
+                      preferences.getString('yingji.danmaku.token') ?? '',
+                      forceRefresh: true,
+                    );
+                  },
+            icon: _danmakuLoading
+                ? const SizedBox.square(
+                    dimension: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh, size: 18),
+            label: Text(_danmakuLoading ? '正在重新获取' : '重新获取弹幕'),
+          ),
+        ),
+        const SizedBox(height: 8),
         const Text(
           '显示方式',
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),

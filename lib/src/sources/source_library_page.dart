@@ -19,6 +19,7 @@ class EmbyLibraryPage extends StatefulWidget {
 }
 
 class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
+  final _scroll = ScrollController();
   String? _parentId;
   String _title = '完整媒体库';
   String? _token;
@@ -29,6 +30,12 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
   void initState() {
     super.initState();
     _items = _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
   }
 
   Future<List<MediaItem>> _load() async {
@@ -73,7 +80,7 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
     }
   }
 
-  void _open(MediaItem item) {
+  void _open(MediaItem item, BuildContext sourceContext) {
     if (item.isContainer) {
       setState(() {
         _parentId = item.id;
@@ -82,20 +89,16 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
       });
       return;
     }
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => MetadataDetailPage(
-          item: TmdbItem(
-            id: int.tryParse(item.providerIds['Tmdb'] ?? '') ?? 0,
-            title: item.title,
-            kind: item.type == 'Series' ? '剧集' : '电影',
-            overview: item.overview,
-            year: item.year,
-          ),
-          media: item,
-        ),
+    MetadataDetailPage.open(
+      sourceContext,
+      item: TmdbItem(
+        id: int.tryParse(item.providerIds['Tmdb'] ?? '') ?? 0,
+        title: item.title,
+        kind: item.type == 'Series' ? '剧集' : '电影',
+        overview: item.overview,
+        year: item.year,
       ),
+      media: item,
     );
   }
 
@@ -167,98 +170,105 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
           ('电影', '${movies.length} 部电影', movies),
           ('其他内容', '${other.length} 项', other),
         ].where((group) => group.$3.isNotEmpty).toList();
-        return CustomScrollView(
-          slivers: [
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(42, 18, 42, 10),
-              sliver: SliverToBoxAdapter(
-                child: GlassPanel(
-                  radius: 16,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 14,
-                  ),
-                  child: Row(
-                    children: [
-                      ServerMark(
-                        source: _resolvedSource ?? widget.source,
-                        token: _token,
-                        size: 30,
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              widget.source.name,
-                              style: const TextStyle(
-                                fontSize: 17,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            const SizedBox(height: 3),
-                            Text(
-                              '${widget.source.kindLabel} · ${groups.length} 个内容分组 · ${items.length} 项',
-                              style: const TextStyle(
-                                color: YingjiColors.muted,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            for (final group in groups) ...[
+        return YingjiSmoothWheel(
+          controller: _scroll,
+          stableGlass: true,
+          child: CustomScrollView(
+            controller: _scroll,
+            physics: yingjiWheelPhysics,
+            slivers: [
               SliverPadding(
-                padding: const EdgeInsets.fromLTRB(42, 24, 42, 12),
+                padding: const EdgeInsets.fromLTRB(42, 18, 42, 10),
                 sliver: SliverToBoxAdapter(
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          group.$1,
-                          style: const TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.w800,
+                  child: GlassPanel(
+                    radius: 16,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 14,
+                    ),
+                    child: Row(
+                      children: [
+                        ServerMark(
+                          source: _resolvedSource ?? widget.source,
+                          token: _token,
+                          size: 30,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.source.name,
+                                style: const TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                '${widget.source.kindLabel} · ${groups.length} 个内容分组 · ${items.length} 项',
+                                style: const TextStyle(
+                                  color: YingjiColors.muted,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                      ),
-                      Text(
-                        group.$2,
-                        style: const TextStyle(
-                          color: YingjiColors.muted,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(42, 0, 42, 26),
-                sliver: SliverGrid(
-                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: 220,
-                    mainAxisExtent: 310,
-                    crossAxisSpacing: 18,
-                    mainAxisSpacing: 22,
-                  ),
-                  delegate: SliverChildBuilderDelegate(
-                    (_, index) => _SourceMediaCard(
-                      item: group.$3[index],
-                      onOpen: () => _open(group.$3[index]),
+                      ],
                     ),
-                    childCount: group.$3.length,
                   ),
                 ),
               ),
+              for (final group in groups) ...[
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(42, 24, 42, 12),
+                  sliver: SliverToBoxAdapter(
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            group.$1,
+                            style: const TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          group.$2,
+                          style: const TextStyle(
+                            color: YingjiColors.muted,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(42, 0, 42, 26),
+                  sliver: SliverGrid(
+                    gridDelegate:
+                        const SliverGridDelegateWithMaxCrossAxisExtent(
+                          maxCrossAxisExtent: 220,
+                          mainAxisExtent: 310,
+                          crossAxisSpacing: 18,
+                          mainAxisSpacing: 22,
+                        ),
+                    delegate: SliverChildBuilderDelegate(
+                      (_, index) => _SourceMediaCard(
+                        item: group.$3[index],
+                        onOpen: (from) => _open(group.$3[index], from),
+                      ),
+                      childCount: group.$3.length,
+                    ),
+                  ),
+                ),
+              ],
             ],
-          ],
+          ),
         );
       },
     ),
@@ -268,30 +278,26 @@ class _EmbyLibraryPageState extends State<EmbyLibraryPage> {
 class _SourceMediaCard extends StatelessWidget {
   const _SourceMediaCard({required this.item, this.onOpen});
   final MediaItem item;
-  final VoidCallback? onOpen;
+  final ValueChanged<BuildContext>? onOpen;
 
   @override
   Widget build(BuildContext context) => SizedBox(
     width: 164,
     child: InkWell(
       borderRadius: BorderRadius.circular(15),
-      onTap:
-          onOpen ??
-          (() => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => MetadataDetailPage(
-                item: TmdbItem(
-                  id: 0,
-                  title: item.title,
-                  kind: '视频',
-                  overview: item.overview,
-                  year: item.year,
-                ),
-                media: item,
+      onTap: () => onOpen == null
+          ? MetadataDetailPage.open(
+              context,
+              item: TmdbItem(
+                id: 0,
+                title: item.title,
+                kind: '视频',
+                overview: item.overview,
+                year: item.year,
               ),
-            ),
-          )),
+              media: item,
+            )
+          : onOpen!(context),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -327,10 +333,10 @@ class _SourceMediaCard extends StatelessWidget {
                         imageUrl: item.imageUrl.toString(),
                         fit: BoxFit.cover,
                         // 源缩略图卡片约 260px 宽，按显示分辨率解码。
-                        memCacheWidth: (320 *
-                                MediaQuery.devicePixelRatioOf(context))
-                            .clamp(1.0, 512.0)
-                            .round(),
+                        memCacheWidth:
+                            (320 * MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 512.0)
+                                .round(),
                         errorWidget: (_, _, _) =>
                             const ColoredBox(color: YingjiColors.elevated),
                       ),

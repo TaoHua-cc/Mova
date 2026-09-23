@@ -106,6 +106,21 @@ void main() {
     expect(FrameTrace.parseGlassSkips('all'), {'all'});
   });
 
+  test('描边环开关：候选值固定，未设置时回落到生产默认（方案 B）', () {
+    // 这一族取值会被 brand.dart 的绘制器直接分支，集合变动等于外观变动。
+    // `linear` 是回到 3.1.112 旧现状的回归对照；生产默认（null）是按角度定值的
+    // 「角度均匀 + 左上受光」。
+    expect(FrameTrace.edgePlans, {'linear', 'const', 'none'});
+    // 测试进程不设置 MOVA_TRACE_EDGE，因此必须回落到 null（= 生产默认）。
+    expect(FrameTrace.edgePlan, isNull);
+    // 默认必须落在 sweep 分支上（而不是旧现状的 linear 分支），且必须带 `circle`
+    // 条件 —— 否则直边卡片会被一起切成 sweep。
+    final brand = File('lib/src/brand.dart').readAsStringSync();
+    expect(brand, contains('final sweep = circle && plan == null;'));
+    // 不留死同义词：`cosine` 曾经与默认同义，实施默认后必须从绘制器里消失。
+    expect(brand, isNot(contains("'cosine'")));
+  });
+
   test('summarize 对空窗口不崩且 fps 归零', () {
     final line = FrameTrace.summarize(
       index: 0,

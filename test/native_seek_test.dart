@@ -35,10 +35,28 @@ void main() {
     expect(interruption, contains('kSeekInterruptRetries'));
   });
 
+  test('seek Range failures retry target and coalesce stale retry errors', () {
+    final source = File('windows/native_player/main.cpp').readAsStringSync();
+    final retry = source.substring(
+      source.indexOf('bool RetryCurrentEpisode()'),
+      source.indexOf('bool ReplayAfterPlaybackFailure()'),
+    );
+    final events = source.substring(
+      source.indexOf('MPV_EVENT_END_FILE && event->data'),
+      source.indexOf('if (event->event_id == MPV_EVENT_FILE_LOADED)'),
+    );
+
+    expect(retry, contains('g_retry_loading = true'));
+    expect(retry, contains('g_pending_seek_seconds'));
+    expect(events, contains('stale_retry_error'));
+    expect(events, contains('g_interruption_message_pending'));
+    expect(events, contains('end->reason == MPV_END_FILE_REASON_ERROR)'));
+    expect(events, isNot(contains('g_pending_seek_seconds.load() < 0.0')));
+  });
+
   test('Windows native playback enables cache pause around range seeks', () {
-    final source = File(
-      'lib/src/player/windows_native_player.dart',
-    ).readAsStringSync();
+    final source = File('lib/src/player/windows_native_player.dart')
+        .readAsStringSync();
 
     expect(source, contains("'--cache=yes'"));
     expect(source, contains("'--cache-pause=yes'"));

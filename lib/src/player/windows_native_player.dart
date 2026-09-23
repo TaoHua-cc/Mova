@@ -596,6 +596,19 @@ class WindowsNativePlayer {
       }
     }
 
+    unawaited(
+      WindowsNativePlayer.cacheImageFiles(
+        {
+          for (var index = 0; index < entries.length; index++)
+            '$index': entries[index].imageUrl,
+        },
+        budget: Duration.zero,
+        onImageReady: (index, path) {
+          sendLine('MOVA_PLAYLIST_IMAGE=$index|$path');
+        },
+      ),
+    );
+
     WindowsNativePlaylistEntry? entryAt(int index) =>
         index >= 0 && index < entries.length ? entries[index] : null;
 
@@ -641,7 +654,10 @@ class WindowsNativePlayer {
     }
 
     /// 拉当前集的弹幕并热加载进播放器。
-    Future<void> pushEpisodeDanmaku(int index) async {
+    Future<void> pushEpisodeDanmaku(
+      int index, {
+      bool forceRefresh = false,
+    }) async {
       final generation = ++danmakuGeneration;
       final preferences = await SharedPreferences.getInstance();
       if (!(preferences.getBool('yingji.danmaku.enabled') ?? false)) return;
@@ -660,6 +676,7 @@ class WindowsNativePlayer {
         token: config.token,
         send: sendLine,
         stale: () => generation != danmakuGeneration,
+        forceRefresh: forceRefresh,
       );
       if (path == null) return;
       if (generation != danmakuGeneration) {
@@ -682,7 +699,8 @@ class WindowsNativePlayer {
     _live = _LiveSession(
       send: sendLine,
       reloadSegments: () => pushEpisodeSegments(extrasEpisode),
-      reloadDanmaku: () => pushEpisodeDanmaku(extrasEpisode),
+      reloadDanmaku: () =>
+          pushEpisodeDanmaku(extrasEpisode, forceRefresh: true),
       danmakuEnabled: danmakuEnabled,
     );
 
@@ -698,6 +716,9 @@ class WindowsNativePlayer {
         .transform(utf8.decoder)
         .transform(const LineSplitter())
         .listen((chunk) {
+          if (chunk == 'MOVA_DANMAKU_RELOAD') {
+            unawaited(pushEpisodeDanmaku(extrasEpisode, forceRefresh: true));
+          }
           // 用户在原生「资源」面板里换了版本：记下选择与当时的位置，等进程退出
           // 之后交给调用方用新资源重新起播。
           for (final match in RegExp(
@@ -953,6 +974,7 @@ class WindowsNativePlayer {
     required List<String> apis,
     required List<String> apiNames,
     required String token,
+    bool forceRefresh = false,
   }) async {
     if (apis.isEmpty) throw StateError('未配置弹幕 API');
     final season = entry?.seasonNumber ?? request.seasonNumber;
@@ -968,13 +990,17 @@ class WindowsNativePlayer {
     List<DanmakuComment>? comments;
     String source = '';
     String matched = '';
-    if (cached != null && cached.comments.isNotEmpty && !cached.isStale) {
+    if (!forceRefresh &&
+        cached != null &&
+        cached.comments.isNotEmpty &&
+        !cached.isStale) {
       comments = cached.comments;
       source = cached.source?.trim().isNotEmpty == true
           ? '${cached.source} · 本机缓存'
           : '本机缓存';
       matched = cached.matchedEpisode ?? '';
     }
+    String? lastError;
     for (var index = 0; comments == null && index < apis.length; index++) {
       final api = apis[index];
       DanmakuClient? client;
@@ -1005,14 +1031,15 @@ class WindowsNativePlayer {
           source: source,
         );
         break;
-      } catch (_) {
-        // 该 API 失败，继续试下一个。
+      } catch (error) {
+        // 继续试下一个来源，但最终保留具体错误供播放器显示和用户判断。
+        lastError = _reasonOf(error);
       } finally {
         client?.dispose();
       }
     }
     if (comments == null || comments.isEmpty) {
-      throw StateError('没有匹配的弹幕');
+      throw StateError(lastError ?? '没有匹配的弹幕');
     }
     final buffer = StringBuffer();
     for (final comment in comments) {
@@ -1055,6 +1082,7 @@ class WindowsNativePlayer {
     required String token,
     required void Function(String) send,
     required bool Function() stale,
+    bool forceRefresh = false,
   }) async {
     try {
       final payload = await _writeDanmakuFile(
@@ -1063,7 +1091,8 @@ class WindowsNativePlayer {
         apis: apis,
         apiNames: apiNames,
         token: token,
-      ).timeout(const Duration(seconds: 20));
+        forceRefresh: forceRefresh,
+      ).timeout(Duration(seconds: 12 * apis.length + 2));
       if (stale()) {
         await _deleteFileQuietly(payload.path);
         return null;
@@ -1363,16 +1392,33 @@ class WindowsNativePlayer {
   /// [_cachedImagePath]，保证剧集面板和应用里的图片走同一份磁盘缓存。
   static Future<String?> cacheImageFile(String? url) => _cachedImagePath(url);
 
+  static Future<Map<String, String?>> cachedImageFiles(
+    Map<String, String?> urls,
+  ) async {
+    final manager = DefaultCacheManager();
+    final found = await Future.wait(
+      urls.entries.map((entry) async {
+        final url = entry.value;
+        if (url == null || url.isEmpty) return MapEntry(entry.key, null);
+        try {
+          final cached = await manager.getFileFromCache(url);
+          return MapEntry(entry.key, cached?.file.path);
+        } catch (_) {
+          return MapEntry(entry.key, null);
+        }
+      }),
+    );
+    return {for (final entry in found) entry.key: entry.value};
+  }
+
   /// 批量把剧照落到本地缓存，返回「调用方给的 key → 文件路径」。
   ///
-  /// 与逐张 [cacheImageFile] 的区别在于**不拿起播去换图**：先在磁盘缓存里找
-  /// （离线、瞬时），只有真的缺图的那几集才去下载，而且并发下载、整体还有一个
-  /// [budget] 上限。一季几十集、其中大半没缓存时，串行下载会把起播卡住好几秒；
-  /// 网络不通时更是能卡到 HTTP 超时。超预算的那几集在面板里显示占位图，下一轮
-  /// 打开就已经缓存好了。
+  /// 只查磁盘缓存，不等待网络。缺失项可在 [budget] 内并发获取；设置零预算时
+  /// 立即返回，但下载仍继续，完成后通过 [onImageReady] 回调交付路径。
   static Future<Map<String, String?>> cacheImageFiles(
     Map<String, String?> urls, {
     Duration budget = const Duration(seconds: 3),
+    void Function(String key, String path)? onImageReady,
   }) async {
     final manager = DefaultCacheManager();
     final found = await Future.wait(
@@ -1390,6 +1436,10 @@ class WindowsNativePlayer {
     final paths = <String, String?>{
       for (final entry in found) entry.key: entry.value,
     };
+    for (final entry in found) {
+      final path = entry.value;
+      if (path != null) onImageReady?.call(entry.key, path);
+    }
     final missing = urls.entries
         .where(
           (entry) =>
@@ -1401,7 +1451,9 @@ class WindowsNativePlayer {
     if (missing.isEmpty) return paths;
     await Future.wait<void>(
       missing.map((entry) async {
-        paths[entry.key] = await _cachedImagePath(entry.value);
+        final path = await _cachedImagePath(entry.value);
+        paths[entry.key] = path;
+        if (path != null) onImageReady?.call(entry.key, path);
       }),
     ).timeout(budget, onTimeout: () => <void>[]);
     return paths;

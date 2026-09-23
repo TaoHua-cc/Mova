@@ -5,7 +5,6 @@ import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
 
 import 'diagnostics/frame_trace.dart';
@@ -38,6 +37,7 @@ class YingjiSmoothWheel extends StatefulWidget {
     required this.child,
     this.stepScale = 1.18,
     this.settlePerFrame = .78,
+    this.stableGlass = false,
   });
 
   final ScrollController controller;
@@ -48,6 +48,10 @@ class YingjiSmoothWheel extends StatefulWidget {
 
   /// 每个 60fps 帧之后仍未走完的距离比例；越小越跟手、滑行尾巴越短。
   final double settlePerFrame;
+
+  /// 滚动列表里的玻璃保持轻量静态材质，不在起步/停稳时切换背板滤镜。
+  /// 全局滚动信号仍会用于暂停流动背景，避免背景动画与列表同时合成。
+  final bool stableGlass;
 
   @override
   State<YingjiSmoothWheel> createState() => _YingjiSmoothWheelState();
@@ -174,12 +178,40 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
   }
 
   @override
-  Widget build(BuildContext context) => Listener(
-    onPointerSignal: (signal) {
-      if (signal is PointerScrollEvent) _handleWheel(signal);
-    },
-    child: widget.child,
-  );
+  Widget build(BuildContext context) {
+    final child = widget.stableGlass
+        ? YingjiStableScrollGlass(child: widget.child)
+        : widget.child;
+    return NotificationListener<ScrollNotification>(
+      onNotification: (notification) {
+        if (!WindowHost.isDesktop) {
+          if (notification is ScrollStartNotification) {
+            yingjiScrollInProgress.value = true;
+          } else if (notification is ScrollEndNotification) {
+            yingjiScrollInProgress.value = false;
+          }
+        }
+        return false;
+      },
+      child: Listener(
+        onPointerSignal: (signal) {
+          if (signal is PointerScrollEvent) _handleWheel(signal);
+        },
+        child: child,
+      ),
+    );
+  }
+}
+
+class YingjiStableScrollGlass extends InheritedWidget {
+  const YingjiStableScrollGlass({super.key, required super.child});
+
+  static bool enabled(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<YingjiStableScrollGlass>() !=
+      null;
+
+  @override
+  bool updateShouldNotify(YingjiStableScrollGlass oldWidget) => false;
 }
 
 class YingjiAppearance extends ChangeNotifier {
@@ -256,6 +288,11 @@ abstract final class YingjiLayout {
   static const double railLeft = 16;
   static const double railWidth = 54;
 
+  /// 导航侧栏图标按钮的尺寸。
+  ///
+  /// 首页浮动导航与详情页顶栏使用同一尺寸和图标栅格。
+  static const double railButtonSize = 44;
+
   /// 设置页窄于这个宽度就从「左栏 + 正文」改成单栏。
   static const double twoColumnMinWidth = 900;
 
@@ -270,58 +307,125 @@ abstract final class YingjiLayout {
 
   /// 正文区右锚点。
   static double get pageRight => WindowHost.isDesktop ? 40 : 18;
-
-  /// 详情页左侧导航栏宽度（详情页是独立路由，自带侧栏，宽度要算进锚点里）。
-  static double get detailSidebarWidth => WindowHost.isDesktop ? 88 : 64;
-
-  /// 详情页侧栏自身的横向内边距，两种宽度下都保证按钮槽位是 44。
-  static EdgeInsets get detailSidebarPadding => WindowHost.isDesktop
-      ? const EdgeInsets.fromLTRB(18, 18, 14, 18)
-      : const EdgeInsets.fromLTRB(10, 18, 10, 18);
-
-  /// 详情页正文与顶部栏在侧栏之外还要补的内缩，补完正好等于 [pageLeft]。
-  static double get detailLeadingInset => pageLeft - detailSidebarWidth;
 }
 
-class YingjiBackdrop extends StatelessWidget {
-  const YingjiBackdrop({super.key, this.overlay, this.blur});
+class YingjiBackdrop extends StatefulWidget {
+  const YingjiBackdrop({super.key, this.overlay});
 
   final Widget? overlay;
 
-  /// 省略时跟随外观里的「模糊程度」，与卡片、浮层同一套数值。
-  final double? blur;
+  @override
+  State<YingjiBackdrop> createState() => _YingjiBackdropState();
+}
+
+class _YingjiBackdropState extends State<YingjiBackdrop>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _flow = AnimationController(
+    vsync: this,
+    duration: const Duration(seconds: 28),
+  )..repeat(reverse: true);
+
+  late final Animation<Offset> _violetDrift = _flow.drive(
+    Tween<Offset>(
+      begin: const Offset(-.12, -.035),
+      end: const Offset(.12, .035),
+    ).chain(CurveTween(curve: Curves.easeInOutSine)),
+  );
+  late final Animation<Offset> _tealDrift = _flow.drive(
+    Tween<Offset>(
+      begin: const Offset(.1, -.03),
+      end: const Offset(-.1, .03),
+    ).chain(CurveTween(curve: Curves.easeInOutSine)),
+  );
 
   @override
-  Widget build(BuildContext context) {
-    // 整屏只糊一半：卡片里的 BackdropFilter 会用完整 sigma，两者之间的「谁更
-    // 糊」就是玻璃的边界 —— 之前整屏和卡片糊得一样狠，卡片边界自然消失了。
-    // 直接给整屏用满 sigma，看起来只是「整张壁纸都糊」，不是玻璃。
-    final sigma = (blur ?? YingjiGlass.blur) * .5;
-    return ValueListenableBuilder<String?>(
-      valueListenable: yingjiBackdropUrl,
-      builder: (context, imageUrl, _) => Stack(
-        fit: StackFit.expand,
-        children: [
-          const ColoredBox(color: YingjiColors.canvas),
-          if (imageUrl != null)
-            ImageFiltered(
-              imageFilter: ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
-              child: CachedNetworkImage(
-                imageUrl: imageUrl,
-                fit: BoxFit.cover,
-                // 全局模糊背景铺满整窗，原图常 1k+ px：按窗口物理宽度解码，
-                // 否则第一次打开软件就要解码+模糊一张超大图，首屏掉帧明显。
-                // 全局模糊背景：反正会被高斯模糊掉，固定 1280 宽即可，
-                // 不必按窗口物理宽解码（大屏/高 DPI 下会比原图还大，反而更卡）。
-                memCacheWidth: 1280,
-                errorWidget: (_, _, _) => const SizedBox.shrink(),
+  void initState() {
+    super.initState();
+    yingjiScrollInProgress.addListener(_syncFlowWithScroll);
+  }
+
+  void _syncFlowWithScroll() {
+    if (yingjiScrollInProgress.value) {
+      // 两张超出视口的大渐变层持续平移时，滚动列表无法复用已经合成的背板。
+      // 滚轮滑行期间冻结在当前相位；列表停稳后从同一位置继续，不会跳色。
+      _flow.stop(canceled: false);
+    } else if (!_flow.isAnimating) {
+      _flow.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    yingjiScrollInProgress.removeListener(_syncFlowWithScroll);
+    _flow.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, size) => Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Color(0xFF111824)),
+        Positioned(
+          left: -size.maxWidth * .4,
+          top: -size.maxHeight * .2,
+          width: size.maxWidth * 1.8,
+          height: size.maxHeight * 1.4,
+          child: SlideTransition(
+            position: _violetDrift,
+            child: const RepaintBoundary(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment(-1, -.5),
+                    end: Alignment(1, .5),
+                    colors: [
+                      Color(0xFF1B3448),
+                      Color(0xFF292947),
+                      Color(0xFF3A2B4C),
+                      Color(0xFF183D46),
+                      Color(0xFF263353),
+                      Color(0xFF1B3448),
+                    ],
+                    stops: [0, .2, .4, .62, .82, 1],
+                  ),
+                ),
               ),
             ),
-          ?overlay,
-        ],
-      ),
-    );
-  }
+          ),
+        ),
+        Positioned(
+          left: -size.maxWidth * .4,
+          top: -size.maxHeight * .2,
+          width: size.maxWidth * 1.8,
+          height: size.maxHeight * 1.4,
+          child: SlideTransition(
+            position: _tealDrift,
+            child: const RepaintBoundary(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment(-1, .6),
+                    end: Alignment(1, -.6),
+                    colors: [
+                      Color(0x00355D70),
+                      Color(0x4D355D70),
+                      Color(0x00355D70),
+                      Color(0x405A3E68),
+                      Color(0x005A3E68),
+                    ],
+                    stops: [0, .26, .5, .76, 1],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        ?widget.overlay,
+      ],
+    ),
+  );
 }
 
 abstract final class YingjiColors {
@@ -539,11 +643,17 @@ class YingjiGlassSurface extends StatelessWidget {
     );
     // 归因开关命中时整条跳过离屏背板模糊，而不只是把 sigma 归零 ——
     // 后者仍会插一层离屏 layer 并做一次全屏回读，量不出通道本身的代价。
+    final stableFilter = YingjiStableScrollGlass.enabled(context);
     final skipFilter =
         FrameTrace.skipGlass('glass') ||
         FrameTrace.skipGlass(circle ? 'circle' : 'rect');
     final surface = skipFilter
         ? body
+        : stableFilter
+        ? BackdropFilter.grouped(
+            filter: YingjiGlass.backdrop(sigma: sigma),
+            child: body,
+          )
         : ValueListenableBuilder<bool>(
             valueListenable: yingjiScrollInProgress,
             child: body,
@@ -615,19 +725,76 @@ class _YingjiGlassEdgePainter extends CustomPainter {
   final bool circle;
   final double devicePixelRatio;
 
+  /// 圆形描边环的角度渐变：α(θ) = .34 + .16·cos(θ − 225°)。
+  ///
+  /// 关键在 **sweep 而不是 linear**：`LinearGradient` 的等 α 线是**弦**，把它套在
+  /// 圆环上时，同一条等 α 线在不同方位扫过的弧长不同 —— 环的可见亮度绕圈起伏
+  /// （3.1.112 环宽 1.5 下于真机 5 颗圆钮实测，环峰亮度极差 2.91×），看起来就是
+  /// 「锯齿感」。`SweepGradient` 按角度定值，每个方位只取一个 α，配合常量环宽就
+  /// 不再有宽度调制；实测极差降到 2.10×，保留左上受光的方向感（方案 B，见
+  /// `docs/specs/2026-09-23-glass-edge-ring-uniformity.md`）。
+  ///
+  /// 225° 是「左上」在屏幕坐标（y 向下）里的 sweep 角，也就是受光方向。
+  ///
+  /// 采样 48 段是精度与常量表大小的折中：SweepGradient 在段间做线性插值，48 段
+  /// 对应 7.5°/段，肉眼在 46px 的圆上分辨不出分段。
+  static const int _sweepSteps = 48;
+
+  static final List<Color> _sweepEdgeColors = List<Color>.generate(
+    _sweepSteps + 1,
+    (int i) {
+      final theta = 2 * math.pi * i / _sweepSteps;
+      final alpha = (.34 + .16 * math.cos(theta - 225 * math.pi / 180)).clamp(
+        0.0,
+        1.0,
+      );
+      return Color.fromRGBO(255, 255, 255, alpha);
+    },
+  );
+
+  static final List<double> _sweepEdgeStops = List<double>.generate(
+    _sweepSteps + 1,
+    (int i) => i / _sweepSteps,
+  );
+
   @override
   void paint(Canvas canvas, Size size) {
     if (size.isEmpty) return;
-    // 圆周若只占 1 个物理像素，Windows 100%/125%/150% 缩放下没有足够的
-    // 覆盖像素做平滑过渡，斜边会呈阶梯状。1.5 个物理像素仍然轻薄，但能让
-    // Skia 在内外两侧留下稳定的半透明抗锯齿采样。
+    // 观感比对开关：**只覆盖圆形**。直边（卡片 / 面板）上的线性渐变在几何上是
+    // 正确的，任何情况下都不动它。
+    final plan = circle ? FrameTrace.edgePlan : null;
+    if (plan == 'none') return;
+    // 生产默认（开关未设置）就是方案 B：圆形环按**角度**定值。必须带 `circle`：
+    // 非圆形时上面把 plan 强置成 null，只看 `plan == null` 会把直边卡片也切成
+    // sweep（卡片上的线性渐变是几何正确的，不能动）。
+    final sweep = circle && plan == null;
+    // 环宽固定 1.5 物理像素（不随开关变化）。圆周若只占 1 个物理像素，Windows
+    // 100%/125%/150% 缩放下没有足够的覆盖像素做平滑过渡，斜边会呈阶梯状。1.5 个
+    // 物理像素仍然轻薄，但能让 Skia 在内外两侧留下稳定的半透明抗锯齿采样。
+    //
+    // 不再内缩：方案 A/B 原型曾用「环宽 2.0 + 内缩 0.5」脱开裁切边界，理由是担心
+    // 外缘 AA 被裁切吃掉。真机逐像素量过——环峰亮度与「无截断」理论值吻合
+    // （136.5 vs 135.9），裁切并没有削掉环，那条内缩是多余的，一并去掉。
     final strokeWidth = 1.5 / devicePixelRatio;
     final rect = (Offset.zero & size).deflate(strokeWidth / 2);
     final paint = Paint()
       ..isAntiAlias = true
       ..style = PaintingStyle.stroke
-      ..strokeWidth = strokeWidth
-      ..shader = const LinearGradient(
+      ..strokeWidth = strokeWidth;
+    if (sweep) {
+      // 方案 B：按角度定值，保留左上受光的方向感。
+      paint.shader = SweepGradient(
+        startAngle: 0,
+        endAngle: math.pi * 2,
+        colors: _sweepEdgeColors,
+        stops: _sweepEdgeStops,
+      ).createShader(rect);
+    } else if (plan == 'const') {
+      // 诊断对照（方案 A）：常量白，环亮度完全不随角度变化。
+      paint.color = const Color(0x57FFFFFF);
+    } else {
+      // 诊断对照：回到 3.1.112 的线性渐变，供观感回归比对。
+      paint.shader = const LinearGradient(
         begin: Alignment.topLeft,
         end: Alignment.bottomRight,
         colors: <Color>[
@@ -638,6 +805,7 @@ class _YingjiGlassEdgePainter extends CustomPainter {
         ],
         stops: <double>[0, .28, .66, 1],
       ).createShader(rect);
+    }
     if (circle) {
       canvas.drawOval(rect, paint);
     } else {
@@ -1274,16 +1442,63 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                     // 一动不动，看着就是一块黑塑料圆片。
                     YingjiGlassSurface(
                       circle: true,
-                      strength: widget.selected ? 1.8 : (active ? 1.3 : .92),
+                      // 小圆片若沿用 30px 的面板模糊，背后颜色会被抹成一块
+                      // 均匀色，看起来像实心按钮。仍跟随同一滑杆，但保留更多
+                      // 实时画面细节，让移动背景能从图标下方流过。
+                      sigma: YingjiGlass.blur * .55,
+                      strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
                       shadow: active,
                       child: widget.selected
-                          ? DecoratedBox(
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: YingjiGlass.accent.withValues(
-                                  alpha: .92,
+                          ? const Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                      colors: [
+                                        Color(0x66FFFFFF),
+                                        Color(0x48F4F7FB),
+                                        Color(0x36D5DEE9),
+                                        Color(0x55F8FAFC),
+                                      ],
+                                      stops: [0, .34, .76, 1],
+                                    ),
+                                  ),
                                 ),
-                              ),
+                                DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: RadialGradient(
+                                      center: Alignment(-.48, -.72),
+                                      radius: .78,
+                                      colors: [
+                                        Color(0x6EFFFFFF),
+                                        Color(0x34FFFFFF),
+                                        Color(0x00FFFFFF),
+                                      ],
+                                      stops: [0, .34, 1],
+                                    ),
+                                  ),
+                                ),
+                                DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topCenter,
+                                      end: Alignment.bottomCenter,
+                                      colors: [
+                                        Color(0x00FFFFFF),
+                                        Color(0x00111A28),
+                                        Color(0x24111A28),
+                                      ],
+                                      stops: [0, .62, 1],
+                                    ),
+                                  ),
+                                ),
+                              ],
                             )
                           : null,
                     ),
@@ -1294,8 +1509,17 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                           widget.icon,
                           size: widget.size * .43,
                           color: widget.selected
-                              ? YingjiColors.canvas
+                              ? const Color(0xFF111824)
                               : Colors.white,
+                          shadows: widget.selected
+                              ? const [
+                                  Shadow(
+                                    color: Color(0x52000000),
+                                    blurRadius: 1.5,
+                                    offset: Offset(0, .7),
+                                  ),
+                                ]
+                              : null,
                         ),
                       ),
                     ),
@@ -1530,6 +1754,7 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls>
   bool _maximized = false;
   bool _fullScreen = false;
   bool _syncing = false;
+  bool _syncPending = false;
 
   /// 重新读一遍真实的窗口状态。
   ///
@@ -1537,7 +1762,11 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls>
   /// 系统快捷键、把窗口拖到屏幕边缘，都会改变窗口状态但不经过这个按钮。
   /// 尺寸变化一定会触发 [didChangeMetrics]，在这里补一次同步最稳。
   Future<void> _sync() async {
-    if (!mounted || !WindowHost.isDesktop || _syncing) return;
+    if (!mounted || !WindowHost.isDesktop) return;
+    if (_syncing) {
+      _syncPending = true;
+      return;
+    }
     _syncing = true;
     try {
       final maximized = await WindowHost.isMaximized();
@@ -1550,6 +1779,10 @@ class _YingjiWindowControlsState extends State<YingjiWindowControls>
       });
     } finally {
       _syncing = false;
+      if (_syncPending && mounted) {
+        _syncPending = false;
+        WidgetsBinding.instance.addPostFrameCallback((_) => _sync());
+      }
     }
   }
 

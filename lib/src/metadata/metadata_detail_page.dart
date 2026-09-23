@@ -4,7 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollCacheExtent;
+import 'package:flutter/rendering.dart' show RenderBox, ScrollCacheExtent;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -74,6 +74,77 @@ class MetadataDetailPage extends StatefulWidget {
   const MetadataDetailPage({super.key, required this.item, this.media});
   final TmdbItem item;
   final MediaItem? media;
+
+  /// 从被点击的作品卡展开详情；入口不在可见卡片内时自然退回淡入。
+  static Future<void> open(
+    BuildContext sourceContext, {
+    required TmdbItem item,
+    MediaItem? media,
+    Offset? tapPosition,
+  }) {
+    final navigator = Navigator.of(sourceContext);
+    final sourceBox = sourceContext.findRenderObject();
+    final overlayBox = navigator.overlay?.context.findRenderObject();
+    Rect? origin;
+    if (sourceBox is RenderBox &&
+        sourceBox.hasSize &&
+        overlayBox is RenderBox &&
+        overlayBox.hasSize &&
+        sourceBox.size.width < overlayBox.size.width * .8 &&
+        sourceBox.size.height < overlayBox.size.height * .8) {
+      final rect =
+          sourceBox.localToGlobal(Offset.zero, ancestor: overlayBox) &
+          sourceBox.size;
+      final viewport = Offset.zero & overlayBox.size;
+      if (rect.overlaps(viewport)) origin = rect.intersect(viewport);
+    }
+    if (origin == null && tapPosition != null && overlayBox is RenderBox) {
+      final center = overlayBox.globalToLocal(tapPosition);
+      origin = Rect.fromCenter(
+        center: center,
+        width: 180,
+        height: 240,
+      ).intersect(Offset.zero & overlayBox.size);
+    }
+    return navigator.push<void>(
+      PageRouteBuilder<void>(
+        opaque: true,
+        allowSnapshotting: true,
+        transitionDuration: const Duration(milliseconds: 300),
+        reverseTransitionDuration: const Duration(milliseconds: 240),
+        pageBuilder: (_, _, _) => MetadataDetailPage(item: item, media: media),
+        transitionsBuilder: (context, animation, _, child) {
+          if (origin == null || MediaQuery.disableAnimationsOf(context)) {
+            return FadeTransition(opacity: animation, child: child);
+          }
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final viewport = constraints.biggest;
+              final center = origin!.center;
+              final alignment = Alignment(
+                (center.dx / viewport.width) * 2 - 1,
+                (center.dy / viewport.height) * 2 - 1,
+              );
+              final curve = CurvedAnimation(
+                parent: animation,
+                curve: Curves.easeOutCubic,
+                reverseCurve: Curves.easeInCubic,
+              );
+              return FadeTransition(
+                opacity: curve,
+                child: ScaleTransition(
+                  alignment: alignment,
+                  scale: Tween<double>(begin: .94, end: 1).animate(curve),
+                  child: RepaintBoundary(child: child),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
   @override
   State<MetadataDetailPage> createState() => _MetadataDetailPageState();
 }
@@ -1205,7 +1276,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                             children: [
                               RepaintBoundary(
                                 child: CachedNetworkImage(
-                                  key: ValueKey('detail-clear-${item.backdropUrl}'),
+                                  key: ValueKey(
+                                    'detail-clear-${item.backdropUrl}',
+                                  ),
                                   imageUrl: item.backdropUrl.toString(),
                                   fit: BoxFit.cover,
                                   // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成
@@ -1274,114 +1347,96 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                 ),
               ),
               SafeArea(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                child: Column(
                   children: [
-                    _DetailSidebar(
-                      onNavigate: (section) {
-                        yingjiSectionRequest.value = section;
-                        Navigator.pop(context);
-                      },
+                    _DetailTopBar(
+                      onBack: () => Navigator.pop(context),
+                      onSearch: () => _showResourceSearch(context),
                     ),
                     Expanded(
-                      child: Column(
-                        children: [
-                          _DetailTopBar(
-                            onBack: () => Navigator.pop(context),
-                            onSearch: () => _showResourceSearch(context),
+                      child: YingjiSmoothWheel(
+                        controller: _pageScroll,
+                        stableGlass: true,
+                        child: ListView(
+                          controller: _pageScroll,
+                          scrollCacheExtent: const ScrollCacheExtent.pixels(
+                            900,
                           ),
-                          Expanded(
-                            child: YingjiSmoothWheel(
-                              controller: _pageScroll,
-                              child: ListView(
-                                controller: _pageScroll,
-                                scrollCacheExtent:
-                                    const ScrollCacheExtent.pixels(900),
-                                // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel
-                                // 平滑驱动；移动端保持原有的回弹手感。
-                                physics:
-                                    yingjiWheelPhysics ??
-                                    const BouncingScrollPhysics(
-                                      parent: AlwaysScrollableScrollPhysics(),
-                                    ),
-                                padding: EdgeInsets.fromLTRB(
-                                  YingjiLayout.detailLeadingInset,
-                                  10,
-                                  YingjiLayout.pageRight,
-                                  80,
-                                ),
-                                children: [
-                                  _DetailHeroCopy(
-                                    item: item,
-                                    selected: _selectedResource,
-                                    loading: _loadingResources,
-                                    inWatchlist: _inWatchlist,
-                                    favorite: _isFavorite,
-                                    onPlay: () => _play(context, item),
-                                    onWatchlist: () async {
-                                      final store = _watchlist;
-                                      if (store == null) return;
-                                      await store.toggle(item);
-                                      if (mounted) {
-                                        setState(
-                                          () => _inWatchlist = !_inWatchlist,
-                                        );
-                                      }
-                                    },
-                                    onFavorite: _toggleFavorite,
-                                  ),
-                                  const SizedBox(height: 32),
-                                  if (_resources.isNotEmpty &&
-                                      item.kind == '剧集') ...[
-                                    _SeasonRail(
-                                      resources: _resources,
-                                      posters: _seasonPosters,
-                                      selectedSeason: _selectedSeason,
-                                      onSelect: _selectSeason,
-                                    ),
-                                    const SizedBox(height: 24),
-                                    _EpisodePreviewRail(
-                                      resources: _episodeChoices,
-                                      selected: _selectedResource,
-                                      completedResourceIds:
-                                          _completedResourceIds,
-                                      metadata: _episodeMetadata,
-                                      episodeProgress: _episodeProgress,
-                                      onMarkPlayed: _setEpisodeCompleted,
-                                      onSelect: _selectEpisode,
-                                    ),
-                                    const SizedBox(height: 30),
-                                  ],
-                                  _ResourceSection(
-                                    resources: _visibleResources,
-                                    selected: _selectedResource,
-                                    loading: _loadingResources,
-                                    error: _resourceError,
-                                    // 手动重试要绕开冷却间隔，立刻重搜。
-                                    onRetry: () => _loadResources(force: true),
-                                    onPicker: (resource) => _showResourcePicker(
-                                      source: resource.source,
-                                    ),
-                                    onSelect: (resource) => setState(
-                                      () => _selectedResource = resource,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 18),
-                                  _ResourceDetailsPanel(
-                                    item: item,
-                                    resource: _selectedResource,
-                                    selectedAudioTrack: _selectedAudioTrack,
-                                    selectedSubtitleTrack:
-                                        _selectedSubtitleTrack,
-                                    onSelectTracks: _showTrackPicker,
-                                  ),
-                                  const SizedBox(height: 36),
-                                  _DetailExtrasSection(extras: _extras),
-                                ],
+                          // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel
+                          // 平滑驱动；移动端保持原有的回弹手感。
+                          physics:
+                              yingjiWheelPhysics ??
+                              const BouncingScrollPhysics(
+                                parent: AlwaysScrollableScrollPhysics(),
                               ),
-                            ),
+                          padding: EdgeInsets.fromLTRB(
+                            YingjiLayout.pageLeft,
+                            10,
+                            YingjiLayout.pageRight,
+                            80,
                           ),
-                        ],
+                          children: [
+                            _DetailHeroCopy(
+                              item: item,
+                              selected: _selectedResource,
+                              loading: _loadingResources,
+                              inWatchlist: _inWatchlist,
+                              favorite: _isFavorite,
+                              onPlay: () => _play(context, item),
+                              onWatchlist: () async {
+                                final store = _watchlist;
+                                if (store == null) return;
+                                await store.toggle(item);
+                                if (mounted) {
+                                  setState(() => _inWatchlist = !_inWatchlist);
+                                }
+                              },
+                              onFavorite: _toggleFavorite,
+                            ),
+                            const SizedBox(height: 32),
+                            if (_resources.isNotEmpty && item.kind == '剧集') ...[
+                              _SeasonRail(
+                                resources: _resources,
+                                posters: _seasonPosters,
+                                selectedSeason: _selectedSeason,
+                                onSelect: _selectSeason,
+                              ),
+                              const SizedBox(height: 24),
+                              _EpisodePreviewRail(
+                                resources: _episodeChoices,
+                                selected: _selectedResource,
+                                completedResourceIds: _completedResourceIds,
+                                metadata: _episodeMetadata,
+                                episodeProgress: _episodeProgress,
+                                onMarkPlayed: _setEpisodeCompleted,
+                                onSelect: _selectEpisode,
+                              ),
+                              const SizedBox(height: 30),
+                            ],
+                            _ResourceSection(
+                              resources: _visibleResources,
+                              selected: _selectedResource,
+                              loading: _loadingResources,
+                              error: _resourceError,
+                              // 手动重试要绕开冷却间隔，立刻重搜。
+                              onRetry: () => _loadResources(force: true),
+                              onPicker: (resource) =>
+                                  _showResourcePicker(source: resource.source),
+                              onSelect: (resource) =>
+                                  setState(() => _selectedResource = resource),
+                            ),
+                            const SizedBox(height: 18),
+                            _ResourceDetailsPanel(
+                              item: item,
+                              resource: _selectedResource,
+                              selectedAudioTrack: _selectedAudioTrack,
+                              selectedSubtitleTrack: _selectedSubtitleTrack,
+                              onSelectTracks: _showTrackPicker,
+                            ),
+                            const SizedBox(height: 36),
+                            _DetailExtrasSection(extras: _extras),
+                          ],
+                        ),
                       ),
                     ),
                   ],
@@ -1510,19 +1565,19 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       // 剧集面板要逐集显示剧照，资源面板要显示服务器图标 —— 两样都必须由应用侧
       // 先取好：原生不联网，也不该持有令牌。图落到本地磁盘缓存后只把路径下发。
       // 这一步放在重播循环之外，换资源重播时不必重新取图；两者都有时限，起播
-      // 不该被取图拖住，赶不上的图在面板里退化成占位图或兜底标记。
-      final episodeImages = await WindowsNativePlayer.cacheImageFiles({
+      // 不该被取图拖住，赶不上的单集剧照会退回真实剧集海报，避免整列空白。
+      final episodeImages = await WindowsNativePlayer.cachedImageFiles({
         for (final episode in episodeOptions)
-          _episodeKey(
-            episode.seasonNumber,
-            episode.episodeNumber,
-          ): _episodeImage(
-            episode,
-            _episodeMetadata[_episodeKey(
-              episode.seasonNumber,
-              episode.episodeNumber,
-            )],
-          )?.toString(),
+          _episodeKey(episode.seasonNumber, episode.episodeNumber):
+              (_episodeImage(
+                        episode,
+                        _episodeMetadata[_episodeKey(
+                          episode.seasonNumber,
+                          episode.episodeNumber,
+                        )],
+                      ) ??
+                      item.posterUrl)
+                  ?.toString(),
       });
       // 名次取自「按画质排序」的那一份版本列表，和详情页资源卡片上的金 / 银 / 铜
       // 标记同源。当前条目不在其中时（比如从播放历史直接起播）不排名次。
@@ -1594,10 +1649,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   : episode,
             )
             .toList(growable: false);
-        final activeMetadata = _episodeMetadata[_episodeKey(
-          activeResource.seasonNumber,
-          activeResource.episodeNumber,
-        )];
+        final activeMetadata =
+            _episodeMetadata[_episodeKey(
+              activeResource.seasonNumber,
+              activeResource.episodeNumber,
+            )];
         try {
           final result = await WindowsNativePlayer.play(
             WindowsNativePlaybackRequest(
@@ -1607,8 +1663,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               initialPosition: startAt,
               imageUrl:
                   (_episodeImage(activeResource, activeMetadata) ??
-                      item.posterUrl)
-                  ?.toString(),
+                          item.posterUrl)
+                      ?.toString(),
               seriesLogoUrl: item.logoUrl?.toString(),
               sourceId: activeResource.source.id,
               serverItemId: activeResource.id,
@@ -1668,10 +1724,14 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       return;
     }
     if (!context.mounted) return;
-    await Navigator.push(
+    await Navigator.push<void>(
       context,
-      MaterialPageRoute(
-        builder: (_) => PlayerPage(
+      PageRouteBuilder<void>(
+        opaque: true,
+        allowSnapshotting: true,
+        transitionDuration: const Duration(milliseconds: 280),
+        reverseTransitionDuration: const Duration(milliseconds: 220),
+        pageBuilder: (_, _, _) => PlayerPage(
           url: resource.playbackUrl.toString(),
           title: item.title,
           seriesLogoUrl: item.logoUrl?.toString(),
@@ -1699,14 +1759,14 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   headers: episode.headers,
                   imageUrl:
                       (_episodeImage(
-                        episode,
-                        _episodeMetadata[_episodeKey(
-                          episode.seasonNumber,
-                          episode.episodeNumber,
-                        )],
-                      ) ??
-                      item.posterUrl)
-                  ?.toString(),
+                                episode,
+                                _episodeMetadata[_episodeKey(
+                                  episode.seasonNumber,
+                                  episode.episodeNumber,
+                                )],
+                              ) ??
+                              item.posterUrl)
+                          ?.toString(),
                   seriesLogoUrl: item.logoUrl?.toString(),
                   episodeTitle: _episodeTitle(
                     episode,
@@ -1740,6 +1800,20 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               )
               .toList(growable: false),
         ),
+        transitionsBuilder: (context, animation, _, child) {
+          final curve = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return FadeTransition(
+            opacity: curve,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: .985, end: 1).animate(curve),
+              child: RepaintBoundary(child: child),
+            ),
+          );
+        },
       ),
     );
     // The player flushed its final position before popping; re-derive the
@@ -1807,63 +1881,22 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 }
 
-class _DetailSidebar extends StatelessWidget {
-  const _DetailSidebar({required this.onNavigate});
-  final ValueChanged<String> onNavigate;
-
-  @override
-  Widget build(BuildContext context) => SizedBox(
-    // 宽度与内边距都取自统一栅格，侧栏按钮槽位和正文锚点一起移动。
-    width: YingjiLayout.detailSidebarWidth,
-    child: Padding(
-      padding: YingjiLayout.detailSidebarPadding,
-      child: Column(
-        children: [
-          const YingjiMark(size: 42),
-          const SizedBox(height: 18),
-          const Spacer(),
-          // 顺序与首页左侧导航完全一致（首页 → 追剧 → 片单 → 服务器），
-          // 同一个入口在不同页面必须落在同一个位置。
-          for (final item in const <(IconData, String, String)>[
-            (YingjiIcons.house, 'home', '首页'),
-            (YingjiIcons.calendar, 'calendar', '追剧'),
-            (YingjiIcons.heart, 'playlists', '片单'),
-            (YingjiIcons.rectangle_stack, 'sources', '服务器'),
-          ]) ...[
-            _DetailRailButton(
-              icon: item.$1,
-              tooltip: item.$3,
-              onPressed: () => onNavigate(item.$2),
-            ),
-            const SizedBox(height: 10),
-          ],
-          const Spacer(),
-          _DetailRailButton(
-            icon: YingjiIcons.gear,
-            tooltip: '设置',
-            onPressed: () => onNavigate('settings'),
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
+/// 详情页顶栏的小图标按钮。
 class _DetailRailButton extends StatelessWidget {
   const _DetailRailButton({
     required this.icon,
     required this.onPressed,
-    this.tooltip,
+    required this.tooltip,
   });
   final IconData icon;
   final VoidCallback onPressed;
-  final String? tooltip;
+  final String tooltip;
 
   @override
   Widget build(BuildContext context) => YingjiMotionIconButton(
     icon: icon,
-    tooltip: tooltip ?? '操作',
-    size: 44,
+    tooltip: tooltip,
+    size: YingjiLayout.railButtonSize,
     onPressed: onPressed,
   );
 }
@@ -1875,10 +1908,9 @@ class _DetailTopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    // 左边距补上侧栏宽度正好等于 YingjiLayout.pageLeft，与正文、与其它页面
-    // 对齐；右侧与首页顶部栏一致，搜索按钮因此固定在屏幕最右。
+    // 顶栏和正文直接使用同一个左锚点。
     padding: EdgeInsets.only(
-      left: YingjiLayout.detailLeadingInset,
+      left: YingjiLayout.pageLeft,
       right: WindowHost.isDesktop ? 0 : 14,
     ),
     child: SizedBox(
@@ -1900,21 +1932,28 @@ class _DetailTopBar extends StatelessWidget {
                 ? WindowHost.dragArea(child: const SizedBox.expand())
                 : const SizedBox.expand(),
           ),
-          _DetailRailButton(icon: YingjiIcons.search, onPressed: onSearch),
+          _DetailRailButton(
+            icon: YingjiIcons.search,
+            tooltip: '搜索资源',
+            onPressed: onSearch,
+          ),
           if (WindowHost.isDesktop) ...[
             const SizedBox(width: 8),
             _DetailRailButton(
               icon: YingjiIcons.minus,
+              tooltip: '最小化',
               onPressed: WindowHost.minimize,
             ),
             const SizedBox(width: 8),
             _DetailRailButton(
               icon: YingjiIcons.square,
+              tooltip: '最大化或还原',
               onPressed: WindowHost.toggleMaximize,
             ),
             const SizedBox(width: 8),
             _DetailRailButton(
               icon: YingjiIcons.xmark,
+              tooltip: '关闭窗口',
               onPressed: WindowHost.close,
             ),
             const SizedBox(width: 14),
@@ -2002,7 +2041,10 @@ class _DetailHeroCopy extends StatelessWidget {
         NextEpisodeLabel(item: item),
       ],
       const SizedBox(height: 16),
-      Row(
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
           _DetailAction(
             icon: YingjiIcons.play_fill,
@@ -2011,7 +2053,6 @@ class _DetailHeroCopy extends StatelessWidget {
             enabled: selected?.playbackUrl != null,
             onPressed: onPlay,
           ),
-          const SizedBox(width: 12),
           YingjiMotionIconButton(
             icon: YingjiIcons.bookmark,
             tooltip: inWatchlist ? '移出待看' : '加入待看',
@@ -2019,7 +2060,6 @@ class _DetailHeroCopy extends StatelessWidget {
             size: 46,
             onPressed: onWatchlist,
           ),
-          const SizedBox(width: 8),
           YingjiMotionIconButton(
             icon: favorite ? YingjiIcons.heart_fill : YingjiIcons.heart,
             tooltip: favorite ? '取消收藏' : '收藏',
@@ -2396,11 +2436,13 @@ class _SeasonRailState extends State<_SeasonRail> {
                                       fit: BoxFit.cover,
                                       // 季海报显示宽 ~190，按物理像素解码即可，
                                       // 不必用原图——批量解码卡在进页面转场的最后一帧。
-                                      memCacheWidth: (320 *
-                                              MediaQuery.devicePixelRatioOf(
-                                                  context))
-                                          .clamp(1.0, 512.0)
-                                          .round(),
+                                      memCacheWidth:
+                                          (320 *
+                                                  MediaQuery.devicePixelRatioOf(
+                                                    context,
+                                                  ))
+                                              .clamp(1.0, 512.0)
+                                              .round(),
                                       errorWidget: (_, _, _) => const Center(
                                         child: Icon(YingjiIcons.film),
                                       ),
@@ -2697,21 +2739,23 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                                   image == null
                                       ? const _EpisodeArtworkFallback()
                                       : CachedNetworkImage(
-                                      fadeInDuration: const Duration(
-                                        milliseconds: 150,
-                                      ),
-                                      imageUrl: image.toString(),
-                                      fit: BoxFit.cover,
-                                      // 剧集静帧显示宽 ~238，按物理像素解码即可，
-                                      // 避免几十张原图在进页面时批量解码卡住转场末帧。
-                                      memCacheWidth: (320 *
-                                              MediaQuery.devicePixelRatioOf(
-                                                  context))
-                                          .clamp(1.0, 512.0)
-                                          .round(),
-                                      errorWidget: (_, _, _) =>
-                                          const _EpisodeArtworkFallback(),
-                                    ),
+                                          fadeInDuration: const Duration(
+                                            milliseconds: 150,
+                                          ),
+                                          imageUrl: image.toString(),
+                                          fit: BoxFit.cover,
+                                          // 剧集静帧显示宽 ~238，按物理像素解码即可，
+                                          // 避免几十张原图在进页面时批量解码卡住转场末帧。
+                                          memCacheWidth:
+                                              (320 *
+                                                      MediaQuery.devicePixelRatioOf(
+                                                        context,
+                                                      ))
+                                                  .clamp(1.0, 512.0)
+                                                  .round(),
+                                          errorWidget: (_, _, _) =>
+                                              const _EpisodeArtworkFallback(),
+                                        ),
                                   if (completed)
                                     const Positioned(
                                       right: 10,
@@ -3551,13 +3595,15 @@ class _ResourceSectionState extends State<_ResourceSection> {
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      Row(
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
           const Text(
             '资源',
             style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
           ),
-          const SizedBox(width: 14),
           _FilterChip(
             label: '色彩范围',
             icon: YingjiIcons.sparkles,
@@ -3582,7 +3628,6 @@ class _ResourceSectionState extends State<_ResourceSection> {
             active: _sort == 'size',
             onTap: () => _selectSort('size'),
           ),
-          const Spacer(),
           YingjiMotionIconButton(
             icon: _viewMode == 'server'
                 ? YingjiIcons.cloud
@@ -4010,7 +4055,9 @@ class _ResourceDetailsPanelState extends State<_ResourceDetailsPanel> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
+        Wrap(
+          spacing: 10,
+          runSpacing: 8,
           children: [
             _FilterChip(
               label: '资源详情',
@@ -4018,7 +4065,6 @@ class _ResourceDetailsPanelState extends State<_ResourceDetailsPanel> {
               active: _expanded,
               onTap: () => setState(() => _expanded = !_expanded),
             ),
-            const SizedBox(width: 14),
             _FilterChip(
               label: '预选字幕 / 音轨',
               icon: YingjiIcons.captions_bubble,
@@ -4608,13 +4654,13 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         imageUrl: person.profileUrl.toString(),
                                         fit: BoxFit.cover,
                                         // 演员头像 100px，按显示分辨率解码。
-                                        memCacheWidth: (160 *
-                                                MediaQuery
-                                                    .devicePixelRatioOf(
-                                                  context,
-                                                ))
-                                            .clamp(1.0, 512.0)
-                                            .round(),
+                                        memCacheWidth:
+                                            (160 *
+                                                    MediaQuery.devicePixelRatioOf(
+                                                      context,
+                                                    ))
+                                                .clamp(1.0, 512.0)
+                                                .round(),
                                         errorWidget: (_, _, _) =>
                                             const ColoredBox(
                                               color: YingjiColors.elevated,
@@ -4691,10 +4737,10 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                             imageUrl: artwork.url.toString(),
                             fit: BoxFit.contain,
                             // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
-                            memCacheWidth: (1280 *
-                                    MediaQuery.devicePixelRatioOf(context))
-                                .clamp(1.0, 1280.0)
-                                .round(),
+                            memCacheWidth:
+                                (1280 * MediaQuery.devicePixelRatioOf(context))
+                                    .clamp(1.0, 1280.0)
+                                    .round(),
                           ),
                         ),
                       ),
@@ -4709,10 +4755,10 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                           width: 300,
                           fit: BoxFit.cover,
                           // 艺术图货架缩略图宽 300，按显示分辨率解码。
-                          memCacheWidth: (320 *
-                                  MediaQuery.devicePixelRatioOf(context))
-                              .clamp(1.0, 512.0)
-                              .round(),
+                          memCacheWidth:
+                              (320 * MediaQuery.devicePixelRatioOf(context))
+                                  .clamp(1.0, 512.0)
+                                  .round(),
                         ),
                       ),
                     ),
@@ -4745,12 +4791,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                 itemBuilder: (context, index) {
                   final item = value.recommendations[index];
                   return InkWell(
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => MetadataDetailPage(item: item),
-                      ),
-                    ),
+                    onTap: () => MetadataDetailPage.open(context, item: item),
                     borderRadius: BorderRadius.circular(14),
                     child: _DetailPosterHover(
                       borderRadius: 14,
@@ -4775,13 +4816,13 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                                         imageUrl: item.posterUrl.toString(),
                                         fit: BoxFit.cover,
                                         // 相似推荐海报 164px 宽，按显示分辨率解码。
-                                        memCacheWidth: (320 *
-                                                MediaQuery
-                                                    .devicePixelRatioOf(
-                                                  context,
-                                                ))
-                                            .clamp(1.0, 512.0)
-                                            .round(),
+                                        memCacheWidth:
+                                            (320 *
+                                                    MediaQuery.devicePixelRatioOf(
+                                                      context,
+                                                    ))
+                                                .clamp(1.0, 512.0)
+                                                .round(),
                                         errorWidget: (_, _, _) =>
                                             const ColoredBox(
                                               color: YingjiColors.elevated,
@@ -5036,15 +5077,7 @@ class _FilterableRecommendationGridState
             itemCount: rows.length,
             itemBuilder: (_, index) => _RecommendationDetailCard(
               item: rows[index],
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => MetadataDetailPage(item: rows[index]),
-                  ),
-                );
-              },
+              onTap: (from) => MetadataDetailPage.open(from, item: rows[index]),
             ),
           ),
         ),
@@ -5086,10 +5119,10 @@ class _PersonDetailCard extends StatelessWidget {
                         imageUrl: person.profileUrl.toString(),
                         fit: BoxFit.cover,
                         // 演员详情卡头像约 110px，按显示分辨率解码。
-                        memCacheWidth: (160 *
-                                MediaQuery.devicePixelRatioOf(context))
-                            .clamp(1.0, 512.0)
-                            .round(),
+                        memCacheWidth:
+                            (160 * MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 512.0)
+                                .round(),
                         errorWidget: (_, _, _) => const ColoredBox(
                           color: YingjiColors.elevated,
                           child: Icon(YingjiIcons.person_fill, size: 42),
@@ -5152,19 +5185,18 @@ class _ArtworkDetailCard extends StatelessWidget {
           children: [
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 1200, maxHeight: 780),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: CachedNetworkImage(
-                    fadeInDuration: const Duration(milliseconds: 150),
-                    imageUrl: artwork.url.toString(),
-                    fit: BoxFit.contain,
-                    // 艺术图大图弹窗（maxWidth 1200），按显示分辨率解码。
-                    memCacheWidth: (1280 *
-                            MediaQuery.devicePixelRatioOf(context))
-                        .clamp(1.0, 1280.0)
-                        .round(),
-                  ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: CachedNetworkImage(
+                  fadeInDuration: const Duration(milliseconds: 150),
+                  imageUrl: artwork.url.toString(),
+                  fit: BoxFit.contain,
+                  // 艺术图大图弹窗（maxWidth 1200），按显示分辨率解码。
+                  memCacheWidth: (1280 * MediaQuery.devicePixelRatioOf(context))
+                      .clamp(1.0, 1280.0)
+                      .round(),
                 ),
+              ),
             ),
             Padding(
               padding: const EdgeInsets.all(12),
@@ -5230,11 +5262,11 @@ class _ArtworkDetailCard extends StatelessWidget {
 class _RecommendationDetailCard extends StatelessWidget {
   const _RecommendationDetailCard({required this.item, required this.onTap});
   final TmdbItem item;
-  final VoidCallback onTap;
+  final ValueChanged<BuildContext> onTap;
 
   @override
   Widget build(BuildContext context) => InkWell(
-    onTap: onTap,
+    onTap: () => onTap(context),
     borderRadius: BorderRadius.circular(14),
     child: _DetailPosterHover(
       borderRadius: 14,
@@ -5255,10 +5287,10 @@ class _RecommendationDetailCard extends StatelessWidget {
                       imageUrl: item.posterUrl.toString(),
                       fit: BoxFit.cover,
                       // 相似推荐详情卡海报 146px 宽，按显示分辨率解码。
-                      memCacheWidth: (320 *
-                              MediaQuery.devicePixelRatioOf(context))
-                          .clamp(1.0, 512.0)
-                          .round(),
+                      memCacheWidth:
+                          (320 * MediaQuery.devicePixelRatioOf(context))
+                              .clamp(1.0, 512.0)
+                              .round(),
                       errorWidget: (_, _, _) =>
                           const ColoredBox(color: YingjiColors.elevated),
                     ),
@@ -5329,17 +5361,18 @@ class _DetailSectionTitle extends StatelessWidget {
   final Widget? trailing;
 
   @override
-  Widget build(BuildContext context) => Row(
+  Widget build(BuildContext context) => Wrap(
+    spacing: 14,
+    runSpacing: 8,
+    crossAxisAlignment: WrapCrossAlignment.center,
     children: [
       Text(
         title,
         style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
       ),
       if (empty) ...[
-        const SizedBox(width: 14),
         const Text('暂无数据', style: TextStyle(color: YingjiColors.muted)),
       ],
-      const Spacer(),
       trailing ?? const SizedBox.shrink(),
     ],
   );
@@ -5392,6 +5425,7 @@ class _PersonPage extends StatefulWidget {
 class _PersonPageState extends State<_PersonPage> {
   late final TmdbClient _client;
   late final Future<TmdbPersonDetails> _details;
+  final _scroll = ScrollController();
   String _type = '全部';
   String _sort = '热门';
 
@@ -5404,6 +5438,7 @@ class _PersonPageState extends State<_PersonPage> {
 
   @override
   void dispose() {
+    _scroll.dispose();
     _client.dispose();
     super.dispose();
   }
@@ -5435,158 +5470,163 @@ class _PersonPageState extends State<_PersonPage> {
                   } else if (_sort == '年份') {
                     rows.sort((a, b) => (b.year ?? 0).compareTo(a.year ?? 0));
                   }
-                  return CustomScrollView(
-                    slivers: [
-                      SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(74, 24, 64, 28),
-                        sliver: SliverToBoxAdapter(
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _DetailPosterHover(
-                                borderRadius: 18,
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(18),
-                                  child: SizedBox(
-                                    width: 190,
-                                    height: 270,
-                                    child: value.person.profileUrl == null
-                                        ? const ColoredBox(
-                                            color: YingjiColors.elevated,
-                                            child: Icon(
-                                              YingjiIcons.person_fill,
-                                              size: 52,
+                  return YingjiSmoothWheel(
+                    controller: _scroll,
+                    stableGlass: true,
+                    child: CustomScrollView(
+                      controller: _scroll,
+                      physics: yingjiWheelPhysics,
+                      slivers: [
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(74, 24, 64, 28),
+                          sliver: SliverToBoxAdapter(
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _DetailPosterHover(
+                                  borderRadius: 18,
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(18),
+                                    child: SizedBox(
+                                      width: 190,
+                                      height: 270,
+                                      child: value.person.profileUrl == null
+                                          ? const ColoredBox(
+                                              color: YingjiColors.elevated,
+                                              child: Icon(
+                                                YingjiIcons.person_fill,
+                                                size: 52,
+                                              ),
+                                            )
+                                          : CachedNetworkImage(
+                                              fadeInDuration: const Duration(
+                                                milliseconds: 150,
+                                              ),
+                                              imageUrl: value.person.profileUrl
+                                                  .toString(),
+                                              fit: BoxFit.cover,
+                                              // 人物页头像 190px 宽，按显示分辨率解码。
+                                              memCacheWidth:
+                                                  (320 *
+                                                          MediaQuery.devicePixelRatioOf(
+                                                            context,
+                                                          ))
+                                                      .clamp(1.0, 512.0)
+                                                      .round(),
                                             ),
-                                          )
-                                        : CachedNetworkImage(
-                                            fadeInDuration: const Duration(
-                                              milliseconds: 150,
-                                            ),
-                                            imageUrl: value.person.profileUrl
-                                                .toString(),
-                                            fit: BoxFit.cover,
-                                            // 人物页头像 190px 宽，按显示分辨率解码。
-                                            memCacheWidth: (320 *
-                                                    MediaQuery
-                                                        .devicePixelRatioOf(
-                                                      context,
-                                                    ))
-                                                .clamp(1.0, 512.0)
-                                                .round(),
-                                          ),
+                                    ),
                                   ),
                                 ),
-                              ),
-                              const SizedBox(width: 28),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      value.person.name,
-                                      style: const TextStyle(
-                                        fontSize: 42,
-                                        height: 1,
-                                        fontWeight: FontWeight.w900,
-                                        letterSpacing: -1,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 12),
-                                    Text(
-                                      [value.birthday, value.placeOfBirth]
-                                          .where(
-                                            (text) => text?.isNotEmpty == true,
-                                          )
-                                          .join(' · '),
-                                      style: const TextStyle(
-                                        color: YingjiColors.muted,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 16),
-                                    YingjiGlassTooltip(
-                                      message:
-                                          value.biography?.isNotEmpty == true
-                                          ? value.biography!
-                                          : '暂无人物简介',
-                                      child: Text(
-                                        value.biography?.isNotEmpty == true
-                                            ? value.biography!
-                                            : '暂无人物简介',
-                                        maxLines: 6,
-                                        overflow: TextOverflow.ellipsis,
+                                const SizedBox(width: 28),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        value.person.name,
                                         style: const TextStyle(
-                                          height: 1.55,
-                                          color: Color(0xFFD9DCE3),
+                                          fontSize: 42,
+                                          height: 1,
+                                          fontWeight: FontWeight.w900,
+                                          letterSpacing: -1,
                                         ),
                                       ),
-                                    ),
-                                    const SizedBox(height: 20),
-                                    Wrap(
-                                      spacing: 8,
-                                      runSpacing: 8,
-                                      children: [
-                                        for (final label in const [
-                                          '全部',
-                                          '电影',
-                                          '剧集',
-                                        ])
-                                          _FilterChip(
-                                            label: label,
-                                            icon: label == '全部'
-                                                ? YingjiIcons.rectangle_stack
-                                                : YingjiIcons.film,
-                                            active: _type == label,
-                                            onTap: () =>
-                                                setState(() => _type = label),
+                                      const SizedBox(height: 12),
+                                      Text(
+                                        [value.birthday, value.placeOfBirth]
+                                            .where(
+                                              (text) =>
+                                                  text?.isNotEmpty == true,
+                                            )
+                                            .join(' · '),
+                                        style: const TextStyle(
+                                          color: YingjiColors.muted,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 16),
+                                      YingjiGlassTooltip(
+                                        message:
+                                            value.biography?.isNotEmpty == true
+                                            ? value.biography!
+                                            : '暂无人物简介',
+                                        child: Text(
+                                          value.biography?.isNotEmpty == true
+                                              ? value.biography!
+                                              : '暂无人物简介',
+                                          maxLines: 6,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            height: 1.55,
+                                            color: Color(0xFFD9DCE3),
                                           ),
-                                        for (final label in const [
-                                          '热门',
-                                          '评分',
-                                          '年份',
-                                        ])
-                                          _FilterChip(
-                                            label: label,
-                                            icon:
-                                                YingjiIcons.slider_horizontal_3,
-                                            active: _sort == label,
-                                            onTap: () =>
-                                                setState(() => _sort = label),
-                                          ),
-                                      ],
-                                    ),
-                                  ],
+                                        ),
+                                      ),
+                                      const SizedBox(height: 20),
+                                      Wrap(
+                                        spacing: 8,
+                                        runSpacing: 8,
+                                        children: [
+                                          for (final label in const [
+                                            '全部',
+                                            '电影',
+                                            '剧集',
+                                          ])
+                                            _FilterChip(
+                                              label: label,
+                                              icon: label == '全部'
+                                                  ? YingjiIcons.rectangle_stack
+                                                  : YingjiIcons.film,
+                                              active: _type == label,
+                                              onTap: () =>
+                                                  setState(() => _type = label),
+                                            ),
+                                          for (final label in const [
+                                            '热门',
+                                            '评分',
+                                            '年份',
+                                          ])
+                                            _FilterChip(
+                                              label: label,
+                                              icon: YingjiIcons
+                                                  .slider_horizontal_3,
+                                              active: _sort == label,
+                                              onTap: () =>
+                                                  setState(() => _sort = label),
+                                            ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(74, 0, 64, 64),
-                        sliver: SliverGrid(
-                          gridDelegate:
-                              const SliverGridDelegateWithMaxCrossAxisExtent(
-                                maxCrossAxisExtent: 360,
-                                mainAxisExtent: 230,
-                                mainAxisSpacing: 16,
-                                crossAxisSpacing: 16,
-                              ),
-                          delegate: SliverChildBuilderDelegate(
-                            (context, index) => _RecommendationDetailCard(
-                              item: rows[index],
-                              onTap: () => Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) =>
-                                      MetadataDetailPage(item: rows[index]),
-                                ),
-                              ),
+                              ],
                             ),
-                            childCount: rows.length,
                           ),
                         ),
-                      ),
-                    ],
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(74, 0, 64, 64),
+                          sliver: SliverGrid(
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                                  maxCrossAxisExtent: 360,
+                                  mainAxisExtent: 230,
+                                  mainAxisSpacing: 16,
+                                  crossAxisSpacing: 16,
+                                ),
+                            delegate: SliverChildBuilderDelegate(
+                              (context, index) => _RecommendationDetailCard(
+                                item: rows[index],
+                                onTap: (from) => MetadataDetailPage.open(
+                                  from,
+                                  item: rows[index],
+                                ),
+                              ),
+                              childCount: rows.length,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   );
                 },
               ),

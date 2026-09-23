@@ -362,42 +362,44 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
 
   @override
   Widget build(BuildContext context) {
-    final shellBody = BackdropGroup(
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          _ContinuousShellBackdrop(controller: _pageController),
-          PageView.builder(
-            controller: _pageController,
-            scrollDirection: Axis.vertical,
-            allowImplicitScrolling: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: _pageSections.length,
-            onPageChanged: (index) {
-              final section = _pageSections[index];
-              setState(() => _section = section);
-              yingjiSectionFocus.value = _sectionKey(section);
-            },
-            itemBuilder: (context, index) {
-              final section = _pageSections[index];
-              final page = _pageFor(section);
-              if (section == _CenterSection.home) return page;
-              return Padding(padding: YingjiLayout.pageInset, child: page);
-            },
-          ),
-          const _FloatingHomeDragRegion(),
-          _FloatingHomeRail(selected: _section, onChanged: _selectSection),
-          _FloatingHomeTopBar(
-            onSearch: () => _selectSection(_CenterSection.search),
-          ),
-          // 首页自带绑定真实滚动位置的提示，壳层这个按页切换的提示在首页会失真。
-          if (_section != _CenterSection.home)
-            Positioned(
-              right: 28,
-              bottom: 30,
-              child: _PageScrollCue(progress: _pageScrollHint),
+    final shellBody = YingjiStableScrollGlass(
+      child: BackdropGroup(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            const _ContinuousShellBackdrop(),
+            PageView.builder(
+              controller: _pageController,
+              scrollDirection: Axis.vertical,
+              allowImplicitScrolling: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: _pageSections.length,
+              onPageChanged: (index) {
+                final section = _pageSections[index];
+                setState(() => _section = section);
+                yingjiSectionFocus.value = _sectionKey(section);
+              },
+              itemBuilder: (context, index) {
+                final section = _pageSections[index];
+                final page = _pageFor(section);
+                if (section == _CenterSection.home) return page;
+                return Padding(padding: YingjiLayout.pageInset, child: page);
+              },
             ),
-        ],
+            const _FloatingHomeDragRegion(),
+            _FloatingHomeRail(selected: _section, onChanged: _selectSection),
+            _FloatingHomeTopBar(
+              onSearch: () => _selectSection(_CenterSection.search),
+            ),
+            // 首页自带绑定真实滚动位置的提示，壳层这个按页切换的提示在首页会失真。
+            if (_section != _CenterSection.home)
+              Positioned(
+                right: 28,
+                bottom: 30,
+                child: _PageScrollCue(progress: _pageScrollHint),
+              ),
+          ],
+        ),
       ),
     );
     return Listener(
@@ -438,7 +440,9 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
     with _SectionTopOnTap<_HomeFeedPage> {
   final ScrollController _scroll = ScrollController();
   bool _showDiscover = true;
-  int _discoverSectionLimit = 4;
+  bool _discoverLayoutReady = false;
+  bool _pendingDiscoverJump = false;
+  int _discoverSectionLimit = 0;
   Timer? _discoverGrowthDebounce;
 
   @override
@@ -463,20 +467,30 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
   void _handleDiscoverRequest() {
     if (!mounted) return;
     if (!_showDiscover) setState(() => _showDiscover = true);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      // 第一帧挂载发现区域，第二帧才能读到扩展后的 maxScrollExtent。
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !_scroll.hasClients) return;
-        _scroll.animateTo(
-          _scroll.position.viewportDimension.clamp(
-            0,
-            _scroll.position.maxScrollExtent,
-          ),
-          duration: const Duration(milliseconds: 420),
-          curve: const Cubic(.22, 1, .36, 1),
-        );
-      });
-    });
+    _pendingDiscoverJump = true;
+    if (_discoverLayoutReady) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToDiscover());
+    }
+  }
+
+  void _onDiscoverLayoutRestored() {
+    _discoverLayoutReady = true;
+    if (_pendingDiscoverJump) _jumpToDiscover();
+  }
+
+  void _jumpToDiscover() {
+    if (!mounted || !_pendingDiscoverJump || !_scroll.hasClients) return;
+    _pendingDiscoverJump = false;
+    final position = _scroll.position;
+    final target = position.viewportDimension
+        .clamp(0.0, position.maxScrollExtent)
+        .toDouble();
+    if (target <= 0) return;
+    _scroll.animateTo(
+      target,
+      duration: const Duration(milliseconds: 420),
+      curve: const Cubic(.22, 1, .36, 1),
+    );
   }
 
   void _handleScroll() {
@@ -485,18 +499,32 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
     if (position.viewportDimension <= 0) return;
     if (_showDiscover) {
       // 所有栏目从一开始就占好固定高度，避免滚动时 maxScrollExtent 增长把海报
-      // 顶来顶去；这里只在停稳后加载当前位置附近的数据，不改变页面几何结构。
-      final targetLimit =
-          ((position.pixels / position.viewportDimension) * 2).ceil() + 4;
+      // 顶来顶去；接近视口时提前加载数据，不改变页面几何结构。
+      final targetLimit = math.max(
+        0,
+        ((position.pixels - position.viewportDimension * .55) / 396).ceil(),
+      );
       if (targetLimit <= _discoverSectionLimit) {
         _discoverGrowthDebounce?.cancel();
+        _discoverGrowthDebounce = null;
       } else {
-        _discoverGrowthDebounce?.cancel();
-        _discoverGrowthDebounce = Timer(const Duration(milliseconds: 180), () {
-          if (mounted && targetLimit > _discoverSectionLimit) {
-            setState(() => _discoverSectionLimit = targetLimit);
-          }
-        });
+        // 首次越过预加载阈值就开始计时，不要每帧重置到「滚动停止后」。
+        // 否则新栏目的图片恰好在滑行尾端一起挂载，表现为最后顿一下。
+        _discoverGrowthDebounce ??= Timer(
+          const Duration(milliseconds: 180),
+          () {
+            _discoverGrowthDebounce = null;
+            if (!mounted || !_scroll.hasClients) return;
+            final current = _scroll.position;
+            final nextLimit = math.max(
+              0,
+              ((current.pixels - current.viewportDimension * .55) / 396).ceil(),
+            );
+            if (nextLimit > _discoverSectionLimit) {
+              setState(() => _discoverSectionLimit = nextLimit);
+            }
+          },
+        );
       }
     }
     final more = position.maxScrollExtent - position.pixels > 24;
@@ -536,6 +564,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
           Positioned.fill(
             child: YingjiSmoothWheel(
               controller: _scroll,
+              stableGlass: true,
               child: CustomScrollView(
                 controller: _scroll,
                 // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
@@ -544,7 +573,10 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
                   SliverToBoxAdapter(
                     child: SizedBox(
                       height: canvasHeight,
-                      child: const _CinematicHome(),
+                      child: const Stack(
+                        fit: StackFit.expand,
+                        children: [_HomeHeroBackdrop(), _CinematicHome()],
+                      ),
                     ),
                   ),
                   if (_showDiscover)
@@ -554,6 +586,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
                       sliver: _DiscoverPage(
                         embedded: true,
                         sectionLimit: _discoverSectionLimit,
+                        onLayoutRestored: _onDiscoverLayoutRestored,
                       ),
                     ),
                   if (!_showDiscover)
@@ -580,9 +613,14 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
 enum _CenterSection { home, search, sources, playlists, calendar, settings }
 
 class _ContinuousShellBackdrop extends StatelessWidget {
-  const _ContinuousShellBackdrop({required this.controller});
+  const _ContinuousShellBackdrop();
 
-  final PageController controller;
+  @override
+  Widget build(BuildContext context) => const YingjiBackdrop();
+}
+
+class _HomeHeroBackdrop extends StatelessWidget {
+  const _HomeHeroBackdrop();
 
   Widget _transition(String effect, Widget child, Animation<double> animation) {
     final curve = CurvedAnimation(
@@ -637,140 +675,76 @@ class _ContinuousShellBackdrop extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder<String?>(
-    valueListenable: yingjiBackdropUrl,
-    builder: (context, imageUrl, _) => ValueListenableBuilder<String>(
-      valueListenable: yingjiBackdropEffect,
-      builder: (context, effect, _) => AnimatedBuilder(
-        animation: Listenable.merge([controller, yingjiHomeScrollDepth]),
-        builder: (context, _) {
-          final rawPage = controller.hasClients
-              ? (controller.page ?? controller.initialPage.toDouble())
-              : controller.initialPage.toDouble();
-          final page = rawPage.clamp(0.0, 6.0);
-          // 首页与“发现”合并后，首页内部可滚动、页码恒为 0，翻页不再是它变糊的
-          // 触发点。首屏→发现栏目的滚动距离由 yingjiHomeScrollDepth 提供；离开
-          // 首页时仍沿用原来的翻页曲线，两者取大者，保证切换不闪。
-          final depth = math.max(
-            yingjiHomeScrollDepth.value,
-            Curves.easeOutCubic.transform(page.clamp(0.0, 1.0)),
-          );
-          final deepening = ((page - 1) / 5).clamp(0.0, 1.0);
-          final darkness = .08 + .42 * depth + .12 * deepening;
-          return RepaintBoundary(
+  Widget build(BuildContext context) => ValueListenableBuilder<double>(
+    valueListenable: yingjiHomeScrollDepth,
+    builder: (context, depth, _) {
+      // 海报随首页滚动位置连续淡出，固定流动渐变始终铺底接管，避免在
+      // hero 与发现内容的边界切换背景。完全淡出后整屏海报不再参与绘制。
+      final posterOpacity = (1 - depth).clamp(0.0, 1.0);
+      return ValueListenableBuilder<String?>(
+        valueListenable: yingjiBackdropUrl,
+        builder: (context, imageUrl, _) => ValueListenableBuilder<String>(
+          valueListenable: yingjiBackdropEffect,
+          builder: (context, effect, _) => RepaintBoundary(
             child: Stack(
               fit: StackFit.expand,
               children: [
-                const ColoredBox(color: YingjiColors.canvas),
-                if (imageUrl != null && !FrameTrace.skipGlass('clear'))
-                  // 隔离成独立图层：翻页 / 滚动时 depth 每帧都在变，只有上面的
-                  // 遮罩需要重画，这张全屏底图不必跟着一起重绘。
-                  RepaintBoundary(
-                    child: AnimatedSwitcher(
-                      duration: effect == 'instant'
-                          ? Duration.zero
-                          : const Duration(milliseconds: 900),
-                      layoutBuilder: (currentChild, previousChildren) => Stack(
-                        fit: StackFit.expand,
-                        children: [...previousChildren, ?currentChild],
-                      ),
-                      transitionBuilder: (child, animation) =>
-                          _transition(effect, child, animation),
-                      child: CachedNetworkImage(
-                        key: ValueKey('clear-$imageUrl'),
-                        imageUrl: imageUrl,
-                        fit: BoxFit.cover,
-                        // 全屏 backdrop 按窗口实际物理宽度解码，省内存也省每帧纹理带宽。
-                        memCacheWidth: 1280,
-                        errorWidget: (_, _, _) =>
-                            const ColoredBox(color: YingjiColors.canvas),
-                      ),
-                    ),
-                  ),
-                if (imageUrl != null && !FrameTrace.skipGlass('shell'))
-                  ValueListenableBuilder<bool>(
-                    valueListenable: yingjiScrollInProgress,
-                    builder: (context, scrolling, _) => Opacity(
-                      opacity: depth,
-                      child: RepaintBoundary(
-                        child: Transform.scale(
-                          scale: 1.05,
-                          child: ImageFiltered(
-                            imageFilter: ImageFilter.blur(
-                              sigmaX: YingjiGlass.blur,
-                              sigmaY: YingjiGlass.blur,
-                            ),
-                            // 滚轮滑行期间冻结这条全屏离屏模糊。之前只有按钮、卡片
-                            // 的 BackdropFilter 接入滚动态，壳层仍每帧处理整张背景，
-                            // Profile 实测 raster p95 达 25ms。停稳即恢复完整材质。
-                            enabled: !scrolling,
-                            child: CachedNetworkImage(
-                              key: ValueKey('blur-$imageUrl'),
-                              imageUrl: imageUrl,
-                              fit: BoxFit.cover,
-                              // 这一层会被高斯模糊糊掉，原图分辨率纯属浪费：降到 320px
-                              // 宽再放大，肉眼完全看不出差别，却能少占数 MB。模糊拉到
-                              // 很低时这层就不再是"氛围光"了，改按 1280 解码，免得出现
-                              // 一层低清放大图压在清晰背景上的发虚重影。
-                              memCacheWidth: YingjiGlass.blur >= 10
-                                  ? 320
-                                  : 1280,
-                              errorWidget: (_, _, _) => const SizedBox.shrink(),
+                if (imageUrl != null &&
+                    posterOpacity > 0 &&
+                    !FrameTrace.skipGlass('clear'))
+                  ShaderMask(
+                    blendMode: BlendMode.dstIn,
+                    shaderCallback: (bounds) => LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Colors.white.withValues(alpha: posterOpacity),
+                        Colors.white.withValues(alpha: posterOpacity),
+                        Colors.transparent,
+                      ],
+                      // 提前完全透明，避免 Sliver 边界最后一行留下亮色接缝。
+                      stops: [0, .58, .985],
+                    ).createShader(bounds),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        AnimatedSwitcher(
+                          duration: effect == 'instant'
+                              ? Duration.zero
+                              : const Duration(milliseconds: 900),
+                          layoutBuilder: (currentChild, previousChildren) =>
+                              Stack(
+                                fit: StackFit.expand,
+                                children: [...previousChildren, ?currentChild],
+                              ),
+                          transitionBuilder: (child, animation) =>
+                              _transition(effect, child, animation),
+                          child: CachedNetworkImage(
+                            key: ValueKey('hero-$imageUrl'),
+                            imageUrl: imageUrl,
+                            fit: BoxFit.cover,
+                            memCacheWidth: 1280,
+                            errorWidget: (_, _, _) => const SizedBox.shrink(),
+                          ),
+                        ),
+                        const DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.centerLeft,
+                              end: Alignment.centerRight,
+                              colors: [Color(0xB307090D), Color(0x0007090D)],
                             ),
                           ),
                         ),
-                      ),
-                    ),
-                  ),
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: darkness),
-                    gradient: LinearGradient(
-                      colors: [
-                        Color.lerp(
-                          const Color(0x9907090D),
-                          const Color(0xB307090D),
-                          depth,
-                        )!,
-                        Color.lerp(
-                          const Color(0x2407090D),
-                          const Color(0x7407090D),
-                          depth,
-                        )!,
-                        Color.lerp(
-                          const Color(0x6607090D),
-                          const Color(0x8C07090D),
-                          depth,
-                        )!,
                       ],
-                      stops: const [0, .5, 1],
-                      begin: Alignment.centerLeft,
-                      end: Alignment.centerRight,
                     ),
                   ),
-                ),
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        const Color(0x0007090D),
-                        Color.lerp(
-                          const Color(0x4D07090D),
-                          const Color(0x9907090D),
-                          depth,
-                        )!,
-                      ],
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                    ),
-                  ),
-                ),
               ],
             ),
-          );
-        },
-      ),
-    ),
+          ),
+        ),
+      );
+    },
   );
 }
 
@@ -890,6 +864,8 @@ class _FloatingRailButton extends StatelessWidget {
     icon: icon,
     selected: selected,
     tooltip: tooltip,
+    // 与详情页侧栏共用同一个尺寸常量，两页的图标必须落在同一像素栅格上。
+    size: YingjiLayout.railButtonSize,
     onPressed: onPressed,
   );
 }
@@ -961,23 +937,7 @@ class _FloatingHomeTopBar extends StatelessWidget {
         ),
         if (WindowHost.isDesktop) ...[
           const SizedBox(width: 8),
-          _CircleAction(
-            icon: YingjiIcons.minus,
-            tooltip: '最小化',
-            onPressed: WindowHost.minimize,
-          ),
-          const SizedBox(width: 8),
-          _CircleAction(
-            icon: YingjiIcons.square,
-            tooltip: '最大化',
-            onPressed: WindowHost.toggleMaximize,
-          ),
-          const SizedBox(width: 8),
-          _CircleAction(
-            icon: YingjiIcons.xmark,
-            tooltip: '关闭',
-            onPressed: WindowHost.close,
-          ),
+          const YingjiWindowControls(size: 46),
           const SizedBox(width: 4),
         ],
       ],
@@ -1006,6 +966,7 @@ class _CinematicHomeState extends State<_CinematicHome>
   Timer? _heroTimer;
   final ScrollController _historyScroll = ScrollController();
   final Map<int, TmdbItem> _heroDetails = <int, TmdbItem>{};
+  final Set<int> _heroDetailRequests = <int>{};
 
   /// 元数据后台刷新后的重读消抖计时器。
   Timer? _revisionDebounce;
@@ -1032,9 +993,7 @@ class _CinematicHomeState extends State<_CinematicHome>
       }
       _heroProgress.value = 0;
       // 只有真正切换到下一张时才需要整页重建（背景/标题/简介变化）。
-      setState(() {
-        _hero = (_hero + 1) % items.length.clamp(1, 8);
-      });
+      _selectHero((_hero + 1) % items.length.clamp(1, 8));
     });
   }
 
@@ -1098,23 +1057,30 @@ class _CinematicHomeState extends State<_CinematicHome>
     };
     // 首屏轮播的大图与标题 logo 提前进磁盘缓存：这是最显眼的一屏，
     // 之后每次打开都应该已经躺在本地。
-    YingjiImageWarmup.items(items, backdrop: true, logo: true, maxItems: 2);
+    YingjiImageWarmup.items(items, backdrop: true, maxItems: 2);
     unawaited(_prefetchHeroDetails(items.take(2).toList(growable: false)));
     return items;
   }
 
   Future<void> _prefetchHeroDetails(List<TmdbItem> items) async {
-    await Future.wait(
-      items.map((item) async {
-        try {
-          final detail = await _tmdb.details(item.id, kind: item.kind);
-          if (!mounted) return;
-          setState(() => _heroDetails[item.id] = detail);
-        } catch (_) {
-          // The list item remains usable when optional artwork lookup fails.
-        }
-      }),
-    );
+    await Future.wait(items.map(_loadHeroDetail));
+  }
+
+  Future<void> _loadHeroDetail(TmdbItem item) async {
+    if (_heroDetails.containsKey(item.id) ||
+        !_heroDetailRequests.add(item.id)) {
+      return;
+    }
+    try {
+      final detail = await _tmdb.details(item.id, kind: item.kind);
+      if (!mounted) return;
+      setState(() => _heroDetails[item.id] = detail);
+      YingjiImageWarmup.items([detail], logo: true, maxItems: 1);
+    } catch (_) {
+      // Keep the title fallback if the optional detail/logo request fails.
+    } finally {
+      _heroDetailRequests.remove(item.id);
+    }
   }
 
   Future<void> _loadHistory() async {
@@ -1179,21 +1145,28 @@ class _CinematicHomeState extends State<_CinematicHome>
     );
   }
 
-  void _openHeroDetails(BuildContext context, TmdbItem item) {
+  void _openHeroDetails(BuildContext context, TmdbItem item, Offset? tap) {
     if (item.id == 0) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-    );
+    MetadataDetailPage.open(context, item: item, tapPosition: tap);
   }
 
   void _moveHero(int delta, int itemCount) {
     if (itemCount < 2) return;
+    final index = (_hero + delta) % itemCount;
+    _selectHero(index < 0 ? index + itemCount : index);
+  }
+
+  void _selectHero(int index) {
     setState(() {
-      _hero = (_hero + delta) % itemCount;
-      if (_hero < 0) _hero += itemCount;
+      _hero = index;
     });
     _heroProgress.value = 0;
+    if (_trendingValue.isEmpty) return;
+    unawaited(_loadHeroDetail(_trendingValue[index]));
+    final nextIndex = (index + 1) % _trendingValue.length.clamp(1, 8);
+    if (nextIndex != index) {
+      unawaited(_loadHeroDetail(_trendingValue[nextIndex]));
+    }
   }
 
   @override
@@ -1254,9 +1227,16 @@ class _CinematicHomeState extends State<_CinematicHome>
                   top: 0,
                   right: 0,
                   height: heroInteractionHeight,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.translucent,
-                    onTap: () => _openHeroDetails(context, selected),
+                  child: Builder(
+                    builder: (sourceContext) {
+                      Offset? tap;
+                      return GestureDetector(
+                        behavior: HitTestBehavior.translucent,
+                        onTapDown: (details) => tap = details.globalPosition,
+                        onTap: () =>
+                            _openHeroDetails(sourceContext, selected, tap),
+                      );
+                    },
                   ),
                 ),
                 Positioned(
@@ -1401,10 +1381,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                         length: carouselItemCount.clamp(1, 8),
                         active: _hero,
                         progress: progress,
-                        onChanged: (value) {
-                          setState(() => _hero = value);
-                          _heroProgress.value = 0;
-                        },
+                        onChanged: _selectHero,
                       ),
                     ),
                   ),
@@ -1770,13 +1747,18 @@ bool _sameWatchStates(List<WatchState> a, List<WatchState> b) {
 }
 
 class _DiscoverPage extends StatefulWidget {
-  const _DiscoverPage({this.embedded = false, this.sectionLimit});
+  const _DiscoverPage({
+    this.embedded = false,
+    this.sectionLimit,
+    this.onLayoutRestored,
+  });
 
   /// 为 true 表示被嵌入首页下半部分：自身不再滚动，改由外层列表统一驱动。
   final bool embedded;
 
   /// 内嵌首页时只构建用户已经滚到附近的栏目；null 表示独立页面加载全部。
   final int? sectionLimit;
+  final VoidCallback? onLayoutRestored;
   @override
   State<_DiscoverPage> createState() => _DiscoverPageState();
 }
@@ -1785,6 +1767,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final _tmdb = TmdbClient();
   final _trakt = TraktClient();
   final _tvMaze = http.Client();
+  final _standaloneScroll = ScrollController();
   static const _sectionsKey = 'yingji.discover.sections';
   static const _stylesKey = 'yingji.discover.card-styles';
   static const _sourcesKey = 'yingji.discover.section-sources';
@@ -2168,6 +2151,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   final Set<String> _hiddenSections = {};
   late Future<Map<String, List<TmdbItem>>> _items;
   Map<String, List<TmdbItem>> _visibleItems = const {};
+  final Map<String, ValueNotifier<List<TmdbItem>>> _sectionRows = {};
   List<String> _sections = List.of(_defaultSections);
 
   /// 元数据后台刷新后的重读消抖计时器。
@@ -2202,8 +2186,38 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     Future<Map<String, List<TmdbItem>>> future,
   ) async {
     final value = await future;
+    if (!mounted) return value;
     _visibleItems = value;
+    for (final entry in value.entries) {
+      final notifier = _sectionRows.putIfAbsent(
+        entry.key,
+        () => ValueNotifier<List<TmdbItem>>(entry.value),
+      );
+      if (!_sameItems(notifier.value, entry.value)) {
+        notifier.value = entry.value;
+      }
+    }
     return value;
+  }
+
+  ValueNotifier<List<TmdbItem>> _rowsFor(String section) =>
+      _sectionRows.putIfAbsent(
+        section,
+        () => ValueNotifier<List<TmdbItem>>(
+          _visibleItems[section] ?? const <TmdbItem>[],
+        ),
+      );
+
+  void _publishSections(Map<String, List<TmdbItem>> updates) {
+    if (updates.isEmpty) return;
+    _visibleItems = {..._visibleItems, ...updates};
+    _items = Future.value(_visibleItems);
+    for (final entry in updates.entries) {
+      final notifier = _rowsFor(entry.key);
+      if (!_sameItems(notifier.value, entry.value)) {
+        notifier.value = entry.value;
+      }
+    }
   }
 
   bool _sameItems(List<TmdbItem>? left, List<TmdbItem> right) {
@@ -2242,13 +2256,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         YingjiImageWarmup.items(rows, maxItems: 6);
       }
       if (!mounted || updates.isEmpty) return;
-      final next = {..._visibleItems, ...updates};
       // 一批后台响应只提交一次布局更新；逐栏 setState 会在滚动过程中制造连续
-      // 几帧的 layout/paint 峰值，看起来正是“一下一下卡”。
-      setState(() {
-        _visibleItems = next;
-        _items = Future.value(next);
-      });
+      // 几帧的 layout/paint 峰值。现在只通知实际变化的栏目，不再重建整页。
+      _publishSections(updates);
     } finally {
       _refreshingVisibleSections = false;
     }
@@ -2261,6 +2271,10 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _tmdb.dispose();
     _trakt.dispose();
     _tvMaze.close();
+    _standaloneScroll.dispose();
+    for (final notifier in _sectionRows.values) {
+      notifier.dispose();
+    }
     super.dispose();
   }
 
@@ -2268,7 +2282,12 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     await _restoreLayout();
     // 本地栏目顺序决定整页几何，不能等网络数据返回后才通过 FutureBuilder 重建；
     // 否则用户已经开始滚动时 maxScrollExtent 才突然切到保存的栏目数量。
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {});
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.onLayoutRestored?.call();
+      });
+    }
     return _loadSections(limit: widget.sectionLimit);
   }
 
@@ -2297,17 +2316,11 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         }),
       );
       if (!mounted) return;
-      final next = {
-        ...current,
-        ...Map<String, List<TmdbItem>>.fromEntries(entries),
-      };
+      final updates = Map<String, List<TmdbItem>>.fromEntries(entries);
       for (final rows in entries.map((entry) => entry.value)) {
         YingjiImageWarmup.items(rows, maxItems: 8);
       }
-      setState(() {
-        _visibleItems = next;
-        _items = Future.value(next);
-      });
+      _publishSections(updates);
     } finally {
       _extendingSections = false;
       if (mounted && widget.sectionLimit != requestedLimit) {
@@ -2479,7 +2492,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         heat: 'popularity.desc',
       ).encoded;
       _cardStyles[title] = 0;
-      _items = _loadSections();
+      _items = _trackItems(_loadSections());
     });
     await _persistLayout();
     if (mounted) await _showSectionSettings(title);
@@ -2501,178 +2514,183 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, updateDialog) => YingjiPinnedDialog(
-          maxWidth: 660,
-          maxHeight: 760,
-          header: Row(
-            children: [
-              const Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '列表设置',
-                      style: TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    SizedBox(height: 5),
-                    Text(
-                      '只调整当前列表；添加、排序与其他列表互不受影响。',
-                      style: TextStyle(color: YingjiColors.muted),
-                    ),
-                  ],
-                ),
-              ),
-              YingjiMotionIconButton(
-                icon: YingjiIcons.trash,
-                tooltip: '删除列表',
-                size: 38,
-                onPressed: () {
-                  deleted = true;
-                  changed = true;
-                  Navigator.pop(dialogContext);
-                },
-              ),
-              const SizedBox(width: 8),
-              YingjiMotionIconButton(
-                icon: YingjiIcons.xmark,
-                tooltip: '关闭',
-                size: 38,
-                onPressed: () => Navigator.pop(dialogContext),
-              ),
-            ],
-          ),
-          body: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextFormField(
-                key: ValueKey('discover-name-$initialSection'),
-                initialValue: titleDraft,
-                decoration: InputDecoration(
-                  labelText: '列表名称',
-                  errorText: error,
-                ),
-                onChanged: (value) => updateDialog(() {
-                  titleDraft = value;
-                  error = null;
-                }),
-              ),
-              const SizedBox(height: 14),
-              _ToggleRow(
-                title: '显示此列表',
-                detail: visible ? '当前显示在发现页中' : '当前已隐藏，可随时重新显示',
-                value: visible,
-                onChanged: (value) => updateDialog(() {
-                  visible = value;
-                  changed = true;
-                }),
-              ),
-              const SizedBox(height: 14),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 13,
-                  vertical: 11,
-                ),
-                decoration: BoxDecoration(
-                  color: YingjiGlass.chrome(strength: .72),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  '当前筛选  ${_filterSummary(source)}',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    height: 1.45,
-                    color: YingjiColors.muted,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              _DiscoverSourceEditor(
-                value: source,
-                style: style,
-                providerLabels: _providerLabels,
-                mediaLabels: _mediaLabels,
-                countryLabels: _countryLabels,
-                onChanged: (value) => updateDialog(() {
-                  source = value;
-                  previewItems = _loadSection(value, 1);
-                  changed = true;
-                }),
-              ),
-              const SizedBox(height: 18),
-              const Text('卡片样式', style: TextStyle(fontWeight: FontWeight.w800)),
-              const SizedBox(height: 10),
-              FutureBuilder<List<TmdbItem>>(
-                future: previewItems,
-                builder: (context, snapshot) => Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: [
-                    for (var index = 0; index < _styleNames.length; index++)
-                      SizedBox(
-                        width: 140,
-                        child: _DiscoveryStylePreview(
-                          label: _styleNames[index],
-                          style: index,
-                          selected: style == index,
-                          items: snapshot.data ?? const [],
-                          source: source,
-                          loading:
-                              snapshot.connectionState ==
-                              ConnectionState.waiting,
-                          onTap: () => updateDialog(() {
-                            style = index;
-                            if (index == 3) {
-                              final selection = _DiscoverFeedSelection.tryParse(
-                                source,
-                              );
-                              if (selection?.provider != 'tmdb') {
-                                source = const _DiscoverFeedSelection(
-                                  provider: 'tmdb',
-                                  mediaType: 'tv',
-                                  genre: 'all',
-                                  heat: 'popularity.desc',
-                                ).encoded;
-                                previewItems = _loadSection(source, 1);
-                              }
-                            }
-                            changed = true;
-                          }),
+        builder: (context, updateDialog) => YingjiStableScrollGlass(
+          child: YingjiPinnedDialog(
+            maxWidth: 660,
+            maxHeight: 760,
+            header: Row(
+              children: [
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '列表设置',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w900,
                         ),
                       ),
-                  ],
+                      SizedBox(height: 5),
+                      Text(
+                        '只调整当前列表；添加、排序与其他列表互不受影响。',
+                        style: TextStyle(color: YingjiColors.muted),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
-          ),
-          actions: Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              TextButton(
-                onPressed: () => Navigator.pop(dialogContext),
-                child: const Text('取消'),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                onPressed: () {
-                  final title = titleDraft.trim();
-                  if (title.isEmpty ||
-                      (title != initialSection && _sections.contains(title))) {
-                    updateDialog(
-                      () => error = title.isEmpty ? '列表名称不能为空' : '已有同名列表',
-                    );
-                    return;
-                  }
-                  changed = true;
-                  Navigator.pop(dialogContext);
-                },
-                child: const Text('保存当前列表'),
-              ),
-            ],
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.trash,
+                  tooltip: '删除列表',
+                  size: 38,
+                  onPressed: () {
+                    deleted = true;
+                    changed = true;
+                    Navigator.pop(dialogContext);
+                  },
+                ),
+                const SizedBox(width: 8),
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.xmark,
+                  tooltip: '关闭',
+                  size: 38,
+                  onPressed: () => Navigator.pop(dialogContext),
+                ),
+              ],
+            ),
+            body: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextFormField(
+                  key: ValueKey('discover-name-$initialSection'),
+                  initialValue: titleDraft,
+                  decoration: InputDecoration(
+                    labelText: '列表名称',
+                    errorText: error,
+                  ),
+                  onChanged: (value) => updateDialog(() {
+                    titleDraft = value;
+                    error = null;
+                  }),
+                ),
+                const SizedBox(height: 14),
+                _ToggleRow(
+                  title: '显示此列表',
+                  detail: visible ? '当前显示在发现页中' : '当前已隐藏，可随时重新显示',
+                  value: visible,
+                  onChanged: (value) => updateDialog(() {
+                    visible = value;
+                    changed = true;
+                  }),
+                ),
+                const SizedBox(height: 14),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 13,
+                    vertical: 11,
+                  ),
+                  decoration: BoxDecoration(
+                    color: YingjiGlass.chrome(strength: .72),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    '当前筛选  ${_filterSummary(source)}',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      height: 1.45,
+                      color: YingjiColors.muted,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _DiscoverSourceEditor(
+                  value: source,
+                  style: style,
+                  providerLabels: _providerLabels,
+                  mediaLabels: _mediaLabels,
+                  countryLabels: _countryLabels,
+                  onChanged: (value) => updateDialog(() {
+                    source = value;
+                    previewItems = _loadSection(value, 1);
+                    changed = true;
+                  }),
+                ),
+                const SizedBox(height: 18),
+                const Text(
+                  '卡片样式',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 10),
+                FutureBuilder<List<TmdbItem>>(
+                  future: previewItems,
+                  builder: (context, snapshot) => Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      for (var index = 0; index < _styleNames.length; index++)
+                        SizedBox(
+                          width: 140,
+                          child: _DiscoveryStylePreview(
+                            label: _styleNames[index],
+                            style: index,
+                            selected: style == index,
+                            items: snapshot.data ?? const [],
+                            source: source,
+                            loading:
+                                snapshot.connectionState ==
+                                ConnectionState.waiting,
+                            onTap: () => updateDialog(() {
+                              style = index;
+                              if (index == 3) {
+                                final selection =
+                                    _DiscoverFeedSelection.tryParse(source);
+                                if (selection?.provider != 'tmdb') {
+                                  source = const _DiscoverFeedSelection(
+                                    provider: 'tmdb',
+                                    mediaType: 'tv',
+                                    genre: 'all',
+                                    heat: 'popularity.desc',
+                                  ).encoded;
+                                  previewItems = _loadSection(source, 1);
+                                }
+                              }
+                              changed = true;
+                            }),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            actions: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('取消'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: () {
+                    final title = titleDraft.trim();
+                    if (title.isEmpty ||
+                        (title != initialSection &&
+                            _sections.contains(title))) {
+                      updateDialog(
+                        () => error = title.isEmpty ? '列表名称不能为空' : '已有同名列表',
+                      );
+                      return;
+                    }
+                    changed = true;
+                    Navigator.pop(dialogContext);
+                  },
+                  child: const Text('保存当前列表'),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2706,7 +2724,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         }
       }
       _groupSectionsByVisibility();
-      _items = _loadSections();
+      _items = _trackItems(_loadSections());
     });
     await _persistLayout();
   }
@@ -2721,6 +2739,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       for (final section in _sections) section: section,
     };
     final nameErrors = <String, String>{};
+    final orderScrollController = ScrollController();
 
     void renameSection(String section, StateSetter updateDialog) {
       final next = (titleDrafts[section] ?? section).trim();
@@ -2750,114 +2769,89 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, updateDialog) => Dialog(
-          backgroundColor: Colors.transparent,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: 760,
-              maxHeight: MediaQuery.sizeOf(context).height * .84,
-            ),
-            child: GlassPanel(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Expanded(
-                        child: Text(
-                          '发现页栏目编排',
-                          style: TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.w800,
+      builder: (dialogContext) => YingjiStableScrollGlass(
+        child: StatefulBuilder(
+          builder: (context, updateDialog) => Dialog(
+            backgroundColor: Colors.transparent,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 760,
+                maxHeight: MediaQuery.sizeOf(context).height * .84,
+              ),
+              child: GlassPanel(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            '发现页栏目编排',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                            ),
                           ),
                         ),
-                      ),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.plus,
-                        tooltip: '添加列表',
-                        size: 36,
-                        onPressed: () => updateDialog(() {
-                          var suffix = _sections.length + 1;
-                          var title = '新列表 $suffix';
-                          while (_sections.contains(title)) {
-                            suffix++;
-                            title = '新列表 $suffix';
-                          }
-                          final visibleCount = _sections
-                              .where((item) => !_hiddenSections.contains(item))
-                              .length;
-                          _sections.insert(visibleCount, title);
-                          _sectionSources[title] = const _DiscoverFeedSelection(
-                            provider: 'tmdb',
-                            mediaType: 'movie',
-                            genre: 'all',
-                            heat: 'popularity.desc',
-                          ).encoded;
-                          titleDrafts[title] = title;
-                          expandedSection = title;
-                          changed = true;
-                        }),
-                      ),
-                      const SizedBox(width: 8),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.xmark,
-                        tooltip: '关闭',
-                        size: 36,
-                        onPressed: () => Navigator.pop(dialogContext),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    '列表可添加、删除和排序；内容只按来源、影视类型、地区与来源榜单配置。',
-                    style: TextStyle(color: Colors.white70, fontSize: 12),
-                  ),
-                  const SizedBox(height: 16),
-                  Flexible(
-                    child: ReorderableListView.builder(
-                      shrinkWrap: true,
-                      itemCount: _sections.length,
-                      buildDefaultDragHandles: false,
-                      // 默认拖拽代理会额外套一层有阴影的 Material，液态玻璃卡片
-                      // 下方因此出现整块黑色矩形。沿用原卡片本身即可。
-                      proxyDecorator: (child, _, _) => child,
-                      onReorderItem: (oldIndex, newIndex) {
-                        updateDialog(() {
-                          final section = _sections.removeAt(oldIndex);
-                          _sections.insert(newIndex, section);
-                          _groupSectionsByVisibility();
-                        });
-                        changed = true;
-                      },
-                      itemBuilder: (_, index) {
-                        final section = _sections[index];
-                        final visible = !_hiddenSections.contains(section);
-                        final source = _sectionSources[section] ?? section;
-                        final expanded = expandedSection == section;
-                        final firstVisible =
-                            visible &&
-                            _sections
-                                    .where(
-                                      (item) => !_hiddenSections.contains(item),
-                                    )
-                                    .firstOrNull ==
-                                section;
-                        final firstHidden =
-                            !visible &&
-                            _sections
-                                    .where(_hiddenSections.contains)
-                                    .firstOrNull ==
-                                section;
-                        return Padding(
-                          key: ValueKey('discover-setting-$section'),
-                          padding: const EdgeInsets.only(bottom: 14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              if (firstVisible || firstHidden) ...[
-                                Padding(
+                        YingjiMotionIconButton(
+                          icon: YingjiIcons.plus,
+                          tooltip: '添加列表',
+                          size: 36,
+                          onPressed: () => updateDialog(() {
+                            var suffix = _sections.length + 1;
+                            var title = '新列表 $suffix';
+                            while (_sections.contains(title)) {
+                              suffix++;
+                              title = '新列表 $suffix';
+                            }
+                            final visibleCount = _sections
+                                .where(
+                                  (item) => !_hiddenSections.contains(item),
+                                )
+                                .length;
+                            _sections.insert(visibleCount, title);
+                            _sectionSources[title] =
+                                const _DiscoverFeedSelection(
+                                  provider: 'tmdb',
+                                  mediaType: 'movie',
+                                  genre: 'all',
+                                  heat: 'popularity.desc',
+                                ).encoded;
+                            titleDrafts[title] = title;
+                            expandedSection = title;
+                            changed = true;
+                          }),
+                        ),
+                        const SizedBox(width: 8),
+                        YingjiMotionIconButton(
+                          icon: YingjiIcons.xmark,
+                          tooltip: '关闭',
+                          size: 36,
+                          onPressed: () => Navigator.pop(dialogContext),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      '列表可添加、删除和排序；内容只按来源、影视类型、地区与来源榜单配置。',
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                    const SizedBox(height: 16),
+                    Flexible(
+                      child: YingjiSmoothWheel(
+                        controller: orderScrollController,
+                        stableGlass: true,
+                        child: ReorderableListView.builder(
+                          scrollController: orderScrollController,
+                          physics: yingjiWheelPhysics,
+                          // 标题属于列表分组，不属于首条可拖动卡片；放在
+                          // ReorderableListView 的静态 header 中，拖动时不会跟着跑。
+                          header:
+                              _sections.any(
+                                (section) => !_hiddenSections.contains(section),
+                              )
+                              ? Padding(
                                   padding: const EdgeInsets.fromLTRB(
                                     2,
                                     2,
@@ -2865,158 +2859,222 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                     10,
                                   ),
                                   child: Text(
-                                    firstVisible ? '显示的列表' : '隐藏的列表',
+                                    '显示的列表',
                                     style: const TextStyle(
                                       color: YingjiColors.muted,
                                       fontSize: 12,
                                       fontWeight: FontWeight.w800,
                                     ),
                                   ),
-                                ),
-                              ],
-                              DecoratedBox(
-                                decoration: BoxDecoration(
-                                  color: YingjiGlass.surface(strength: .72),
-                                  borderRadius: BorderRadius.circular(15),
-                                ),
-                                child: Padding(
-                                  padding: const EdgeInsets.all(14),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          ReorderableDragStartListener(
-                                            index: index,
-                                            child: const Padding(
-                                              padding: EdgeInsets.all(6),
-                                              child: Icon(
-                                                YingjiIcons.line_horizontal_3,
-                                                size: 18,
-                                                color: YingjiColors.muted,
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Expanded(
-                                            child: Column(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              children: [
-                                                Text(
-                                                  section,
-                                                  style: const TextStyle(
-                                                    fontWeight: FontWeight.w800,
-                                                  ),
-                                                ),
-                                                const SizedBox(height: 3),
-                                                Text(
-                                                  _sourceLabel(source),
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: const TextStyle(
-                                                    color: YingjiColors.muted,
-                                                    fontSize: 11,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                          YingjiMotionIconButton(
-                                            icon: expanded
-                                                ? YingjiIcons.chevron_up
-                                                : YingjiIcons.chevron_down,
-                                            tooltip: expanded ? '收起编辑' : '编辑栏目',
-                                            size: 34,
-                                            onPressed: () => updateDialog(() {
-                                              expandedSection = expanded
-                                                  ? null
-                                                  : section;
-                                            }),
-                                          ),
-                                          const SizedBox(width: 6),
-                                          YingjiMotionIconButton(
-                                            icon: YingjiIcons.trash,
-                                            tooltip: '删除列表',
-                                            size: 34,
-                                            onPressed: () => updateDialog(() {
-                                              _sections.remove(section);
-                                              _sectionSources.remove(section);
-                                              _cardStyles.remove(section);
-                                              _hiddenSections.remove(section);
-                                              titleDrafts.remove(section);
-                                              nameErrors.remove(section);
-                                              if (expandedSection == section) {
-                                                expandedSection = null;
-                                              }
-                                              changed = true;
-                                            }),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Text(
-                                            visible ? '显示' : '隐藏',
-                                            style: const TextStyle(
-                                              color: YingjiColors.muted,
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Switch(
-                                            value: visible,
-                                            onChanged: (value) {
-                                              updateDialog(() {
-                                                if (value) {
-                                                  _hiddenSections.remove(
-                                                    section,
-                                                  );
-                                                } else {
-                                                  _hiddenSections.add(section);
-                                                }
-                                                _groupSectionsByVisibility();
-                                              });
-                                              changed = true;
-                                            },
-                                          ),
-                                        ],
+                                )
+                              : null,
+                          itemCount: _sections.length,
+                          buildDefaultDragHandles: false,
+                          // 默认拖拽代理会额外套一层有阴影的 Material，液态玻璃卡片
+                          // 下方因此出现整块黑色矩形。沿用原卡片本身即可。
+                          proxyDecorator: (child, _, _) => child,
+                          onReorderItem: (oldIndex, newIndex) {
+                            updateDialog(() {
+                              final section = _sections.removeAt(oldIndex);
+                              _sections.insert(newIndex, section);
+                              _groupSectionsByVisibility();
+                            });
+                            changed = true;
+                          },
+                          itemBuilder: (_, index) {
+                            final section = _sections[index];
+                            final visible = !_hiddenSections.contains(section);
+                            final source = _sectionSources[section] ?? section;
+                            final expanded = expandedSection == section;
+                            final firstHidden =
+                                !visible &&
+                                _sections
+                                        .where(_hiddenSections.contains)
+                                        .firstOrNull ==
+                                    section;
+                            return Padding(
+                              key: ValueKey('discover-setting-$section'),
+                              padding: const EdgeInsets.only(bottom: 14),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  if (firstHidden) ...[
+                                    Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                        2,
+                                        2,
+                                        2,
+                                        10,
                                       ),
-                                      AnimatedSize(
-                                        duration: const Duration(
-                                          milliseconds: 220,
+                                      child: Text(
+                                        '隐藏的列表',
+                                        style: const TextStyle(
+                                          color: YingjiColors.muted,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w800,
                                         ),
-                                        curve: Curves.easeOutCubic,
-                                        alignment: Alignment.topCenter,
-                                        child: expanded
-                                            ? Column(
-                                                children: [
-                                                  const SizedBox(height: 12),
-                                                  TextFormField(
-                                                    key: ValueKey(
-                                                      'discover-name-$section',
+                                      ),
+                                    ),
+                                  ],
+                                  DecoratedBox(
+                                    decoration: BoxDecoration(
+                                      color: YingjiGlass.surface(strength: .72),
+                                      borderRadius: BorderRadius.circular(15),
+                                    ),
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(14),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                            children: [
+                                              ReorderableDragStartListener(
+                                                index: index,
+                                                child: const Padding(
+                                                  padding: EdgeInsets.all(6),
+                                                  child: Icon(
+                                                    YingjiIcons
+                                                        .line_horizontal_3,
+                                                    size: 18,
+                                                    color: YingjiColors.muted,
+                                                  ),
+                                                ),
+                                              ),
+                                              const SizedBox(width: 8),
+                                              Expanded(
+                                                child: Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      section,
+                                                      style: const TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.w800,
+                                                      ),
                                                     ),
-                                                    initialValue:
-                                                        titleDrafts[section] ??
-                                                        section,
-                                                    onChanged: (value) {
-                                                      titleDrafts[section] =
-                                                          value;
-                                                      nameErrors.remove(
+                                                    const SizedBox(height: 3),
+                                                    Text(
+                                                      _sourceLabel(source),
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: const TextStyle(
+                                                        color:
+                                                            YingjiColors.muted,
+                                                        fontSize: 11,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                              YingjiMotionIconButton(
+                                                icon: expanded
+                                                    ? YingjiIcons.chevron_up
+                                                    : YingjiIcons.chevron_down,
+                                                tooltip: expanded
+                                                    ? '收起编辑'
+                                                    : '编辑栏目',
+                                                size: 34,
+                                                onPressed: () =>
+                                                    updateDialog(() {
+                                                      expandedSection = expanded
+                                                          ? null
+                                                          : section;
+                                                    }),
+                                              ),
+                                              const SizedBox(width: 6),
+                                              YingjiMotionIconButton(
+                                                icon: YingjiIcons.trash,
+                                                tooltip: '删除列表',
+                                                size: 34,
+                                                onPressed: () => updateDialog(
+                                                  () {
+                                                    _sections.remove(section);
+                                                    _sectionSources.remove(
+                                                      section,
+                                                    );
+                                                    _cardStyles.remove(section);
+                                                    _hiddenSections.remove(
+                                                      section,
+                                                    );
+                                                    titleDrafts.remove(section);
+                                                    nameErrors.remove(section);
+                                                    if (expandedSection ==
+                                                        section) {
+                                                      expandedSection = null;
+                                                    }
+                                                    changed = true;
+                                                  },
+                                                ),
+                                              ),
+                                              const SizedBox(width: 8),
+                                              Text(
+                                                visible ? '显示' : '隐藏',
+                                                style: const TextStyle(
+                                                  color: YingjiColors.muted,
+                                                  fontSize: 12,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                              const SizedBox(width: 8),
+                                              Switch(
+                                                value: visible,
+                                                onChanged: (value) {
+                                                  updateDialog(() {
+                                                    if (value) {
+                                                      _hiddenSections.remove(
                                                         section,
                                                       );
-                                                    },
-                                                    onFieldSubmitted: (_) =>
-                                                        renameSection(
-                                                          section,
-                                                          updateDialog,
+                                                    } else {
+                                                      _hiddenSections.add(
+                                                        section,
+                                                      );
+                                                    }
+                                                    _groupSectionsByVisibility();
+                                                  });
+                                                  changed = true;
+                                                },
+                                              ),
+                                            ],
+                                          ),
+                                          AnimatedSize(
+                                            duration: const Duration(
+                                              milliseconds: 220,
+                                            ),
+                                            curve: Curves.easeOutCubic,
+                                            alignment: Alignment.topCenter,
+                                            child: expanded
+                                                ? Column(
+                                                    children: [
+                                                      const SizedBox(
+                                                        height: 12,
+                                                      ),
+                                                      TextFormField(
+                                                        key: ValueKey(
+                                                          'discover-name-$section',
                                                         ),
-                                                    decoration: InputDecoration(
-                                                      labelText: '列表名称',
-                                                      errorText:
-                                                          nameErrors[section],
-                                                      suffixIcon:
-                                                          YingjiMotionIconButton(
+                                                        initialValue:
+                                                            titleDrafts[section] ??
+                                                            section,
+                                                        onChanged: (value) {
+                                                          titleDrafts[section] =
+                                                              value;
+                                                          nameErrors.remove(
+                                                            section,
+                                                          );
+                                                        },
+                                                        onFieldSubmitted: (_) =>
+                                                            renameSection(
+                                                              section,
+                                                              updateDialog,
+                                                            ),
+                                                        decoration: InputDecoration(
+                                                          labelText: '列表名称',
+                                                          errorText:
+                                                              nameErrors[section],
+                                                          suffixIcon: YingjiMotionIconButton(
                                                             icon: YingjiIcons
                                                                 .checkmark_circle_fill,
                                                             tooltip: '保存列表名称',
@@ -3027,97 +3085,108 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                                                                   updateDialog,
                                                                 ),
                                                           ),
-                                                    ),
-                                                  ),
-                                                  const SizedBox(height: 12),
-                                                  _DiscoverSourceEditor(
-                                                    value: source,
-                                                    style:
-                                                        _cardStyles[section] ??
-                                                        index % 4,
-                                                    providerLabels:
-                                                        _providerLabels,
-                                                    mediaLabels: _mediaLabels,
-                                                    countryLabels:
-                                                        _countryLabels,
-                                                    onChanged: (value) {
-                                                      updateDialog(() {
-                                                        _sectionSources[section] =
-                                                            value;
-                                                      });
-                                                      changed = true;
-                                                    },
-                                                  ),
-                                                  const SizedBox(height: 12),
-                                                  Row(
-                                                    children: [
-                                                      for (
-                                                        var style = 0;
-                                                        style < 4;
-                                                        style++
-                                                      )
-                                                        Expanded(
-                                                          child: Padding(
-                                                            padding:
-                                                                EdgeInsets.only(
-                                                                  right:
-                                                                      style == 3
-                                                                      ? 0
-                                                                      : 8,
-                                                                ),
-                                                            child: _DiscoveryStylePreview(
-                                                              label:
-                                                                  _styleNames[style],
-                                                              style: style,
-                                                              selected:
-                                                                  (_cardStyles[section] ??
-                                                                      index %
-                                                                          3) ==
-                                                                  style,
-                                                              items:
-                                                                  previews[section] ??
-                                                                  const [],
-                                                              source: source,
-                                                              loading: false,
-                                                              onTap: () {
-                                                                updateDialog(
-                                                                  () =>
-                                                                      _cardStyles[section] =
-                                                                          style,
-                                                                );
-                                                                changed = true;
-                                                              },
-                                                            ),
-                                                          ),
                                                         ),
+                                                      ),
+                                                      const SizedBox(
+                                                        height: 12,
+                                                      ),
+                                                      _DiscoverSourceEditor(
+                                                        value: source,
+                                                        style:
+                                                            _cardStyles[section] ??
+                                                            index % 4,
+                                                        providerLabels:
+                                                            _providerLabels,
+                                                        mediaLabels:
+                                                            _mediaLabels,
+                                                        countryLabels:
+                                                            _countryLabels,
+                                                        onChanged: (value) {
+                                                          updateDialog(() {
+                                                            _sectionSources[section] =
+                                                                value;
+                                                          });
+                                                          changed = true;
+                                                        },
+                                                      ),
+                                                      const SizedBox(
+                                                        height: 12,
+                                                      ),
+                                                      Row(
+                                                        children: [
+                                                          for (
+                                                            var style = 0;
+                                                            style < 4;
+                                                            style++
+                                                          )
+                                                            Expanded(
+                                                              child: Padding(
+                                                                padding:
+                                                                    EdgeInsets.only(
+                                                                      right:
+                                                                          style ==
+                                                                              3
+                                                                          ? 0
+                                                                          : 8,
+                                                                    ),
+                                                                child: _DiscoveryStylePreview(
+                                                                  label:
+                                                                      _styleNames[style],
+                                                                  style: style,
+                                                                  selected:
+                                                                      (_cardStyles[section] ??
+                                                                          index %
+                                                                              3) ==
+                                                                      style,
+                                                                  items:
+                                                                      previews[section] ??
+                                                                      const [],
+                                                                  source:
+                                                                      source,
+                                                                  loading:
+                                                                      false,
+                                                                  onTap: () {
+                                                                    updateDialog(
+                                                                      () => _cardStyles[section] =
+                                                                          style,
+                                                                    );
+                                                                    changed =
+                                                                        true;
+                                                                  },
+                                                                ),
+                                                              ),
+                                                            ),
+                                                        ],
+                                                      ),
                                                     ],
-                                                  ),
-                                                ],
-                                              )
-                                            : const SizedBox.shrink(),
+                                                  )
+                                                : const SizedBox.shrink(),
+                                          ),
+                                        ],
                                       ),
-                                    ],
+                                    ),
                                   ),
-                                ),
+                                ],
                               ),
-                            ],
-                          ),
-                        );
-                      },
+                            );
+                          },
+                        ),
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
         ),
       ),
     );
+    orderScrollController.dispose();
     if (changed && mounted) {
       await _persistLayout();
       if (!mounted) return;
       setState(() {
-        _items = _loadSections();
+        _items = _trackItems(_loadSections());
       });
     }
   }
@@ -3569,125 +3638,133 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   }
 
   @override
-  Widget build(BuildContext context) =>
-      FutureBuilder<Map<String, List<TmdbItem>>>(
-        future: _items,
-        builder: (context, snapshot) {
-          final sections = snapshot.data ?? _visibleItems;
-          final visibleSections = _sections
-              .where((section) => !_hiddenSections.contains(section))
-              .toList(growable: false);
-          Widget buildRow(int index) {
-            if (index == 0) {
-              return Padding(
-                key: const ValueKey('discover-header'),
-                padding: const EdgeInsets.only(bottom: 28),
-                child: Row(
-                  children: [
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '发现',
-                            style: TextStyle(
-                              fontSize: 48,
-                              height: 1,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: -1.2,
-                            ),
-                          ),
-                          SizedBox(height: 8),
-                          Text(
-                            '浏览影视榜单，自定义每个列表的数据、顺序与卡片样式。',
-                            style: TextStyle(color: Color(0xFFABB1BE)),
-                          ),
-                        ],
+  Widget build(
+    BuildContext context,
+  ) => FutureBuilder<Map<String, List<TmdbItem>>>(
+    future: _items,
+    builder: (context, snapshot) {
+      final visibleSections = _sections
+          .where((section) => !_hiddenSections.contains(section))
+          .toList(growable: false);
+      Widget buildRow(int index) {
+        if (index == 0) {
+          return Padding(
+            key: const ValueKey('discover-header'),
+            padding: const EdgeInsets.only(bottom: 28),
+            child: Row(
+              children: [
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '发现',
+                        style: TextStyle(
+                          fontSize: 48,
+                          height: 1,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: -1.2,
+                        ),
                       ),
-                    ),
-                    YingjiMotionIconButton(
-                      icon: YingjiIcons.line_horizontal_3,
-                      tooltip: '排序与显示栏目',
-                      onPressed: _showCardSettings,
-                      size: 44,
-                    ),
-                    const SizedBox(width: 8),
-                    YingjiMotionIconButton(
-                      icon: YingjiIcons.plus,
-                      tooltip: '添加列表',
-                      onPressed: _addDiscoverSection,
-                      size: 44,
-                    ),
-                  ],
+                      SizedBox(height: 8),
+                      Text(
+                        '浏览影视榜单，自定义每个列表的数据、顺序与卡片样式。',
+                        style: TextStyle(color: Color(0xFFABB1BE)),
+                      ),
+                    ],
+                  ),
                 ),
-              );
-            }
-            if (visibleSections.isEmpty) {
-              return const Padding(
-                padding: EdgeInsets.only(top: 42),
-                child: _EmptyStrip(
-                  icon: YingjiIcons.rectangle_stack,
-                  title: '所有栏目均已隐藏',
-                  detail: '在任意列表右侧打开设置，重新显示需要的栏目。',
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.line_horizontal_3,
+                  tooltip: '排序与显示栏目',
+                  onPressed: _showCardSettings,
+                  size: 44,
                 ),
-              );
-            }
-            final section = visibleSections[index - 1];
-            final block = _DiscoverBlock(
-              title: section,
-              source: _sectionSources[section] ?? section,
-              sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
-              items: sections[section] ?? const [],
-              variant: _cardStyles[section] ?? _sections.indexOf(section) % 4,
-              onConfigure: () => _showSectionSettings(section),
-              loadPage: (page) => _loadSectionFor(section, page),
-              loadSourcePage: _loadSection,
-            );
-            return RepaintBoundary(
-              key: ValueKey(section),
-              child: Padding(
-                padding: const EdgeInsets.only(bottom: 36),
-                child: block,
-              ),
-            );
-          }
-
-          final itemCount = visibleSections.isEmpty
-              ? 2
-              : visibleSections.length + 1;
-          if (widget.embedded) {
-            // 首页直接把发现栏目接进同一个 CustomScrollView。SliverList 只布局、
-            // 构建视口附近的榜单；旧 Column 会让已经加载的所有栏目一直参与每次
-            // 滚动布局，越靠近页面底部帧率越低。
-            return SliverPadding(
-              padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-              sliver: SliverMainAxisGroup(
-                slivers: [
-                  SliverToBoxAdapter(child: buildRow(0)),
-                  if (visibleSections.isEmpty)
-                    SliverToBoxAdapter(child: buildRow(1))
-                  else
-                    // 所有栏目槽位用同一个确定高度。SliverVariedExtentList 即使
-                    // 提供 itemExtentBuilder，也会在子项首次出现时修正总范围；
-                    // Windows 高刷滚动中该修正会把海报整体推移，肉眼就是抖动。
-                    // 固定槽位让 maxScrollExtent 从首帧起保持不变，较矮卡片留下
-                    // 的少量呼吸空间也比滚动时改变几何更自然。
-                    SliverFixedExtentList.builder(
-                      itemExtent: 396,
-                      itemCount: visibleSections.length,
-                      itemBuilder: (context, index) => buildRow(index + 1),
-                    ),
-                ],
-              ),
-            );
-          }
-          return ListView.builder(
-            padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-            itemCount: itemCount,
-            itemBuilder: (context, index) => buildRow(index),
+                const SizedBox(width: 8),
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.plus,
+                  tooltip: '添加列表',
+                  onPressed: _addDiscoverSection,
+                  size: 44,
+                ),
+              ],
+            ),
           );
-        },
+        }
+        if (visibleSections.isEmpty) {
+          return const Padding(
+            padding: EdgeInsets.only(top: 42),
+            child: _EmptyStrip(
+              icon: YingjiIcons.rectangle_stack,
+              title: '所有栏目均已隐藏',
+              detail: '在任意列表右侧打开设置，重新显示需要的栏目。',
+            ),
+          );
+        }
+        final section = visibleSections[index - 1];
+        return RepaintBoundary(
+          key: ValueKey(section),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 36),
+            child: ValueListenableBuilder<List<TmdbItem>>(
+              valueListenable: _rowsFor(section),
+              builder: (context, rows, _) => _DiscoverBlock(
+                title: section,
+                source: _sectionSources[section] ?? section,
+                sourceLabel: _sourceLabel(_sectionSources[section] ?? section),
+                items: rows,
+                variant: _cardStyles[section] ?? _sections.indexOf(section) % 4,
+                onConfigure: () => _showSectionSettings(section),
+                loadPage: (page) => _loadSectionFor(section, page),
+                loadSourcePage: _loadSection,
+              ),
+            ),
+          ),
+        );
+      }
+
+      final itemCount = visibleSections.isEmpty
+          ? 2
+          : visibleSections.length + 1;
+      if (widget.embedded) {
+        // 首页直接把发现栏目接进同一个 CustomScrollView。SliverList 只布局、
+        // 构建视口附近的榜单；旧 Column 会让已经加载的所有栏目一直参与每次
+        // 滚动布局，越靠近页面底部帧率越低。
+        return SliverPadding(
+          padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+          sliver: SliverMainAxisGroup(
+            slivers: [
+              SliverToBoxAdapter(child: buildRow(0)),
+              if (visibleSections.isEmpty)
+                SliverToBoxAdapter(child: buildRow(1))
+              else
+                // 所有栏目槽位用同一个确定高度。SliverVariedExtentList 即使
+                // 提供 itemExtentBuilder，也会在子项首次出现时修正总范围；
+                // Windows 高刷滚动中该修正会把海报整体推移，肉眼就是抖动。
+                // 固定槽位让 maxScrollExtent 从首帧起保持不变，较矮卡片留下
+                // 的少量呼吸空间也比滚动时改变几何更自然。
+                SliverFixedExtentList.builder(
+                  itemExtent: 396,
+                  itemCount: visibleSections.length,
+                  itemBuilder: (context, index) => buildRow(index + 1),
+                ),
+            ],
+          ),
+        );
+      }
+      return YingjiSmoothWheel(
+        controller: _standaloneScroll,
+        stableGlass: true,
+        child: ListView.builder(
+          controller: _standaloneScroll,
+          physics: yingjiWheelPhysics,
+          padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+          itemCount: itemCount,
+          itemBuilder: (context, index) => buildRow(index),
+        ),
       );
+    },
+  );
 }
 
 class _DiscoverFeedSelection {
@@ -4841,6 +4918,7 @@ class _RankingPage extends StatefulWidget {
 
 class _RankingPageState extends State<_RankingPage> {
   final _tmdb = TmdbClient();
+  final _scroll = ScrollController();
   static const _labels = <String>['院线热映', '电影热度', '剧集热度', '高分电影'];
   late Future<Map<String, List<TmdbItem>>> _charts;
   String _active = _labels.first;
@@ -4853,6 +4931,7 @@ class _RankingPageState extends State<_RankingPage> {
 
   @override
   void dispose() {
+    _scroll.dispose();
     _tmdb.dispose();
     super.dispose();
   }
@@ -4919,98 +4998,104 @@ class _RankingPageState extends State<_RankingPage> {
                         message: '榜单暂时无法加载，请稍后重试。',
                       );
                     }
-                    return CustomScrollView(
-                      scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
-                      slivers: [
-                        SliverPadding(
-                          padding: EdgeInsets.fromLTRB(
-                            YingjiLayout.pageLeft,
-                            32,
-                            YingjiLayout.pageRight,
-                            24,
-                          ),
-                          sliver: SliverToBoxAdapter(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  '影视榜单',
-                                  style: TextStyle(
-                                    fontSize: 48,
-                                    height: 1,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: -1.2,
+                    return YingjiSmoothWheel(
+                      controller: _scroll,
+                      stableGlass: true,
+                      child: CustomScrollView(
+                        controller: _scroll,
+                        physics: yingjiWheelPhysics,
+                        scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
+                        slivers: [
+                          SliverPadding(
+                            padding: EdgeInsets.fromLTRB(
+                              YingjiLayout.pageLeft,
+                              32,
+                              YingjiLayout.pageRight,
+                              24,
+                            ),
+                            sliver: SliverToBoxAdapter(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    '影视榜单',
+                                    style: TextStyle(
+                                      fontSize: 48,
+                                      height: 1,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: -1.2,
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(height: 10),
-                                const Text(
-                                  '每个榜单显示本次数据源返回的完整列表；评分仅在来源实际提供时展示。',
-                                  style: TextStyle(color: YingjiColors.muted),
-                                ),
-                                const SizedBox(height: 22),
-                                Wrap(
-                                  spacing: 10,
-                                  runSpacing: 10,
-                                  children: [
-                                    for (final label in _labels)
-                                      _RankingFilter(
-                                        label: label,
-                                        selected: _active == label,
-                                        onTap: () =>
-                                            setState(() => _active = label),
+                                  const SizedBox(height: 10),
+                                  const Text(
+                                    '每个榜单显示本次数据源返回的完整列表；评分仅在来源实际提供时展示。',
+                                    style: TextStyle(color: YingjiColors.muted),
+                                  ),
+                                  const SizedBox(height: 22),
+                                  Wrap(
+                                    spacing: 10,
+                                    runSpacing: 10,
+                                    children: [
+                                      for (final label in _labels)
+                                        _RankingFilter(
+                                          label: label,
+                                          selected: _active == label,
+                                          onTap: () =>
+                                              setState(() => _active = label),
+                                        ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 26),
+                                  Row(
+                                    children: [
+                                      Text(
+                                        _active,
+                                        style: const TextStyle(
+                                          fontSize: 24,
+                                          fontWeight: FontWeight.w800,
+                                        ),
                                       ),
-                                  ],
-                                ),
-                                const SizedBox(height: 26),
-                                Row(
-                                  children: [
-                                    Text(
-                                      _active,
-                                      style: const TextStyle(
-                                        fontSize: 24,
-                                        fontWeight: FontWeight.w800,
+                                      const SizedBox(width: 10),
+                                      Text(
+                                        '${rows.length} 部',
+                                        style: const TextStyle(
+                                          color: YingjiColors.muted,
+                                        ),
                                       ),
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Text(
-                                      '${rows.length} 部',
-                                      style: const TextStyle(
-                                        color: YingjiColors.muted,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
+                                    ],
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                        ),
-                        SliverPadding(
-                          padding: EdgeInsets.fromLTRB(
-                            YingjiLayout.pageLeft,
-                            0,
-                            YingjiLayout.pageRight,
-                            56,
+                          SliverPadding(
+                            padding: EdgeInsets.fromLTRB(
+                              YingjiLayout.pageLeft,
+                              0,
+                              YingjiLayout.pageRight,
+                              56,
+                            ),
+                            sliver: SliverGrid(
+                              gridDelegate:
+                                  const SliverGridDelegateWithMaxCrossAxisExtent(
+                                    maxCrossAxisExtent: 224,
+                                    mainAxisExtent: 372,
+                                    mainAxisSpacing: 20,
+                                    crossAxisSpacing: 16,
+                                  ),
+                              delegate: SliverChildBuilderDelegate((
+                                context,
+                                index,
+                              ) {
+                                return _RankingPosterCard(
+                                  rank: index + 1,
+                                  item: rows[index],
+                                );
+                              }, childCount: rows.length),
+                            ),
                           ),
-                          sliver: SliverGrid(
-                            gridDelegate:
-                                const SliverGridDelegateWithMaxCrossAxisExtent(
-                                  maxCrossAxisExtent: 224,
-                                  mainAxisExtent: 372,
-                                  mainAxisSpacing: 20,
-                                  crossAxisSpacing: 16,
-                                ),
-                            delegate: SliverChildBuilderDelegate((
-                              context,
-                              index,
-                            ) {
-                              return _RankingPosterCard(
-                                rank: index + 1,
-                                item: rows[index],
-                              );
-                            }, childCount: rows.length),
-                          ),
-                        ),
-                      ],
+                        ],
+                      ),
                     );
                   },
                 ),
@@ -5410,6 +5495,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                 Expanded(
                   child: YingjiSmoothWheel(
                     controller: _controller,
+                    stableGlass: true,
                     child: CustomScrollView(
                       controller: _controller,
                       physics: yingjiWheelPhysics,
@@ -5576,10 +5662,7 @@ class _RankingPosterCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => InkWell(
-    onTap: () => Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-    ),
+    onTap: () => MetadataDetailPage.open(context, item: item),
     borderRadius: BorderRadius.circular(17),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -5597,7 +5680,7 @@ class _RankingPosterCard extends StatelessWidget {
                           ),
                           child: const Center(child: Icon(YingjiIcons.film)),
                         )
-                      : _OverscanImage(
+                      : _PosterImage(
                           imageUrl: item.posterUrl.toString(),
                           // 发现列表网格卡显示宽 ~224，按物理像素解码即可，不必用原图。
                           memCacheWidth:
@@ -5707,7 +5790,7 @@ class _SearchPageState extends State<_SearchPage>
     } catch (_) {}
   }
 
-  Future<void> _openResult(TmdbItem item) async {
+  Future<void> _openResult(TmdbItem item, BuildContext sourceContext) async {
     final rows = [
       item,
       ..._recentOpened.where(
@@ -5721,10 +5804,8 @@ class _SearchPageState extends State<_SearchPage>
       jsonEncode(rows.map((value) => value.toJson()).toList()),
     );
     if (!mounted) return;
-    await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-    );
+    if (!sourceContext.mounted) return;
+    await MetadataDetailPage.open(sourceContext, item: item);
   }
 
   @override
@@ -5829,6 +5910,7 @@ class _SearchPageState extends State<_SearchPage>
   @override
   Widget build(BuildContext context) => YingjiSmoothWheel(
     controller: _pageScroll,
+    stableGlass: true,
     child: ListView(
       controller: _pageScroll,
       // 桌面端交出滚轮处理权，改由 YingjiSmoothWheel 平滑驱动。
@@ -5941,8 +6023,10 @@ class _SearchPageState extends State<_SearchPage>
             runSpacing: 26,
             children: _recentOpened
                 .map(
-                  (item) =>
-                      _PosterTile(item: item, onOpen: () => _openResult(item)),
+                  (item) => _PosterTile(
+                    item: item,
+                    onOpen: (from) => _openResult(item, from),
+                  ),
                 )
                 .toList(),
           ),
@@ -5956,8 +6040,10 @@ class _SearchPageState extends State<_SearchPage>
             runSpacing: 26,
             children: _results
                 .map(
-                  (item) =>
-                      _PosterTile(item: item, onOpen: () => _openResult(item)),
+                  (item) => _PosterTile(
+                    item: item,
+                    onOpen: (from) => _openResult(item, from),
+                  ),
                 )
                 .toList(),
           ),
@@ -6094,14 +6180,10 @@ Future<void> _openServerSearchDetail(
       // broken container page.
       final playable = media.type != 'Series' && !media.isContainer;
       if (playable) {
-        await Navigator.push(
+        await MetadataDetailPage.open(
           context,
-          MaterialPageRoute(
-            builder: (_) => MetadataDetailPage(
-              item: TmdbItem(id: 0, title: title, kind: isSeries ? '剧集' : '电影'),
-              media: media,
-            ),
-          ),
+          item: TmdbItem(id: 0, title: title, kind: isSeries ? '剧集' : '电影'),
+          media: media,
         );
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -6110,13 +6192,7 @@ Future<void> _openServerSearchDetail(
       }
       return;
     }
-    // `match` is assigned inside a catch above, which defeats flow-typed
-    // promotion; the `== null` branch already returned, so the assertion is
-    // safe.
-    await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => MetadataDetailPage(item: match!)),
-    );
+    await MetadataDetailPage.open(context, item: match);
   } finally {
     tmdb.dispose();
   }
@@ -6647,169 +6723,174 @@ class _SourceHubState extends State<_SourceHub>
     return _buildSourceList(context);
   }
 
-  Widget _buildSourceList(BuildContext context) => ListView(
+  Widget _buildSourceList(BuildContext context) => YingjiSmoothWheel(
     controller: _pageScroll,
-    padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-    children: [
-      Row(
-        children: [
-          const Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+    stableGlass: true,
+    child: ListView(
+      controller: _pageScroll,
+      physics: yingjiWheelPhysics,
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '服务器',
+                    style: TextStyle(
+                      fontSize: 48,
+                      height: 1,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -1.2,
+                    ),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    '连接、验证并管理聚合到 Mova 的媒体来源。',
+                    style: TextStyle(color: Color(0xFFABB1BE)),
+                  ),
+                ],
+              ),
+            ),
+            if (_refreshing)
+              const Padding(
+                padding: EdgeInsets.all(11),
+                child: SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2.4),
+                ),
+              )
+            else
+              YingjiMotionIconButton(
+                onPressed: () => unawaited(_refresh(manual: true)),
+                icon: YingjiIcons.refresh,
+                tooltip: '检查服务器连接',
+                size: 46,
+              ),
+            const SizedBox(width: 10),
+            YingjiMotionIconButton(
+              onPressed: _add,
+              icon: YingjiIcons.plus,
+              tooltip: '添加来源',
+              size: 46,
+            ),
+          ],
+        ),
+        const SizedBox(height: 30),
+        if (!_ready)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(50),
+              child: CircularProgressIndicator(),
+            ),
+          )
+        else if (_error != null)
+          _LoadFailure(onRetry: _load, message: _error!)
+        else if (_sources.isEmpty)
+          const _EmptyStrip(
+            icon: YingjiIcons.dot_radiowaves_left_right,
+            title: '还没有媒体来源',
+            detail: '添加 Emby、Jellyfin 或 WebDAV 后，可聚合浏览并播放你的媒体。',
+          )
+        else ...[
+          _SectionHeader(title: '已连接', subtitle: _statusSubtitle),
+          const SizedBox(height: 14),
+          ..._sources.map(
+            (source) => Align(
+              alignment: Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: _SourceCard(
+                  source: source,
+                  stats: _stats[source.id],
+                  iconToken: _store?.tokenFor(source),
+                  onPickIcon: () => _pickIcon(source),
+                  offline: _offline.contains(source.id),
+                  onRemove: () => _remove(source),
+                  onEdit: () => _edit(source),
+                  testing: _testing == source.id,
+                  onTest: () => _test(source),
+                  onOpen: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => EmbyLibraryPage(source: source),
+                    ),
+                  ),
+                  onSwitchEndpoint: (endpoint) =>
+                      _switchEndpoint(source, endpoint),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 26),
+          _FrostSurface(
+            borderRadius: 22,
+            padding: const EdgeInsets.fromLTRB(18, 15, 14, 15),
+            child: Row(
               children: [
-                Text(
-                  '服务器',
-                  style: TextStyle(
-                    fontSize: 48,
-                    height: 1,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -1.2,
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '同步观看记录到服务器',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _historyLocalOnly
+                            ? '本机仍会保存观看记录；当前不向媒体服务器或 Trakt 回传。'
+                            : '本机始终保存；同时读取服务器继续播放记录，并在播放时回传进度。',
+                        style: const TextStyle(
+                          color: YingjiColors.muted,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                SizedBox(height: 8),
-                Text(
-                  '连接、验证并管理聚合到 Mova 的媒体来源。',
-                  style: TextStyle(color: Color(0xFFABB1BE)),
+                const SizedBox(width: 18),
+                Switch.adaptive(
+                  value: !_historyLocalOnly,
+                  onChanged: (value) async {
+                    setState(() => _historyLocalOnly = !value);
+                    final prefs = await SharedPreferences.getInstance();
+                    await prefs.setBool(WatchStateStore.localOnlyKey, !value);
+                  },
                 ),
               ],
             ),
           ),
-          if (_refreshing)
-            const Padding(
-              padding: EdgeInsets.all(11),
-              child: SizedBox(
-                width: 22,
-                height: 22,
-                child: CircularProgressIndicator(strokeWidth: 2.4),
-              ),
-            )
-          else
-            YingjiMotionIconButton(
-              onPressed: () => unawaited(_refresh(manual: true)),
-              icon: YingjiIcons.refresh,
-              tooltip: '检查服务器连接',
-              size: 46,
-            ),
-          const SizedBox(width: 10),
-          YingjiMotionIconButton(
-            onPressed: _add,
-            icon: YingjiIcons.plus,
-            tooltip: '添加来源',
-            size: 46,
-          ),
         ],
-      ),
-      const SizedBox(height: 30),
-      if (!_ready)
-        const Center(
-          child: Padding(
-            padding: EdgeInsets.all(50),
-            child: CircularProgressIndicator(),
-          ),
-        )
-      else if (_error != null)
-        _LoadFailure(onRetry: _load, message: _error!)
-      else if (_sources.isEmpty)
-        const _EmptyStrip(
-          icon: YingjiIcons.dot_radiowaves_left_right,
-          title: '还没有媒体来源',
-          detail: '添加 Emby、Jellyfin 或 WebDAV 后，可聚合浏览并播放你的媒体。',
-        )
-      else ...[
-        _SectionHeader(title: '已连接', subtitle: _statusSubtitle),
+        const SizedBox(height: 34),
+        const _SectionHeader(title: '可接入类型', subtitle: '当前版本已实现的来源'),
         const SizedBox(height: 14),
-        ..._sources.map(
-          (source) => Align(
-            alignment: Alignment.centerLeft,
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 12),
-              child: _SourceCard(
-                source: source,
-                stats: _stats[source.id],
-                iconToken: _store?.tokenFor(source),
-                onPickIcon: () => _pickIcon(source),
-                offline: _offline.contains(source.id),
-                onRemove: () => _remove(source),
-                onEdit: () => _edit(source),
-                testing: _testing == source.id,
-                onTest: () => _test(source),
-                onOpen: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => EmbyLibraryPage(source: source),
-                  ),
-                ),
-                onSwitchEndpoint: (endpoint) =>
-                    _switchEndpoint(source, endpoint),
-              ),
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: const [
+            _CapabilityTile(
+              icon: YingjiIcons.play_rectangle_fill,
+              title: 'Emby',
+              detail: '账户验证、媒体库与直连播放',
             ),
-          ),
-        ),
-        const SizedBox(height: 26),
-        _FrostSurface(
-          borderRadius: 22,
-          padding: const EdgeInsets.fromLTRB(18, 15, 14, 15),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      '同步观看记录到服务器',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _historyLocalOnly
-                          ? '本机仍会保存观看记录；当前不向媒体服务器或 Trakt 回传。'
-                          : '本机始终保存；同时读取服务器继续播放记录，并在播放时回传进度。',
-                      style: const TextStyle(
-                        color: YingjiColors.muted,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 18),
-              Switch.adaptive(
-                value: !_historyLocalOnly,
-                onChanged: (value) async {
-                  setState(() => _historyLocalOnly = !value);
-                  final prefs = await SharedPreferences.getInstance();
-                  await prefs.setBool(WatchStateStore.localOnlyKey, !value);
-                },
-              ),
-            ],
-          ),
+            _CapabilityTile(
+              icon: YingjiIcons.play_rectangle_fill,
+              title: 'Jellyfin',
+              detail: '账户验证、媒体库与直连播放',
+            ),
+            _CapabilityTile(
+              icon: YingjiIcons.cloud_fill,
+              title: 'WebDAV',
+              detail: '目录扫描与直连播放',
+            ),
+          ],
         ),
       ],
-      const SizedBox(height: 34),
-      const _SectionHeader(title: '可接入类型', subtitle: '当前版本已实现的来源'),
-      const SizedBox(height: 14),
-      Wrap(
-        spacing: 12,
-        runSpacing: 12,
-        children: const [
-          _CapabilityTile(
-            icon: YingjiIcons.play_rectangle_fill,
-            title: 'Emby',
-            detail: '账户验证、媒体库与直连播放',
-          ),
-          _CapabilityTile(
-            icon: YingjiIcons.play_rectangle_fill,
-            title: 'Jellyfin',
-            detail: '账户验证、媒体库与直连播放',
-          ),
-          _CapabilityTile(
-            icon: YingjiIcons.cloud_fill,
-            title: 'WebDAV',
-            detail: '目录扫描与直连播放',
-          ),
-        ],
-      ),
-    ],
+    ),
   );
 }
 
@@ -7546,86 +7627,91 @@ class _PlaylistsPageState extends State<_PlaylistsPage>
     return _buildPlaylistsList(context);
   }
 
-  Widget _buildPlaylistsList(BuildContext context) => ListView(
+  Widget _buildPlaylistsList(BuildContext context) => YingjiSmoothWheel(
     controller: _pageScroll,
-    padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-    children: [
-      Row(
-        children: [
-          const Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '片单',
-                  style: TextStyle(
-                    fontSize: 48,
-                    height: 1,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -1.2,
-                  ),
-                ),
-                SizedBox(height: 8),
-                Text(
-                  '把待看、收藏与自定义顺序保存在自己的媒体空间。',
-                  style: TextStyle(color: Color(0xFFABB1BE)),
-                ),
-              ],
-            ),
-          ),
-          YingjiMotionIconButton(
-            onPressed: _create,
-            icon: YingjiIcons.plus,
-            tooltip: '新建片单',
-            size: 46,
-          ),
-        ],
-      ),
-      const SizedBox(height: 32),
-      _SectionHeader(title: '待看', subtitle: '${_watchlist.length} 部已收藏内容'),
-      const SizedBox(height: 14),
-      if (_watchlist.isEmpty)
-        const _EmptyStrip(
-          icon: YingjiIcons.bookmark,
-          title: '待看列表为空',
-          detail: '在媒体详情页点击“加入待看”，即可保存到这里。',
-        )
-      else
-        _PosterStrip(items: _watchlist),
-      const SizedBox(height: 38),
-      _SectionHeader(title: '自定义片单', subtitle: '本地保存，可继续扩展为 Trakt 同步'),
-      const SizedBox(height: 14),
-      if (_playlists.isEmpty)
-        const _EmptyStrip(
-          icon: YingjiIcons.rectangle_stack,
-          title: '还没有自定义片单',
-          detail: '创建片单后可从详情页把内容加入其中。',
-        )
-      else
-        Wrap(
-          spacing: 14,
-          runSpacing: 14,
-          children: _playlists
-              .map(
-                (playlist) => _PlaylistTile(
-                  playlist: playlist,
-                  onOpen: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          PlaylistDetailPage(playlistId: playlist.id),
+    stableGlass: true,
+    child: ListView(
+      controller: _pageScroll,
+      physics: yingjiWheelPhysics,
+      padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '片单',
+                    style: TextStyle(
+                      fontSize: 48,
+                      height: 1,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -1.2,
                     ),
-                  ).then((_) => _load()),
-                  onDelete: () async {
-                    final store = await PlaylistStore.create();
-                    await store.remove(playlist.id);
-                    await _load();
-                  },
-                ),
-              )
-              .toList(),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    '把待看、收藏与自定义顺序保存在自己的媒体空间。',
+                    style: TextStyle(color: Color(0xFFABB1BE)),
+                  ),
+                ],
+              ),
+            ),
+            YingjiMotionIconButton(
+              onPressed: _create,
+              icon: YingjiIcons.plus,
+              tooltip: '新建片单',
+              size: 46,
+            ),
+          ],
         ),
-    ],
+        const SizedBox(height: 32),
+        _SectionHeader(title: '待看', subtitle: '${_watchlist.length} 部已收藏内容'),
+        const SizedBox(height: 14),
+        if (_watchlist.isEmpty)
+          const _EmptyStrip(
+            icon: YingjiIcons.bookmark,
+            title: '待看列表为空',
+            detail: '在媒体详情页点击“加入待看”，即可保存到这里。',
+          )
+        else
+          _PosterStrip(items: _watchlist),
+        const SizedBox(height: 38),
+        _SectionHeader(title: '自定义片单', subtitle: '本地保存，可继续扩展为 Trakt 同步'),
+        const SizedBox(height: 14),
+        if (_playlists.isEmpty)
+          const _EmptyStrip(
+            icon: YingjiIcons.rectangle_stack,
+            title: '还没有自定义片单',
+            detail: '创建片单后可从详情页把内容加入其中。',
+          )
+        else
+          Wrap(
+            spacing: 14,
+            runSpacing: 14,
+            children: _playlists
+                .map(
+                  (playlist) => _PlaylistTile(
+                    playlist: playlist,
+                    onOpen: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) =>
+                            PlaylistDetailPage(playlistId: playlist.id),
+                      ),
+                    ).then((_) => _load()),
+                    onDelete: () async {
+                      final store = await PlaylistStore.create();
+                      await store.remove(playlist.id);
+                      await _load();
+                    },
+                  ),
+                )
+                .toList(),
+          ),
+      ],
+    ),
   );
 }
 
@@ -8013,154 +8099,160 @@ class _CalendarPageState extends State<_CalendarPage>
           ..sort((a, b) => a.airDate.compareTo(b.airDate));
     final dates = _scheduleDates();
     final now = DateTime.now();
-    return ListView(
+    return YingjiSmoothWheel(
       controller: _pageScroll,
-      padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
-      children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '追剧日历',
-                    style: TextStyle(
-                      fontSize: 44,
-                      height: 1,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -1.2,
+      stableGlass: true,
+      child: ListView(
+        controller: _pageScroll,
+        physics: yingjiWheelPhysics,
+        padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '追剧日历',
+                      style: TextStyle(
+                        fontSize: 44,
+                        height: 1,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -1.2,
+                      ),
                     ),
+                    SizedBox(height: 9),
+                    Text(
+                      '待看剧集与 Trakt 观看记录的下一次播出安排。',
+                      style: TextStyle(color: Color(0xFFABB1BE)),
+                    ),
+                  ],
+                ),
+              ),
+              YingjiMotionIconButton(
+                icon: YingjiIcons.refresh,
+                tooltip: '刷新播出安排',
+                onPressed: _load,
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Row(
+            children: [
+              YingjiDirectionalArrow(
+                previous: true,
+                tooltip: '向前浏览日期',
+                onPressed: () => _moveCalendarRail(-420),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: SizedBox(
+                  height: 82,
+                  child: ListView.separated(
+                    controller: _calendarRail,
+                    scrollDirection: Axis.horizontal,
+                    // Date cards must stay within the rail. Allowing the list to
+                    // paint outside its viewport lets the final date overlap the
+                    // next-arrow control at the far right.
+                    clipBehavior: Clip.hardEdge,
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    itemCount: dates.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 9),
+                    itemBuilder: (context, index) {
+                      final date = dates[index];
+                      final count = visibleEvents
+                          .where(
+                            (event) => _sameDate(event.airDate.toLocal(), date),
+                          )
+                          .length;
+                      return _CalendarDateRailTile(
+                        date: date,
+                        count: count,
+                        selected: _sameDate(date, _selectedDate),
+                        today: _sameDate(date, now),
+                        weekday: _weekday(date),
+                        onTap: () => setState(() => _selectedDate = date),
+                      );
+                    },
                   ),
-                  SizedBox(height: 9),
-                  Text(
-                    '待看剧集与 Trakt 观看记录的下一次播出安排。',
-                    style: TextStyle(color: Color(0xFFABB1BE)),
+                ),
+              ),
+              const SizedBox(width: 10),
+              YingjiDirectionalArrow(
+                previous: false,
+                tooltip: '向后浏览日期',
+                onPressed: () => _moveCalendarRail(420),
+              ),
+            ],
+          ),
+          const SizedBox(height: 28),
+          if (_droppedTitles.isNotEmpty) ...[
+            _droppedBar(),
+            const SizedBox(height: 18),
+          ],
+          _SectionHeader(
+            title:
+                '${_eventTime(_selectedDate)} · ${selectedEvents.length} 项更新',
+            subtitle: _events.isEmpty
+                ? (_traktMessage ?? '正在读取 Trakt 日历…')
+                : selectedEvents.isEmpty
+                ? '当天没有待播内容，选择带圆点的日期查看安排。'
+                : '时间以已连接的 Trakt 与媒体元数据为准。',
+          ),
+          const SizedBox(height: 12),
+          if (selectedEvents.isNotEmpty)
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final width = constraints.maxWidth >= 1000
+                    ? (constraints.maxWidth - 16) / 2
+                    : constraints.maxWidth;
+                return Wrap(
+                  spacing: 16,
+                  runSpacing: 16,
+                  children: selectedEvents
+                      .map(
+                        (event) => SizedBox(
+                          width: width,
+                          child: _TrackingEventCard(
+                            event: event,
+                            inWatchlist: _inWatchlist(event),
+                            dropped: _isDropped(event.title),
+                            onOpen: () => _openTrackingDetail(event),
+                            onToggleWatchlist: () => _toggleWatchlist(event),
+                            onToggleDropped: () => _setTrackingStatus(
+                              event.title,
+                              _isDropped(event.title) ? 'none' : 'dropped',
+                            ),
+                          ),
+                        ),
+                      )
+                      .toList(growable: false),
+                );
+              },
+            ),
+          if (selectedEvents.isEmpty)
+            _FrostSurface(
+              borderRadius: 16,
+              padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 28),
+              child: Row(
+                children: [
+                  const Icon(YingjiIcons.calendar, color: YingjiColors.muted),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _events.isEmpty
+                          ? (_traktMessage ?? '正在读取更新安排…')
+                          : '这一天没有更新，选择带进度标记的日期查看剧集。',
+                      style: const TextStyle(color: YingjiColors.muted),
+                    ),
                   ),
                 ],
               ),
             ),
-            YingjiMotionIconButton(
-              icon: YingjiIcons.refresh,
-              tooltip: '刷新播出安排',
-              onPressed: _load,
-            ),
-          ],
-        ),
-        const SizedBox(height: 24),
-        Row(
-          children: [
-            YingjiDirectionalArrow(
-              previous: true,
-              tooltip: '向前浏览日期',
-              onPressed: () => _moveCalendarRail(-420),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: SizedBox(
-                height: 82,
-                child: ListView.separated(
-                  controller: _calendarRail,
-                  scrollDirection: Axis.horizontal,
-                  // Date cards must stay within the rail. Allowing the list to
-                  // paint outside its viewport lets the final date overlap the
-                  // next-arrow control at the far right.
-                  clipBehavior: Clip.hardEdge,
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  itemCount: dates.length,
-                  separatorBuilder: (_, _) => const SizedBox(width: 9),
-                  itemBuilder: (context, index) {
-                    final date = dates[index];
-                    final count = visibleEvents
-                        .where(
-                          (event) => _sameDate(event.airDate.toLocal(), date),
-                        )
-                        .length;
-                    return _CalendarDateRailTile(
-                      date: date,
-                      count: count,
-                      selected: _sameDate(date, _selectedDate),
-                      today: _sameDate(date, now),
-                      weekday: _weekday(date),
-                      onTap: () => setState(() => _selectedDate = date),
-                    );
-                  },
-                ),
-              ),
-            ),
-            const SizedBox(width: 10),
-            YingjiDirectionalArrow(
-              previous: false,
-              tooltip: '向后浏览日期',
-              onPressed: () => _moveCalendarRail(420),
-            ),
-          ],
-        ),
-        const SizedBox(height: 28),
-        if (_droppedTitles.isNotEmpty) ...[
-          _droppedBar(),
-          const SizedBox(height: 18),
         ],
-        _SectionHeader(
-          title: '${_eventTime(_selectedDate)} · ${selectedEvents.length} 项更新',
-          subtitle: _events.isEmpty
-              ? (_traktMessage ?? '正在读取 Trakt 日历…')
-              : selectedEvents.isEmpty
-              ? '当天没有待播内容，选择带圆点的日期查看安排。'
-              : '时间以已连接的 Trakt 与媒体元数据为准。',
-        ),
-        const SizedBox(height: 12),
-        if (selectedEvents.isNotEmpty)
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final width = constraints.maxWidth >= 1000
-                  ? (constraints.maxWidth - 16) / 2
-                  : constraints.maxWidth;
-              return Wrap(
-                spacing: 16,
-                runSpacing: 16,
-                children: selectedEvents
-                    .map(
-                      (event) => SizedBox(
-                        width: width,
-                        child: _TrackingEventCard(
-                          event: event,
-                          inWatchlist: _inWatchlist(event),
-                          dropped: _isDropped(event.title),
-                          onOpen: () => _openTrackingDetail(event),
-                          onToggleWatchlist: () => _toggleWatchlist(event),
-                          onToggleDropped: () => _setTrackingStatus(
-                            event.title,
-                            _isDropped(event.title) ? 'none' : 'dropped',
-                          ),
-                        ),
-                      ),
-                    )
-                    .toList(growable: false),
-              );
-            },
-          ),
-        if (selectedEvents.isEmpty)
-          _FrostSurface(
-            borderRadius: 16,
-            padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 28),
-            child: Row(
-              children: [
-                const Icon(YingjiIcons.calendar, color: YingjiColors.muted),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    _events.isEmpty
-                        ? (_traktMessage ?? '正在读取更新安排…')
-                        : '这一天没有更新，选择带进度标记的日期查看剧集。',
-                    style: const TextStyle(color: YingjiColors.muted),
-                  ),
-                ),
-              ],
-            ),
-          ),
-      ],
+      ),
     );
   }
 
@@ -8208,10 +8300,7 @@ class _CalendarPageState extends State<_CalendarPage>
             .showSnackBar(const SnackBar(content: Text('暂未找到该剧集的详情。')));
         return;
       }
-      await Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => MetadataDetailPage(item: match)),
-      );
+      await MetadataDetailPage.open(context, item: match);
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context)
@@ -10858,12 +10947,17 @@ class _SettingsPageState extends State<SettingsPage>
     BuildContext context,
     Widget child, {
     EdgeInsets padding = EdgeInsets.zero,
-  }) => ScrollConfiguration(
-    behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
-    child: SingleChildScrollView(
-      controller: _settingsScroll,
-      padding: padding,
-      child: child,
+  }) => YingjiSmoothWheel(
+    controller: _settingsScroll,
+    stableGlass: true,
+    child: ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: SingleChildScrollView(
+        controller: _settingsScroll,
+        physics: yingjiWheelPhysics,
+        padding: padding,
+        child: child,
+      ),
     ),
   );
 
@@ -10884,7 +10978,10 @@ class _SettingsPageState extends State<SettingsPage>
     physics: const NeverScrollableScrollPhysics(),
     padding: EdgeInsets.zero,
     buildDefaultDragHandles: false,
-    onReorder: _reorderPlayerTool,
+    // 保留原始行作为拖动代理，避免默认 Material / elevation 覆盖玻璃行，
+    // 造成拖动时重影、错位或按钮状态看起来跳变。
+    proxyDecorator: (child, _, _) => child,
+    onReorderItem: _reorderPlayerTool,
     itemCount: _playerToolOrder.length,
     itemBuilder: (context, index) {
       final id = _playerToolOrder[index];
@@ -10971,7 +11068,6 @@ class _SettingsPageState extends State<SettingsPage>
 
   void _reorderPlayerTool(int oldIndex, int newIndex) {
     setState(() {
-      if (oldIndex < newIndex) newIndex -= 1;
       final moved = _playerToolOrder.removeAt(oldIndex);
       _playerToolOrder.insert(newIndex, moved);
     });
@@ -11063,6 +11159,12 @@ class _SettingsPageState extends State<SettingsPage>
   );
 }
 
+Widget _withoutScrollbars(BuildContext context, Widget child) =>
+    ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: child,
+    );
+
 class _PosterStrip extends StatefulWidget {
   const _PosterStrip({required this.items, this.shelf});
   final List<TmdbItem> items;
@@ -11091,17 +11193,20 @@ class _PosterStripState extends State<_PosterStrip> {
   @override
   Widget build(BuildContext context) => SizedBox(
     height: 296,
-    child: ListView.separated(
-      controller: _controller,
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-      physics: const BouncingScrollPhysics(
-        parent: AlwaysScrollableScrollPhysics(),
+    child: _withoutScrollbars(
+      context,
+      ListView.separated(
+        controller: _controller,
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        physics: const BouncingScrollPhysics(
+          parent: AlwaysScrollableScrollPhysics(),
+        ),
+        itemCount: widget.items.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 14),
+        itemBuilder: (_, i) => _PosterTile(item: widget.items[i]),
       ),
-      itemCount: widget.items.length,
-      separatorBuilder: (_, _) => const SizedBox(width: 14),
-      itemBuilder: (_, i) => _PosterTile(item: widget.items[i]),
     ),
   );
 }
@@ -11133,17 +11238,20 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
   @override
   Widget build(BuildContext context) => SizedBox(
     height: 184,
-    child: ListView.separated(
-      controller: _controller,
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-      physics: const BouncingScrollPhysics(
-        parent: AlwaysScrollableScrollPhysics(),
+    child: _withoutScrollbars(
+      context,
+      ListView.separated(
+        controller: _controller,
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        physics: const BouncingScrollPhysics(
+          parent: AlwaysScrollableScrollPhysics(),
+        ),
+        itemCount: widget.items.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 14),
+        itemBuilder: (_, i) => _LandscapeTile(item: widget.items[i]),
       ),
-      itemCount: widget.items.length,
-      separatorBuilder: (_, _) => const SizedBox(width: 14),
-      itemBuilder: (_, i) => _LandscapeTile(item: widget.items[i]),
     ),
   );
 }
@@ -11197,41 +11305,44 @@ class _PlatformEntryStripState extends State<_PlatformEntryStrip> {
     }
     return SizedBox(
       height: 258,
-      child: ListView.separated(
-        controller: _controller,
-        scrollDirection: Axis.horizontal,
-        clipBehavior: Clip.none,
-        physics: const BouncingScrollPhysics(),
-        itemCount: platforms.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 16),
-        itemBuilder: (context, index) {
-          final platformSource = selection
-              .withPlatform(platforms[index])
-              .encoded;
-          return FutureBuilder<List<TmdbItem>>(
-            future: widget.loadSourcePage(platformSource, 1),
-            builder: (context, snapshot) {
-              final items = snapshot.data ?? const <TmdbItem>[];
-              return _PlatformEntryCard(
-                items: items,
-                source: platformSource,
-                onConfigure: widget.onConfigure,
-                onOpen: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => _DiscoverListPage(
-                      title:
-                          _resolvedPlatformLabels[platforms[index]] ?? '平台内容',
-                      items: items,
-                      source: platformSource,
-                      loadSourcePage: widget.loadSourcePage,
+      child: _withoutScrollbars(
+        context,
+        ListView.separated(
+          controller: _controller,
+          scrollDirection: Axis.horizontal,
+          clipBehavior: Clip.none,
+          physics: const BouncingScrollPhysics(),
+          itemCount: platforms.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 16),
+          itemBuilder: (context, index) {
+            final platformSource = selection
+                .withPlatform(platforms[index])
+                .encoded;
+            return FutureBuilder<List<TmdbItem>>(
+              future: widget.loadSourcePage(platformSource, 1),
+              builder: (context, snapshot) {
+                final items = snapshot.data ?? const <TmdbItem>[];
+                return _PlatformEntryCard(
+                  items: items,
+                  source: platformSource,
+                  onConfigure: widget.onConfigure,
+                  onOpen: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => _DiscoverListPage(
+                        title:
+                            _resolvedPlatformLabels[platforms[index]] ?? '平台内容',
+                        items: items,
+                        source: platformSource,
+                        loadSourcePage: widget.loadSourcePage,
+                      ),
                     ),
                   ),
-                ),
-              );
-            },
-          );
-        },
+                );
+              },
+            );
+          },
+        ),
       ),
     );
   }
@@ -11429,6 +11540,8 @@ class _PlatformArtwork extends StatelessWidget {
       // 平台 logo / 背景图按展示尺寸封顶解码（多为小图，大图也不会超过 1024 宽）。
       memCacheWidth: 1024,
       alignment: alignment,
+      fadeInDuration: Duration.zero,
+      fadeOutDuration: Duration.zero,
       errorWidget: (_, _, _) => const SizedBox.shrink(),
     );
     if (!fadeEdges) return image;
@@ -11492,17 +11605,20 @@ class _RankStripState extends State<_RankStrip> {
   @override
   Widget build(BuildContext context) => SizedBox(
     height: 252,
-    child: ListView.separated(
-      controller: _controller,
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-      physics: const BouncingScrollPhysics(
-        parent: AlwaysScrollableScrollPhysics(),
+    child: _withoutScrollbars(
+      context,
+      ListView.separated(
+        controller: _controller,
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        physics: const BouncingScrollPhysics(
+          parent: AlwaysScrollableScrollPhysics(),
+        ),
+        itemCount: widget.items.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 12),
+        itemBuilder: (_, i) => _RankTile(index: i + 1, item: widget.items[i]),
       ),
-      itemCount: widget.items.length,
-      separatorBuilder: (_, _) => const SizedBox(width: 12),
-      itemBuilder: (_, i) => _RankTile(index: i + 1, item: widget.items[i]),
     ),
   );
 }
@@ -11510,19 +11626,16 @@ class _RankStripState extends State<_RankStrip> {
 class _PosterTile extends StatelessWidget {
   const _PosterTile({required this.item, this.onOpen});
   final TmdbItem item;
-  final VoidCallback? onOpen;
+  final ValueChanged<BuildContext>? onOpen;
 
   @override
   Widget build(BuildContext context) => SizedBox(
     width: 168,
     child: InkWell(
       borderRadius: BorderRadius.circular(14),
-      onTap:
-          onOpen ??
-          () => Navigator.push(
-            context,
-            MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-          ),
+      onTap: () => onOpen == null
+          ? MetadataDetailPage.open(context, item: item)
+          : onOpen!(context),
       child: SizedBox(
         height: 280,
         child: _MediaHover(
@@ -11531,7 +11644,7 @@ class _PosterTile extends StatelessWidget {
             fit: StackFit.expand,
             children: [
               if (item.posterUrl != null)
-                _OverscanImage(
+                _PosterImage(
                   imageUrl: item.posterUrl.toString(),
                   // 海报卡显示宽 168（高 280），按物理像素解码即可，不必用原图 500px 宽。
                   memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
@@ -11623,10 +11736,7 @@ class _LandscapeTile extends StatelessWidget {
     width: 286,
     child: InkWell(
       borderRadius: BorderRadius.circular(16),
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => MetadataDetailPage(item: item)),
-      ),
+      onTap: () => MetadataDetailPage.open(context, item: item),
       child: _MediaHover(
         borderRadius: 16,
         child: Stack(
@@ -11640,6 +11750,8 @@ class _LandscapeTile extends StatelessWidget {
                 memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
                     .clamp(1.0, 512.0)
                     .round(),
+                fadeInDuration: Duration.zero,
+                fadeOutDuration: Duration.zero,
                 errorWidget: (_, _, _) =>
                     const ColoredBox(color: Color(0xFF1A1D25)),
               )
@@ -11745,6 +11857,21 @@ class _RankTileState extends State<_RankTile>
     reverseDuration: const Duration(milliseconds: 130),
   );
 
+  @override
+  void initState() {
+    super.initState();
+    yingjiScrollInProgress.addListener(_dismissPreviewWhileScrolling);
+  }
+
+  void _dismissPreviewWhileScrolling() {
+    if (!yingjiScrollInProgress.value) return;
+    if (_hovered && mounted) setState(() => _hovered = false);
+    _previewController.stop();
+    _preview?.remove();
+    _preview = null;
+    _previewController.value = 0;
+  }
+
   void _showPreview() {
     if (_preview != null) {
       _previewController.forward();
@@ -11820,6 +11947,7 @@ class _RankTileState extends State<_RankTile>
 
   @override
   void dispose() {
+    yingjiScrollInProgress.removeListener(_dismissPreviewWhileScrolling);
     _preview?.remove();
     _previewController.dispose();
     super.dispose();
@@ -11830,22 +11958,18 @@ class _RankTileState extends State<_RankTile>
     link: _link,
     child: MouseRegion(
       onEnter: (_) {
+        if (yingjiScrollInProgress.value) return;
         setState(() => _hovered = true);
         _showPreview();
       },
       onExit: (_) {
         setState(() => _hovered = false);
-        unawaited(_hidePreview());
+        if (!yingjiScrollInProgress.value) unawaited(_hidePreview());
       },
       child: SizedBox(
         width: 166,
         child: InkWell(
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => MetadataDetailPage(item: widget.item),
-            ),
-          ),
+          onTap: () => MetadataDetailPage.open(context, item: widget.item),
           child: Stack(
             children: [
               Positioned(
@@ -11884,7 +12008,7 @@ class _RankTileState extends State<_RankTile>
                       fit: StackFit.expand,
                       children: [
                         if (widget.item.posterUrl != null)
-                          _OverscanImage(
+                          _PosterImage(
                             imageUrl: widget.item.posterUrl.toString(),
                             // 榜单卡显示宽 166，按物理像素解码即可，不必用原图。
                             memCacheWidth:
@@ -12145,6 +12269,7 @@ class _ContinueWatchingPage extends StatefulWidget {
 }
 
 class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
+  final _scroll = ScrollController();
   List<WatchState> _rows = const [];
   bool _loading = true;
   bool _busy = false;
@@ -12153,6 +12278,12 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
   }
 
   /// Local records render immediately; the server resume rail is then pulled
@@ -12221,95 +12352,102 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                     if (_loading && rows.isEmpty) {
                       return const Center(child: CircularProgressIndicator());
                     }
-                    return CustomScrollView(
-                      physics: const BouncingScrollPhysics(
-                        parent: AlwaysScrollableScrollPhysics(),
-                      ),
-                      slivers: [
-                        SliverPadding(
-                          padding: EdgeInsets.fromLTRB(
-                            YingjiLayout.pageLeft,
-                            30,
-                            YingjiLayout.pageRight,
-                            18,
-                          ),
-                          sliver: SliverToBoxAdapter(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  '继续播放',
-                                  style: TextStyle(
-                                    fontSize: 46,
-                                    height: 1,
-                                    fontWeight: FontWeight.w900,
-                                    letterSpacing: -1.1,
-                                  ),
-                                ),
-                                SizedBox(height: 10),
-                                Text(
-                                  '按最后观看时间保留本机进度。',
-                                  style: TextStyle(color: YingjiColors.muted),
-                                ),
-                              ],
+                    return YingjiSmoothWheel(
+                      controller: _scroll,
+                      stableGlass: true,
+                      child: CustomScrollView(
+                        controller: _scroll,
+                        physics:
+                            yingjiWheelPhysics ??
+                            const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
                             ),
-                          ),
-                        ),
-                        if (rows.isEmpty)
-                          const SliverFillRemaining(
-                            hasScrollBody: false,
-                            child: _EmptyStrip(
-                              icon: YingjiIcons.play_circle,
-                              title: '还没有继续播放内容',
-                              detail: '开始播放任意媒体后，会在这里保留进度。',
-                            ),
-                          )
-                        else
+                        slivers: [
                           SliverPadding(
                             padding: EdgeInsets.fromLTRB(
                               YingjiLayout.pageLeft,
-                              0,
+                              30,
                               YingjiLayout.pageRight,
-                              64,
+                              18,
                             ),
-                            sliver: SliverGrid(
-                              gridDelegate:
-                                  const SliverGridDelegateWithMaxCrossAxisExtent(
-                                    maxCrossAxisExtent: 336,
-                                    mainAxisExtent: 252,
-                                    mainAxisSpacing: 22,
-                                    crossAxisSpacing: 18,
+                            sliver: SliverToBoxAdapter(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    '继续播放',
+                                    style: TextStyle(
+                                      fontSize: 46,
+                                      height: 1,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: -1.1,
+                                    ),
                                   ),
-                              delegate: SliverChildBuilderDelegate((
-                                context,
-                                index,
-                              ) {
-                                final state = rows[index];
-                                return Stack(
-                                  children: [
-                                    Positioned.fill(
-                                      child: _ContinueTile(
-                                        state: state,
-                                        width: double.infinity,
-                                        onChanged: _load,
-                                      ),
-                                    ),
-                                    Positioned(
-                                      right: 6,
-                                      top: 6,
-                                      child: YingjiMotionIconButton(
-                                        icon: YingjiIcons.trash,
-                                        tooltip: '移除继续播放记录',
-                                        size: 32,
-                                        onPressed: () => _remove(state),
-                                      ),
-                                    ),
-                                  ],
-                                );
-                              }, childCount: rows.length),
+                                  SizedBox(height: 10),
+                                  Text(
+                                    '按最后观看时间保留本机进度。',
+                                    style: TextStyle(color: YingjiColors.muted),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                      ],
+                          if (rows.isEmpty)
+                            const SliverFillRemaining(
+                              hasScrollBody: false,
+                              child: _EmptyStrip(
+                                icon: YingjiIcons.play_circle,
+                                title: '还没有继续播放内容',
+                                detail: '开始播放任意媒体后，会在这里保留进度。',
+                              ),
+                            )
+                          else
+                            SliverPadding(
+                              padding: EdgeInsets.fromLTRB(
+                                YingjiLayout.pageLeft,
+                                0,
+                                YingjiLayout.pageRight,
+                                64,
+                              ),
+                              sliver: SliverGrid(
+                                gridDelegate:
+                                    const SliverGridDelegateWithMaxCrossAxisExtent(
+                                      maxCrossAxisExtent: 336,
+                                      mainAxisExtent: 252,
+                                      mainAxisSpacing: 22,
+                                      crossAxisSpacing: 18,
+                                    ),
+                                delegate: SliverChildBuilderDelegate((
+                                  context,
+                                  index,
+                                ) {
+                                  final state = rows[index];
+                                  return Stack(
+                                    children: [
+                                      Positioned.fill(
+                                        child: _ContinueTile(
+                                          state: state,
+                                          width: double.infinity,
+                                          onChanged: _load,
+                                        ),
+                                      ),
+                                      Positioned(
+                                        right: 6,
+                                        top: 6,
+                                        child: YingjiMotionIconButton(
+                                          icon: YingjiIcons.trash,
+                                          tooltip: '移除继续播放记录',
+                                          size: 32,
+                                          onPressed: () => _remove(state),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                }, childCount: rows.length),
+                              ),
+                            ),
+                        ],
+                      ),
                     );
                   },
                 ),
@@ -12332,17 +12470,20 @@ class _HistoryStrip extends StatelessWidget {
   final VoidCallback onChanged;
   final ScrollController? controller;
   @override
-  Widget build(BuildContext context) => ListView.separated(
-    controller: controller,
-    scrollDirection: Axis.horizontal,
-    clipBehavior: Clip.none,
-    padding: const EdgeInsets.only(bottom: 4),
-    itemCount: history.length,
-    separatorBuilder: (_, _) => const SizedBox(width: 16),
-    itemBuilder: (_, index) {
-      final state = history[index];
-      return _ContinueTile(state: state, onChanged: onChanged);
-    },
+  Widget build(BuildContext context) => _withoutScrollbars(
+    context,
+    ListView.separated(
+      controller: controller,
+      scrollDirection: Axis.horizontal,
+      clipBehavior: Clip.none,
+      padding: const EdgeInsets.only(bottom: 4),
+      itemCount: history.length,
+      separatorBuilder: (_, _) => const SizedBox(width: 16),
+      itemBuilder: (_, index) {
+        final state = history[index];
+        return _ContinueTile(state: state, onChanged: onChanged);
+      },
+    ),
   );
 }
 
@@ -12729,11 +12870,9 @@ class _ContinueArtworkFallback extends StatelessWidget {
   );
 }
 
-/// 圆角海报图：轻微放大溢出裁剪框，让圆角抗锯齿接缝落在不透明图片上而非透明区，
-/// 消除滚动时海报边缘闪白边（ClipRRect 接缝的经典修法）。调用方仍需用 ClipRRect
-/// 裁出圆角——这里的放大正好被外层 ClipRRect 切掉，不会露边。
-class _OverscanImage extends StatelessWidget {
-  const _OverscanImage({
+/// 海报按目标尺寸直接裁切，避免滚动时对图片做额外缩放采样。
+class _PosterImage extends StatelessWidget {
+  const _PosterImage({
     required this.imageUrl,
     this.memCacheWidth,
     this.errorWidget,
@@ -12743,14 +12882,13 @@ class _OverscanImage extends StatelessWidget {
   final Widget Function(BuildContext, String, dynamic)? errorWidget;
 
   @override
-  Widget build(BuildContext context) => Transform.scale(
-    scale: 1.05,
-    child: CachedNetworkImage(
-      imageUrl: imageUrl,
-      fit: BoxFit.cover,
-      memCacheWidth: memCacheWidth,
-      errorWidget: errorWidget,
-    ),
+  Widget build(BuildContext context) => CachedNetworkImage(
+    imageUrl: imageUrl,
+    fit: BoxFit.cover,
+    memCacheWidth: memCacheWidth,
+    fadeInDuration: Duration.zero,
+    fadeOutDuration: Duration.zero,
+    errorWidget: errorWidget,
   );
 }
 
@@ -12768,47 +12906,66 @@ class _MediaHoverState extends State<_MediaHover> {
   bool _hovered = false;
 
   @override
-  Widget build(BuildContext context) => MouseRegion(
-    onEnter: (_) => setState(() => _hovered = true),
-    onExit: (_) => setState(() => _hovered = false),
-    child: AnimatedScale(
-      scale: _hovered ? 1.018 : 1,
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        curve: Curves.easeOutCubic,
-        transform: Matrix4.translationValues(0, _hovered ? -4 : 0, 0),
-        decoration: BoxDecoration(
-          // 不透明深色底：图片未加载/透明时圆角内显示深色而非页面背景，
-          // 杜绝滚动中圆角透出白边（与 errorWidget 的 0xFF1A1D25 一致）。
-          color: const Color(0xFF1A1D25),
-          borderRadius: BorderRadius.circular(widget.borderRadius),
-          border: Border.all(
-            color: _hovered
-                ? Colors.white.withValues(alpha: .72)
-                : Colors.white.withValues(alpha: .09),
-            width: _hovered ? 2.2 : 1,
+  void initState() {
+    super.initState();
+    yingjiScrollInProgress.addListener(_clearHoverWhileScrolling);
+  }
+
+  void _clearHoverWhileScrolling() {
+    if (yingjiScrollInProgress.value && _hovered && mounted) {
+      setState(() => _hovered = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    yingjiScrollInProgress.removeListener(_clearHoverWhileScrolling);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
+    valueListenable: yingjiScrollInProgress,
+    builder: (context, scrolling, _) {
+      final hovered = _hovered && !scrolling;
+      final duration = scrolling
+          ? Duration.zero
+          : const Duration(milliseconds: 180);
+      return MouseRegion(
+        onEnter: (_) {
+          if (!yingjiScrollInProgress.value) setState(() => _hovered = true);
+        },
+        onExit: (_) => setState(() => _hovered = false),
+        child: AnimatedContainer(
+          duration: duration,
+          curve: Curves.easeOutCubic,
+          decoration: BoxDecoration(
+            // 不透明底托住圆角海报，合成时不会透出流动背景。
+            color: const Color(0xFF1A1D25),
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            border: Border.all(
+              color: hovered
+                  ? Colors.white.withValues(alpha: .72)
+                  : Colors.transparent,
+              width: 1,
+            ),
+            boxShadow: hovered
+                ? const [
+                    BoxShadow(
+                      color: Color(0x99000000),
+                      blurRadius: 24,
+                      offset: Offset(0, 12),
+                    ),
+                  ]
+                : const [],
           ),
-          boxShadow: _hovered
-              ? const [
-                  BoxShadow(
-                    color: Color(0x99000000),
-                    blurRadius: 24,
-                    offset: Offset(0, 12),
-                  ),
-                ]
-              : const [],
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            child: widget.child,
+          ),
         ),
-        child: ClipRRect(
-          // 裁切半径与容器圆角取齐（之前 radius-1 会留 1px 透明环，
-          // 圆角处透出页面背景形成白边）。内部图片已用 _OverscanImage
-          // 放大溢出，接缝落在实拍图上，不再闪白。
-          borderRadius: BorderRadius.circular(widget.borderRadius),
-          child: widget.child,
-        ),
-      ),
-    ),
+      );
+    },
   );
 }
 
@@ -12817,16 +12974,12 @@ String _duration(Duration value) =>
 
 Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
   if (state.tmdbId != null && state.tmdbId! > 0) {
-    await Navigator.push(
+    await MetadataDetailPage.open(
       context,
-      MaterialPageRoute(
-        builder: (_) => MetadataDetailPage(
-          item: TmdbItem(
-            id: state.tmdbId!,
-            title: state.title.split(' · ').first.trim(),
-            kind: '剧集',
-          ),
-        ),
+      item: TmdbItem(
+        id: state.tmdbId!,
+        title: state.title.split(' · ').first.trim(),
+        kind: '剧集',
       ),
     );
     return;
@@ -12909,12 +13062,7 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
       ).showSnackBar(const SnackBar(content: Text('暂未找到该内容的详情，仍可从完整列表继续播放。')));
       return;
     }
-    await Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => MetadataDetailPage(item: matches.first),
-      ),
-    );
+    await MetadataDetailPage.open(context, item: matches.first);
   } catch (_) {
     if (context.mounted) {
       ScaffoldMessenger.of(context)
@@ -13061,12 +13209,7 @@ Future<void> _showDiscoverItems(
               subtitle: MediaRatingRow(item: item),
               onTap: () {
                 Navigator.pop(dialogContext);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => MetadataDetailPage(item: item),
-                  ),
-                );
+                MetadataDetailPage.open(context, item: item);
               },
             );
           },

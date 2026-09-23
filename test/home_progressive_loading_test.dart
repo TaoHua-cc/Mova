@@ -8,12 +8,15 @@ void main() {
     () {
       final source = File('lib/src/media_center.dart').readAsStringSync();
       expect(source, contains('bool _showDiscover = true'));
-      expect(source, contains('int _discoverSectionLimit = 4'));
+      expect(source, contains('int _discoverSectionLimit = 0'));
+      expect(source, contains('position.viewportDimension * .55'));
+      expect(source, contains('current.viewportDimension * .55'));
+      expect(source, contains('/ 396).ceil()'));
       expect(
         source,
-        contains('setState(() => _discoverSectionLimit = targetLimit)'),
+        contains('setState(() => _discoverSectionLimit = nextLimit)'),
       );
-      expect(source, contains('_discoverGrowthDebounce = Timer'));
+      expect(source, contains('_discoverGrowthDebounce ??= Timer('));
       expect(source, contains('sectionLimit: _discoverSectionLimit'));
       final initialize = source.substring(
         source.indexOf(
@@ -22,12 +25,13 @@ void main() {
         source.indexOf('bool _extendingSections'),
       );
       expect(initialize, contains('await _restoreLayout();'));
-      expect(initialize, contains('if (mounted) setState(() {});'));
-      final discoverBuild = source.substring(
-        source.indexOf('final sections = snapshot.data ?? _visibleItems'),
-        source.indexOf('Widget buildRow(int index)'),
+      expect(initialize, contains('if (mounted) {'));
+      expect(initialize, contains('setState(() {});'));
+      expect(initialize, contains('widget.onLayoutRestored?.call()'));
+      expect(
+        source,
+        contains('snapshot.data ?? const <String, List<TmdbItem>>{}'),
       );
-      expect(discoverBuild, isNot(contains('.take(widget.sectionLimit')));
       expect(source, isNot(contains('_discoverMountTimer')));
       expect(source, isNot(contains('_loadRemainingSections')));
     },
@@ -46,6 +50,18 @@ void main() {
     );
   });
 
+  test('carousel loads title logos for the active and upcoming items', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    expect(
+      source,
+      contains('_selectHero((_hero + 1) % items.length.clamp(1, 8))'),
+    );
+    expect(source, contains('onChanged: _selectHero'));
+    expect(source, contains('_loadHeroDetail(_trendingValue[index])'));
+    expect(source, contains('_loadHeroDetail(_trendingValue[nextIndex])'));
+    expect(source, contains('YingjiImageWarmup.items([detail], logo: true'));
+  });
+
   test('shared preferences metadata cache is bounded for fast startup', () {
     final source = File('lib/src/metadata/tmdb_client.dart').readAsStringSync();
     expect(source, contains('static const int _tmdbCacheCapacity = 160'));
@@ -54,8 +70,12 @@ void main() {
 
   test('discovery keeps cached rows while background refresh completes', () {
     final source = File('lib/src/media_center.dart').readAsStringSync();
-    expect(source, contains('snapshot.data ?? _visibleItems'));
+    expect(
+      source,
+      contains('snapshot.data ?? const <String, List<TmdbItem>>{}'),
+    );
     expect(source, contains('_refreshVisibleSections()'));
+    expect(source, contains('_visibleItems = {..._visibleItems, ...updates}'));
     expect(source, contains('YingjiImageWarmup.items(rows, maxItems: 6)'));
     expect(
       source,

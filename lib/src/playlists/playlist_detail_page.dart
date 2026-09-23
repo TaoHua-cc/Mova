@@ -16,12 +16,19 @@ class PlaylistDetailPage extends StatefulWidget {
 }
 
 class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
+  final _scroll = ScrollController();
   YingjiPlaylist? _playlist;
 
   @override
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -70,128 +77,140 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                     padding: const EdgeInsets.only(top: 76),
                     child: playlist.items.isEmpty
                         ? _EmptyPlaylist(name: playlist.name)
-                        : ReorderableListView.builder(
-                            buildDefaultDragHandles: false,
-                            padding: const EdgeInsets.fromLTRB(54, 24, 54, 52),
-                            header: _PlaylistHeader(playlist: playlist),
-                            itemCount: playlist.items.length,
-                            onReorderItem: (oldIndex, newIndex) async {
-                              final rows = [...playlist.items];
-                              final item = rows.removeAt(oldIndex);
-                              rows.insert(newIndex, item);
-                              await _saveItems(rows);
-                            },
-                            itemBuilder: (context, index) {
-                              final item = playlist.items[index];
-                              return Padding(
-                                key: ValueKey('${item.id}-$index'),
-                                padding: const EdgeInsets.only(bottom: 10),
-                                child: GlassPanel(
-                                  radius: 18,
-                                  padding: EdgeInsets.zero,
-                                  child: InkWell(
-                                    onTap: () => Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (_) =>
-                                            MetadataDetailPage(item: item),
+                        : YingjiSmoothWheel(
+                            controller: _scroll,
+                            stableGlass: true,
+                            child: ReorderableListView.builder(
+                              scrollController: _scroll,
+                              physics: yingjiWheelPhysics,
+                              buildDefaultDragHandles: false,
+                              padding: const EdgeInsets.fromLTRB(
+                                54,
+                                24,
+                                54,
+                                52,
+                              ),
+                              header: _PlaylistHeader(playlist: playlist),
+                              itemCount: playlist.items.length,
+                              onReorderItem: (oldIndex, newIndex) async {
+                                final rows = [...playlist.items];
+                                final item = rows.removeAt(oldIndex);
+                                rows.insert(newIndex, item);
+                                await _saveItems(rows);
+                              },
+                              itemBuilder: (context, index) {
+                                final item = playlist.items[index];
+                                return Padding(
+                                  key: ValueKey('${item.id}-$index'),
+                                  padding: const EdgeInsets.only(bottom: 10),
+                                  child: GlassPanel(
+                                    radius: 18,
+                                    padding: EdgeInsets.zero,
+                                    child: InkWell(
+                                      onTap: () => MetadataDetailPage.open(
+                                        context,
+                                        item: item,
                                       ),
-                                    ),
-                                    child: SizedBox(
-                                      height: 92,
-                                      child: Row(
-                                        children: [
-                                          const SizedBox(width: 16),
-                                          ReorderableDragStartListener(
-                                            index: index,
-                                            child: const YingjiGlassTooltip(
-                                              message: '拖动排序',
-                                              child: Padding(
-                                                padding: EdgeInsets.all(10),
-                                                child: Icon(
-                                                  YingjiIcons.line_horizontal_3,
-                                                  color: YingjiColors.quiet,
+                                      child: SizedBox(
+                                        height: 92,
+                                        child: Row(
+                                          children: [
+                                            const SizedBox(width: 16),
+                                            ReorderableDragStartListener(
+                                              index: index,
+                                              child: const YingjiGlassTooltip(
+                                                message: '拖动排序',
+                                                child: Padding(
+                                                  padding: EdgeInsets.all(10),
+                                                  child: Icon(
+                                                    YingjiIcons
+                                                        .line_horizontal_3,
+                                                    color: YingjiColors.quiet,
+                                                  ),
                                                 ),
                                               ),
                                             ),
-                                          ),
-                                          const SizedBox(width: 5),
-                                          ClipRRect(
-                                            borderRadius: BorderRadius.circular(
-                                              10,
+                                            const SizedBox(width: 5),
+                                            ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(10),
+                                              child: SizedBox(
+                                                width: 52,
+                                                height: 70,
+                                                child: item.posterUrl == null
+                                                    ? const _PosterFallback()
+                                                    : CachedNetworkImage(
+                                                        imageUrl: item.posterUrl
+                                                            .toString(),
+                                                        fit: BoxFit.cover,
+                                                        // 列表缩略图仅 52px 宽，按显示分辨率解码。
+                                                        memCacheWidth:
+                                                            (160 *
+                                                                    MediaQuery.devicePixelRatioOf(
+                                                                      context,
+                                                                    ))
+                                                                .clamp(
+                                                                  1.0,
+                                                                  256.0,
+                                                                )
+                                                                .round(),
+                                                        errorWidget: (_, _, _) =>
+                                                            const _PosterFallback(),
+                                                      ),
+                                              ),
                                             ),
-                                            child: SizedBox(
-                                              width: 52,
-                                              height: 70,
-                                              child: item.posterUrl == null
-                                                  ? const _PosterFallback()
-                                                  : CachedNetworkImage(
-                                                      imageUrl: item.posterUrl
-                                                          .toString(),
-                                                      fit: BoxFit.cover,
-                                                      // 列表缩略图仅 52px 宽，按显示分辨率解码。
-                                                      memCacheWidth: (160 *
-                                                              MediaQuery
-                                                                  .devicePixelRatioOf(
-                                                                context,
-                                                              ))
-                                                          .clamp(1.0, 256.0)
-                                                          .round(),
-                                                      errorWidget: (_, _, _) =>
-                                                          const _PosterFallback(),
+                                            const SizedBox(width: 16),
+                                            Expanded(
+                                              child: Column(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment.center,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(
+                                                    item.title,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                      fontSize: 17,
+                                                      fontWeight:
+                                                          FontWeight.w700,
                                                     ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 16),
-                                          Expanded(
-                                            child: Column(
-                                              mainAxisAlignment:
-                                                  MainAxisAlignment.center,
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              children: [
-                                                Text(
-                                                  item.title,
-                                                  maxLines: 1,
-                                                  overflow:
-                                                      TextOverflow.ellipsis,
-                                                  style: const TextStyle(
-                                                    fontSize: 17,
-                                                    fontWeight: FontWeight.w700,
                                                   ),
-                                                ),
-                                                const SizedBox(height: 5),
-                                                MediaRatingRow(item: item),
-                                                Text(
-                                                  '${item.year ?? '年份未知'} · ${item.kind}',
-                                                  style: const TextStyle(
-                                                    color: YingjiColors.muted,
-                                                    fontSize: 12,
+                                                  const SizedBox(height: 5),
+                                                  MediaRatingRow(item: item),
+                                                  Text(
+                                                    '${item.year ?? '年份未知'} · ${item.kind}',
+                                                    style: const TextStyle(
+                                                      color: YingjiColors.muted,
+                                                      fontSize: 12,
+                                                    ),
                                                   ),
-                                                ),
-                                              ],
+                                                ],
+                                              ),
                                             ),
-                                          ),
-                                          IconButton(
-                                            tooltip: '从片单移除',
-                                            icon: const Icon(
-                                              YingjiIcons.trash,
-                                              color: YingjiColors.danger,
+                                            IconButton(
+                                              tooltip: '从片单移除',
+                                              icon: const Icon(
+                                                YingjiIcons.trash,
+                                                color: YingjiColors.danger,
+                                              ),
+                                              onPressed: () async {
+                                                final rows = [...playlist.items]
+                                                  ..removeAt(index);
+                                                await _saveItems(rows);
+                                              },
                                             ),
-                                            onPressed: () async {
-                                              final rows = [...playlist.items]
-                                                ..removeAt(index);
-                                              await _saveItems(rows);
-                                            },
-                                          ),
-                                          const SizedBox(width: 12),
-                                        ],
+                                            const SizedBox(width: 12),
+                                          ],
+                                        ),
                                       ),
                                     ),
                                   ),
-                                ),
-                              );
-                            },
+                                );
+                              },
+                            ),
                           ),
                   ),
           ),

@@ -128,6 +128,14 @@ void main() {
   testWidgets('discover shelves can be shown and persist their layout', (
     tester,
   ) async {
+    // The shared flowing backdrop has a deliberate repeating ticker, so this
+    // test advances finite transitions instead of waiting for global settling.
+    Future<void> pumpUiTransition() async {
+      for (var frame = 0; frame < 10; frame++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+    }
+
     const sections = <String>[
       '今日热门电视剧',
       '今日热门电影',
@@ -159,17 +167,17 @@ void main() {
     );
     await tester.pump();
     yingjiSectionRequest.value = 'discover';
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     expect(find.text('所有栏目均已隐藏'), findsOneWidget);
     expect(find.byTooltip('排序与显示栏目'), findsOneWidget);
     await tester.tap(find.byTooltip('排序与显示栏目'));
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     expect(find.text('发现页栏目编排'), findsOneWidget);
     await tester.tap(find.byTooltip('关闭').last);
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
 
     await tester.tap(find.byTooltip('添加列表'));
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     expect(find.text('列表设置'), findsOneWidget);
     expect(find.textContaining('当前筛选  TMDB · 电影'), findsOneWidget);
     expect(find.text('内容筛选'), findsWidgets);
@@ -191,13 +199,13 @@ void main() {
     );
     await tester.ensureVisible(find.text('保存当前列表'));
     await tester.tap(find.text('保存当前列表'));
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     expect(find.text('我的电影榜'), findsWidgets);
     expect(find.byTooltip('设置我的电影榜'), findsOneWidget);
     yingjiSectionRequest.value = 'discover';
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     await tester.tap(find.byTooltip('设置我的电影榜'));
-    await tester.pumpAndSettle();
+    await pumpUiTransition();
     expect(find.text('列表设置'), findsOneWidget);
     await tester.ensureVisible(find.text('保存当前列表'));
     await tester.tap(find.text('保存当前列表'));

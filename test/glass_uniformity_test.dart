@@ -101,13 +101,27 @@ void main() {
   test('shared glass edge stays aligned to physical pixels', () {
     final brand = File('lib/src/brand.dart').readAsStringSync();
     final shell = File('lib/src/media_center.dart').readAsStringSync();
-    expect(brand, contains('final strokeWidth = 1 / devicePixelRatio;'));
+    // 环宽按**物理像素**换算（口径），不锁具体数值：3.1.112 把它从 1 提到 1.5 时
+    // 这条断言没跟上，测试一直是红的。断言口径才不会被观感调整打破。
+    expect(brand, contains(RegExp(r'strokeWidth = [^;\n]*/ devicePixelRatio')));
     expect(brand, contains('..isAntiAlias = true'));
     expect(brand, contains('scale: _pressed ? MovaMotion.pressScaleIcon : 1'));
     expect(
       shell,
       isNot(contains('color: Colors.black.withValues(alpha: .58)')),
     );
+  });
+
+  test('selected icon buttons use a glossy pearl material', () {
+    final brand = File('lib/src/brand.dart').readAsStringSync();
+    final selected = brand.substring(
+      brand.indexOf('child: widget.selected'),
+      brand.indexOf('Center(', brand.indexOf('child: widget.selected')),
+    );
+    expect(selected, contains('LinearGradient'));
+    expect(selected, contains('RadialGradient'));
+    expect(selected, contains('Color(0x36D5DEE9)'));
+    expect(selected, isNot(contains('color: YingjiGlass.accent')));
   });
 
   test('player dock draws a full-bleed progress bar without a backdrop plate', () {

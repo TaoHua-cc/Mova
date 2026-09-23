@@ -24,6 +24,9 @@ import 'package:flutter/widgets.dart';
 ///   `frost`（`_FrostSurface` 的背板模糊）、`glass`（`YingjiGlassSurface` 的背板
 ///   模糊）、`circle`/`rect`（只跳过圆形 / 非圆形的 `YingjiGlassSurface`）、
 ///   `all`（以上全部跳过）。用来把「模糊」的账分到具体某一处，见 [skipGlass]。
+/// - `MOVA_TRACE_EDGE=<linear|const|none>`：诊断用，覆盖**圆形**玻璃的描边环画法
+///   （见 [edgePlan]）。不设置时是生产默认的「角度均匀 + 左上受光」。只影响圆形：
+///   直边（卡片 / 面板）上的线性渐变在几何上是正确的，任何情况下都不动。
 ///
 /// ### `FRAMES` 行长（字段稳定，改动要同步 `tool/analyze_frame_trace.py`）
 ///
@@ -44,6 +47,18 @@ abstract final class FrameTrace {
   static const String _glassSkipVar = 'MOVA_TRACE_GLASS_SKIP';
 
   static Set<String>? _glassSkips;
+
+  static const String _edgeVar = 'MOVA_TRACE_EDGE';
+
+  /// 描边环画法的候选值。
+  ///
+  /// `linear` / `const` / `none` 都只是**诊断对照**：生产默认（开关未设置）是
+  /// 「按角度定值 + 保留左上受光」。`linear` 可以回到 3.1.112 的线性渐变做观感
+  /// 回归，`none` 是「整条去掉」，供方案 C 的前半做观感对照。
+  static const Set<String> edgePlans = <String>{'linear', 'const', 'none'};
+
+  static String? _edgePlan;
+  static bool _edgePlanRead = false;
 
   static File? _file;
   static Stopwatch? _clock;
@@ -102,6 +117,28 @@ abstract final class FrameTrace {
         .map((part) => part.trim().toLowerCase())
         .where((part) => part.isNotEmpty)
         .toSet();
+  }
+
+  /// `MOVA_TRACE_EDGE`：覆盖**圆形**玻璃描边环的画法，供真机观感比对。
+  ///
+  /// 取值（[edgePlans]）：
+  /// - `linear`：回到 3.1.112 的线性渐变环 —— 等 α 线是**弦**，同一条等 α 线在
+  ///   不同方位扫过的弧长不同，亮度绕圈极差 2.91×，看起来就是「锯齿感」。
+  /// - `const`：环改成**常量白**（α .34）—— 亮度完全不随角度变化。
+  /// - `none`：整条环不画（方案 C 的前半）。
+  ///
+  /// 未设置 / 无法识别 → null，即**生产默认**：α = .34 ± .16·cos(θ − 225°)，
+  /// 角度均匀但保留「左上受光」的方向感。环宽始终 1.5 物理像素，不随开关变化。
+  ///
+  /// ⚠️ 这里必须缓存：`_YingjiGlassEdgePainter.paint` **每一帧**都会问一次，而
+  /// `Platform.environment` 在 Windows 上是一次 `GetEnvironmentStrings` 调用，
+  /// 放在绘制路径上代价可观。第一帧读一次，之后只读静态字段。
+  static String? get edgePlan {
+    if (_edgePlanRead) return _edgePlan;
+    _edgePlanRead = true;
+    final raw = Platform.environment[_edgeVar]?.trim().toLowerCase();
+    _edgePlan = (raw != null && edgePlans.contains(raw)) ? raw : null;
+    return _edgePlan;
   }
 
   /// 在 `runApp` 之前调用。未设置 `MOVA_TRACE_FRAMES` 时立刻返回。
