@@ -112,16 +112,19 @@ void main() {
     );
   });
 
-  test('selected icon buttons use a glossy pearl material', () {
+  test('selected controls share a glossy pearl theme', () {
     final brand = File('lib/src/brand.dart').readAsStringSync();
     final selected = brand.substring(
       brand.indexOf('child: widget.selected'),
       brand.indexOf('Center(', brand.indexOf('child: widget.selected')),
     );
+    expect(brand, contains('static const Color accent = Color(0xFFF3F4F7)'));
     expect(selected, contains('LinearGradient'));
     expect(selected, contains('RadialGradient'));
     expect(selected, contains('Color(0x36D5DEE9)'));
-    expect(selected, isNot(contains('color: YingjiGlass.accent')));
+    expect(selected, isNot(contains('Color(0x48D99A68)')));
+    expect(brand, contains('Colors.white.withValues(alpha: .92)'));
+    expect(brand, contains('const Color(0xFF111824)'));
   });
 
   test('player dock draws a full-bleed progress bar without a backdrop plate', () {

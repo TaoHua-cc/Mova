@@ -10,34 +10,50 @@ class TraktEvent {
     required this.episode,
     required this.airDate,
     this.posterUrl,
+    this.backdropUrl,
     this.platform,
     this.timeKnown = true,
     this.tmdbId,
+    this.traktId,
     this.seasonNumber,
     this.episodeNumber,
+    this.absoluteEpisodeNumber,
+    this.totalEpisodes,
+    this.platformLogoUrl,
   });
   final String title;
   final String episode;
   final DateTime airDate;
   final Uri? posterUrl;
+  final Uri? backdropUrl;
 
   /// Trakt supplies the show's broadcast network when it is known.
   final String? platform;
   final bool timeKnown;
   final int? tmdbId;
+  final int? traktId;
   final int? seasonNumber;
   final int? episodeNumber;
+  final int? absoluteEpisodeNumber;
+  final int? totalEpisodes;
+  final Uri? platformLogoUrl;
 
   Map<String, dynamic> toJson() => {
     'title': title,
     'episode': episode,
     'airDate': airDate.toIso8601String(),
     'posterUrl': posterUrl?.toString(),
+    'backdropUrl': backdropUrl?.toString(),
     'platform': platform,
     'timeKnown': timeKnown,
     'tmdbId': tmdbId,
+    'traktId': traktId,
     'seasonNumber': seasonNumber,
     'episodeNumber': episodeNumber,
+    if (absoluteEpisodeNumber != null)
+      'absoluteEpisodeNumber': absoluteEpisodeNumber,
+    if (totalEpisodes != null) 'totalEpisodes': totalEpisodes,
+    if (platformLogoUrl != null) 'platformLogoUrl': platformLogoUrl.toString(),
   };
 
   factory TraktEvent.fromJson(Map<String, dynamic> value) => TraktEvent(
@@ -47,11 +63,20 @@ class TraktEvent {
     posterUrl: '${value['posterUrl'] ?? ''}'.isEmpty
         ? null
         : Uri.tryParse('${value['posterUrl']}'),
+    backdropUrl: '${value['backdropUrl'] ?? ''}'.isEmpty
+        ? null
+        : Uri.tryParse('${value['backdropUrl']}'),
     platform: value['platform'] as String?,
     timeKnown: value['timeKnown'] != false,
     tmdbId: (value['tmdbId'] as num?)?.toInt(),
+    traktId: (value['traktId'] as num?)?.toInt(),
     seasonNumber: (value['seasonNumber'] as num?)?.toInt(),
     episodeNumber: (value['episodeNumber'] as num?)?.toInt(),
+    absoluteEpisodeNumber: (value['absoluteEpisodeNumber'] as num?)?.toInt(),
+    totalEpisodes: (value['totalEpisodes'] as num?)?.toInt(),
+    platformLogoUrl: '${value['platformLogoUrl'] ?? ''}'.isEmpty
+        ? null
+        : Uri.tryParse('${value['platformLogoUrl']}'),
   );
 }
 
@@ -70,6 +95,34 @@ class TraktDeviceCode {
   final int interval;
 }
 
+class TraktOAuthToken {
+  const TraktOAuthToken({
+    required this.accessToken,
+    this.refreshToken = '',
+    this.expiresAt,
+  });
+
+  final String accessToken;
+  final String refreshToken;
+  final DateTime? expiresAt;
+
+  factory TraktOAuthToken.fromJson(Map<String, dynamic> value) {
+    final createdAt = (value['created_at'] as num?)?.toInt();
+    final expiresIn = (value['expires_in'] as num?)?.toInt();
+    final expiresAt = createdAt != null && expiresIn != null
+        ? DateTime.fromMillisecondsSinceEpoch(
+            (createdAt + expiresIn) * 1000,
+            isUtc: true,
+          )
+        : null;
+    return TraktOAuthToken(
+      accessToken: '${value['access_token'] ?? ''}',
+      refreshToken: '${value['refresh_token'] ?? ''}',
+      expiresAt: expiresAt,
+    );
+  }
+}
+
 class TraktPlaybackProgress {
   const TraktPlaybackProgress({
     required this.tmdbId,
@@ -86,6 +139,14 @@ class TraktPlaybackProgress {
   final DateTime? pausedAt;
 }
 
+class TraktShowProgress {
+  const TraktShowProgress({required this.aired, required this.completed});
+
+  final int aired;
+  final int completed;
+  int get unwatched => (aired - completed).clamp(0, aired);
+}
+
 class TraktDiscoveryItem {
   const TraktDiscoveryItem({required this.tmdbId, required this.kind});
   final int tmdbId;
@@ -96,6 +157,83 @@ class TraktClient {
   TraktClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
 
+  Future<String> accountUuid({
+    required String clientId,
+    required String accessToken,
+  }) async {
+    final response = await _client
+        .get(
+          Uri.https('api.trakt.tv', '/users/settings'),
+          headers: {
+            'Authorization': 'Bearer ${accessToken.trim()}',
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 账户信息读取失败（HTTP ${response.statusCode}）');
+    }
+    final data = jsonDecode(response.body);
+    final user = data is Map ? data['user'] : null;
+    final uuid = user is Map ? '${user['uuid'] ?? ''}'.trim() : '';
+    if (uuid.isEmpty) throw Exception('Trakt 未返回账户标识');
+    return uuid;
+  }
+
+  Future<TraktOAuthToken> exchangeAuthorizationCode({
+    required Uri redirectUri,
+    required String code,
+  }) async {
+    final response = await _client
+        .post(
+          Uri.parse('${TmdbClient.managedEndpoint}/trakt/oauth/token'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'code': code,
+            'redirect_uri': redirectUri.toString(),
+            'grant_type': 'authorization_code',
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 令牌交换失败（HTTP ${response.statusCode}）');
+    }
+    final token = TraktOAuthToken.fromJson(
+      jsonDecode(response.body) as Map<String, dynamic>,
+    );
+    if (token.accessToken.isEmpty) throw Exception('Trakt 未返回访问令牌');
+    return token;
+  }
+
+  Future<TraktOAuthToken> refreshAccessToken({
+    required String refreshToken,
+    required Uri redirectUri,
+  }) async {
+    final response = await _client
+        .post(
+          Uri.parse('${TmdbClient.managedEndpoint}/trakt/oauth/token'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'refresh_token': refreshToken,
+            'redirect_uri': redirectUri.toString(),
+            'grant_type': 'refresh_token',
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 令牌刷新失败（HTTP ${response.statusCode}）');
+    }
+    final token = TraktOAuthToken.fromJson(
+      jsonDecode(response.body) as Map<String, dynamic>,
+    );
+    if (token.accessToken.isEmpty || token.refreshToken.isEmpty) {
+      throw Exception('Trakt 刷新未返回完整令牌');
+    }
+    return token;
+  }
+
   Future<List<TraktDiscoveryItem>> discover({
     required String clientId,
     required String type,
@@ -103,7 +241,7 @@ class TraktClient {
     int page = 1,
   }) async {
     if (clientId.trim().isEmpty) {
-      throw Exception('请先在设置中配置 Trakt Client ID');
+      throw Exception('Mova 的 Trakt 应用配置不可用，请检查网络后重试');
     }
     final kind = type == 'shows' ? '剧集' : '电影';
     final query = {
@@ -205,12 +343,12 @@ class TraktClient {
         .toList(growable: false);
   }
 
-  Future<TraktDeviceCode> requestDeviceCode(String clientId) async {
+  Future<TraktDeviceCode> requestDeviceCode() async {
     final response = await _client
         .post(
-          Uri.parse('https://api.trakt.tv/oauth/device/code'),
+          Uri.parse('${TmdbClient.managedEndpoint}/trakt/oauth/device/code'),
           headers: const {'Content-Type': 'application/json'},
-          body: jsonEncode({'client_id': clientId.trim()}),
+          body: jsonEncode(const <String, String>{}),
         )
         .timeout(const Duration(seconds: 15));
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -226,23 +364,15 @@ class TraktClient {
     );
   }
 
-  Future<String> pollDeviceCode({
-    required String clientId,
-    required String clientSecret,
-    required TraktDeviceCode device,
-  }) async {
+  Future<String> pollDeviceCode({required TraktDeviceCode device}) async {
     final deadline = DateTime.now().add(Duration(seconds: device.expiresIn));
     while (DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(Duration(seconds: device.interval));
       final response = await _client
           .post(
-            Uri.parse('https://api.trakt.tv/oauth/device/token'),
+            Uri.parse('${TmdbClient.managedEndpoint}/trakt/oauth/device/token'),
             headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'code': device.deviceCode,
-              'client_id': clientId.trim(),
-              'client_secret': clientSecret.trim(),
-            }),
+            body: jsonEncode({'code': device.deviceCode}),
           )
           .timeout(const Duration(seconds: 15));
       if (response.statusCode == 200) {
@@ -263,7 +393,7 @@ class TraktClient {
     DateTime? start,
   }) async {
     if (clientId.trim().isEmpty || accessToken.trim().isEmpty) {
-      throw Exception('请先在设置中配置 Trakt Client ID 和访问令牌');
+      throw Exception('Trakt 尚未连接或访问令牌已失效');
     }
     final day = (start ?? DateTime.now()).toIso8601String().substring(0, 10);
     final response = await _client
@@ -283,25 +413,63 @@ class TraktClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception('Trakt 同步失败（HTTP ${response.statusCode}）');
     }
-    final data = jsonDecode(response.body) as List<dynamic>;
+    return _decodeCalendar(response.body);
+  }
+
+  /// Trakt's global calendar is filtered by Mova's local watchlist by TMDB ID.
+  /// It is public, so it works even when the user has not connected an account.
+  Future<List<TraktEvent>> allShowsCalendar({
+    required String clientId,
+    DateTime? start,
+  }) async {
+    if (clientId.trim().isEmpty) throw Exception('缺少 Trakt Client ID');
+    final day = (start ?? DateTime.now()).toIso8601String().substring(0, 10);
+    final response = await _client
+        .get(
+          Uri.https('api.trakt.tv', '/calendars/all/shows/$day/31', {
+            'extended': 'full',
+          }),
+          headers: {
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 全站日历读取失败（HTTP ${response.statusCode}）');
+    }
+    return _decodeCalendar(response.body);
+  }
+
+  List<TraktEvent> _decodeCalendar(String body) {
+    final decoded = jsonDecode(body);
+    if (decoded is! List) return const [];
+    final data = decoded;
     return data
         .whereType<Map<String, dynamic>>()
         .where(
           (item) => DateTime.tryParse('${item['first_aired'] ?? ''}') != null,
         )
         .map((item) {
+          final firstAired = '${item['first_aired']}';
           final show = item['show'] as Map<String, dynamic>? ?? const {};
           final episode = item['episode'] as Map<String, dynamic>? ?? const {};
           final image = (show['images'] as Map<String, dynamic>?)?['poster'];
           final poster = image is Map<String, dynamic>
               ? image['full'] as String?
               : null;
+          final fanart = (show['images'] as Map<String, dynamic>?)?['fanart'];
+          final backdrop = fanart is Map<String, dynamic>
+              ? fanart['full'] as String?
+              : null;
           return TraktEvent(
             tmdbId: ((show['ids'] as Map?)?['tmdb'] as num?)?.toInt(),
+            traktId: ((show['ids'] as Map?)?['trakt'] as num?)?.toInt(),
             seasonNumber: (episode['season'] as num?)?.toInt(),
             episodeNumber: (episode['number'] as num?)?.toInt(),
-            timeKnown: RegExp(r'(Z|[+-]\d{2}:\d{2})$')
-                .hasMatch('${item['first_aired']}'),
+            absoluteEpisodeNumber: (episode['number_abs'] as num?)?.toInt(),
+            timeKnown: _hasPublishedAirtime(firstAired),
             title: '${show['title'] ?? '未命名剧集'}',
             episode:
                 '第 ${episode['season'] ?? 0} 季 · 第 ${episode['number'] ?? 0} 集 · ${episode['title'] ?? ''}',
@@ -309,12 +477,193 @@ class TraktClient {
                 DateTime.tryParse('${item['first_aired'] ?? ''}') ??
                 DateTime.now(),
             posterUrl: poster == null ? null : Uri.tryParse(poster),
+            backdropUrl: backdrop == null ? null : Uri.tryParse(backdrop),
             platform: '${show['network'] ?? ''}'.trim().isEmpty
                 ? null
                 : '${show['network']}',
           );
         })
         .toList(growable: false);
+  }
+
+  bool _hasPublishedAirtime(String value) {
+    if (!RegExp(r'(Z|[+-]\d{2}:\d{2})$').hasMatch(value)) return false;
+    final aired = DateTime.tryParse(value);
+    if (aired == null) return false;
+    // Trakt may encode a date-only placeholder as midnight UTC. Do not present
+    // that transport default as a confirmed local broadcast time.
+    final utc = value.endsWith('Z') || value.endsWith('+00:00');
+    return !(utc && aired.hour == 0 && aired.minute == 0 && aired.second == 0);
+  }
+
+  /// Read both media types from the authenticated Trakt watchlist.
+  Future<List<TmdbItem>> watchlist({
+    required String clientId,
+    required String accessToken,
+  }) async {
+    final rows = await Future.wait([
+      _watchlistRequest(
+        '/sync/watchlist/shows',
+        clientId: clientId,
+        accessToken: accessToken,
+        kind: '剧集',
+        key: 'show',
+      ),
+      _watchlistRequest(
+        '/sync/watchlist/movies',
+        clientId: clientId,
+        accessToken: accessToken,
+        kind: '电影',
+        key: 'movie',
+      ),
+    ]);
+    return rows.expand((items) => items).toList(growable: false);
+  }
+
+  Future<List<TmdbItem>> _watchlistRequest(
+    String path, {
+    required String clientId,
+    required String accessToken,
+    required String kind,
+    required String key,
+  }) async {
+    if (clientId.trim().isEmpty || accessToken.trim().isEmpty) {
+      throw Exception('Trakt 尚未连接或访问令牌已失效');
+    }
+    final response = await _client
+        .get(
+          Uri.https('api.trakt.tv', path, {'extended': 'full'}),
+          headers: {
+            'Authorization': 'Bearer ${accessToken.trim()}',
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 待看读取失败（HTTP ${response.statusCode}）');
+    }
+    final data = jsonDecode(response.body);
+    if (data is! List) return const [];
+    return data
+        .whereType<Map>()
+        .map((row) {
+          final media = row[key] as Map? ?? row;
+          final ids = media['ids'] as Map? ?? const {};
+          return TmdbItem(
+            id: (ids['tmdb'] as num?)?.toInt() ?? 0,
+            title: '${media['title'] ?? '未命名'}',
+            kind: kind,
+            year: (media['year'] as num?)?.toInt(),
+          );
+        })
+        .where((item) => item.id > 0)
+        .toList(growable: false);
+  }
+
+  Future<void> addWatchlistItems({
+    required String clientId,
+    required String accessToken,
+    required Iterable<TmdbItem> items,
+  }) => _changeWatchlist(
+    '/sync/watchlist',
+    clientId: clientId,
+    accessToken: accessToken,
+    items: items,
+  );
+
+  Future<void> removeWatchlistItems({
+    required String clientId,
+    required String accessToken,
+    required Iterable<TmdbItem> items,
+  }) => _changeWatchlist(
+    '/sync/watchlist/remove',
+    clientId: clientId,
+    accessToken: accessToken,
+    items: items,
+  );
+
+  Future<void> _changeWatchlist(
+    String path, {
+    required String clientId,
+    required String accessToken,
+    required Iterable<TmdbItem> items,
+  }) async {
+    if (clientId.trim().isEmpty || accessToken.trim().isEmpty) {
+      throw Exception('Trakt 尚未连接或访问令牌已失效');
+    }
+    final valid = items.where((item) => item.id > 0).toList(growable: false);
+    if (valid.isEmpty) return;
+    final shows = valid
+        .where((item) => item.kind == '剧集')
+        .map(
+          (item) => {
+            'ids': {'tmdb': item.id},
+          },
+        )
+        .toList(growable: false);
+    final movies = valid
+        .where((item) => item.kind == '电影')
+        .map(
+          (item) => {
+            'ids': {'tmdb': item.id},
+          },
+        )
+        .toList(growable: false);
+    if (shows.isEmpty && movies.isEmpty) return;
+    final response = await _client
+        .post(
+          Uri.https('api.trakt.tv', path),
+          headers: {
+            'Authorization': 'Bearer ${accessToken.trim()}',
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: jsonEncode({
+            if (shows.isNotEmpty) 'shows': shows,
+            if (movies.isNotEmpty) 'movies': movies,
+          }),
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 待看同步失败（HTTP ${response.statusCode}）');
+    }
+  }
+
+  Future<TraktShowProgress?> showWatchedProgress({
+    required String clientId,
+    required String accessToken,
+    required int traktId,
+  }) async {
+    if (clientId.trim().isEmpty || accessToken.trim().isEmpty || traktId <= 0) {
+      return null;
+    }
+    final response = await _client
+        .get(
+          Uri.https('api.trakt.tv', '/shows/$traktId/progress/watched'),
+          headers: {
+            'Authorization': 'Bearer ${accessToken.trim()}',
+            'trakt-api-version': '2',
+            'trakt-api-key': clientId.trim(),
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Trakt 剧集进度读取失败（HTTP ${response.statusCode}）');
+    }
+    final value = jsonDecode(response.body);
+    if (value is! Map) return null;
+    final aired = (value['aired'] as num?)?.toInt() ?? 0;
+    final completed = (value['completed'] as num?)?.toInt() ?? 0;
+    if (aired <= 0) return null;
+    return TraktShowProgress(
+      aired: aired,
+      completed: completed.clamp(0, aired),
+    );
   }
 
   Future<void> setEpisodeWatched({

@@ -5,6 +5,9 @@
 // gestures. You can also use WidgetTester to find child widgets in the widget
 // tree, read text, and verify that the values of widget properties are correct.
 
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,6 +17,54 @@ import 'package:yingji/src/media_center.dart';
 import 'package:yingji/src/metadata/tmdb_client.dart';
 
 void main() {
+  test('discover shelf previews never exceed twenty items', () {
+    final rows = List.generate(
+      32,
+      (index) => TmdbItem(id: index, title: '$index', kind: '电影'),
+    );
+    expect(discoverPreviewItems(rows), hasLength(20));
+  });
+
+  test('refreshed rows keep their bundled poster assets', () {
+    const bundled = TmdbItem(
+      id: 4,
+      title: '快照影片',
+      kind: '电影',
+      posterPath: '/poster.jpg',
+      localPosterAsset: 'assets/defaults/posters/电影_4.jpg',
+    );
+    const refreshed = TmdbItem(
+      id: 4,
+      title: '更新影片',
+      kind: '电影',
+      posterPath: '/poster.jpg',
+    );
+    expect(
+      retainBundledPosters([refreshed], [bundled]).single.localPosterAsset,
+      bundled.localPosterAsset,
+    );
+  });
+
+  test(
+    'first-run snapshot contains the default 18 public lists and posters',
+    () {
+      final file = File('assets/defaults/discover_first_run.json');
+      final raw = file.readAsStringSync();
+      final snapshot = jsonDecode(raw) as Map<String, dynamic>;
+      final lists = snapshot['lists'] as Map<String, dynamic>;
+      expect(lists, hasLength(18));
+      expect(lists.values.every((rows) => (rows as List).length <= 20), isTrue);
+      expect(raw.toLowerCase(), isNot(contains('api_key')));
+      expect(raw.toLowerCase(), isNot(contains('token')));
+      for (final rows in lists.values.cast<List<dynamic>>()) {
+        for (final row in rows.cast<Map<String, dynamic>>()) {
+          final asset = row['localPosterAsset'];
+          if (asset != null) expect(File(asset as String).existsSync(), isTrue);
+        }
+      }
+    },
+  );
+
   test('all-list genre filter matches actual media genres', () {
     const item = TmdbItem(
       id: 1,
@@ -147,6 +198,7 @@ void main() {
       '热门国产电视剧',
       '热门国产电影',
       '热门综艺',
+      '热门国产综艺',
       '热门国产动漫',
       '热门番剧',
       '热门韩剧',
@@ -156,6 +208,7 @@ void main() {
       '按平台',
     ];
     SharedPreferences.setMockInitialValues({
+      'yingji.discover.sections': sections,
       'yingji.discover.hidden-sections': sections,
     });
     tester.view.physicalSize = const Size(1440, 1000);
@@ -192,9 +245,9 @@ void main() {
     expect(find.text('最低评分'), findsWidgets);
     expect(find.text('评分人数'), findsWidgets);
     expect(find.text('内容时长'), findsWidgets);
-    expect(find.text('新列表 18'), findsWidgets);
+    expect(find.text('新列表 19'), findsWidgets);
     await tester.enterText(
-      find.byKey(const ValueKey('discover-name-新列表 18')),
+      find.byKey(const ValueKey('discover-name-新列表 19')),
       '我的电影榜',
     );
     await tester.ensureVisible(find.text('保存当前列表'));

@@ -20,9 +20,11 @@ import 'platform/window_host.dart';
 import 'app_route_observer.dart';
 import 'brand.dart';
 import 'cache/danmaku_cache.dart';
+import 'cache/discover_snapshot_cache.dart';
 import 'cache/image_prefetch.dart';
 import 'cache/media_cache.dart';
 import 'cache/video_cache.dart';
+import 'cache/windows_metadata_cache.dart';
 import 'diagnostics/frame_trace.dart';
 import 'motion.dart';
 import 'network/proxy_routing.dart';
@@ -38,12 +40,16 @@ import 'player/subtitle_preference.dart';
 import 'player/player_page.dart';
 import 'player/windows_native_player.dart';
 import 'sources/emby_client.dart';
+import 'sources/endpoint_input.dart';
 import 'sources/media_source.dart';
 import 'sources/server_mark.dart';
 import 'sources/source_store.dart';
 import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
+import 'tracking/calendar_events.dart';
+import 'tracking/trakt_auth.dart';
+import 'tracking/trakt_watchlist_sync.dart';
 import 'update/update_checker.dart';
 import 'update/update_flow.dart';
 import 'version.dart';
@@ -70,6 +76,24 @@ const _shortcutNames = <String, String>{
 };
 
 final Map<String, Future<Map<String, String>>> _watchProviderRequests = {};
+
+void _syncTraktWatchlistAfterConnection(BuildContext context) {
+  unawaited(() async {
+    try {
+      await synchronizeTraktWatchlist(await WatchlistStore.create());
+    } catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Trakt 待看同步失败：${error.toString().replaceFirst('Exception: ', '')}',
+          ),
+        ),
+      );
+    }
+  }());
+}
+
 const _knownPlatformLabels = <String, String>{
   'watch:8': 'Netflix',
   'watch:119': 'Prime Video',
@@ -970,6 +994,7 @@ class _CinematicHomeState extends State<_CinematicHome>
 
   /// 元数据后台刷新后的重读消抖计时器。
   Timer? _revisionDebounce;
+  bool _metadataRefreshPending = false;
 
   @override
   void initState() {
@@ -981,6 +1006,7 @@ class _CinematicHomeState extends State<_CinematicHome>
     // 后台把轮播那批元数据刷新回来后换上新内容（FutureBuilder 会保留旧数据，
     // 所以替换过程不会闪一下空白）。
     yingjiMetadataRevision.addListener(_handleMetadataRevision);
+    yingjiScrollInProgress.addListener(_flushMetadataAfterScroll);
     _heroTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (!mounted) return;
       final items = _trendingValue;
@@ -1023,8 +1049,18 @@ class _CinematicHomeState extends State<_CinematicHome>
     _revisionDebounce?.cancel();
     _revisionDebounce = Timer(const Duration(milliseconds: 800), () {
       if (!mounted) return;
+      if (yingjiScrollInProgress.value) {
+        _metadataRefreshPending = true;
+        return;
+      }
       setState(() => _trending = _loadCarouselItems());
     });
+  }
+
+  void _flushMetadataAfterScroll() {
+    if (yingjiScrollInProgress.value || !_metadataRefreshPending) return;
+    _metadataRefreshPending = false;
+    _handleMetadataRevision();
   }
 
   List<TmdbItem> _trendingValue = const [];
@@ -1055,6 +1091,7 @@ class _CinematicHomeState extends State<_CinematicHome>
       'top-rated' => _tmdb.topRatedMovies(),
       _ => _tmdb.trending(),
     };
+    FrameTrace.mark('home_carousel_ready');
     // 首屏轮播的大图与标题 logo 提前进磁盘缓存：这是最显眼的一屏，
     // 之后每次打开都应该已经躺在本地。
     YingjiImageWarmup.items(items, backdrop: true, maxItems: 2);
@@ -1124,6 +1161,7 @@ class _CinematicHomeState extends State<_CinematicHome>
   void dispose() {
     yingjiHomeFocusTick.removeListener(_handleHomeFocus);
     yingjiMetadataRevision.removeListener(_handleMetadataRevision);
+    yingjiScrollInProgress.removeListener(_flushMetadataAfterScroll);
     _revisionDebounce?.cancel();
     yingjiRouteObserver.unsubscribe(this);
     _heroTimer?.cancel();
@@ -1595,9 +1633,14 @@ Future<List<WatchState>> _mergeServerWatchHistory(
     merged[existingIndex] = adopted;
   }
   try {
-    final prefs = await SharedPreferences.getInstance();
-    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
-    final token = prefs.getString('yingji.trakt.access-token') ?? '';
+    var credentials = await TraktCredentials.read();
+    try {
+      credentials = await credentials.refreshIfNeeded();
+    } catch (_) {
+      // Fall through with the last saved token if a refresh is temporarily unavailable.
+    }
+    final clientId = credentials.clientId;
+    final token = credentials.accessToken;
     if (clientId.isNotEmpty && token.isNotEmpty) {
       final trakt = TraktClient();
       try {
@@ -1772,21 +1815,23 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   static const _stylesKey = 'yingji.discover.card-styles';
   static const _sourcesKey = 'yingji.discover.section-sources';
   static const _hiddenKey = 'yingji.discover.hidden-sections';
+  static const _defaultSeedAsset = 'assets/defaults/discover_first_run.json';
   static const _styleNames = ['沉浸海报', '剧照横幅', '动态排行', '平台入口'];
   static const _defaultSections = <String>[
     '今日热门电视剧',
     '热门国产电视剧',
-    '今日热门电影',
-    '热门番剧',
-    '热门国产动漫',
     '今日播出剧集',
     '本周播出剧集',
-    '院线热映',
-    '热门国产电影',
-    '热门综艺',
-    '热门韩剧',
     '热门日剧',
+    '热门韩剧',
     '热门台剧',
+    '热门综艺',
+    '热门国产综艺',
+    '热门番剧',
+    '热门国产动漫',
+    '今日热门电影',
+    '热门国产电影',
+    '院线热映',
     '高分剧集',
     '高分电影',
     '按分类',
@@ -1794,39 +1839,45 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   ];
   static const _defaultCardStyles = <String, int>{
     '按平台': 3,
+    '今日热门电视剧': 0,
     '热门国产电视剧': 0,
-    '热门番剧': 0,
+    '今日播出剧集': 2,
     '本周播出剧集': 0,
     '热门日剧': 1,
-    '按分类': 0,
+    '热门韩剧': 2,
+    '热门台剧': 0,
+    '热门综艺': 0,
+    '热门国产综艺': 0,
+    '热门番剧': 0,
+    '热门国产动漫': 2,
+    '今日热门电影': 2,
+    '热门国产电影': 0,
     '院线热映': 0,
+    '高分剧集': 2,
+    '高分电影': 0,
+    '按分类': 0,
   };
   static const _defaultSectionSources = <String, String>{
     '按平台': 'custom|tmdb|movie|all|trending|all|all|all|all|all|all|watch:8,watch:337,watch:350,watch:119|HK|all',
-    '热门国产电视剧':
-        'custom|tmdb|tv|all|popularity.desc|CN|all|all|all|all|all|all|HK|all',
+    '热门国产电视剧': 'custom|tmdb|tv|all|popularity.desc|CN|all|all|all|all|all|all|HK|recent90',
     '热门番剧': 'custom|tmdb|tv|animation|popularity.desc|all|all|all|all|all|all|all|HK|all',
     '本周播出剧集':
         'custom|tmdb|tv|all|on_the_air|all|all|all|all|all|all|all|HK|all',
-    '热门日剧':
-        'custom|tmdb|tv|all|popularity.desc|JP|all|all|all|all|all|all|HK|all',
+    '热门日剧': 'custom|tmdb|tv|all|popularity.desc|JP|all|all|all|all|all|all|HK|recent90',
+    '热门韩剧': 'custom|tmdb|tv|all|popularity.desc|KR|all|all|all|all|all|all|HK|recent90',
+    '热门台剧': 'custom|tmdb|tv|all|popularity.desc|TW|all|all|all|all|all|all|HK|recent90',
+    '热门综艺': 'custom|tmdb|tv|reality|popularity.desc|all|all|all|all|all|all|all|HK|all',
+    '热门国产综艺': 'custom|tmdb|tv|reality|popularity.desc|CN|all|all|all|all|all|all|CN|all',
     '今日热门电视剧': 'custom|tmdb|tv|all|trending|all|all|all|all|all|all|all|HK|all',
-    '今日热门电影':
-        'custom|tmdb|movie|all|trending|all|all|all|all|all|all|all|HK|all',
+    '今日热门电影': 'custom|tmdb|movie|all|trending|all|all|all|all|all|all|all|HK|recent90',
     '今日播出剧集':
         'custom|tmdb|tv|all|airing_today|all|all|all|all|all|all|all|HK|all',
-    '院线热映':
-        'custom|tmdb|movie|all|now_playing|CN|all|all|all|all|all|all|HK|all',
+    '院线热映': 'custom|tmdb|movie|all|now_playing|CN|all|all|all|all|all|all|HK|recent90',
     '高分电影':
         'custom|tmdb|movie|all|top_rated|all|all|all|all|all|all|all|HK|all',
     '高分剧集': 'custom|tmdb|tv|all|top_rated|all|all|all|all|all|all|all|HK|all',
-    '热门国产电影': 'custom|tmdb|movie|all|popularity.desc|CN|all|all|all|all|all|all|HK|all',
-    '热门综艺': 'custom|tmdb|tv|reality|popularity.desc|all|all|all|all|all|all|all|HK|all',
+    '热门国产电影': 'custom|tmdb|movie|all|popularity.desc|CN|all|all|all|all|all|all|HK|recent90',
     '热门国产动漫': 'custom|tmdb|tv|animation|popularity.desc|CN|all|all|all|all|all|all|HK|all',
-    '热门韩剧':
-        'custom|tmdb|tv|all|popularity.desc|KR|all|all|all|all|all|all|HK|all',
-    '热门台剧':
-        'custom|tmdb|tv|all|popularity.desc|TW|all|all|all|all|all|all|HK|all',
     '按分类':
         'custom|tmdb|tv|all|popularity.desc|all|all|all|all|all|all|all|HK|all',
   };
@@ -2153,9 +2204,12 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   Map<String, List<TmdbItem>> _visibleItems = const {};
   final Map<String, ValueNotifier<List<TmdbItem>>> _sectionRows = {};
   List<String> _sections = List.of(_defaultSections);
+  final Set<String> _seededSections = {};
+  Map<String, List<TmdbItem>> _firstRunSeed = const {};
 
   /// 元数据后台刷新后的重读消抖计时器。
   Timer? _revisionDebounce;
+  bool _metadataRefreshPending = false;
 
   @override
   void initState() {
@@ -2163,6 +2217,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _items = _trackItems(_initializeSections());
     // 后台把某批元数据刷新回来后重读一次缓存，把栏目内容换成新的。
     yingjiMetadataRevision.addListener(_handleMetadataRevision);
+    yingjiScrollInProgress.addListener(_flushMetadataAfterScroll);
   }
 
   @override
@@ -2178,8 +2233,18 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _revisionDebounce?.cancel();
     _revisionDebounce = Timer(const Duration(milliseconds: 800), () {
       if (!mounted) return;
+      if (yingjiScrollInProgress.value) {
+        _metadataRefreshPending = true;
+        return;
+      }
       unawaited(_refreshVisibleSections());
     });
+  }
+
+  void _flushMetadataAfterScroll() {
+    if (yingjiScrollInProgress.value || !_metadataRefreshPending) return;
+    _metadataRefreshPending = false;
+    _handleMetadataRevision();
   }
 
   Future<Map<String, List<TmdbItem>>> _trackItems(
@@ -2208,16 +2273,68 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ),
       );
 
+  String _snapshotKey(String section, SharedPreferences prefs) =>
+      DiscoverSnapshotCache.key(
+        section,
+        _sectionSources[section] ?? section,
+        prefs.getString(_discoverListFilterKey(section)) ?? '',
+      );
+
+  Future<Map<String, List<TmdbItem>>> _loadSessionSnapshots() async {
+    if (!Platform.isWindows) return const {};
+    final prefs = await SharedPreferences.getInstance();
+    final entries = await Future.wait(
+      _sections.where((section) => !_hiddenSections.contains(section)).map((
+        section,
+      ) async {
+        final rows = await DiscoverSnapshotCache.read(
+          _snapshotKey(section, prefs),
+        );
+        return MapEntry(section, rows);
+      }),
+    );
+    return {
+      for (final entry in entries)
+        if (entry.value != null && entry.value!.isNotEmpty)
+          entry.key: entry.value!,
+    };
+  }
+
+  Future<void> _saveSessionSnapshots(
+    Map<String, List<TmdbItem>> updates,
+  ) async {
+    if (!Platform.isWindows || updates.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await Future.wait(
+      updates.entries.where((entry) => entry.value.isNotEmpty).map((
+        entry,
+      ) async {
+        try {
+          await DiscoverSnapshotCache.write(
+            _snapshotKey(entry.key, prefs),
+            entry.value,
+          );
+        } catch (_) {
+          // 可再生快照的写入失败不得阻断正在浏览的页面。
+        }
+      }),
+    );
+  }
+
   void _publishSections(Map<String, List<TmdbItem>> updates) {
-    if (updates.isEmpty) return;
-    _visibleItems = {..._visibleItems, ...updates};
+    final changed = {
+      for (final entry in updates.entries)
+        if (!_sameItems(_visibleItems[entry.key], entry.value))
+          entry.key: entry.value,
+    };
+    if (changed.isEmpty) return;
+    _visibleItems = {..._visibleItems, ...changed};
     _items = Future.value(_visibleItems);
-    for (final entry in updates.entries) {
+    for (final entry in changed.entries) {
       final notifier = _rowsFor(entry.key);
-      if (!_sameItems(notifier.value, entry.value)) {
-        notifier.value = entry.value;
-      }
+      notifier.value = entry.value;
     }
+    unawaited(_saveSessionSnapshots(changed));
   }
 
   bool _sameItems(List<TmdbItem>? left, List<TmdbItem> right) {
@@ -2229,7 +2346,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           a.kind != b.kind ||
           a.title != b.title ||
           a.posterPath != b.posterPath ||
+          a.localPosterAsset != b.localPosterAsset ||
           a.backdropPath != b.backdropPath ||
+          a.year != b.year ||
           a.rating != b.rating) {
         return false;
       }
@@ -2249,13 +2368,25 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           .take(widget.sectionLimit ?? _sections.length)
           .toList(growable: false);
       for (final section in visible) {
-        final rows = await _loadSectionFor(section, 1);
+        late List<TmdbItem> rows;
+        try {
+          rows = await _loadSectionFor(section, 1);
+        } catch (_) {
+          continue; // Keep the bundled snapshot until a refresh succeeds.
+        }
         if (!mounted) return;
-        if (_sameItems(_visibleItems[section], rows)) continue;
-        updates[section] = rows;
-        YingjiImageWarmup.items(rows, maxItems: 6);
+        rows = retainBundledPosters(rows, _visibleItems[section] ?? const []);
+        _seededSections.remove(section);
+        if (!_sameItems(_visibleItems[section], rows)) {
+          updates[section] = rows;
+          YingjiImageWarmup.items(rows, maxItems: 6);
+        }
       }
       if (!mounted || updates.isEmpty) return;
+      if (yingjiScrollInProgress.value) {
+        _metadataRefreshPending = true;
+        return;
+      }
       // 一批后台响应只提交一次布局更新；逐栏 setState 会在滚动过程中制造连续
       // 几帧的 layout/paint 峰值。现在只通知实际变化的栏目，不再重建整页。
       _publishSections(updates);
@@ -2267,6 +2398,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   @override
   void dispose() {
     yingjiMetadataRevision.removeListener(_handleMetadataRevision);
+    yingjiScrollInProgress.removeListener(_flushMetadataAfterScroll);
     _revisionDebounce?.cancel();
     _tmdb.dispose();
     _trakt.dispose();
@@ -2288,7 +2420,21 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         if (mounted) widget.onLayoutRestored?.call();
       });
     }
-    return _loadSections(limit: widget.sectionLimit);
+    final snapshots = await _loadSessionSnapshots();
+    FrameTrace.mark('discover_snapshot_ready');
+    final bundled = Map<String, List<TmdbItem>>.fromEntries(
+      _sections
+          .where((section) => !_hiddenSections.contains(section))
+          .where(_firstRunSeed.containsKey)
+          .map((section) => MapEntry(section, _firstRunSeed[section]!)),
+    );
+    final initial = {...bundled, ...snapshots};
+    if (initial.isEmpty) return _loadSections(limit: widget.sectionLimit);
+    _seededSections.addAll(initial.keys);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_refreshVisibleSections());
+    });
+    return initial;
   }
 
   bool _extendingSections = false;
@@ -2303,21 +2449,37 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       final target = widget.sectionLimit;
       final wanted = (target == null ? _sections : _sections.take(target))
           .where((section) => !_hiddenSections.contains(section))
-          .where((section) => !current.containsKey(section))
+          .where(
+            (section) =>
+                !current.containsKey(section) ||
+                _seededSections.contains(section),
+          )
           .toList(growable: false);
       if (wanted.isEmpty) return;
+      final successful = <String>{};
       final entries = await Future.wait(
         wanted.map((section) async {
           try {
-            return MapEntry(section, await _loadSectionFor(section, 1));
+            final loaded = await _loadSectionFor(section, 1);
+            successful.add(section);
+            return MapEntry(
+              section,
+              retainBundledPosters(loaded, current[section] ?? const []),
+            );
           } catch (_) {
-            return MapEntry<String, List<TmdbItem>>(section, const []);
+            return MapEntry<String, List<TmdbItem>>(
+              section,
+              current[section] ?? const [],
+            );
           }
         }),
       );
       if (!mounted) return;
-      final updates = Map<String, List<TmdbItem>>.fromEntries(entries);
-      for (final rows in entries.map((entry) => entry.value)) {
+      _seededSections.removeAll(successful);
+      final updates = Map<String, List<TmdbItem>>.fromEntries(
+        entries.where((entry) => !_sameItems(current[entry.key], entry.value)),
+      );
+      for (final rows in updates.values) {
         YingjiImageWarmup.items(rows, maxItems: 8);
       }
       _publishSections(updates);
@@ -2337,6 +2499,38 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     } else {
       _cardStyles.addAll(_defaultCardStyles);
       _sectionSources.addAll(_defaultSectionSources);
+      try {
+        final bundled = jsonDecode(
+          await rootBundle.loadString(_defaultSeedAsset),
+        );
+        if (bundled is Map<String, dynamic>) {
+          final lists = bundled['lists'];
+          if (lists is Map<String, dynamic>) {
+            _firstRunSeed = {
+              for (final entry in lists.entries)
+                if (entry.value is List)
+                  entry.key: (entry.value as List)
+                      .whereType<Map<String, dynamic>>()
+                      .map(TmdbItem.fromJson)
+                      .take(discoverPreviewLimit)
+                      .toList(growable: false),
+            };
+          }
+        }
+        final filters = bundled is Map<String, dynamic>
+            ? bundled['filters']
+            : null;
+        if (filters is Map<String, dynamic>) {
+          for (final entry in filters.entries) {
+            final key = _discoverListFilterKey(entry.key);
+            if (prefs.getString(key) == null) {
+              await prefs.setString(key, jsonEncode(entry.value));
+            }
+          }
+        }
+      } catch (_) {
+        // A missing/invalid optional seed falls back to the normal live load.
+      }
     }
     final rawStyles = prefs.getString(_stylesKey);
     if (rawStyles != null) {
@@ -2384,6 +2578,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       (prefs.getStringList(_hiddenKey) ?? const []).where(_sections.contains),
     );
     _groupSectionsByVisibility();
+    FrameTrace.mark('discover_layout_ready');
   }
 
   Future<void> _persistLayout() async {
@@ -3206,12 +3401,17 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         }
       }),
     );
-    final charts = Map<String, List<TmdbItem>>.fromEntries(entries);
+    final charts = Map<String, List<TmdbItem>>.fromEntries(
+      entries.map(
+        (entry) => MapEntry(entry.key, discoverPreviewItems(entry.value)),
+      ),
+    );
     // 只预热一屏能看到的海报。把每栏 20 张一起解码会和纵向滚动争用 UI/GPU；
     // 后面的图片由横向列表真正滚到附近时按 CachedNetworkImage 的缓存自然加载。
     for (final rows in charts.values) {
       YingjiImageWarmup.items(rows, maxItems: 6);
     }
+    unawaited(_saveSessionSnapshots(charts));
     return charts;
   }
 
@@ -3583,8 +3783,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   Future<List<TmdbItem>> _loadTrakt(String source, int page) async {
     final parts = source.split('.');
     if (parts.length != 3) return const [];
-    final prefs = await SharedPreferences.getInstance();
-    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
+    final clientId = traktMovaClientId;
     final rows = await _trakt.discover(
       clientId: clientId,
       type: parts[1],
@@ -4650,29 +4849,30 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
   @override
   void initState() {
     super.initState();
-    _items = List.of(widget.items);
+    _items = discoverPreviewItems(widget.items).toList();
   }
 
   @override
   void didUpdateWidget(covariant _DiscoverBlock oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.items, widget.items)) {
-      _items = List.of(widget.items);
+      _items = discoverPreviewItems(widget.items).toList();
       _page = 1;
     }
   }
 
   Future<void> _moveNext() async {
     _shelf.move(560);
-    if (_loadingMore) return;
+    if (_loadingMore || _items.length >= discoverPreviewLimit) return;
     _loadingMore = true;
     try {
       final next = await widget.loadPage(_page + 1);
       if (!mounted || next.isEmpty) return;
       final ids = _items.map((item) => '${item.kind}:${item.id}').toSet();
+      final unique = next.where((item) => ids.add('${item.kind}:${item.id}'));
       setState(() {
         _page++;
-        _items.addAll(next.where((item) => ids.add('${item.kind}:${item.id}')));
+        _items.addAll(unique.take(discoverPreviewLimit - _items.length));
       });
     } finally {
       _loadingMore = false;
@@ -4685,7 +4885,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
       MaterialPageRoute(
         builder: (_) => _DiscoverListPage(
           title: widget.title,
-          items: _items,
+          items: discoverPreviewItems(_items),
           source: widget.source,
           loadSourcePage: widget.loadSourcePage,
         ),
@@ -4694,7 +4894,8 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
     final refreshed = await widget.loadPage(1);
     if (!mounted) return;
     setState(() {
-      _items = refreshed;
+      _items = discoverPreviewItems(retainBundledPosters(refreshed, _items))
+          .toList();
       _page = 1;
     });
   }
@@ -4922,6 +5123,8 @@ class _RankingPageState extends State<_RankingPage> {
   static const _labels = <String>['院线热映', '电影热度', '剧集热度', '高分电影'];
   late Future<Map<String, List<TmdbItem>>> _charts;
   String _active = _labels.first;
+  bool _refreshingCharts = true;
+  final Set<String> _snapshotLabels = {};
 
   @override
   void initState() {
@@ -4937,6 +5140,26 @@ class _RankingPageState extends State<_RankingPage> {
   }
 
   Future<Map<String, List<TmdbItem>>> _loadCharts() async {
+    _refreshingCharts = true;
+    final saved = await Future.wait(
+      _labels.map(
+        (label) => DiscoverSnapshotCache.read(
+          DiscoverSnapshotCache.key('ranking:$label', label, ''),
+        ),
+      ),
+    );
+    final charts = <String, List<TmdbItem>>{
+      for (var index = 0; index < _labels.length; index++)
+        if (saved[index] != null && saved[index]!.isNotEmpty)
+          _labels[index]: saved[index]!,
+    };
+    _snapshotLabels.addAll(charts.keys);
+    charts.putIfAbsent('院线热映', () => widget.initialItems);
+    unawaited(_refreshCharts());
+    return charts;
+  }
+
+  Future<void> _refreshCharts() async {
     final requests = <String, Future<List<TmdbItem>> Function()>{
       '院线热映': _tmdb.nowPlaying,
       '电影热度': _tmdb.popularMovies,
@@ -4952,15 +5175,53 @@ class _RankingPageState extends State<_RankingPage> {
         }
       }),
     );
-    final charts = Map<String, List<TmdbItem>>.fromEntries(resolved);
-    if (charts['院线热映']?.isEmpty ?? true) {
-      charts['院线热映'] = widget.initialItems;
+    if (!mounted) return;
+    final current = await _charts;
+    if (!mounted) return;
+    final updates = <String, List<TmdbItem>>{};
+    for (final entry in resolved) {
+      if (entry.value.isNotEmpty &&
+          !_sameRankingRows(current[entry.key], entry.value)) {
+        updates[entry.key] = entry.value;
+      }
     }
-    // 四个榜单的海报一起预热，切换榜单时不该再等图片。
-    for (final rows in charts.values) {
-      YingjiImageWarmup.items(rows);
+    for (final entry in resolved) {
+      if (entry.value.isEmpty ||
+          (_snapshotLabels.contains(entry.key) &&
+              !updates.containsKey(entry.key))) {
+        continue;
+      }
+      _snapshotLabels.add(entry.key);
+      unawaited(
+        DiscoverSnapshotCache.write(
+          DiscoverSnapshotCache.key('ranking:${entry.key}', entry.key, ''),
+          entry.value,
+        ).catchError((Object _) {}),
+      );
     }
-    return charts;
+    if (updates.isEmpty) {
+      setState(() => _refreshingCharts = false);
+      return;
+    }
+    setState(() {
+      _charts = Future.value({...current, ...updates});
+      _refreshingCharts = false;
+    });
+    YingjiImageWarmup.items(updates[_active] ?? const [], maxItems: 6);
+  }
+
+  bool _sameRankingRows(List<TmdbItem>? previous, List<TmdbItem> next) {
+    if (previous == null || previous.length != next.length) return false;
+    for (var index = 0; index < next.length; index++) {
+      if (previous[index].id != next[index].id ||
+          previous[index].title != next[index].title ||
+          previous[index].posterPath != next[index].posterPath ||
+          previous[index].rating != next[index].rating ||
+          previous[index].year != next[index].year) {
+        return false;
+      }
+    }
+    return true;
   }
 
   @override
@@ -4984,6 +5245,9 @@ class _RankingPageState extends State<_RankingPage> {
               Expanded(
                 child: FutureBuilder<Map<String, List<TmdbItem>>>(
                   future: _charts,
+                  initialData: widget.initialItems.isEmpty
+                      ? null
+                      : {'院线热映': widget.initialItems},
                   builder: (context, snapshot) {
                     if (snapshot.connectionState == ConnectionState.waiting &&
                         !snapshot.hasData) {
@@ -4993,6 +5257,9 @@ class _RankingPageState extends State<_RankingPage> {
                         snapshot.data ?? const <String, List<TmdbItem>>{};
                     final rows = charts[_active] ?? const <TmdbItem>[];
                     if (rows.isEmpty) {
+                      if (_refreshingCharts) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
                       return _LoadFailure(
                         onRetry: () => setState(() => _charts = _loadCharts()),
                         message: '榜单暂时无法加载，请稍后重试。',
@@ -5040,8 +5307,13 @@ class _RankingPageState extends State<_RankingPage> {
                                         _RankingFilter(
                                           label: label,
                                           selected: _active == label,
-                                          onTap: () =>
-                                              setState(() => _active = label),
+                                          onTap: () {
+                                            YingjiImageWarmup.items(
+                                              charts[label] ?? const [],
+                                              maxItems: 6,
+                                            );
+                                            setState(() => _active = label);
+                                          },
                                         ),
                                     ],
                                   ),
@@ -5109,6 +5381,32 @@ class _RankingPageState extends State<_RankingPage> {
 }
 
 const _discoverListFilterKeyPrefix = 'yingji.discover.all-list.filters.';
+const discoverPreviewLimit = 20;
+
+@visibleForTesting
+List<TmdbItem> discoverPreviewItems(Iterable<TmdbItem> items) =>
+    items.take(discoverPreviewLimit).toList(growable: false);
+
+@visibleForTesting
+List<TmdbItem> retainBundledPosters(
+  List<TmdbItem> refreshed,
+  List<TmdbItem> bundled,
+) {
+  final posterAssets = {
+    for (final item in bundled)
+      if (item.localPosterAsset != null)
+        '${item.kind}:${item.id}': item.localPosterAsset!,
+  };
+  return [
+    for (final item in refreshed)
+      posterAssets['${item.kind}:${item.id}'] == null
+          ? item
+          : TmdbItem.fromJson({
+              ...item.toJson(),
+              'localPosterAsset': posterAssets['${item.kind}:${item.id}'],
+            }),
+  ];
+}
 
 String _discoverListFilterKey(String title) =>
     '$_discoverListFilterKeyPrefix${base64Url.encode(utf8.encode(title))}';
@@ -5682,6 +5980,7 @@ class _RankingPosterCard extends StatelessWidget {
                         )
                       : _PosterImage(
                           imageUrl: item.posterUrl.toString(),
+                          assetPath: item.localPosterAsset,
                           // 发现列表网格卡显示宽 ~224，按物理像素解码即可，不必用原图。
                           memCacheWidth:
                               (320 * MediaQuery.devicePixelRatioOf(context))
@@ -6121,8 +6420,10 @@ String _titleKey(String value) =>
 
 Future<void> _openServerSearchDetail(
   BuildContext context,
-  MediaItem media,
-) async {
+  MediaItem media, {
+  int? initialSeasonNumber,
+  int? initialEpisodeNumber,
+}) async {
   final providerId = media.providerIds.entries
       .where((entry) => entry.key.toLowerCase() == 'tmdb')
       .map((entry) => int.tryParse(entry.value))
@@ -6184,6 +6485,8 @@ Future<void> _openServerSearchDetail(
           context,
           item: TmdbItem(id: 0, title: title, kind: isSeries ? '剧集' : '电影'),
           media: media,
+          initialSeasonNumber: initialSeasonNumber,
+          initialEpisodeNumber: initialEpisodeNumber,
         );
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -6192,7 +6495,12 @@ Future<void> _openServerSearchDetail(
       }
       return;
     }
-    await MetadataDetailPage.open(context, item: match);
+    await MetadataDetailPage.open(
+      context,
+      item: match,
+      initialSeasonNumber: initialSeasonNumber,
+      initialEpisodeNumber: initialEpisodeNumber,
+    );
   } finally {
     tmdb.dispose();
   }
@@ -6275,6 +6583,7 @@ class _SourceHubState extends State<_SourceHub>
     initSectionTopListener();
     _load();
     unawaited(_loadHistoryPreference());
+    unawaited(TraktCredentials.read());
   }
 
   /// 观看记录是否只保存在本机。这个开关放在服务器页而不是设置页，因为它
@@ -6286,6 +6595,38 @@ class _SourceHubState extends State<_SourceHub>
     if (!mounted) return;
     setState(() => _historyLocalOnly = value);
   }
+
+  Future<void> _toggleHistorySync() async {
+    final localOnly = !_historyLocalOnly;
+    setState(() => _historyLocalOnly = localOnly);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(WatchStateStore.localOnlyKey, localOnly);
+  }
+
+  Future<void> _showTraktConnection() => showDialog<void>(
+    context: context,
+    builder: (dialogContext) => YingjiPinnedDialog(
+      maxWidth: 480,
+      header: Row(
+        children: [
+          const Expanded(
+            child: Text(
+              'Trakt 连接',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+          ),
+          YingjiMotionIconButton(
+            icon: YingjiIcons.xmark,
+            tooltip: '关闭',
+            onPressed: () => Navigator.pop(dialogContext),
+          ),
+        ],
+      ),
+      body: TraktConnectionPanel(
+        onChanged: () => _syncTraktWatchlistAfterConnection(dialogContext),
+      ),
+    ),
+  );
 
   @override
   void dispose() {
@@ -6731,55 +7072,119 @@ class _SourceHubState extends State<_SourceHub>
       physics: yingjiWheelPhysics,
       padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
       children: [
-        Row(
-          children: [
-            const Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '服务器',
-                    style: TextStyle(
-                      fontSize: 48,
-                      height: 1,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -1.2,
-                    ),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            const title = Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '服务器',
+                  style: TextStyle(
+                    fontSize: 48,
+                    height: 1,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -1.2,
                   ),
-                  SizedBox(height: 8),
-                  Text(
-                    '连接、验证并管理聚合到 Mova 的媒体来源。',
-                    style: TextStyle(color: Color(0xFFABB1BE)),
-                  ),
-                ],
-              ),
-            ),
-            if (_refreshing)
-              const Padding(
-                padding: EdgeInsets.all(11),
-                child: SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2.4),
                 ),
-              )
-            else
-              YingjiMotionIconButton(
-                onPressed: () => unawaited(_refresh(manual: true)),
-                icon: YingjiIcons.refresh,
-                tooltip: '检查服务器连接',
-                size: 46,
-              ),
-            const SizedBox(width: 10),
-            YingjiMotionIconButton(
-              onPressed: _add,
-              icon: YingjiIcons.plus,
-              tooltip: '添加来源',
-              size: 46,
-            ),
-          ],
+                SizedBox(height: 8),
+                Text(
+                  '连接、验证并管理聚合到 Mova 的媒体来源。',
+                  style: TextStyle(color: Color(0xFFABB1BE)),
+                ),
+              ],
+            );
+            final actions = Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                YingjiMotionIconButton(
+                  onPressed: _toggleHistorySync,
+                  icon: YingjiIcons.cloud_fill,
+                  tooltip: _historyLocalOnly ? '开启观看记录同步' : '关闭观看记录同步',
+                  selected: !_historyLocalOnly,
+                  size: 42,
+                ),
+                const SizedBox(width: 7),
+                ValueListenableBuilder<bool?>(
+                  valueListenable: TraktConnectionStatus.connected,
+                  builder: (context, connected, _) => YingjiMotionIconButton(
+                    onPressed: _showTraktConnection,
+                    icon: YingjiIcons.link,
+                    tooltip: connected == true ? '管理 Trakt 连接' : '连接 Trakt',
+                    selected: connected == true,
+                    size: 42,
+                  ),
+                ),
+                const SizedBox(width: 7),
+                if (_refreshing)
+                  const SizedBox(
+                    width: 42,
+                    height: 42,
+                    child: Padding(
+                      padding: EdgeInsets.all(10),
+                      child: CircularProgressIndicator(strokeWidth: 2.2),
+                    ),
+                  )
+                else
+                  YingjiMotionIconButton(
+                    onPressed: () => unawaited(_refresh(manual: true)),
+                    icon: YingjiIcons.refresh,
+                    tooltip: '检查服务器连接',
+                    size: 42,
+                  ),
+                const SizedBox(width: 7),
+                YingjiMotionIconButton(
+                  onPressed: _add,
+                  icon: YingjiIcons.plus,
+                  tooltip: '添加来源',
+                  size: 42,
+                ),
+              ],
+            );
+            if (constraints.maxWidth < 620) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  title,
+                  const SizedBox(height: 12),
+                  Align(alignment: Alignment.centerRight, child: actions),
+                ],
+              );
+            }
+            return Row(
+              children: [
+                const Expanded(child: title),
+                const SizedBox(width: 12),
+                actions,
+              ],
+            );
+          },
         ),
-        const SizedBox(height: 30),
+        const SizedBox(height: 16),
+        _FrostSurface(
+          borderRadius: 16,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: const Row(
+            children: [
+              Icon(
+                YingjiIcons.info_circle,
+                size: 18,
+                color: YingjiColors.muted,
+              ),
+              SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  '观看记录始终保存在本机。右上角云朵按钮控制服务器记录同步；Trakt 按钮用于授权或断开连接。',
+                  style: TextStyle(
+                    color: YingjiColors.muted,
+                    fontSize: 12,
+                    height: 1.45,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
         if (!_ready)
           const Center(
             child: Padding(
@@ -6823,45 +7228,6 @@ class _SourceHubState extends State<_SourceHub>
                       _switchEndpoint(source, endpoint),
                 ),
               ),
-            ),
-          ),
-          const SizedBox(height: 26),
-          _FrostSurface(
-            borderRadius: 22,
-            padding: const EdgeInsets.fromLTRB(18, 15, 14, 15),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        '同步观看记录到服务器',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _historyLocalOnly
-                            ? '本机仍会保存观看记录；当前不向媒体服务器或 Trakt 回传。'
-                            : '本机始终保存；同时读取服务器继续播放记录，并在播放时回传进度。',
-                        style: const TextStyle(
-                          color: YingjiColors.muted,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 18),
-                Switch.adaptive(
-                  value: !_historyLocalOnly,
-                  onChanged: (value) async {
-                    setState(() => _historyLocalOnly = !value);
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.setBool(WatchStateStore.localOnlyKey, !value);
-                  },
-                ),
-              ],
             ),
           ),
         ],
@@ -6920,7 +7286,10 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
       _kind = existing.kind;
       _scheme = existing.endpoint.scheme == 'http' ? 'http' : 'https';
       _name.text = existing.name;
-      _url.text = existing.endpoint.toString();
+      _url.text = existing.endpoint.toString().replaceFirst(
+        RegExp(r'^https?://', caseSensitive: false),
+        '',
+      );
       _alternateUrlControllers.addAll(
         existing.alternateEndpoints.map(
           (value) => TextEditingController(text: value.toString()),
@@ -6930,38 +7299,20 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
     }
   }
 
-  List<Uri> _parsedEndpoints() {
-    final raw = [
-      _url.text,
-      ..._alternateUrlControllers.map((row) => row.text),
-    ].join('\n');
-    final matches = RegExp(r'https?://[^\s,;]+', caseSensitive: false)
-        .allMatches(raw)
-        .map((match) => Uri.tryParse(match.group(0)!))
-        .whereType<Uri>();
-    final values = <Uri>[];
-    for (final value in matches) {
-      if (value.host.isEmpty || !['http', 'https'].contains(value.scheme)) {
-        continue;
-      }
-      final normalized = value.toString().endsWith('/')
-          ? value
-          : value.replace(path: '${value.path}/');
-      if (!values.contains(normalized)) values.add(normalized);
-    }
-    if (values.isEmpty && _url.text.trim().isNotEmpty) {
-      final value = Uri.tryParse('$_scheme://${_url.text.trim()}');
-      if (value != null && value.host.isNotEmpty) values.add(value);
-    }
-    return values;
-  }
+  List<Uri> _parsedEndpoints() => parseSourceEndpoints([
+    _url.text,
+    ..._alternateUrlControllers.map((row) => row.text),
+  ], _scheme);
 
   void _selectScheme(String scheme) {
     final value = Uri.tryParse(_url.text.trim());
     setState(() {
       _scheme = scheme;
       if (value != null && value.host.isNotEmpty) {
-        _url.text = value.replace(scheme: scheme).toString();
+        _url.text = value
+            .replace(scheme: scheme)
+            .toString()
+            .replaceFirst(RegExp(r'^https?://', caseSensitive: false), '');
       }
     });
   }
@@ -6974,6 +7325,46 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
         .substring(0, match.group(0)!.length - 3)
         .toLowerCase();
     if (_scheme != scheme) setState(() => _scheme = scheme);
+  }
+
+  Widget _endpointInput(double width) {
+    final protocol = YingjiGlassSurface(
+      radius: 14,
+      padding: const EdgeInsets.all(4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final scheme in const ['https', 'http'])
+            _SourceProtocolChoice(
+              scheme: scheme,
+              selected: _scheme == scheme,
+              onTap: _saving ? null : () => _selectScheme(scheme),
+            ),
+        ],
+      ),
+    );
+    final address = TextField(
+      controller: _url,
+      keyboardType: TextInputType.url,
+      onChanged: _detectScheme,
+      decoration: const InputDecoration(
+        labelText: '服务器地址',
+        hintText: '192.168.1.124:11566/',
+        prefixIcon: Icon(YingjiIcons.link),
+      ),
+    );
+    return width < 480
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [protocol, const SizedBox(height: 10), address],
+          )
+        : Row(
+            children: [
+              protocol,
+              const SizedBox(width: 10),
+              Expanded(child: address),
+            ],
+          );
   }
 
   @override
@@ -6992,7 +7383,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
   Future<void> _submit() async {
     final candidates = _parsedEndpoints();
     if (candidates.isEmpty) {
-      setState(() => _error = '请输入完整的 http:// 或 https:// 服务器地址');
+      setState(() => _error = '请输入服务器地址，例如 192.168.1.10:8096');
       return;
     }
     final endpoint = candidates.firstWhere(
@@ -7271,35 +7662,14 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
           style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
         ),
         const SizedBox(height: 10),
-        TextField(
-          controller: _url,
-          keyboardType: TextInputType.url,
-          onChanged: _detectScheme,
-          decoration: const InputDecoration(
-            labelText: '服务器线路',
-            hintText: 'https://server.example.com/（可直接粘贴多条）',
-            prefixIcon: Icon(YingjiIcons.link),
-          ),
+        LayoutBuilder(
+          builder: (context, constraints) =>
+              _endpointInput(constraints.maxWidth),
         ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            for (final scheme in const ['https', 'http']) ...[
-              ChoiceChip(
-                label: Text(scheme.toUpperCase()),
-                selected: _scheme == scheme,
-                onSelected: _saving ? null : (_) => _selectScheme(scheme),
-              ),
-              if (scheme == 'https') const SizedBox(width: 8),
-            ],
-            const SizedBox(width: 12),
-            const Expanded(
-              child: Text(
-                '优先使用选中协议；其他粘贴的地址会自动保存为可切换线路。',
-                style: TextStyle(color: YingjiColors.muted, fontSize: 11),
-              ),
-            ),
-          ],
+        const SizedBox(height: 7),
+        const Text(
+          '选好协议后直接输入 IP 或域名，无需输入 http://；粘贴完整地址也可以。',
+          style: TextStyle(color: YingjiColors.muted, fontSize: 11),
         ),
         for (
           var index = 0;
@@ -7313,10 +7683,9 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
                 child: TextField(
                   controller: _alternateUrlControllers[index],
                   keyboardType: TextInputType.url,
-                  onChanged: _detectScheme,
                   decoration: InputDecoration(
                     labelText: '线路 ${index + 2}',
-                    hintText: 'https://mirror.example.com/',
+                    hintText: '备用 IP:端口，或完整 http(s) 地址',
                     prefixIcon: const Icon(YingjiIcons.link),
                   ),
                 ),
@@ -7347,7 +7716,7 @@ class _AddSourceDialogState extends State<_AddSourceDialog> {
         ),
         const SizedBox(height: 4),
         const Text(
-          '每个输入框保存一条线路；验证后也会加入服务器发布的线路。',
+          '备用线路不带前缀时使用上方所选协议；完整地址保留自己的协议。',
           style: TextStyle(color: YingjiColors.muted, fontSize: 11),
         ),
         const SizedBox(height: 12),
@@ -7460,6 +7829,63 @@ class _SourceKindChoice extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    ),
+  );
+}
+
+class _SourceProtocolChoice extends StatelessWidget {
+  const _SourceProtocolChoice({
+    required this.scheme,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String scheme;
+  final bool selected;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) => Material(
+    color: Colors.transparent,
+    child: InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        width: 76,
+        height: 46,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          gradient: selected
+              ? const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFFFFFFFF), Color(0xFFE5E7EC)],
+                )
+              : null,
+          border: Border.all(
+            color: selected ? Colors.white : Colors.transparent,
+          ),
+          boxShadow: selected
+              ? const [
+                  BoxShadow(
+                    color: Color(0x44000000),
+                    blurRadius: 10,
+                    offset: Offset(0, 3),
+                  ),
+                ]
+              : null,
+        ),
+        child: Text(
+          scheme.toUpperCase(),
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w800,
+            color: selected ? const Color(0xFF171B22) : YingjiColors.muted,
+          ),
+        ),
       ),
     ),
   );
@@ -7730,15 +8156,25 @@ class _CalendarPageState extends State<_CalendarPage>
   final _trakt = TraktClient();
   final _tmdb = TmdbClient();
   List<TraktEvent> _events = const [];
+  Map<int, TraktShowProgress> _traktProgressByShow = const {};
+  Map<int, int> _localWatchedByShow = const {};
   Map<String, String> _trackingStatus = const {};
 
   /// 待看列表，与详情页 / 片单页共用 yingji.watchlist。日历上的「待看」
   /// 直接读它，不再自己另存一份状态，两边才不会各说各话。
   List<TmdbItem> _watchlist = const [];
   String? _traktMessage;
+  bool _calendarLoading = true;
+  int _calendarGeneration = 0;
   DateTime _selectedDate = DateTime.now();
   final ScrollController _calendarRail = ScrollController();
   final ScrollController _pageScroll = ScrollController();
+
+  /// 日历右上角 Trakt 入口的状态：连接与否决定按钮是「连接」还是「已连接」，
+  /// 授权中则换成转圈，避免一次点出两个授权对话框（两个设备码互不相同）。
+  bool _traktConnected = false;
+  bool _traktAuthorizing = false;
+  bool _calendarLoadedOnce = false;
 
   @override
   ScrollController get sectionTopController => _pageScroll;
@@ -7762,44 +8198,118 @@ class _CalendarPageState extends State<_CalendarPage>
   void initState() {
     super.initState();
     initSectionTopListener();
+    TraktConnectionStatus.connected.addListener(_syncTraktConnection);
     _load();
   }
 
+  void _syncTraktConnection() {
+    final connected = TraktConnectionStatus.connected.value ?? false;
+    if (!mounted || connected == _traktConnected) return;
+    setState(() {
+      _traktConnected = connected;
+      _traktMessage = connected ? 'Trakt 已连接' : '已断开 Trakt 连接。';
+    });
+    if (_calendarLoadedOnce) unawaited(_load());
+  }
+
   Future<void> _load() async {
+    final generation = ++_calendarGeneration;
+    if (mounted) {
+      setState(() {
+        _calendarLoading = true;
+        _traktMessage = null;
+      });
+    }
+    try {
+      await _loadCalendarData(generation);
+    } catch (error) {
+      if (!mounted || generation != _calendarGeneration) return;
+      setState(() {
+        _calendarLoading = false;
+        _traktMessage =
+            '日历读取失败：${error.toString().replaceFirst('Exception: ', '')}';
+      });
+    }
+  }
+
+  Future<void> _loadCalendarData(int generation) async {
     final watchlist = await WatchlistStore.create();
     final watchStates = await WatchStateStore.create();
+    final watchStateRows = watchStates.load();
+    final watchedEpisodesByShow = <int, Set<String>>{};
+    for (final state in watchStateRows) {
+      final id = state.tmdbId ?? 0;
+      final season = state.seasonNumber;
+      final episode = state.episodeNumber;
+      if (id <= 0 || season == null || episode == null || !state.isCompleted) {
+        continue;
+      }
+      watchedEpisodesByShow
+          .putIfAbsent(id, () => <String>{})
+          .add('$season:$episode');
+    }
+    final localWatchedByShow = {
+      for (final entry in watchedEpisodesByShow.entries)
+        entry.key: entry.value.length,
+    };
     final prefs = await SharedPreferences.getInstance();
-    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
-    final token = prefs.getString('yingji.trakt.access-token') ?? '';
+    var credentials = await TraktCredentials.read();
+    try {
+      credentials = await credentials.refreshIfNeeded();
+    } catch (_) {
+      // The current token may remain valid; let the calendar request decide.
+    }
+    final clientId = credentials.clientId;
+    final token = credentials.accessToken;
     final statusJson = prefs.getString('yingji.tracking.status');
-    final cached = _readCachedEvents(prefs);
+    final connected = clientId.isNotEmpty && token.isNotEmpty;
+    final localCached = _readCachedEvents(
+      prefs,
+      key: 'yingji.tracking.calendar-cache',
+    );
+    final traktCached = connected
+        ? _readCachedEvents(prefs, key: 'yingji.tracking.calendar-trakt-cache')
+        : const <TraktEvent>[];
+    final cachedShowIds = watchlist
+        .load()
+        .where((item) => item.kind == '剧集' && item.id > 0)
+        .map((item) => item.id)
+        .toSet();
+    final cachedAll = filterCalendarEventsByShowIds(
+      _readCachedEvents(prefs, key: 'yingji.tracking.calendar-trakt-all-cache'),
+      cachedShowIds,
+    );
+    final cached = mergeCalendarEvents([
+      ...localCached,
+      ...cachedAll,
+      ...traktCached,
+    ]);
     if (mounted) {
       setState(() {
         _events = cached;
+        _localWatchedByShow = localWatchedByShow;
         _trackingStatus = _readTrackingStatus(statusJson);
         _watchlist = watchlist.load();
-        _traktMessage = clientId.isEmpty || token.isEmpty
-            ? '未连接 Trakt；已展示本地待看的更新信息。'
+        _traktConnected = connected;
+        _traktMessage = !connected
+            ? '未连接个人日历；播出安排仍按 Mova 待看筛选 Trakt 全站日历。'
             : null;
       });
+      _calendarLoadedOnce = true;
     }
 
-    List<TraktEvent> traktEvents = const [];
     String? message;
-    if (clientId.isNotEmpty && token.isNotEmpty) {
+    if (connected) {
       try {
-        traktEvents = await _trakt.calendar(
-          clientId: clientId,
-          accessToken: token,
-        );
+        await synchronizeTraktWatchlist(watchlist, client: _trakt);
       } catch (error) {
-        message = error.toString().replaceFirst('Exception: ', '');
+        message =
+            'Trakt 待看同步失败：${error.toString().replaceFirst('Exception: ', '')}';
       }
-    } else {
-      message = '未连接 Trakt；可在设置中连接以同步观看记录。';
     }
+
     final tracked = <int, TmdbItem>{
-      for (final state in watchStates.load())
+      for (final state in watchStateRows)
         if ((state.tmdbId ?? 0) > 0 && state.seasonNumber != null)
           state.tmdbId!: TmdbItem(
             id: state.tmdbId!,
@@ -7811,14 +8321,74 @@ class _CalendarPageState extends State<_CalendarPage>
       for (final item in watchlist.load())
         if (item.kind == '剧集' && item.id > 0) item.id: item,
     };
-    final localEvents = await _localWatchlistEvents(tracked.values.toList());
-    final events = _mergeEvents([...traktEvents, ...localEvents]);
+    final watchlistShowIds = watchlist
+        .load()
+        .where((item) => item.kind == '剧集' && item.id > 0)
+        .map((item) => item.id)
+        .toSet();
+    final localEventsFuture = _localWatchlistEvents(tracked.values.toList());
+    final allCalendarFuture = watchlistShowIds.isEmpty
+        ? Future.value(const <TraktEvent>[])
+        : _trakt.allShowsCalendar(clientId: clientId);
+    final personalCalendarFuture = connected
+        ? _trakt.calendar(clientId: clientId, accessToken: token)
+        : Future.value(const <TraktEvent>[]);
+    var allCalendarEvents = filterCalendarEventsByShowIds(
+      _readCachedEvents(prefs, key: 'yingji.tracking.calendar-trakt-all-cache'),
+      watchlistShowIds,
+    );
+    if (watchlistShowIds.isNotEmpty) {
+      try {
+        allCalendarEvents = filterCalendarEventsByShowIds(
+          await allCalendarFuture,
+          watchlistShowIds,
+        );
+        await prefs.setString(
+          'yingji.tracking.calendar-trakt-all-cache',
+          jsonEncode(allCalendarEvents.map((event) => event.toJson()).toList()),
+        );
+      } catch (error) {
+        message =
+            'Trakt 全站日历读取失败：${error.toString().replaceFirst('Exception: ', '')}';
+      }
+    }
+    // Mova's watchlist is independent of Trakt. Always resolve its upcoming
+    // episodes locally. Trakt's all-shows calendar is filtered by the local
+    // watchlist, while the user's personal calendar is an additional source.
+    List<TraktEvent> traktEvents = const [];
+    var traktCalendarSucceeded = false;
+    if (connected) {
+      try {
+        traktEvents = await personalCalendarFuture;
+        traktCalendarSucceeded = true;
+      } catch (error) {
+        message ??= error.toString().replaceFirst('Exception: ', '');
+      }
+    } else {
+      message ??= '未连接个人日历；连接后会加入 Trakt 个人日历与待看同步。';
+    }
+    List<TraktEvent> personalEvents = traktCached;
+    if (connected) {
+      if (traktCalendarSucceeded) {
+        personalEvents = traktEvents;
+        await prefs.setString(
+          'yingji.tracking.calendar-trakt-cache',
+          jsonEncode(traktEvents.map((event) => event.toJson()).toList()),
+        );
+      }
+    }
+    final localEvents = await localEventsFuture;
     await prefs.setString(
       'yingji.tracking.calendar-cache',
-      jsonEncode(events.map((event) => event.toJson()).toList()),
+      jsonEncode(localEvents.map((event) => event.toJson()).toList()),
     );
-    if (mounted) {
-      final visibleEvents = events.isEmpty ? cached : events;
+    final events = mergeCalendarEvents([
+      ...localEvents,
+      ...allCalendarEvents,
+      ...personalEvents,
+    ]);
+    if (mounted && generation == _calendarGeneration) {
+      final visibleEvents = events;
       // 缓存里留着全部事件（含已弃剧的），只是不显示 —— 取消弃剧立刻回来。
       final status = _readTrackingStatus(statusJson);
       final shownEvents = visibleEvents
@@ -7835,14 +8405,150 @@ class _CalendarPageState extends State<_CalendarPage>
           shownEvents.firstOrNull?.airDate.toLocal();
       setState(() {
         _events = visibleEvents;
+        _localWatchedByShow = localWatchedByShow;
+        _traktProgressByShow = const {};
         _trackingStatus = status;
         _watchlist = watchlist.load();
-        _traktMessage = message;
+        _traktMessage =
+            message ??
+            (connected && traktCalendarSucceeded && visibleEvents.isEmpty
+                ? 'Trakt 全站日历、个人日历与 Mova 备用播出源目前都没有安排。'
+                : null);
+        _calendarLoading = false;
         if (!selectedHasEvent && preferredDate != null) {
           _selectedDate = preferredDate;
         }
       });
+      if (connected) {
+        unawaited(_loadCalendarProgress(events, clientId, token, generation));
+      }
     }
+  }
+
+  Future<void> _loadCalendarProgress(
+    List<TraktEvent> events,
+    String clientId,
+    String token,
+    int generation,
+  ) async {
+    final ids = events
+        .map((event) => event.traktId)
+        .whereType<int>()
+        .where((id) => id > 0)
+        .toSet()
+        .toList(growable: false);
+    for (var start = 0; start < ids.length; start += 4) {
+      final end = (start + 4).clamp(0, ids.length);
+      final results = await Future.wait(
+        ids.sublist(start, end).map((id) async {
+          try {
+            final progress = await _trakt.showWatchedProgress(
+              clientId: clientId,
+              accessToken: token,
+              traktId: id,
+            );
+            return progress == null ? null : MapEntry(id, progress);
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      if (!mounted || generation != _calendarGeneration) return;
+      final updates = Map<int, TraktShowProgress>.from(_traktProgressByShow);
+      for (final result
+          in results.whereType<MapEntry<int, TraktShowProgress>>()) {
+        updates[result.key] = result.value;
+      }
+      if (updates.length != _traktProgressByShow.length) {
+        setState(() => _traktProgressByShow = updates);
+      }
+    }
+  }
+
+  /// 日历右上角的 Trakt 入口。
+  ///
+  /// 未连接时走设备授权：浏览器里登录 → 令牌写回 prefs → 直接刷新日历，用户
+  /// 不用再回设置页点一次刷新。已连接时改成账户对话框，免得把「重新授权」和
+  /// 「连一次」混成同一个动作。
+  Future<void> _connectTrakt() async {
+    if (_traktAuthorizing) return;
+    final credentials = await TraktCredentials.read();
+    if (!mounted) return;
+    setState(() => _traktAuthorizing = true);
+    try {
+      final token = await showDialog<TraktOAuthToken>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => TraktAuthDialog(clientId: credentials.clientId),
+      );
+      if (token == null || token.accessToken.isEmpty) return;
+      await credentials.saveTokenPair(token);
+      if (!mounted) return;
+      setState(() {
+        _traktConnected = true;
+        _traktMessage = 'Trakt 已连接';
+      });
+      await _load();
+    } finally {
+      if (mounted) setState(() => _traktAuthorizing = false);
+    }
+  }
+
+  Future<void> _showTraktAccount() => showDialog<void>(
+    context: context,
+    builder: (dialogContext) => YingjiPinnedDialog(
+      maxWidth: 470,
+      header: Row(
+        children: [
+          const Expanded(
+            child: Text(
+              'Trakt',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+          ),
+          YingjiMotionIconButton(
+            icon: YingjiIcons.xmark,
+            tooltip: '关闭',
+            onPressed: () => Navigator.pop(dialogContext),
+          ),
+        ],
+      ),
+      body: const Text(
+        '已连接。日历会按 Trakt 的观看记录与播出安排同步。',
+        style: TextStyle(color: Color(0xFFABB1BE), height: 1.6),
+      ),
+      actions: Row(
+        children: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              unawaited(_disconnectTrakt());
+            },
+            child: const Text('断开连接'),
+          ),
+          const Spacer(),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              unawaited(_connectTrakt());
+            },
+            child: const Text('重新授权'),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  /// 只清访问令牌：Client ID / Secret 是应用登记信息，留着下次一键重连。
+  Future<void> _disconnectTrakt() async {
+    final credentials = await TraktCredentials.read();
+    await credentials.saveAccessToken('');
+    if (!mounted) return;
+    setState(() {
+      _traktConnected = false;
+      _traktMessage = '已断开 Trakt 连接。';
+    });
+    await _load();
   }
 
   Map<String, String> _readTrackingStatus(String? value) {
@@ -7856,14 +8562,19 @@ class _CalendarPageState extends State<_CalendarPage>
     }
   }
 
-  List<TraktEvent> _readCachedEvents(SharedPreferences prefs) {
-    final raw = prefs.getString('yingji.tracking.calendar-cache');
+  List<TraktEvent> _readCachedEvents(
+    SharedPreferences prefs, {
+    String key = 'yingji.tracking.calendar-cache',
+  }) {
+    final raw = prefs.getString(key);
     if (raw == null || raw.isEmpty) return const [];
     try {
-      return (jsonDecode(raw) as List<dynamic>)
-          .whereType<Map<String, dynamic>>()
-          .map(TraktEvent.fromJson)
-          .toList(growable: false);
+      return mergeCalendarEvents(
+        (jsonDecode(raw) as List<dynamic>)
+            .whereType<Map<String, dynamic>>()
+            .map(TraktEvent.fromJson)
+            .toList(growable: false),
+      );
     } catch (_) {
       return const [];
     }
@@ -7888,12 +8599,17 @@ class _CalendarPageState extends State<_CalendarPage>
                     tmdbId: item.id,
                     seasonNumber: next.seasonNumber,
                     episodeNumber: next.episodeNumber,
-                    title: item.title,
+                    title: next.showTitle?.trim().isNotEmpty == true
+                        ? next.showTitle!
+                        : item.title,
                     episode:
                         '第 ${next.seasonNumber} 季 · 第 ${next.episodeNumber} 集 · ${next.title}',
                     airDate: next.airDate,
                     posterUrl: item.posterUrl ?? next.stillUrl,
+                    backdropUrl: item.backdropUrl,
                     platform: next.network,
+                    platformLogoUrl: next.networkLogoUrl,
+                    totalEpisodes: next.totalEpisodes,
                     timeKnown: next.timeKnown,
                   ),
                 )
@@ -7906,39 +8622,6 @@ class _CalendarPageState extends State<_CalendarPage>
       );
       result.addAll(rows.expand((row) => row));
     }
-    return result;
-  }
-
-  List<TraktEvent> _mergeEvents(List<TraktEvent> rows) {
-    final distinct = <String, TraktEvent>{};
-    for (final event in rows) {
-      final local = event.airDate.toLocal();
-      final key =
-          event.tmdbId != null &&
-              event.seasonNumber != null &&
-              event.episodeNumber != null
-          ? '${event.tmdbId}:${event.seasonNumber}:${event.episodeNumber}'
-          : '${event.title}|${event.episode}|${local.year}-${local.month}-${local.day}';
-      final previous = distinct[key];
-      if (previous == null) {
-        distinct[key] = event;
-      } else {
-        final precise = previous.timeKnown ? previous : event;
-        distinct[key] = TraktEvent(
-          title: event.title,
-          episode: event.episode,
-          airDate: precise.airDate,
-          timeKnown: precise.timeKnown,
-          posterUrl: event.posterUrl ?? previous.posterUrl,
-          platform: precise.platform ?? previous.platform ?? event.platform,
-          tmdbId: event.tmdbId,
-          seasonNumber: event.seasonNumber,
-          episodeNumber: event.episodeNumber,
-        );
-      }
-    }
-    final result = distinct.values.toList()
-      ..sort((a, b) => a.airDate.compareTo(b.airDate));
     return result;
   }
 
@@ -7997,7 +8680,10 @@ class _CalendarPageState extends State<_CalendarPage>
       await store.add(item);
     }
     final rows = store.load();
-    if (mounted) setState(() => _watchlist = rows);
+    if (mounted) {
+      setState(() => _watchlist = rows);
+      unawaited(_load());
+    }
   }
 
   /// 把日历条目转成待看列表里的条目。Trakt 来的事件通常自带 TMDB 编号，
@@ -8034,49 +8720,48 @@ class _CalendarPageState extends State<_CalendarPage>
     return path.isEmpty ? null : path;
   }
 
-  /// 弃剧后卡片会从日历里消失，恢复入口必须单独留一条，否则点错了找不回来。
-  Widget _droppedBar() => _FrostSurface(
-    borderRadius: 16,
-    padding: const EdgeInsets.fromLTRB(18, 12, 14, 12),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            const Icon(
-              YingjiIcons.forbidden,
-              size: 16,
-              color: YingjiColors.muted,
+  /// 恢复入口按需打开，不再占据日期轨与当天内容之间的主要空间。
+  Future<void> _showDropped() => showDialog<void>(
+    context: context,
+    builder: (dialogContext) => YingjiPinnedDialog(
+      maxWidth: 460,
+      header: Row(
+        children: [
+          const Expanded(
+            child: Text(
+              '已弃剧',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
             ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(
-                '已弃剧 ${_droppedTitles.length} 部，不再出现在日历里',
-                style: const TextStyle(fontSize: 13, color: YingjiColors.muted),
+          ),
+          YingjiMotionIconButton(
+            icon: YingjiIcons.xmark,
+            tooltip: '关闭',
+            onPressed: () => Navigator.pop(dialogContext),
+          ),
+        ],
+      ),
+      body: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: _droppedTitles
+            .map(
+              (title) => _DroppedChip(
+                title: title,
+                onRestore: () {
+                  Navigator.pop(dialogContext);
+                  _setTrackingStatus(title, 'none');
+                },
               ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 10),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: _droppedTitles
-              .map(
-                (title) => _DroppedChip(
-                  title: title,
-                  onRestore: () => _setTrackingStatus(title, 'none'),
-                ),
-              )
-              .toList(growable: false),
-        ),
-      ],
+            )
+            .toList(growable: false),
+      ),
     ),
   );
 
   @override
   void dispose() {
     disposeSectionTopListener();
+    TraktConnectionStatus.connected.removeListener(_syncTraktConnection);
     _calendarRail.dispose();
     _pageScroll.dispose();
     _trakt.dispose();
@@ -8099,6 +8784,10 @@ class _CalendarPageState extends State<_CalendarPage>
           ..sort((a, b) => a.airDate.compareTo(b.airDate));
     final dates = _scheduleDates();
     final now = DateTime.now();
+    final traktButton = traktConnectButtonState(
+      connected: _traktConnected,
+      busy: _traktAuthorizing,
+    );
     return YingjiSmoothWheel(
       controller: _pageScroll,
       stableGlass: true,
@@ -8131,11 +8820,29 @@ class _CalendarPageState extends State<_CalendarPage>
                   ],
                 ),
               ),
+              YingjiGlassPillButton(
+                icon: traktButton.icon,
+                label: traktButton.label,
+                compactLabel: traktButton.compactLabel,
+                tooltip: traktButton.tooltip,
+                selected: traktButton.selected,
+                busy: _traktAuthorizing,
+                onPressed: _traktConnected ? _showTraktAccount : _connectTrakt,
+              ),
+              const SizedBox(width: 8),
               YingjiMotionIconButton(
                 icon: YingjiIcons.refresh,
                 tooltip: '刷新播出安排',
                 onPressed: _load,
               ),
+              if (_droppedTitles.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                YingjiMotionIconButton(
+                  icon: YingjiIcons.forbidden,
+                  tooltip: '管理已弃剧（${_droppedTitles.length}）',
+                  onPressed: _showDropped,
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 24),
@@ -8188,18 +8895,19 @@ class _CalendarPageState extends State<_CalendarPage>
             ],
           ),
           const SizedBox(height: 28),
-          if (_droppedTitles.isNotEmpty) ...[
-            _droppedBar(),
-            const SizedBox(height: 18),
-          ],
           _SectionHeader(
             title:
                 '${_eventTime(_selectedDate)} · ${selectedEvents.length} 项更新',
-            subtitle: _events.isEmpty
-                ? (_traktMessage ?? '正在读取 Trakt 日历…')
+            subtitle: _calendarLoading
+                ? (_events.isEmpty ? '正在读取 Trakt 日历…' : '先显示已缓存日历，正在更新…')
+                : (_traktMessage != null &&
+                      (_events.isEmpty || _traktConnected))
+                ? _traktMessage!
+                : _events.isEmpty
+                ? '暂时没有日历数据。'
                 : selectedEvents.isEmpty
                 ? '当天没有待播内容，选择带圆点的日期查看安排。'
-                : '时间以已连接的 Trakt 与媒体元数据为准。',
+                : '按 Mova 待看筛选 Trakt 全站安排；连接后再合并个人日历。',
           ),
           const SizedBox(height: 12),
           if (selectedEvents.isNotEmpty)
@@ -8217,6 +8925,7 @@ class _CalendarPageState extends State<_CalendarPage>
                           width: width,
                           child: _TrackingEventCard(
                             event: event,
+                            progress: _progressForEvent(event),
                             inWatchlist: _inWatchlist(event),
                             dropped: _isDropped(event.title),
                             onOpen: () => _openTrackingDetail(event),
@@ -8243,17 +8952,51 @@ class _CalendarPageState extends State<_CalendarPage>
                   Expanded(
                     child: Text(
                       _events.isEmpty
-                          ? (_traktMessage ?? '正在读取更新安排…')
+                          ? _calendarLoading
+                                ? '正在读取更新安排…'
+                                : (_traktMessage ?? '目前没有可显示的播出安排。')
                           : '这一天没有更新，选择带进度标记的日期查看剧集。',
                       style: const TextStyle(color: YingjiColors.muted),
                     ),
                   ),
+                  if (!_calendarLoading && _events.isEmpty) ...[
+                    const SizedBox(width: 8),
+                    YingjiMotionIconButton(
+                      icon: YingjiIcons.refresh,
+                      tooltip: '重新读取日历',
+                      onPressed: () => unawaited(_load()),
+                      size: 38,
+                    ),
+                  ],
                 ],
               ),
             ),
         ],
       ),
     );
+  }
+
+  CalendarProgressCounts? _progressForEvent(TraktEvent event) {
+    final trakt = event.traktId == null
+        ? null
+        : _traktProgressByShow[event.traktId];
+    final remoteCounts = trakt == null
+        ? null
+        : calendarProgressCounts(trakt, announcedTotal: event.totalEpisodes);
+    final announcedTotal = event.totalEpisodes;
+    final total = [
+      announcedTotal,
+      remoteCounts?.total,
+    ].whereType<int>().fold<int?>(null, (a, b) => a == null || b > a ? b : a);
+    if (total == null || total <= 0) return null;
+    final localWatched = _localWatchedByShow[event.tmdbId] ?? 0;
+    // Local playback history is authoritative for this installation; Trakt
+    // fills gaps on other devices. Use the larger count, never sum duplicates.
+    final watched = [
+      localWatched,
+      remoteCounts?.watched ?? 0,
+    ].reduce((a, b) => a > b ? a : b);
+    return localCalendarProgressCounts(watched: watched, total: total);
   }
 
   List<DateTime> _scheduleDates() {
@@ -8447,6 +9190,7 @@ class _DroppedChip extends StatelessWidget {
 class _TrackingEventCard extends StatelessWidget {
   const _TrackingEventCard({
     required this.event,
+    required this.progress,
     required this.inWatchlist,
     required this.dropped,
     required this.onOpen,
@@ -8454,6 +9198,7 @@ class _TrackingEventCard extends StatelessWidget {
     required this.onToggleDropped,
   });
   final TraktEvent event;
+  final CalendarProgressCounts? progress;
 
   /// 是否已在待看列表里 —— 与详情页的「加入待看」共用同一份数据。
   final bool inWatchlist;
@@ -8465,99 +9210,472 @@ class _TrackingEventCard extends StatelessWidget {
   final VoidCallback onToggleDropped;
 
   @override
-  Widget build(BuildContext context) => InkWell(
-    onTap: onOpen,
-    borderRadius: BorderRadius.circular(18),
-    child: _FrostSurface(
-      borderRadius: 18,
-      padding: const EdgeInsets.all(12),
-      child: SizedBox(
-        height: 104,
-        child: Row(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
+  Widget build(BuildContext context) {
+    final local = event.airDate.toLocal();
+    final time = event.timeKnown
+        ? '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}'
+        : '时刻未公布';
+    final parts = event.episode.split(' · ');
+    final seasonEpisode =
+        event.seasonNumber != null && event.episodeNumber != null
+        ? '第 ${event.seasonNumber} 季 · 第 ${event.episodeNumber} 集'
+        : parts.length >= 2
+        ? parts.take(2).join(' · ')
+        : event.episode;
+    final episodeTitle = parts.length > 2
+        ? parts.skip(2).where((part) => part != parts[1]).join(' · ')
+        : '';
+    return InkWell(
+      onTap: onOpen,
+      borderRadius: BorderRadius.circular(18),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 490;
+          final artworkWidth = compact ? 78.0 : 92.0;
+          final actionSize = compact ? 30.0 : 34.0;
+          final platformColumnWidth = compact ? 84.0 : 126.0;
+          return YingjiGlassSurface(
+            radius: 18,
+            strength: 1.25,
+            shadow: false,
+            padding: EdgeInsets.zero,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(18),
               child: SizedBox(
-                width: 166,
-                height: 104,
-                child: event.posterUrl == null
-                    ? const ColoredBox(
-                        color: YingjiColors.elevated,
-                        child: Icon(YingjiIcons.calendar),
-                      )
-                    : CachedNetworkImage(
-                        imageUrl: event.posterUrl.toString(),
+                height: 152,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (event.backdropUrl != null) ...[
+                      CachedNetworkImage(
+                        imageUrl: _calendarArtworkUrl(
+                          event.backdropUrl!,
+                          size: 'w1280',
+                        ).toString(),
                         fit: BoxFit.cover,
-                        // 活动海报仅 166px 宽，按显示分辨率解码，避免首屏原图批量解码卡顿。
                         memCacheWidth:
-                            (320 * MediaQuery.devicePixelRatioOf(context))
-                                .clamp(1.0, 512.0)
+                            (constraints.maxWidth *
+                                    MediaQuery.devicePixelRatioOf(context))
+                                .clamp(1.0, 1600.0)
                                 .round(),
-                        errorWidget: (_, _, _) =>
-                            const ColoredBox(color: YingjiColors.elevated),
+                        errorWidget: (_, _, _) => const SizedBox.shrink(),
                       ),
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.centerLeft,
+                            end: Alignment.centerRight,
+                            colors: [
+                              YingjiColors.canvas.withValues(alpha: .94),
+                              YingjiColors.canvas.withValues(alpha: .78),
+                              YingjiColors.canvas.withValues(alpha: .42),
+                              const Color(0xFF111318).withValues(alpha: .72),
+                            ],
+                            stops: const [0, .36, .68, 1],
+                          ),
+                        ),
+                      ),
+                    ],
+                    Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: Row(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: SizedBox(
+                              width: artworkWidth,
+                              height: 132,
+                              child: event.posterUrl == null
+                                  ? const ColoredBox(
+                                      color: YingjiColors.elevated,
+                                      child: Icon(
+                                        YingjiIcons.calendar,
+                                        color: YingjiColors.muted,
+                                        size: 28,
+                                      ),
+                                    )
+                                  : CachedNetworkImage(
+                                      imageUrl: _calendarArtworkUrl(
+                                        event.posterUrl!,
+                                        size: 'w780',
+                                      ).toString(),
+                                      fit: BoxFit.cover,
+                                      memCacheWidth:
+                                          (artworkWidth *
+                                                  MediaQuery.devicePixelRatioOf(
+                                                    context,
+                                                  ))
+                                              .clamp(1.0, 512.0)
+                                              .round(),
+                                      errorWidget: (_, _, _) =>
+                                          const ColoredBox(
+                                            color: YingjiColors.elevated,
+                                            child: Icon(
+                                              YingjiIcons.calendar,
+                                              color: YingjiColors.muted,
+                                            ),
+                                          ),
+                                    ),
+                            ),
+                          ),
+                          SizedBox(width: compact ? 11 : 16),
+                          Expanded(
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        event.title,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: compact ? 16 : 18,
+                                          height: 1.1,
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: -.25,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        seasonEpisode,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: compact ? 12 : 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: YingjiColors.ink,
+                                        ),
+                                      ),
+                                      if (episodeTitle.isNotEmpty) ...[
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          episodeTitle,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: compact ? 11 : 12,
+                                            color: YingjiColors.ink.withValues(
+                                              alpha: .78,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                      if (progress != null) ...[
+                                        const SizedBox(height: 8),
+                                        _CalendarProgressBar(
+                                          progress: progress!,
+                                          compact: compact,
+                                        ),
+                                      ],
+                                      const Spacer(),
+                                      _CalendarAirtimeBadge(
+                                        label: time,
+                                        known: event.timeKnown,
+                                        compact: compact,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                SizedBox(width: compact ? 7 : 14),
+                                SizedBox(
+                                  width: platformColumnWidth,
+                                  child: Column(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Expanded(
+                                        child: Center(
+                                          child:
+                                              event.platform?.isNotEmpty == true
+                                              ? _CalendarPlatformLogo(
+                                                  platform: event.platform!,
+                                                  logoUrl:
+                                                      event.platformLogoUrl,
+                                                  compact: compact,
+                                                )
+                                              : const SizedBox.shrink(),
+                                        ),
+                                      ),
+                                      Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.end,
+                                        children: [
+                                          YingjiMotionIconButton(
+                                            icon: YingjiIcons.bookmark,
+                                            tooltip: inWatchlist
+                                                ? '移出待看'
+                                                : '加入待看',
+                                            selected: inWatchlist,
+                                            size: actionSize,
+                                            onPressed: onToggleWatchlist,
+                                          ),
+                                          const SizedBox(width: 5),
+                                          YingjiMotionIconButton(
+                                            icon: YingjiIcons.forbidden,
+                                            tooltip: dropped ? '取消弃剧' : '弃剧',
+                                            selected: dropped,
+                                            size: actionSize,
+                                            onPressed: onToggleDropped,
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    event.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    event.episode,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: YingjiColors.muted,
-                      fontSize: 12,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    '${event.timeKnown ? '${event.airDate.toLocal().hour.toString().padLeft(2, '0')}:${event.airDate.toLocal().minute.toString().padLeft(2, '0')}' : '已公布日期，时分未公布'}  ·  ${event.platform?.isNotEmpty == true ? event.platform : '播出平台待定'}',
-                    style: const TextStyle(
-                      color: YingjiColors.quiet,
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+Uri _calendarArtworkUrl(Uri source, {required String size}) {
+  if (source.host != 'image.tmdb.org') return source;
+  final path = source.path.replaceFirst(
+    RegExp(r'/t/p/(?:w\d+|original)/'),
+    '/t/p/$size/',
+  );
+  return source.replace(path: path);
+}
+
+class _CalendarPlatformLogo extends StatelessWidget {
+  const _CalendarPlatformLogo({
+    required this.platform,
+    required this.logoUrl,
+    required this.compact,
+  });
+
+  final String platform;
+  final Uri? logoUrl;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final normalizedPlatform = platform.toLowerCase();
+    final needsLightLogo =
+        normalizedPlatform.contains('hbo') ||
+        normalizedPlatform == 'max' ||
+        normalizedPlatform.contains('apple tv');
+    Widget logo = logoUrl == null
+        ? _CalendarPlatformWordmark(platform: platform, compact: compact)
+        : Semantics(
+            label: platform,
+            image: true,
+            child: CachedNetworkImage(
+              imageUrl: logoUrl.toString(),
+              fit: BoxFit.contain,
+              errorWidget: (_, _, _) => _CalendarPlatformWordmark(
+                platform: platform,
+                compact: compact,
               ),
             ),
-            const SizedBox(width: 8),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                YingjiMotionIconButton(
-                  icon: YingjiIcons.bookmark,
-                  tooltip: inWatchlist ? '移出待看' : '加入待看',
-                  selected: inWatchlist,
-                  size: 34,
-                  onPressed: onToggleWatchlist,
-                ),
-                const SizedBox(width: 6),
-                YingjiMotionIconButton(
-                  icon: YingjiIcons.forbidden,
-                  tooltip: dropped ? '取消弃剧' : '弃剧',
-                  selected: dropped,
-                  size: 34,
-                  onPressed: onToggleDropped,
-                ),
-              ],
+          );
+    if (needsLightLogo) {
+      logo = ColorFiltered(
+        colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn),
+        child: logo,
+      );
+    }
+    return YingjiGlassTooltip(
+      message: platform,
+      child: SizedBox(
+        width: compact ? 76 : 116,
+        height: compact ? 40 : 58,
+        child: logo,
+      ),
+    );
+  }
+}
+
+class _CalendarPlatformWordmark extends StatelessWidget {
+  const _CalendarPlatformWordmark({
+    required this.platform,
+    required this.compact,
+  });
+
+  final String platform;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final normalized = platform.toLowerCase().replaceAll('+', ' plus ');
+    final hbo = normalized.contains('hbo') || normalized.trim() == 'max';
+    final color = normalized.contains('iqiyi') || platform.contains('爱奇艺')
+        ? const Color(0xFF7CE36B)
+        : normalized.contains('netflix')
+        ? const Color(0xFFE50914)
+        : Colors.white;
+    return Center(
+      child: Text(
+        hbo ? (normalized.contains('hbo') ? 'HBO max' : 'max') : platform,
+        maxLines: 2,
+        textAlign: TextAlign.center,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: compact ? 12 : 15,
+          height: 1.05,
+          fontWeight: FontWeight.w800,
+          letterSpacing: hbo ? -0.8 : 0,
+          color: color,
+          shadows: const [Shadow(color: Colors.black87, blurRadius: 7)],
+        ),
+      ),
+    );
+  }
+}
+
+class _CalendarProgressBar extends StatelessWidget {
+  const _CalendarProgressBar({required this.progress, required this.compact});
+  final CalendarProgressCounts progress;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = progress;
+    final fraction = counts.total <= 0
+        ? 0.0
+        : (counts.watched / counts.total).clamp(0.0, 1.0);
+    final percent = (fraction * 100).round();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Icon(
+              YingjiIcons.play_circle_fill,
+              size: compact ? 12 : 13,
+              color: YingjiGlass.accent.withValues(alpha: .9),
+            ),
+            const SizedBox(width: 5),
+            Text(
+              '追剧进度',
+              style: TextStyle(
+                fontSize: compact ? 9 : 10,
+                fontWeight: FontWeight.w600,
+                color: YingjiColors.muted.withValues(alpha: .9),
+              ),
+            ),
+            const Spacer(),
+            Text(
+              '已看 $percent%',
+              style: TextStyle(
+                fontSize: compact ? 9 : 10,
+                fontWeight: FontWeight.w700,
+                color: YingjiColors.ink,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
             ),
           ],
         ),
-      ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(99),
+          child: SizedBox(
+            height: compact ? 5 : 6,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                ColoredBox(color: YingjiColors.ink.withValues(alpha: .16)),
+                FractionallySizedBox(
+                  alignment: Alignment.centerLeft,
+                  widthFactor: fraction,
+                  child: ColoredBox(color: YingjiGlass.accent),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(child: _countLabel('已看 ${counts.watched}', compact)),
+            Expanded(
+              child: Center(
+                child: _countLabel('未看 ${counts.unwatched}', compact),
+              ),
+            ),
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: _countLabel('总集 ${counts.total}', compact, bold: true),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _countLabel(String text, bool compact, {bool bold = false}) => Text(
+    text,
+    maxLines: 1,
+    overflow: TextOverflow.ellipsis,
+    style: TextStyle(
+      fontSize: compact ? 9 : 10,
+      fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+      color: bold
+          ? YingjiColors.ink
+          : YingjiColors.muted.withValues(alpha: .94),
+      fontFeatures: const [FontFeature.tabularFigures()],
     ),
+  );
+}
+
+class _CalendarAirtimeBadge extends StatelessWidget {
+  const _CalendarAirtimeBadge({
+    required this.label,
+    required this.known,
+    required this.compact,
+  });
+
+  final String label;
+  final bool known;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Icon(
+        YingjiIcons.clock,
+        size: compact ? 13 : 15,
+        color: Colors.white,
+        shadows: const [Shadow(color: Colors.black87, blurRadius: 8)],
+      ),
+      const SizedBox(width: 6),
+      Flexible(
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: known ? (compact ? 15 : 17) : (compact ? 10 : 11),
+            height: 1,
+            fontWeight: FontWeight.w700,
+            color: Colors.white,
+            fontFeatures: const [FontFeature.tabularFigures()],
+            shadows: const [
+              Shadow(color: Colors.black87, blurRadius: 8),
+              Shadow(color: Colors.black54, blurRadius: 2),
+            ],
+          ),
+        ),
+      ),
+    ],
   );
 }
 
@@ -8654,9 +9772,6 @@ class _SettingsPageState extends State<SettingsPage>
   String? _knownUpdateVersion;
   final _tmdbApiKey = TextEditingController();
   bool _danmakuEnabled = false;
-  final _traktClientId = TextEditingController();
-  final _traktClientSecret = TextEditingController();
-  final _traktToken = TextEditingController();
   final _danmakuUrl = TextEditingController();
   final _danmakuApiNameControllers = <TextEditingController>[];
   final _danmakuApiControllers = <TextEditingController>[];
@@ -8674,8 +9789,6 @@ class _SettingsPageState extends State<SettingsPage>
   String? _tmdbMessage;
   bool _danmakuTesting = false;
   String? _danmakuMessage;
-  bool _traktAuthorizing = false;
-  String? _traktMessage;
 
   /// 「代理」页：已添加的服务器列表（用于渲染开关行）。
   List<MediaSource> _proxySources = const [];
@@ -8855,10 +9968,6 @@ class _SettingsPageState extends State<SettingsPage>
         _danmakuScroll = prefs.getBool('yingji.danmaku.scroll') ?? true;
         _danmakuTop = prefs.getBool('yingji.danmaku.top') ?? true;
         _danmakuBottom = prefs.getBool('yingji.danmaku.bottom') ?? true;
-        _traktClientId.text = prefs.getString('yingji.trakt.client-id') ?? '';
-        _traktClientSecret.text =
-            prefs.getString('yingji.trakt.client-secret') ?? '';
-        _traktToken.text = prefs.getString('yingji.trakt.access-token') ?? '';
         _danmakuUrl.text = prefs.getString('yingji.danmaku.url') ?? '';
         final savedApis =
             prefs.getStringList('yingji.danmaku.apis') ?? const [];
@@ -8964,9 +10073,6 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.player.preload-lead-minutes': _preloadLeadMinutes,
       'yingji.player.shortcuts': jsonEncode(_shortcuts),
       'yingji.tmdb.api-key': _tmdbApiKey.text.trim(),
-      'yingji.trakt.client-id': _traktClientId.text.trim(),
-      'yingji.trakt.client-secret': _traktClientSecret.text.trim(),
-      'yingji.trakt.access-token': _traktToken.text.trim(),
       'yingji.danmaku.enabled': _danmakuEnabled,
       'yingji.danmaku.url': danmakuApis.firstOrNull ?? '',
       'yingji.danmaku.apis': danmakuApis,
@@ -9136,11 +10242,12 @@ class _SettingsPageState extends State<SettingsPage>
     client.dispose();
     // 详情页的资源快照属于同一类元数据缓存，一起清掉。
     final details = await MediaDetailCache.clear();
+    final discover = await DiscoverSnapshotCache.clear();
     if (mounted) {
       setState(
-        () => _savedMessage = count == 0 && details == 0
+        () => _savedMessage = count == 0 && details == 0 && discover == 0
             ? '没有可清理的 TMDB 缓存'
-            : '已清理 ${count + details} 项 TMDB 与详情缓存',
+            : '已清理 ${count + details + discover} 项 TMDB、详情与榜单缓存',
       );
       unawaited(_refreshCacheStats());
     }
@@ -9153,7 +10260,9 @@ class _SettingsPageState extends State<SettingsPage>
             .getKeys()
             .where((key) => key.startsWith('yingji.tmdb.cache.'))
             .length +
-        await MediaDetailCache.count();
+        await WindowsMetadataCache.count(WindowsMetadataCache.tmdb) +
+        await MediaDetailCache.count() +
+        await DiscoverSnapshotCache.count();
     var bytes = 0;
     try {
       final root = await getTemporaryDirectory();
@@ -9283,52 +10392,6 @@ class _SettingsPageState extends State<SettingsPage>
     final store = await WatchStateStore.create();
     await store.clear();
     if (mounted) setState(() => _savedMessage = '观看记录已清空');
-  }
-
-  Future<void> _authorizeTrakt() async {
-    if (_traktAuthorizing) return;
-    final clientId = _traktClientId.text.trim();
-    final clientSecret = _traktClientSecret.text.trim();
-    if (clientId.isEmpty || clientSecret.isEmpty) {
-      setState(() => _traktMessage = '请先填写 Trakt Client ID 和 Client Secret');
-      return;
-    }
-    setState(() {
-      _traktAuthorizing = true;
-      _traktMessage = '正在获取设备授权码…';
-    });
-    final client = TraktClient();
-    try {
-      final device = await client.requestDeviceCode(clientId);
-      // 桌面走 cmd /c start，安卓走宿主的 Intent.ACTION_VIEW；打不开时把地址
-      // 原样显示出来，让用户自己复制。
-      final opened = await WindowHost.openUrl(device.verificationUrl);
-      if (mounted) {
-        setState(
-          () => _traktMessage = opened
-              ? '浏览器已打开，请输入代码 ${device.userCode} 完成授权'
-              : '请手动打开 ${device.verificationUrl}，输入代码 ${device.userCode} 完成授权',
-        );
-      }
-      final token = await client.pollDeviceCode(
-        clientId: clientId,
-        clientSecret: clientSecret,
-        device: device,
-      );
-      _traktToken.text = token;
-      await _save();
-      if (mounted) setState(() => _traktMessage = 'Trakt 已授权');
-    } catch (error) {
-      if (mounted) {
-        setState(
-          () =>
-              _traktMessage = error.toString().replaceFirst('Exception: ', ''),
-        );
-      }
-    } finally {
-      client.dispose();
-      if (mounted) setState(() => _traktAuthorizing = false);
-    }
   }
 
   Future<void> _testTmdb() async {
@@ -9491,9 +10554,6 @@ class _SettingsPageState extends State<SettingsPage>
     _settingsScroll.dispose();
     _activeSetting.dispose();
     _tmdbApiKey.dispose();
-    _traktClientId.dispose();
-    _traktClientSecret.dispose();
-    _traktToken.dispose();
     _danmakuUrl.dispose();
     for (final controller in _danmakuApiNameControllers) {
       controller.dispose();
@@ -10037,7 +11097,7 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 8),
               const Text(
-                'TMDB 默认通过 Mova 托管网关获取；也可以填写自己的 API Key。填写 Trakt 凭据后，追剧页会读取未来两周的播出安排。',
+                'TMDB 默认通过 Mova 托管网关获取；也可以填写自己的 API Key。连接 Trakt 后，追剧页会读取未来两周的播出安排。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
               ),
               const SizedBox(height: 14),
@@ -10075,48 +11135,18 @@ class _SettingsPageState extends State<SettingsPage>
                 ],
               ),
               const SizedBox(height: 14),
-              TextField(
-                controller: _traktClientId,
-                decoration: const InputDecoration(labelText: 'Trakt Client ID'),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _traktToken,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Trakt Access Token',
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _traktClientSecret,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'Trakt Client Secret（设备授权需要）',
+              const Text(
+                'Trakt 使用浏览器安全授权，应用凭据由 Mova 托管；连接状态会同步显示在服务器页。',
+                style: TextStyle(
+                  color: YingjiColors.muted,
+                  fontSize: 12,
+                  height: 1.45,
                 ),
               ),
               const SizedBox(height: 12),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  FilledButton.tonal(
-                    onPressed: _traktAuthorizing ? null : _authorizeTrakt,
-                    child: Text(_traktAuthorizing ? '等待授权…' : '浏览器授权 Trakt'),
-                  ),
-                  const SizedBox(width: 10),
-                  FilledButton(
-                    onPressed: _save,
-                    child: Text(_savedMessage ?? '保存设置'),
-                  ),
-                ],
+              TraktConnectionPanel(
+                onChanged: () => _syncTraktWatchlistAfterConnection(context),
               ),
-              if (_traktMessage != null) ...[
-                const SizedBox(height: 8),
-                Text(
-                  _traktMessage!,
-                  style: const TextStyle(color: Color(0xFFABB1BE)),
-                ),
-              ],
             ],
           ),
         ),
@@ -10796,13 +11826,31 @@ class _SettingsPageState extends State<SettingsPage>
                       applicationName: 'Mova',
                       applicationIcon: const YingjiMark(size: 56),
                       applicationVersion: movaVersion,
-                      applicationLegalese: '私人媒体中心 · 内置 libmpv',
+                      applicationLegalese: '私人媒体中心 · 内置 libmpv\nThis product uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.',
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 16),
               const Divider(height: 1),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Image.asset(
+                    'app/assets/ratings/tmdb.png',
+                    width: 44,
+                    height: 32,
+                    fit: BoxFit.contain,
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      '影视资料与图片由 TMDB 提供。本产品使用 TMDB API，但未获 TMDB 背书、认证或批准。',
+                      style: TextStyle(fontSize: 12, color: YingjiColors.muted),
+                    ),
+                  ),
+                ],
+              ),
               const SizedBox(height: 14),
               Wrap(
                 spacing: 10,
@@ -11646,8 +12694,9 @@ class _PosterTile extends StatelessWidget {
               if (item.posterUrl != null)
                 _PosterImage(
                   imageUrl: item.posterUrl.toString(),
-                  // 海报卡显示宽 168（高 280），按物理像素解码即可，不必用原图 500px 宽。
-                  memCacheWidth: (320 * MediaQuery.devicePixelRatioOf(context))
+                  assetPath: item.localPosterAsset,
+                  // 卡片只显示 168px 宽；悬浮大图另有独立尺寸的图像。
+                  memCacheWidth: (168 * MediaQuery.devicePixelRatioOf(context))
                       .clamp(1.0, 512.0)
                       .round(),
                   errorWidget: (_, _, _) =>
@@ -12010,9 +13059,10 @@ class _RankTileState extends State<_RankTile>
                         if (widget.item.posterUrl != null)
                           _PosterImage(
                             imageUrl: widget.item.posterUrl.toString(),
-                            // 榜单卡显示宽 166，按物理像素解码即可，不必用原图。
+                            assetPath: widget.item.localPosterAsset,
+                            // 实际海报区宽 130；悬浮卡单独按展示尺寸解码。
                             memCacheWidth:
-                                (320 * MediaQuery.devicePixelRatioOf(context))
+                                (130 * MediaQuery.devicePixelRatioOf(context))
                                     .clamp(1.0, 512.0)
                                     .round(),
                             errorWidget: (_, _, _) =>
@@ -12874,22 +13924,34 @@ class _ContinueArtworkFallback extends StatelessWidget {
 class _PosterImage extends StatelessWidget {
   const _PosterImage({
     required this.imageUrl,
+    this.assetPath,
     this.memCacheWidth,
     this.errorWidget,
   });
   final String imageUrl;
+  final String? assetPath;
   final int? memCacheWidth;
   final Widget Function(BuildContext, String, dynamic)? errorWidget;
 
   @override
-  Widget build(BuildContext context) => CachedNetworkImage(
-    imageUrl: imageUrl,
-    fit: BoxFit.cover,
-    memCacheWidth: memCacheWidth,
-    fadeInDuration: Duration.zero,
-    fadeOutDuration: Duration.zero,
-    errorWidget: errorWidget,
-  );
+  Widget build(BuildContext context) {
+    Widget networkImage() => CachedNetworkImage(
+      imageUrl: imageUrl,
+      fit: BoxFit.cover,
+      memCacheWidth: memCacheWidth,
+      fadeInDuration: Duration.zero,
+      fadeOutDuration: Duration.zero,
+      errorWidget: errorWidget,
+    );
+    final asset = assetPath;
+    if (asset == null) return networkImage();
+    return Image.asset(
+      asset,
+      fit: BoxFit.cover,
+      cacheWidth: memCacheWidth,
+      errorBuilder: (_, _, _) => networkImage(),
+    );
+  }
 }
 
 class _MediaHover extends StatefulWidget {
@@ -12924,48 +13986,41 @@ class _MediaHoverState extends State<_MediaHover> {
   }
 
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
-    valueListenable: yingjiScrollInProgress,
-    builder: (context, scrolling, _) {
-      final hovered = _hovered && !scrolling;
-      final duration = scrolling
-          ? Duration.zero
-          : const Duration(milliseconds: 180);
-      return MouseRegion(
-        onEnter: (_) {
-          if (!yingjiScrollInProgress.value) setState(() => _hovered = true);
-        },
-        onExit: (_) => setState(() => _hovered = false),
-        child: AnimatedContainer(
-          duration: duration,
-          curve: Curves.easeOutCubic,
-          decoration: BoxDecoration(
-            // 不透明底托住圆角海报，合成时不会透出流动背景。
-            color: const Color(0xFF1A1D25),
-            borderRadius: BorderRadius.circular(widget.borderRadius),
-            border: Border.all(
-              color: hovered
-                  ? Colors.white.withValues(alpha: .72)
-                  : Colors.transparent,
-              width: 1,
-            ),
-            boxShadow: hovered
-                ? const [
-                    BoxShadow(
-                      color: Color(0x99000000),
-                      blurRadius: 24,
-                      offset: Offset(0, 12),
-                    ),
-                  ]
-                : const [],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(widget.borderRadius),
-            child: widget.child,
-          ),
-        ),
-      );
+  Widget build(BuildContext context) => MouseRegion(
+    onEnter: (_) {
+      if (!yingjiScrollInProgress.value) setState(() => _hovered = true);
     },
+    onExit: (_) {
+      if (_hovered) setState(() => _hovered = false);
+    },
+    child: AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      decoration: BoxDecoration(
+        // 不透明底托住圆角海报，合成时不会透出流动背景。
+        color: const Color(0xFF1A1D25),
+        borderRadius: BorderRadius.circular(widget.borderRadius),
+        border: Border.all(
+          color: _hovered
+              ? Colors.white.withValues(alpha: .72)
+              : Colors.transparent,
+          width: 1,
+        ),
+        boxShadow: _hovered
+            ? const [
+                BoxShadow(
+                  color: Color(0x99000000),
+                  blurRadius: 24,
+                  offset: Offset(0, 12),
+                ),
+              ]
+            : const [],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(widget.borderRadius),
+        child: widget.child,
+      ),
+    ),
   );
 }
 
@@ -12981,6 +14036,8 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
         title: state.title.split(' · ').first.trim(),
         kind: '剧集',
       ),
+      initialSeasonNumber: state.seasonNumber,
+      initialEpisodeNumber: state.episodeNumber,
     );
     return;
   }
@@ -13038,7 +14095,12 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
                 rows.firstOrNull;
           }
           if (media != null && context.mounted) {
-            await _openServerSearchDetail(context, media);
+            await _openServerSearchDetail(
+              context,
+              media,
+              initialSeasonNumber: state.seasonNumber,
+              initialEpisodeNumber: state.episodeNumber,
+            );
             return;
           }
         } finally {
@@ -13062,7 +14124,12 @@ Future<void> _openWatchDetail(BuildContext context, WatchState state) async {
       ).showSnackBar(const SnackBar(content: Text('暂未找到该内容的详情，仍可从完整列表继续播放。')));
       return;
     }
-    await MetadataDetailPage.open(context, item: matches.first);
+    await MetadataDetailPage.open(
+      context,
+      item: matches.first,
+      initialSeasonNumber: state.seasonNumber,
+      initialEpisodeNumber: state.episodeNumber,
+    );
   } catch (_) {
     if (context.mounted) {
       ScaffoldMessenger.of(context)

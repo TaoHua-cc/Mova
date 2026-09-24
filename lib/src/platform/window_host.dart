@@ -1,9 +1,11 @@
 import 'dart:io' show File, Platform, Process, ProcessException;
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:win32/win32.dart';
 import 'package:window_manager/window_manager.dart';
 
 /// 窗口操作的跨平台适配层。
@@ -57,6 +59,15 @@ class WindowHost {
   static Future<void> close() async {
     if (!isDesktop) return;
     await windowManager.close();
+  }
+
+  /// Desktop OAuth/browser callbacks may arrive while the app is behind the
+  /// browser; restore and focus it once the user flow has completed.
+  static Future<void> bringToFront() async {
+    if (!isDesktop) return;
+    if (await windowManager.isMinimized()) await windowManager.restore();
+    await windowManager.show();
+    await windowManager.focus();
   }
 
   static Future<void> toggleMaximize() async {
@@ -118,15 +129,36 @@ class WindowHost {
 
   /// 用系统默认浏览器打开外部链接。
   ///
-  /// 桌面端走 `cmd /c start`；移动端交给宿主的 `Intent.ACTION_VIEW`——旧实现
-  /// 在 Android 上直接跑 `Process.run('cmd', ...)`，会抛异常，Trakt 设备授权
-  /// 按钮点了没有任何反应。返回是否成功发起。
+  /// Windows 用 ShellExecute 交给系统 URL 处理器，避免 cmd 解析 OAuth URL
+  /// 中的 `&`，也避免 explorer.exe 把链接误当成目录；移动端交给宿主的
+  /// `Intent.ACTION_VIEW`。返回是否成功发起。
   static Future<bool> openUrl(String url) async {
     if (url.isEmpty) return false;
+    if (!kIsWeb && Platform.isWindows) {
+      final operation = 'open'.toNativeUtf16();
+      final target = url.toNativeUtf16();
+      try {
+        final result = ShellExecute(
+          null,
+          PCWSTR(operation),
+          PCWSTR(target),
+          null,
+          null,
+          SW_SHOWNORMAL,
+        );
+        return result.address > 32;
+      } finally {
+        free(operation);
+        free(target);
+      }
+    }
     if (isDesktop) {
       try {
-        await Process.run('cmd', ['/c', 'start', '', url]);
-        return true;
+        final result = await Process.run(
+          Platform.isMacOS ? 'open' : 'xdg-open',
+          [url],
+        );
+        return result.exitCode == 0;
       } on ProcessException {
         return false;
       }

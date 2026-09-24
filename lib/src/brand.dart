@@ -496,7 +496,7 @@ abstract final class YingjiGlass {
   /// 不是来自一层黑板。
   static const double alpha = .10;
 
-  /// 选中态 / 高亮态用的实心色：与玻璃同一色系的中性浅灰。
+  /// 选中态 / 高亮态使用珍珠白，在深色玻璃上保持清晰、克制。
   static const Color accent = Color(0xFFF3F4F7);
 
   /// 背后画面透过玻璃后的饱和度提升（vibrancy）：玻璃会聚光，透出来的颜色比
@@ -1524,6 +1524,133 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                       ),
                     ),
                   ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 带文字的液态玻璃胶囊按钮。
+///
+/// 页面右上角那一排 [YingjiMotionIconButton] 只说得出「一个图标」，说不清
+/// 「未连接 / 已连接」这类带状态的动作，需要文字的地方用这个。材质、悬停描边、
+/// 按下回弹与圆形按钮完全同源（同一层 [YingjiGlassSurface]、同一套 [MovaMotion]
+/// 曲线），只是把圆片换成胶囊、把图标换成「图标 + 文字」，没有另立一套令牌。
+class YingjiGlassPillButton extends StatefulWidget {
+  const YingjiGlassPillButton({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    required this.tooltip,
+    this.compactLabel,
+    this.compactBelow = 760,
+    this.selected = false,
+    this.busy = false,
+    this.height = 46,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onPressed;
+  final String tooltip;
+
+  /// 窄屏（可用宽度小于 [compactBelow]）时改用的短文案；为空则一直用 [label]。
+  final String? compactLabel;
+  final double compactBelow;
+
+  /// 选中态：底色更浓、前景转深色，用于「已连接」这类持续状态。
+  final bool selected;
+
+  /// 进行中：图标位置换成转圈，并屏蔽重复点击。
+  final bool busy;
+
+  final double height;
+
+  @override
+  State<YingjiGlassPillButton> createState() => _YingjiGlassPillButtonState();
+}
+
+class _YingjiGlassPillButtonState extends State<YingjiGlassPillButton> {
+  bool _hovered = false;
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = widget.selected || _hovered;
+    final foreground = widget.selected ? const Color(0xFF111824) : Colors.white;
+    final compact =
+        widget.compactLabel != null &&
+        MediaQuery.sizeOf(context).width < widget.compactBelow;
+    final label = compact ? widget.compactLabel! : widget.label;
+    return YingjiGlassTooltip(
+      message: widget.tooltip,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() {
+          _hovered = false;
+          _pressed = false;
+        }),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (_) {
+            MovaMotion.tap();
+            setState(() => _pressed = true);
+          },
+          onTapUp: (_) => setState(() => _pressed = false),
+          onTapCancel: () => setState(() => _pressed = false),
+          onTap: widget.busy ? null : widget.onPressed,
+          child: Semantics(
+            button: true,
+            label: widget.tooltip,
+            selected: widget.selected,
+            child: AnimatedScale(
+              // 与圆形按钮同一取舍：缩放会带动缓存好的玻璃层，只做轻微的按下
+              // 回弹，悬停反馈交给描边和投影。
+              scale: _pressed ? MovaMotion.pressScaleIcon : 1,
+              duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
+              curve: _pressed ? MovaMotion.press : MovaMotion.spring,
+              child: SizedBox(
+                height: widget.height,
+                child: YingjiGlassSurface(
+                  radius: widget.height / 2,
+                  // 小面积玻璃沿用圆形按钮那一档：面板的 30px 模糊会把胶囊背后
+                  // 抹成一块均匀色，看起来就是个实心按钮。
+                  sigma: YingjiGlass.blur * .55,
+                  strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
+                  shadow: active,
+                  padding: const EdgeInsets.symmetric(horizontal: 18),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (widget.busy)
+                        SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: foreground,
+                          ),
+                        )
+                      else
+                        Icon(widget.icon, size: 18, color: foreground),
+                      const SizedBox(width: 9),
+                      Text(
+                        label,
+                        style: TextStyle(
+                          color: foreground,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          height: 1,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

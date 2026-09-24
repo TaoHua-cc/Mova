@@ -5,8 +5,48 @@ import worker, {
   handleDoubanDiscovery,
   handleDiscovery,
   handleTraktDiscovery,
+  handleTraktOAuth,
   parseRatings as bundledParseRatings,
 } from './worker.mjs';
+
+test('Trakt OAuth exchanges codes and refresh tokens with the Worker secret only', async () => {
+  const env = { TRAKT_CLIENT_ID: 'public-id', TRAKT_CLIENT_SECRET: 'private-secret' };
+  const calls = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url, options, payload: JSON.parse(options.body) });
+    return Response.json({ access_token: 'access', refresh_token: 'rotated' });
+  };
+  const exchange = await handleTraktOAuth(new Request('https://worker.test/trakt/oauth/token', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'authorization_code', code: 'auth-code-12345678', redirect_uri: 'http://127.0.0.1:43829/trakt/callback' }),
+  }), env, { fetcher });
+  assert.equal(exchange.status, 200);
+  assert.deepEqual(calls[0].payload, {
+    code: 'auth-code-12345678', grant_type: 'authorization_code',
+    redirect_uri: 'http://127.0.0.1:43829/trakt/callback',
+    client_id: 'public-id', client_secret: 'private-secret',
+  });
+  assert.equal((await exchange.text()).includes('private-secret'), false);
+
+  await handleTraktOAuth(new Request('https://worker.test/trakt/oauth/token', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: 'refresh-token-123' }),
+  }), env, { fetcher });
+  assert.deepEqual(calls[1].payload, {
+    grant_type: 'refresh_token', refresh_token: 'refresh-token-123',
+    client_id: 'public-id', client_secret: 'private-secret', redirect_uri: 'http://127.0.0.1:43829/trakt/callback',
+  });
+});
+
+test('Trakt OAuth rejects invalid callbacks/grants and missing Worker secrets', async () => {
+  const request = (body) => new Request('https://worker.test/trakt/oauth/token', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const env = { TRAKT_CLIENT_ID: 'public-id', TRAKT_CLIENT_SECRET: 'private-secret' };
+  assert.equal((await handleTraktOAuth(request({ grant_type: 'authorization_code', code: 'abcdefgh', redirect_uri: 'https://evil.test/callback' }), env)).status, 400);
+  assert.equal((await handleTraktOAuth(request({ grant_type: 'password' }), env)).status, 400);
+  assert.equal((await handleTraktOAuth(request({ grant_type: 'refresh_token', refresh_token: 'refresh-token-123' }), { TRAKT_CLIENT_ID: 'public-id' })).status, 503);
+});
 
 test('same-origin redirect succeeds with manual mode and preserves headers', async () => {
   let calls = 0;

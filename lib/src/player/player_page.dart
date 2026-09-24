@@ -29,6 +29,7 @@ import '../sources/source_store.dart';
 import '../cache/danmaku_cache.dart';
 import '../cache/video_cache.dart';
 import '../tracking/trakt_client.dart';
+import '../tracking/trakt_auth.dart';
 
 const _defaultShortcuts = <String, String>{
   'playPause': 'Space',
@@ -2055,9 +2056,12 @@ class _PlayerPageState extends State<PlayerPage> {
       return;
     }
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
-      final token = prefs.getString('yingji.trakt.access-token') ?? '';
+      var credentials = await TraktCredentials.read();
+      try {
+        credentials = await credentials.refreshIfNeeded();
+      } catch (_) {}
+      final clientId = credentials.clientId;
+      final token = credentials.accessToken;
       if (clientId.isEmpty || token.isEmpty) return;
       final trakt = TraktClient();
       try {

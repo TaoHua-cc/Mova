@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -48,6 +50,59 @@ void main() {
       client.dispose();
     },
   );
+
+  test('Windows deduplicates and bounds stale background refreshes', () async {
+    if (!Platform.isWindows) return;
+    TestWidgetsFlutterBinding.ensureInitialized();
+    // 只用不会碰到用户真实磁盘缓存的页号，避免测试读到本机的新鲜榜单。
+    final pages = List.generate(4, (index) => 900000000 + index);
+    final stale = <String, Object>{};
+    for (final page in pages) {
+      final uri =
+          Uri.parse('${TmdbClient.managedEndpoint}/tmdb/trending/tv/day')
+              .replace(
+                queryParameters: {
+                  'language': 'zh-CN',
+                  'page': '$page',
+                  'client': 'yingji-flutter',
+                },
+              );
+      final key =
+          'yingji.tmdb.cache.${base64UrlEncode(utf8.encode(uri.toString())).replaceAll('=', '')}';
+      stale[key] = jsonEncode({'results': <Object>[]});
+      stale['$key.savedAt'] = DateTime.now()
+          .subtract(const Duration(hours: 9))
+          .toIso8601String();
+    }
+    SharedPreferences.setMockInitialValues(stale);
+    final releaseRequests = Completer<void>();
+    var active = 0;
+    var peak = 0;
+    var requests = 0;
+    final client = TmdbClient(
+      client: MockClient((_) async {
+        requests++;
+        active++;
+        if (active > peak) peak = active;
+        await releaseRequests.future;
+        active--;
+        return http.Response('unavailable', 503);
+      }),
+    );
+
+    await Future.wait(
+      pages.map((page) => client.trendingToday('tv', page: page)),
+    );
+    await client.trendingToday('tv', page: pages.first);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(requests, 3);
+    expect(peak, 3);
+    releaseRequests.complete();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(requests, 4);
+    expect(peak, 3);
+    client.dispose();
+  });
 
   test(
     'falls back to managed metadata when a saved direct key cannot connect',

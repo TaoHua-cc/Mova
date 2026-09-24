@@ -182,6 +182,12 @@ abstract final class FrameTrace {
     _startScrollDriver();
   }
 
+  /// Named startup milestone; only writes when frame tracing is enabled.
+  static void mark(String stage) {
+    if (_file == null) return;
+    _write('STARTUP stage=$stage wall_ms=${_clock?.elapsedMilliseconds ?? 0}');
+  }
+
   static void _onTimings(List<FrameTiming> timings) => _window.addAll(timings);
 
   static void _emitWindow() {

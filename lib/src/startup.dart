@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import 'brand.dart';
+import 'diagnostics/frame_trace.dart';
 
 /// Keeps startup work behind a real, lightweight first frame instead of
 /// exposing an unpainted window. The indicator is intentionally indeterminate:
@@ -13,7 +14,7 @@ class MovaStartupGate extends StatefulWidget {
     super.key,
     required this.child,
     this.startup,
-    this.minimumDuration = const Duration(milliseconds: 720),
+    this.minimumDuration = const Duration(milliseconds: 250),
   });
 
   final Widget child;
@@ -50,6 +51,7 @@ class _MovaStartupGateState extends State<MovaStartupGate>
     ]);
     if (!mounted) return;
     _pulse.stop();
+    FrameTrace.mark('shell_ready');
     setState(() => _ready = true);
   }
 
@@ -63,7 +65,7 @@ class _MovaStartupGateState extends State<MovaStartupGate>
   Widget build(BuildContext context) {
     if (widget.startup == null) return widget.child;
     return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 360),
+      duration: const Duration(milliseconds: 240),
       reverseDuration: const Duration(milliseconds: 220),
       switchInCurve: Curves.easeOutCubic,
       switchOutCurve: Curves.easeInCubic,

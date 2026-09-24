@@ -75,7 +75,8 @@ void main() {
       contains('snapshot.data ?? const <String, List<TmdbItem>>{}'),
     );
     expect(source, contains('_refreshVisibleSections()'));
-    expect(source, contains('_visibleItems = {..._visibleItems, ...updates}'));
+    expect(source, contains('_visibleItems = {..._visibleItems, ...changed}'));
+    expect(source, contains('if (changed.isEmpty) return;'));
     expect(source, contains('YingjiImageWarmup.items(rows, maxItems: 6)'));
     expect(
       source,

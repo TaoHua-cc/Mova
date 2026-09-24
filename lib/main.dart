@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/app.dart';
 import 'src/brand.dart';
+import 'src/cache/windows_metadata_cache.dart';
 import 'src/diagnostics/frame_trace.dart';
 import 'src/network/network_http_client.dart';
 import 'src/network/proxy_routing.dart';
@@ -39,7 +40,10 @@ Future<void> main() async {
 }
 
 Future<void> _loadStartupSettings() async {
+  await WindowsMetadataCache.migrateLegacy();
+  FrameTrace.mark('metadata_migrated');
   final prefs = await SharedPreferences.getInstance();
+  FrameTrace.mark('preferences_ready');
   ProxyRouting.loadFrom(prefs);
   // 外观只保留「模糊程度」一项：底色、不透明度与色调固定为中性磨砂玻璃
   // （见 YingjiGlass），颜色模式固定深色。旧的玻璃色调 / 不透明度 / 背景卡片

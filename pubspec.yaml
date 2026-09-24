@@ -41,6 +41,7 @@ dependencies:
   http: ^1.6.0
   shared_preferences: ^2.5.5
   path_provider: ^2.1.6
+  crypto: ^3.0.7
   ffi: ^2.2.0
   win32: ^6.4.0
   cached_network_image: ^4.0.0
@@ -66,6 +67,8 @@ dev_dependencies:
 flutter:
 
   assets:
+    - assets/defaults/
+    - assets/defaults/posters/
     - app/assets/ratings/
     - app/yingji-hero-original.png
     - app/yingji-posters-original.png

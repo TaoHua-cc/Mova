@@ -31,6 +31,18 @@ class WatchlistStore {
     await _save(load().where((value) => value.id != id).toList());
   }
 
+  /// Apply a Trakt reconciliation atomically while preserving existing Mova
+  /// metadata for entries that are already in the local watchlist.
+  Future<void> reconcile({
+    Iterable<TmdbItem> add = const [],
+    Set<int> removeIds = const {},
+  }) async {
+    final rows = load().where((item) => !removeIds.contains(item.id)).toList();
+    final ids = rows.map((item) => item.id).toSet();
+    rows.insertAll(0, add.where((item) => item.id > 0 && ids.add(item.id)));
+    await _save(rows);
+  }
+
   Future<void> toggle(TmdbItem item) async {
     if (contains(item.id)) {
       await remove(item.id);

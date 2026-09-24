@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../network/network_http_client.dart';
+import '../cache/windows_metadata_cache.dart';
+import 'iqiyi_schedule.dart';
 import '../version.dart';
 
 /// 后台刷新真正改写了元数据缓存时 +1。
@@ -27,6 +31,10 @@ Map<String, double> _parseRatingsMap(dynamic value) {
   return result;
 }
 
+String _normalizedScheduleTitle(Object? value) => '${value ?? ''}'
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^\p{L}\p{N}]', unicode: true), '');
+
 class TmdbItem {
   const TmdbItem({
     required this.id,
@@ -34,6 +42,7 @@ class TmdbItem {
     required this.kind,
     this.overview,
     this.posterPath,
+    this.localPosterAsset,
     this.backdropPath,
     this.logoPath,
     this.year,
@@ -46,6 +55,7 @@ class TmdbItem {
   final String kind;
   final String? overview;
   final String? posterPath;
+  final String? localPosterAsset;
   final String? backdropPath;
   final String? logoPath;
   final int? year;
@@ -69,6 +79,7 @@ class TmdbItem {
     'kind': kind,
     'overview': overview,
     'posterPath': posterPath,
+    if (localPosterAsset != null) 'localPosterAsset': localPosterAsset,
     'backdropPath': backdropPath,
     'logoPath': logoPath,
     'year': year,
@@ -82,6 +93,7 @@ class TmdbItem {
     kind: '${value['kind'] ?? '电影'}',
     overview: value['overview'] as String?,
     posterPath: value['posterPath'] as String?,
+    localPosterAsset: value['localPosterAsset'] as String?,
     backdropPath: value['backdropPath'] as String?,
     logoPath: value['logoPath'] as String?,
     year: (value['year'] as num?)?.toInt(),
@@ -175,6 +187,9 @@ class TmdbUpcomingEpisode {
     required this.title,
     required this.airDate,
     this.network,
+    this.networkLogoUrl,
+    this.totalEpisodes,
+    this.showTitle,
     this.stillPath,
     this.timeKnown = false,
     this.source = 'TMDB',
@@ -186,6 +201,9 @@ class TmdbUpcomingEpisode {
   final bool timeKnown;
   final String source;
   final String? network;
+  final Uri? networkLogoUrl;
+  final int? totalEpisodes;
+  final String? showTitle;
   final String? stillPath;
   Uri? get stillUrl => stillPath == null
       ? null
@@ -197,6 +215,8 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
   Map show,
   DateTime now, {
   DateTime? until,
+  int? totalEpisodes,
+  String? showTitle,
 }) {
   if (episodes is! List) return const [];
   final candidates = <TmdbUpcomingEpisode>[];
@@ -219,6 +239,11 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
     if (date.isBefore(cutoff)) continue;
     if (until != null && date.isAfter(until)) continue;
     final channel = show['webChannel'] ?? show['network'];
+    final logo = channel is Map ? channel['logo'] ?? channel['image'] : null;
+    final logoValue = logo is Map
+        ? '${logo['original'] ?? logo['medium'] ?? ''}'
+        : '';
+    final logoUrl = logoValue.isEmpty ? null : Uri.tryParse(logoValue);
     candidates.add(
       TmdbUpcomingEpisode(
         seasonNumber: season.toInt(),
@@ -227,6 +252,9 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
         airDate: date,
         timeKnown: known,
         network: channel is Map ? channel['name'] as String? : null,
+        networkLogoUrl: logoUrl,
+        totalEpisodes: totalEpisodes,
+        showTitle: showTitle ?? '${show['name'] ?? ''}',
         source: 'TVmaze',
       ),
     );
@@ -261,6 +289,35 @@ class TmdbClient {
     : _client = client ?? createNetworkHttpClient();
   final http.Client _client;
   static const managedEndpoint = 'https://yingji-metadata.gctykxy.workers.dev';
+
+  // Windows 启动时可能同时读到多个过期榜单。旧内容立即可用，后台刷新则
+  // 全进程去重并限制并发，避免网络响应、JSON 解析和磁盘写入一起抢滚动帧。
+  static const _maxBackgroundRefreshes = 3;
+  static final _pendingRefreshKeys = <String>{};
+  static final _backgroundRefreshes =
+      Queue<({String key, Future<void> Function() run})>();
+  static int _activeBackgroundRefreshes = 0;
+
+  static void _queueBackgroundRefresh(String key, Future<void> Function() run) {
+    if (!_pendingRefreshKeys.add(key)) return;
+    _backgroundRefreshes.add((key: key, run: run));
+    _drainBackgroundRefreshes();
+  }
+
+  static void _drainBackgroundRefreshes() {
+    while (_activeBackgroundRefreshes < _maxBackgroundRefreshes &&
+        _backgroundRefreshes.isNotEmpty) {
+      final work = _backgroundRefreshes.removeFirst();
+      _activeBackgroundRefreshes++;
+      unawaited(
+        Future.sync(work.run).whenComplete(() {
+          _activeBackgroundRefreshes--;
+          _pendingRefreshKeys.remove(work.key);
+          _drainBackgroundRefreshes();
+        }),
+      );
+    }
+  }
 
   Future<List<TmdbItem>> trending({String apiKey = ''}) async {
     final data = await _get('/trending/all/week', apiKey, {
@@ -670,37 +727,65 @@ class TmdbClient {
       'append_to_response': 'external_ids',
       // 播出安排变化慢，但也别每次都打网络：缓存优先，超过 6 小时才后台刷新。
     }, minRefreshInterval: const Duration(hours: 6));
+    final totalEpisodes = (data['number_of_episodes'] as num?)?.toInt();
+    final showTitle = '${data['name'] ?? data['original_name'] ?? item.title}'
+        .trim();
     final exact = <TmdbUpcomingEpisode>[];
     try {
       final ids = data['external_ids'] as Map<String, dynamic>? ?? const {};
       final imdb = '${ids['imdb_id'] ?? ''}';
       final tvdb = ids['tvdb_id'];
+      Map? show;
       if (RegExp(r'^tt\d+$').hasMatch(imdb) || tvdb is num) {
-        final show = await _scheduleJson(
-          Uri.https('api.tvmaze.com', '/lookup/shows', {
-            if (RegExp(r'^tt\d+$').hasMatch(imdb))
-              'imdb': imdb
-            else
-              'thetvdb': '$tvdb',
-          }),
-        );
-        if (show is Map && show['id'] is num) {
-          final episodes = await _scheduleJson(
-            Uri.https('api.tvmaze.com', '/shows/${show['id']}/episodes'),
-          );
-          exact.addAll(
-            upcomingListFromTvmaze(episodes, show, now, until: until),
-          );
+        for (final lookup in [
+          if (RegExp(r'^tt\d+$').hasMatch(imdb)) {'imdb': imdb},
+          if (tvdb is num) {'thetvdb': '$tvdb'},
+        ]) {
+          try {
+            final candidate = await _scheduleJson(
+              Uri.https('api.tvmaze.com', '/lookup/shows', lookup),
+            );
+            if (candidate is Map && candidate['id'] is num) {
+              show = candidate;
+              break;
+            }
+          } catch (_) {
+            // TVmaze may know only one of the two external identifiers.
+          }
         }
+      }
+      // Some region-specific / streaming titles have no IMDb or TVDB ID in
+      // TVmaze. Resolve those by exact title or exact AKA, rejecting ambiguous
+      // matches and conflicting premiere years instead of trusting fuzzy score.
+      show ??= await _tvmazeShowByExactTitle(item);
+      if (show is Map && show['id'] is num) {
+        final episodes = await _scheduleJson(
+          Uri.https('api.tvmaze.com', '/shows/${show['id']}/episodes'),
+        );
+        exact.addAll(
+          upcomingListFromTvmaze(
+            episodes,
+            show,
+            now,
+            until: until,
+            totalEpisodes: totalEpisodes,
+            showTitle: showTitle,
+          ),
+        );
       }
     } catch (_) {
       /* Retain TMDB's date if the time source is unavailable. */
     }
     final networks = data['networks'] as List<dynamic>? ?? const [];
-    final network = networks
+    final networkRow = networks
         .whereType<Map<String, dynamic>>()
-        .map((entry) => '${entry['name'] ?? ''}')
-        .firstWhere((name) => name.isNotEmpty, orElse: () => '');
+        .where((entry) => '${entry['name'] ?? ''}'.isNotEmpty)
+        .firstOrNull;
+    final network = '${networkRow?['name'] ?? ''}';
+    final logoPath = '${networkRow?['logo_path'] ?? ''}';
+    final networkLogoUrl = logoPath.isEmpty
+        ? null
+        : Uri.https('image.tmdb.org', '/t/p/w300$logoPath');
     final nextRow = data['next_episode_to_air'] as Map<String, dynamic>?;
     final firstSeason = (nextRow?['season_number'] as num?)?.toInt();
     final seasonRows = (data['seasons'] as List<dynamic>? ?? const [])
@@ -732,6 +817,9 @@ class TmdbClient {
               title: episode.name,
               airDate: date,
               network: network.isEmpty ? null : network,
+              networkLogoUrl: networkLogoUrl,
+              totalEpisodes: totalEpisodes,
+              showTitle: showTitle,
               stillPath: episode.stillPath,
             ),
           );
@@ -751,9 +839,30 @@ class TmdbClient {
             title: '${nextRow['name'] ?? ''}',
             airDate: date,
             network: network.isEmpty ? null : network,
+            networkLogoUrl: networkLogoUrl,
+            totalEpisodes: totalEpisodes,
+            showTitle: showTitle,
             stillPath: nextRow['still_path'] as String?,
           ),
         );
+      }
+    }
+    final isIqiyiNetwork =
+        network.toLowerCase().contains('iqiyi') || network.contains('爱奇艺');
+    // Query iQIYI only when TMDB does not identify another network, or when it
+    // explicitly names iQIYI. This avoids replacing a known platform's schedule
+    // with the same title's availability on a different service.
+    if (network.isEmpty || isIqiyiNetwork) {
+      try {
+        exact.addAll(
+          await _iqiyiUpcomingEpisode(item, showTitle, now, until, [
+            ...dated,
+            ...exact,
+          ], totalEpisodes: totalEpisodes),
+        );
+      } catch (_) {
+        // The official platform is an optional time source; other schedules
+        // remain available when search or the album page changes.
       }
     }
     final merged = <String, TmdbUpcomingEpisode>{};
@@ -781,13 +890,162 @@ class TmdbClient {
         airDate: timing.airDate,
         timeKnown: timing.timeKnown,
         source: primary.source,
-        network: primary.network ?? episode.network ?? previous.network,
+        showTitle: primary.showTitle ?? episode.showTitle ?? previous.showTitle,
+        network:
+            timing.network ??
+            primary.network ??
+            episode.network ??
+            previous.network,
+        networkLogoUrl:
+            timing.networkLogoUrl ??
+            primary.networkLogoUrl ??
+            episode.networkLogoUrl ??
+            previous.networkLogoUrl,
+        totalEpisodes:
+            [
+              primary.totalEpisodes,
+              episode.totalEpisodes,
+              previous.totalEpisodes,
+            ].whereType<int>().fold<int?>(
+              null,
+              (a, b) => a == null || b > a ? b : a,
+            ),
         stillPath: primary.stillPath ?? previous.stillPath,
       );
     }
     final result = merged.values.toList()
       ..sort((a, b) => a.airDate.compareTo(b.airDate));
     return result;
+  }
+
+  Future<Map?> _tvmazeShowByExactTitle(TmdbItem item) async {
+    final title = _normalizedScheduleTitle(item.title);
+    if (title.isEmpty) return null;
+    final search = await _scheduleJson(
+      Uri.https('api.tvmaze.com', '/search/shows', {'q': item.title}),
+    );
+    if (search is! List) return null;
+    final matches = <Map>[];
+    for (final row in search.whereType<Map>().take(8)) {
+      final show = row['show'];
+      if (show is! Map || show['id'] is! num) continue;
+      final premieredYear = DateTime.tryParse('${show['premiered'] ?? ''}')
+          ?.year;
+      if (item.year != null &&
+          premieredYear != null &&
+          item.year != premieredYear) {
+        continue;
+      }
+      final canonicalName = _normalizedScheduleTitle(show['name']);
+      final names = <String>{canonicalName};
+      final showId = (show['id'] as num).toInt();
+      if (canonicalName != title) {
+        try {
+          final akas = await _scheduleJson(
+            Uri.https('api.tvmaze.com', '/shows/$showId/akas'),
+          );
+          if (akas is List) {
+            names.addAll(
+              akas.whereType<Map>().map(
+                (aka) => _normalizedScheduleTitle(aka['name']),
+              ),
+            );
+          }
+        } catch (_) {
+          // The canonical name can still be an exact match if AKA data is absent.
+        }
+      }
+      names.remove('');
+      if (names.contains(title)) {
+        matches.add(Map<String, dynamic>.from(show));
+      }
+    }
+    final ids = matches.map((show) => (show['id'] as num).toInt()).toSet();
+    return ids.length == 1 ? matches.first : null;
+  }
+
+  Future<List<TmdbUpcomingEpisode>> _iqiyiUpcomingEpisode(
+    TmdbItem item,
+    String showTitle,
+    DateTime now,
+    DateTime until,
+    List<TmdbUpcomingEpisode> knownEpisodes, {
+    int? totalEpisodes,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'yingji.schedule.iqiyi.${item.id}';
+    final cachedRaw = prefs.getString(key);
+    IqiyiReleaseSchedule? schedule;
+    try {
+      final cache = jsonDecode(cachedRaw ?? '') as Map<String, dynamic>;
+      final saved = DateTime.tryParse('${cache['savedAt'] ?? ''}');
+      if (saved != null &&
+          DateTime.now().difference(saved) < const Duration(hours: 6) &&
+          cache['title'] == showTitle &&
+          cache['schedule'] is Map<String, dynamic>) {
+        schedule = IqiyiReleaseSchedule.fromJson(
+          cache['schedule'] as Map<String, dynamic>,
+        );
+      }
+    } catch (_) {
+      // An absent or obsolete schedule cache is fetched from the official page.
+    }
+    if (schedule == null) {
+      final search = await _scheduleJson(
+        Uri.https('mesh.if.iqiyi.com', '/portal/lw/search/homePageV3', {
+          'key': showTitle,
+          'current_page': '1',
+          'mode': '1',
+          'pageSize': '20',
+        }),
+      );
+      final album = exactIqiyiAlbumInfo(search, showTitle);
+      if (album == null) return const [];
+      final update = album['updateTime'];
+      final updateText = update is Map ? '${update['value'] ?? ''}' : '';
+      final episodeTotal = (album['totalNumber'] as num?)?.toInt();
+      schedule = parseIqiyiReleaseSchedule(
+        '${album['subscriptContent'] ?? ''} / 共${episodeTotal ?? ''}集 $updateText',
+      );
+      if (schedule == null) return const [];
+      await prefs.setString(
+        key,
+        jsonEncode({
+          'savedAt': DateTime.now().toIso8601String(),
+          'title': showTitle,
+          'schedule': schedule.toJson(),
+        }),
+      );
+    }
+    final number = schedule.releasedEpisodes == null
+        ? (knownEpisodes
+                      .map((episode) => episode.episodeNumber)
+                      .fold<int?>(null, (a, b) => a == null || b > a ? b : a) ??
+                  0) +
+              1
+        : schedule.releasedEpisodes! + 1;
+    final total = schedule.totalEpisodes ?? totalEpisodes;
+    if (number <= 0 || (total != null && number > total)) return const [];
+    final release = schedule.nextReleaseAfter(now);
+    if (release.isAfter(until)) return const [];
+    final existing = knownEpisodes
+        .where((episode) => episode.episodeNumber == number)
+        .firstOrNull;
+    return [
+      TmdbUpcomingEpisode(
+        seasonNumber: existing?.seasonNumber ?? 1,
+        episodeNumber: number,
+        title: existing?.title ?? '',
+        airDate: release,
+        timeKnown: true,
+        source: 'iQIYI',
+        network: 'iQIYI',
+        networkLogoUrl: existing?.networkLogoUrl,
+        totalEpisodes: total,
+        showTitle: showTitle,
+        stillPath: existing?.stillPath,
+      ),
+    ];
   }
 
   /// Compatibility helper for detail surfaces that only need the next item.
@@ -802,7 +1060,12 @@ class TmdbClient {
     final prefs = await SharedPreferences.getInstance();
     final key =
         'yingji.schedule.${base64UrlEncode(utf8.encode(uri.toString()))}';
-    final raw = prefs.getString(key);
+    final raw =
+        (await WindowsMetadataCache.read(
+          WindowsMetadataCache.schedule,
+          key,
+        ))?.value ??
+        prefs.getString(key);
     Map<String, dynamic>? cached;
     try {
       if (raw != null) cached = jsonDecode(raw) as Map<String, dynamic>;
@@ -816,14 +1079,34 @@ class TmdbClient {
     }
     try {
       final response = await _client
-          .get(uri, headers: const {'User-Agent': 'Mova/3 schedule-client'})
+          .get(
+            uri,
+            headers: {
+              'User-Agent': 'Mova/3 schedule-client',
+              if (uri.host == 'mesh.if.iqiyi.com')
+                'Referer': 'https://so.iqiyi.com/',
+            },
+          )
           .timeout(const Duration(seconds: 8));
       if (response.statusCode != 200) throw Exception('Schedule unavailable');
       final data = jsonDecode(response.body);
-      await prefs.setString(
-        key,
-        jsonEncode({'savedAt': DateTime.now().toIso8601String(), 'data': data}),
-      );
+      final body = jsonEncode({
+        'savedAt': DateTime.now().toIso8601String(),
+        'data': data,
+      });
+      if (Platform.isWindows) {
+        try {
+          await WindowsMetadataCache.write(
+            WindowsMetadataCache.schedule,
+            key,
+            body,
+          );
+        } catch (_) {
+          await prefs.setString(key, body);
+        }
+      } else {
+        await prefs.setString(key, body);
+      }
       return data;
     } catch (_) {
       if (cached != null) return cached['data'];
@@ -860,7 +1143,11 @@ class TmdbClient {
     // 于是短时间内反复打开同一个页面不会把同一批接口重复打一遍。
     for (final uri in uris) {
       final cacheKey = _cacheKey(uri);
-      final cached = prefs.getString(cacheKey);
+      final stored = await WindowsMetadataCache.read(
+        WindowsMetadataCache.tmdb,
+        cacheKey,
+      );
+      final cached = stored?.value ?? prefs.getString(cacheKey);
       if (cached == null || cached.isEmpty) continue;
       final Map<String, dynamic> data;
       try {
@@ -870,14 +1157,23 @@ class TmdbClient {
         continue;
       }
       final savedAt = DateTime.tryParse(
-        prefs.getString('$cacheKey.savedAt') ?? '',
+        stored?.savedAt ?? prefs.getString('$cacheKey.savedAt') ?? '',
       );
       // 没有时间戳的是升级前写入的旧条目：内容照旧可用，但按已过期处理，
       // 后台补一次刷新并把时间戳补上。
       final fresh =
           savedAt != null &&
           DateTime.now().difference(savedAt) < minRefreshInterval;
-      if (!fresh) unawaited(_refresh(uri, prefs, cacheKey));
+      if (!fresh) {
+        if (Platform.isWindows) {
+          _queueBackgroundRefresh(
+            cacheKey,
+            () => _refresh(uri, prefs, cacheKey),
+          );
+        } else {
+          unawaited(_refresh(uri, prefs, cacheKey));
+        }
+      }
       return data;
     }
     Object? lastError;
@@ -911,7 +1207,12 @@ class TmdbClient {
           }
         }
       }
-      final cached = prefs.getString(cacheKey);
+      final cached =
+          (await WindowsMetadataCache.read(
+            WindowsMetadataCache.tmdb,
+            cacheKey,
+          ))?.value ??
+          prefs.getString(cacheKey);
       if (cached != null && cached.isNotEmpty) {
         try {
           return jsonDecode(cached) as Map<String, dynamic>;
@@ -946,12 +1247,29 @@ class TmdbClient {
     String cacheKey,
     String body,
   ) async {
-    final previous = prefs.getString(cacheKey);
-    await prefs.setString(cacheKey, body);
-    await prefs.setString(
-      '$cacheKey.savedAt',
-      DateTime.now().toIso8601String(),
-    );
+    final previous =
+        (await WindowsMetadataCache.read(
+          WindowsMetadataCache.tmdb,
+          cacheKey,
+        ))?.value ??
+        prefs.getString(cacheKey);
+    final stamp = DateTime.now().toIso8601String();
+    if (Platform.isWindows) {
+      try {
+        await WindowsMetadataCache.write(
+          WindowsMetadataCache.tmdb,
+          cacheKey,
+          body,
+          savedAt: stamp,
+        );
+      } catch (_) {
+        await prefs.setString(cacheKey, body);
+        await prefs.setString('$cacheKey.savedAt', stamp);
+      }
+    } else {
+      await prefs.setString(cacheKey, body);
+      await prefs.setString('$cacheKey.savedAt', stamp);
+    }
     if (previous != null && previous != body) yingjiMetadataRevision.value++;
     // 本次运行首次写入就清理旧版本可能积下的超大缓存；之后每 16 次平摊一次。
     // SharedPreferences 会在启动时整份解析，保留数百份榜单 JSON 会直接拖慢首屏。
@@ -962,6 +1280,13 @@ class TmdbClient {
 
   /// 淘汰最旧的 TMDB 缓存条目与过期排期，把常驻规模压在 [_tmdbCacheCapacity] 内。
   Future<void> _pruneTmdbCache(SharedPreferences prefs) async {
+    if (Platform.isWindows) {
+      await WindowsMetadataCache.prune(
+        WindowsMetadataCache.tmdb,
+        _tmdbCacheCapacity,
+      );
+      await WindowsMetadataCache.prune(WindowsMetadataCache.schedule, 64);
+    }
     final cacheKeys = prefs
         .getKeys()
         .where(
@@ -1133,11 +1458,12 @@ class TmdbClient {
   }
 
   Future<int> clearCache() async {
+    var count = await WindowsMetadataCache.clear(WindowsMetadataCache.tmdb);
+    count += await WindowsMetadataCache.clear(WindowsMetadataCache.schedule);
     final prefs = await SharedPreferences.getInstance();
     final keys = prefs.getKeys().where(
       (key) => key.startsWith('yingji.tmdb.cache.'),
     );
-    var count = 0;
     for (final key in keys.toList(growable: false)) {
       if (await prefs.remove(key)) count++;
     }

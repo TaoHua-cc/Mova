@@ -1,10 +1,12 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../metadata/tmdb_client.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
+import 'windows_metadata_cache.dart';
 
 /// 详情页「资源卡片」的本地快照。
 ///
@@ -45,7 +47,13 @@ abstract final class MediaDetailCache {
     if (item.id <= 0) return null;
     try {
       final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_key(_rowsPrefix, item));
+      final key = _key(_rowsPrefix, item);
+      final raw =
+          (await WindowsMetadataCache.read(
+            WindowsMetadataCache.detail,
+            key,
+          ))?.value ??
+          prefs.getString(key);
       if (raw == null || raw.isEmpty) return null;
       final data = jsonDecode(raw) as Map<String, dynamic>;
       final rows = (data['rows'] as List<dynamic>? ?? const [])
@@ -87,17 +95,28 @@ abstract final class MediaDetailCache {
       final capped = rows.length > _maxRows
           ? rows.take(_maxRows).toList(growable: false)
           : rows;
-      await prefs.setString(
-        _key(_rowsPrefix, item),
-        jsonEncode({
-          'savedAt': DateTime.now().toIso8601String(),
-          'rows': capped.map(_mediaItemToJson).toList(growable: false),
-          'posters': {
-            for (final entry in seasonPosters.entries)
-              '${entry.key}': entry.value.toString(),
-          },
-        }),
-      );
+      final key = _key(_rowsPrefix, item);
+      final body = jsonEncode({
+        'savedAt': DateTime.now().toIso8601String(),
+        'rows': capped.map(_mediaItemToJson).toList(growable: false),
+        'posters': {
+          for (final entry in seasonPosters.entries)
+            '${entry.key}': entry.value.toString(),
+        },
+      });
+      if (Platform.isWindows) {
+        try {
+          await WindowsMetadataCache.write(
+            WindowsMetadataCache.detail,
+            key,
+            body,
+          );
+        } catch (_) {
+          await prefs.setString(key, body);
+        }
+      } else {
+        await prefs.setString(key, body);
+      }
     } catch (_) {
       // 缓存写不进去只是少了加速，不影响本次渲染。
     }
@@ -135,6 +154,7 @@ abstract final class MediaDetailCache {
   /// 「清理元数据缓存」时连同详情快照一起清掉。
   static Future<int> clear() async {
     try {
+      var count = await WindowsMetadataCache.clear(WindowsMetadataCache.detail);
       final prefs = await SharedPreferences.getInstance();
       final keys = prefs
           .getKeys()
@@ -142,7 +162,6 @@ abstract final class MediaDetailCache {
             (key) => key.startsWith(_rowsPrefix) || key.startsWith(_scanPrefix),
           )
           .toList(growable: false);
-      var count = 0;
       for (final key in keys) {
         if (await prefs.remove(key)) count++;
       }
@@ -156,7 +175,11 @@ abstract final class MediaDetailCache {
   static Future<int> count() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs.getKeys().where((key) => key.startsWith(_rowsPrefix)).length;
+      return prefs
+              .getKeys()
+              .where((key) => key.startsWith(_rowsPrefix))
+              .length +
+          await WindowsMetadataCache.count(WindowsMetadataCache.detail);
     } catch (_) {
       return 0;
     }

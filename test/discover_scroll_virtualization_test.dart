@@ -98,6 +98,57 @@ void main() {
     expect(brand, isNot(contains('color: YingjiGlass.accent.withValues(')));
   });
 
+  test('discover posters decode at their rendered width', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final poster = source.substring(
+      source.indexOf('class _PosterTile extends StatelessWidget'),
+      source.indexOf('class _LandscapeTile extends StatelessWidget'),
+    );
+    final ranking = source.substring(
+      source.indexOf('class _RankTileState'),
+      source.indexOf('class _RankHoverPreview'),
+    );
+
+    expect(poster, contains('width: 168'));
+    expect(poster, contains('(168 * MediaQuery.devicePixelRatioOf(context))'));
+    expect(ranking, contains('width: 166'));
+    expect(ranking, contains('left: 36'));
+    expect(ranking, contains('(130 * MediaQuery.devicePixelRatioOf(context))'));
+  });
+
+  test('saved discover rows are restored before scroll-triggered refresh', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final initialize = source.substring(
+      source.indexOf(
+        'Future<Map<String, List<TmdbItem>>> _initializeSections()',
+      ),
+      source.indexOf('Future<void> _extendToVisibleLimit()'),
+    );
+    final extend = source.substring(
+      source.indexOf('Future<void> _extendToVisibleLimit()'),
+      source.indexOf('Future<void> _restoreLayout()'),
+    );
+    expect(
+      initialize,
+      contains('final snapshots = await _loadSessionSnapshots()'),
+    );
+    expect(initialize, contains('final initial = {...bundled, ...snapshots}'));
+    expect(extend, contains('!_sameItems(current[entry.key], entry.value)'));
+    expect(extend, contains('for (final rows in updates.values)'));
+  });
+
+  test('full ranking page shows saved charts before refreshing', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final ranking = source.substring(
+      source.indexOf('class _RankingPageState'),
+      source.indexOf('class _DiscoverListPage extends StatefulWidget'),
+    );
+    expect(ranking, contains('DiscoverSnapshotCache.read('));
+    expect(ranking, contains('initialData: widget.initialItems.isEmpty'));
+    expect(ranking, contains('unawaited(_refreshCharts())'));
+    expect(ranking, contains('if (updates.isEmpty)'));
+  });
+
   test('discover hover effects are suspended during scrolling', () {
     final source = File('lib/src/media_center.dart').readAsStringSync();
     final posterHover = source.substring(
@@ -109,10 +160,13 @@ void main() {
       source.indexOf('class _ContinueWatchingPage'),
     );
 
-    expect(posterHover, contains('final hovered = _hovered && !scrolling;'));
+    expect(posterHover, isNot(contains('ValueListenableBuilder<bool>(')));
     expect(posterHover, contains('if (!yingjiScrollInProgress.value)'));
-    expect(posterHover, contains(RegExp(r'scrolling\s*\?\s*Duration.zero')));
     expect(posterHover, contains('_clearHoverWhileScrolling'));
+    expect(
+      posterHover,
+      contains('if (yingjiScrollInProgress.value && _hovered && mounted)'),
+    );
     expect(posterHover, isNot(contains('AnimatedScale')));
     expect(posterHover, isNot(contains('Matrix4.translationValues')));
     expect(posterHover, contains('Colors.transparent'));

@@ -25,8 +25,10 @@ import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
 import '../sources/webdav_client.dart';
 import '../history/watchlist_store.dart';
+import '../tracking/trakt_watchlist_sync.dart';
 import '../history/watch_state_store.dart';
 import '../tracking/trakt_client.dart';
+import '../tracking/trakt_auth.dart';
 import 'tmdb_client.dart';
 import 'ratings.dart';
 import 'next_episode.dart';
@@ -63,6 +65,23 @@ Uri? _episodeImage(MediaItem resource, TmdbEpisode? metadata) =>
     // Prefer the episode-specific still, then retain the server artwork.
     metadata?.stillUrl ?? resource.imageUrl;
 
+/// Returns every server version for the exact episode stored in a resume row.
+/// Season is part of the identity: episode 2 in season 1 is not season 2's E2.
+List<MediaItem> episodeResourcesForResume(
+  List<MediaItem> resources, {
+  required int? seasonNumber,
+  required int? episodeNumber,
+}) {
+  if (seasonNumber == null || episodeNumber == null) return const [];
+  return resources
+      .where(
+        (resource) =>
+            resource.seasonNumber == seasonNumber &&
+            resource.episodeNumber == episodeNumber,
+      )
+      .toList(growable: false);
+}
+
 String _dateLabel(DateTime? date) => date == null
     ? ''
     : '${date.year}年${date.month.toString().padLeft(2, '0')}月${date.day.toString().padLeft(2, '0')}日';
@@ -71,15 +90,25 @@ String _minuteClock(int minutes) =>
     '${minutes ~/ 60 > 0 ? '${minutes ~/ 60}:' : ''}${(minutes % 60).toString().padLeft(2, '0')}:00';
 
 class MetadataDetailPage extends StatefulWidget {
-  const MetadataDetailPage({super.key, required this.item, this.media});
+  const MetadataDetailPage({
+    super.key,
+    required this.item,
+    this.media,
+    this.initialSeasonNumber,
+    this.initialEpisodeNumber,
+  });
   final TmdbItem item;
   final MediaItem? media;
+  final int? initialSeasonNumber;
+  final int? initialEpisodeNumber;
 
   /// 从被点击的作品卡展开详情；入口不在可见卡片内时自然退回淡入。
   static Future<void> open(
     BuildContext sourceContext, {
     required TmdbItem item,
     MediaItem? media,
+    int? initialSeasonNumber,
+    int? initialEpisodeNumber,
     Offset? tapPosition,
   }) {
     final navigator = Navigator.of(sourceContext);
@@ -112,7 +141,12 @@ class MetadataDetailPage extends StatefulWidget {
         allowSnapshotting: true,
         transitionDuration: const Duration(milliseconds: 300),
         reverseTransitionDuration: const Duration(milliseconds: 240),
-        pageBuilder: (_, _, _) => MetadataDetailPage(item: item, media: media),
+        pageBuilder: (_, _, _) => MetadataDetailPage(
+          item: item,
+          media: media,
+          initialSeasonNumber: initialSeasonNumber,
+          initialEpisodeNumber: initialEpisodeNumber,
+        ),
         transitionsBuilder: (context, animation, _, child) {
           if (origin == null || MediaQuery.disableAnimationsOf(context)) {
             return FadeTransition(opacity: animation, child: child);
@@ -245,7 +279,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         })
         .toList(growable: false);
     if (rows.isEmpty) return false;
-    final preferred = await _preferredResource(rows);
+    final preferred = await _initialResource(rows);
     final history = (await WatchStateStore.create()).load();
     // Trakt 的已看剧集要联网，先用本机记录把进度渲染出来；真正聚合那一步
     // （或冷却期内的进度刷新）会再带上 Trakt 重算一次。
@@ -401,7 +435,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                     (candidate.contains(title) || title.contains(candidate)));
           })
           .toList(growable: false);
-      final preferred = await _preferredResource(matches);
+      final preferred = await _initialResource(matches);
       final history = (await WatchStateStore.create()).load();
       final traktCompleted = await _traktCompletedEpisodes();
       final derived = _deriveProgress(matches, history, traktCompleted);
@@ -547,9 +581,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (widget.item.id <= 0 || widget.item.kind != '剧集') {
       return const <String>{};
     }
-    final prefs = await SharedPreferences.getInstance();
-    final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
-    final token = prefs.getString('yingji.trakt.access-token') ?? '';
+    var credentials = await TraktCredentials.read();
+    try {
+      credentials = await credentials.refreshIfNeeded();
+    } catch (_) {}
+    final clientId = credentials.clientId;
+    final token = credentials.accessToken;
     if (clientId.isEmpty || token.isEmpty) return const <String>{};
     final trakt = TraktClient();
     try {
@@ -653,6 +690,17 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               (resource) => matches(recentState, resource),
               orElse: () => ordered.last,
             ),
+    );
+  }
+
+  Future<MediaItem?> _initialResource(List<MediaItem> resources) {
+    final resumedEpisode = episodeResourcesForResume(
+      resources,
+      seasonNumber: widget.initialSeasonNumber,
+      episodeNumber: widget.initialEpisodeNumber,
+    );
+    return _preferredResource(
+      resumedEpisode.isEmpty ? resources : resumedEpisode,
     );
   }
 
@@ -769,9 +817,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       if (versions.any((item) => item.source.kind != SourceKind.webdav)) {
         messages.add('服务器已同步');
       }
-      final prefs = await SharedPreferences.getInstance();
-      final clientId = prefs.getString('yingji.trakt.client-id') ?? '';
-      final token = prefs.getString('yingji.trakt.access-token') ?? '';
+      var credentials = await TraktCredentials.read();
+      try {
+        credentials = await credentials.refreshIfNeeded();
+      } catch (_) {}
+      final clientId = credentials.clientId;
+      final token = credentials.accessToken;
       if (widget.item.id > 0 && clientId.isNotEmpty && token.isNotEmpty) {
         final trakt = TraktClient();
         try {
@@ -1387,8 +1438,19 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                                 final store = _watchlist;
                                 if (store == null) return;
                                 await store.toggle(item);
-                                if (mounted) {
-                                  setState(() => _inWatchlist = !_inWatchlist);
+                                if (!mounted) return;
+                                setState(() => _inWatchlist = !_inWatchlist);
+                                try {
+                                  await synchronizeTraktWatchlist(store);
+                                } catch (error) {
+                                  if (!context.mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(
+                                        'Mova 已更新，Trakt 同步失败：${error.toString().replaceFirst('Exception: ', '')}',
+                                      ),
+                                    ),
+                                  );
                                 }
                               },
                               onFavorite: _toggleFavorite,

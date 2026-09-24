@@ -48,7 +48,8 @@ function safeFailure(error) {
 const pending = new Map();
 const headers = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json; charset=utf-8',
 };
 const json = (body, status = 200, ttl = 0) => new Response(JSON.stringify(body), {
@@ -179,6 +180,102 @@ const traktLists = new Set([
   'anticipated', 'boxoffice', 'collected', 'played', 'popular', 'trending', 'watched',
 ]);
 
+const traktRedirectUri = 'http://127.0.0.1:43829/trakt/callback';
+
+/** Keep Trakt's private OAuth secret on the Worker, never in the desktop app. */
+export async function handleTraktOAuth(request, env, {
+  fetcher = fetch,
+} = {}) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/trakt/oauth/')) return null;
+  if (request.method === 'OPTIONS') return new Response(null, { headers });
+  if (typeof env.TRAKT_CLIENT_ID !== 'string' || !env.TRAKT_CLIENT_ID.trim() ||
+      typeof env.TRAKT_CLIENT_SECRET !== 'string' || !env.TRAKT_CLIENT_SECRET.trim()) {
+    return json({ error: 'trakt_oauth_not_configured' }, 503);
+  }
+  if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+
+  const isDeviceCode = url.pathname === '/trakt/oauth/device/code';
+  const isDeviceToken = url.pathname === '/trakt/oauth/device/token';
+  if (!isDeviceCode && !isDeviceToken && url.pathname !== '/trakt/oauth/token') {
+    return json({ error: 'not_found' }, 404);
+  }
+  let body;
+  try {
+    const raw = await request.text();
+    if (raw.length > 8192) return json({ error: 'invalid_trakt_oauth_request' }, 413);
+    body = JSON.parse(raw);
+  } catch {
+    return json({ error: 'invalid_trakt_oauth_request' }, 400);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return json({ error: 'invalid_trakt_oauth_request' }, 400);
+  }
+
+  let endpoint;
+  let payload;
+  if (isDeviceCode) {
+    endpoint = 'https://api.trakt.tv/oauth/device/code';
+    payload = { client_id: env.TRAKT_CLIENT_ID.trim() };
+  } else if (isDeviceToken) {
+    if (typeof body.code !== 'string' || !/^[\w-]{4,256}$/.test(body.code)) {
+      return json({ error: 'invalid_trakt_oauth_request' }, 400);
+    }
+    endpoint = 'https://api.trakt.tv/oauth/device/token';
+    payload = {
+      code: body.code,
+      client_id: env.TRAKT_CLIENT_ID.trim(),
+      client_secret: env.TRAKT_CLIENT_SECRET.trim(),
+    };
+  } else {
+    if (body.grant_type === 'authorization_code') {
+      if (typeof body.code !== 'string' || !/^[\w-]{8,1024}$/.test(body.code) ||
+          body.redirect_uri !== traktRedirectUri) {
+        return json({ error: 'invalid_trakt_oauth_request' }, 400);
+      }
+      payload = {
+        code: body.code,
+        grant_type: 'authorization_code',
+        redirect_uri: traktRedirectUri,
+      };
+    } else if (body.grant_type === 'refresh_token' &&
+        typeof body.refresh_token === 'string' && body.refresh_token.length >= 8 &&
+        body.refresh_token.length <= 4096) {
+      payload = { grant_type: 'refresh_token', refresh_token: body.refresh_token };
+    } else {
+      return json({ error: 'invalid_trakt_oauth_request' }, 400);
+    }
+    endpoint = 'https://auth.trakt.tv/oauth/token';
+    payload.client_id = env.TRAKT_CLIENT_ID.trim();
+    payload.client_secret = env.TRAKT_CLIENT_SECRET.trim();
+    payload.redirect_uri ??= traktRedirectUri;
+  }
+
+  try {
+    const response = await fetcher(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'trakt-api-version': '2',
+        'trakt-api-key': env.TRAKT_CLIENT_ID.trim(),
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000),
+    });
+    const responseBody = await response.text();
+    // Trakt OAuth errors may include request details; return only a safe status.
+    if (!response.ok) {
+      return json({ error: 'trakt_oauth_failed', upstreamStatus: response.status }, response.status === 400 ? 400 : 503);
+    }
+    let data;
+    try { data = JSON.parse(responseBody); } catch { return json({ error: 'trakt_oauth_invalid_response' }, 502); }
+    return json(data);
+  } catch (error) {
+    return json({ error: 'trakt_oauth_unavailable', reason: safeFailure(error) }, 503);
+  }
+}
+
 export async function handleTraktDiscovery(request, _env, ctx, {
   fetcher = fetch,
   cache = globalThis.caches?.default,
@@ -298,10 +395,14 @@ export default {
     const incoming = new URL(request.url);
     const cors = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
+    if (incoming.pathname.startsWith('/trakt/oauth/')) {
+      const traktOAuthResponse = await handleTraktOAuth(request, env);
+      if (traktOAuthResponse) return traktOAuthResponse;
+    }
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: cors });
     if (incoming.pathname === '/health') return Response.json({ ok: true }, { headers: cors });
     const ratingResponse = await handleRatings(request, env, ctx);
