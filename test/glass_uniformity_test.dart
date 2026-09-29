@@ -208,21 +208,37 @@ void main() {
     // 弹幕和 mpv 字幕都要避开播放器自己的顶部、底部控制区域。
     expect(native, contains('origin.y + safe_top'));
     expect(native, contains('SetOption(g_handle, "sub-pos", "84")'));
-    // 截图和模糊在后台连续产帧，UI 帧循环只消费完成帧，不能再同步调用采集。
+    // 截图和模糊在后台按显隐变化更新，UI 帧循环只消费完成帧，不能同步采集。
     expect(native, contains('std::thread glass_backdrop'));
     expect(
       native,
-      contains('constexpr ULONGLONG kGlassBackdropRefreshMs = 16;'),
+      contains('constexpr ULONGLONG kGlassBackdropRefreshMs = 66;'),
     );
     expect(native, contains('constexpr int kGlassDownscale = 6;'));
     expect(native, contains('Sleep(1);'));
     expect(native, contains('bool CaptureGlassLayer('));
     expect(native, isNot(contains('HDC screen = GetDC(nullptr);')));
-    expect(native, contains('const std::array<HWND, 4> windows'));
+    expect(native, contains('const std::array<HWND, 2> windows'));
     expect(native, contains('PrintWindow(g_window'));
     expect(native, contains('g_backdrop.captured_at.load()'));
+    // 操作提示固定为同一种轻透明胶囊，不得等待视频背板后再切换模糊材质。
+    final hintSurface = native.substring(
+      native.indexOf('void FillHintGlassSurface('),
+      native.indexOf('HintMode g_hint_mode'),
+    );
+    expect(hintSurface, contains('kHintGlassTopAlpha'));
+    expect(hintSurface, contains('kHintGlassBottomAlpha'));
+    expect(hintSurface, isNot(contains('DrawGlassBackdrop')));
+    expect(hintSurface, isNot(contains('HintTone')));
+    expect(native, contains('layout == HintLayout::Episode ? 250 : 270'));
+    expect(native, contains('每次鼠标移动都可直接同步重绘'));
+    expect(native, contains('g_hint_target_fraction'));
+    expect(native, contains('-18.0 * frame_dt'));
     expect(
-      RegExp(r'UpdateGlassBackdrop\(false\);').allMatches(native).length,
+      RegExp(
+        r'^\s+UpdateGlassBackdrop\(\);$',
+        multiLine: true,
+      ).allMatches(native).length,
       1,
     );
   });
