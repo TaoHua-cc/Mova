@@ -1,0 +1,5 @@
+// Distinct playback mark built from Mova's existing application identity.
+#include "resource.h"
+#include "winres.h"
+
+IDI_PLAYER_ICON ICON "resources\\player_icon.ico"

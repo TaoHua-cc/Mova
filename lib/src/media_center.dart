@@ -701,72 +701,67 @@ class _HomeHeroBackdrop extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ValueListenableBuilder<double>(
     valueListenable: yingjiHomeScrollDepth,
-    builder: (context, depth, _) {
-      // 海报随首页滚动位置连续淡出，固定流动渐变始终铺底接管，避免在
-      // hero 与发现内容的边界切换背景。完全淡出后整屏海报不再参与绘制。
-      final posterOpacity = (1 - depth).clamp(0.0, 1.0);
-      return ValueListenableBuilder<String?>(
-        valueListenable: yingjiBackdropUrl,
-        builder: (context, imageUrl, _) => ValueListenableBuilder<String>(
-          valueListenable: yingjiBackdropEffect,
-          builder: (context, effect, _) => RepaintBoundary(
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                if (imageUrl != null &&
-                    posterOpacity > 0 &&
-                    !FrameTrace.skipGlass('clear'))
-                  ShaderMask(
-                    blendMode: BlendMode.dstIn,
-                    shaderCallback: (bounds) => LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [
-                        Colors.white.withValues(alpha: posterOpacity),
-                        Colors.white.withValues(alpha: posterOpacity),
-                        Colors.transparent,
-                      ],
-                      // 提前完全透明，避免 Sliver 边界最后一行留下亮色接缝。
-                      stops: [0, .58, .985],
-                    ).createShader(bounds),
-                    child: Stack(
+    child: ValueListenableBuilder<String?>(
+      valueListenable: yingjiBackdropUrl,
+      builder: (context, imageUrl, _) => ValueListenableBuilder<String>(
+        valueListenable: yingjiBackdropEffect,
+        builder: (context, effect, _) {
+          if (imageUrl == null || FrameTrace.skipGlass('clear')) {
+            return const SizedBox.expand();
+          }
+          return RepaintBoundary(
+            child: ShaderMask(
+              blendMode: BlendMode.dstIn,
+              shaderCallback: (bounds) => const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Colors.white, Colors.white, Colors.transparent],
+                // 固定遮罩与滚动无关，可在海报 URL / 转场变化时重绘一次。
+                stops: [0, .58, .985],
+              ).createShader(bounds),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  AnimatedSwitcher(
+                    duration: effect == 'instant'
+                        ? Duration.zero
+                        : const Duration(milliseconds: 900),
+                    layoutBuilder: (currentChild, previousChildren) => Stack(
                       fit: StackFit.expand,
-                      children: [
-                        AnimatedSwitcher(
-                          duration: effect == 'instant'
-                              ? Duration.zero
-                              : const Duration(milliseconds: 900),
-                          layoutBuilder: (currentChild, previousChildren) =>
-                              Stack(
-                                fit: StackFit.expand,
-                                children: [...previousChildren, ?currentChild],
-                              ),
-                          transitionBuilder: (child, animation) =>
-                              _transition(effect, child, animation),
-                          child: CachedNetworkImage(
-                            key: ValueKey('hero-$imageUrl'),
-                            imageUrl: imageUrl,
-                            fit: BoxFit.cover,
-                            memCacheWidth: 1280,
-                            errorWidget: (_, _, _) => const SizedBox.shrink(),
-                          ),
-                        ),
-                        const DecoratedBox(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.centerLeft,
-                              end: Alignment.centerRight,
-                              colors: [Color(0xB307090D), Color(0x0007090D)],
-                            ),
-                          ),
-                        ),
-                      ],
+                      children: [...previousChildren, ?currentChild],
+                    ),
+                    transitionBuilder: (child, animation) =>
+                        _transition(effect, child, animation),
+                    child: CachedNetworkImage(
+                      key: ValueKey('hero-$imageUrl'),
+                      imageUrl: imageUrl,
+                      fit: BoxFit.cover,
+                      memCacheWidth: 1280,
+                      errorWidget: (_, _, _) => const SizedBox.shrink(),
                     ),
                   ),
-              ],
+                  const DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: [Color(0xB307090D), Color(0x0007090D)],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
+      ),
+    ),
+    builder: (context, depth, child) {
+      // 遮罩内容静态缓存，滚动只更新合成透明度；到发现区后不绘制整屏海报。
+      final posterOpacity = (1 - depth).clamp(0.0, 1.0);
+      return Opacity(
+        opacity: posterOpacity,
+        child: posterOpacity == 0 ? const SizedBox.expand() : child,
       );
     },
   );
@@ -980,7 +975,9 @@ class _CinematicHomeState extends State<_CinematicHome>
   final _tmdb = TmdbClient();
   late Future<List<TmdbItem>> _trending;
   List<WatchState> _history = const [];
+  bool _historyLocalOnly = false;
   bool _historyLoadRunning = false;
+  bool _historyReloadRequested = false;
   int _hero = 0;
   // 轮播进度由 ValueNotifier 驱动：每 100ms 只刷新圆点层，避免整页重建。
   final ValueNotifier<double> _heroProgress = ValueNotifier<double>(0);
@@ -1008,7 +1005,11 @@ class _CinematicHomeState extends State<_CinematicHome>
     yingjiMetadataRevision.addListener(_handleMetadataRevision);
     yingjiScrollInProgress.addListener(_flushMetadataAfterScroll);
     _heroTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      if (!mounted) return;
+      if (!mounted ||
+          yingjiScrollInProgress.value ||
+          yingjiHomeScrollDepth.value > 0) {
+        return;
+      }
       final items = _trendingValue;
       if (items.length < 2 || !_autoCarousel) return;
       final next = _heroProgress.value + .1 / _carouselSeconds;
@@ -1124,32 +1125,60 @@ class _CinematicHomeState extends State<_CinematicHome>
     // Several callers (init, didPopNext, shelf callbacks) may fire while a
     // previous refresh is still fetching server resume items; the guard keeps
     // refreshes serialized so the UI never stacks duplicate network work.
-    if (_historyLoadRunning) return;
+    if (_historyLoadRunning) {
+      _historyReloadRequested = true;
+      return;
+    }
     _historyLoadRunning = true;
     try {
       final store = await WatchStateStore.create();
+      final localOnly = await WatchStateStore.localOnly();
       final local = store.load();
       // Local records are authoritative for what this device just watched, so
       // surface them immediately; the server merge below only fills gaps and
       // never overwrites fresher local progress.
-      final visible = continueWatchingRows(local);
-      if (mounted && !_sameWatchStates(_history, visible)) {
-        setState(() => _history = visible);
+      final visible = store.visibleContinueRows(local);
+      if (mounted &&
+          (!_sameWatchStates(_history, visible) ||
+              _historyLocalOnly != localOnly)) {
+        setState(() {
+          _history = visible;
+          _historyLocalOnly = localOnly;
+        });
       }
       final merged = await _mergeServerWatchHistory(store, local);
-      if (mounted && !_sameWatchStates(_history, merged)) {
-        setState(() => _history = merged);
+      final current = store.visibleContinueRows(merged);
+      if (mounted &&
+          (!_sameWatchStates(_history, current) ||
+              _historyLocalOnly != localOnly)) {
+        setState(() {
+          _history = current;
+          _historyLocalOnly = localOnly;
+        });
       }
       // 封面在合并后一次性解析并落盘（可疑/缺图行 → TMDB 稳定图），解析完再刷新
       // 一次。渲染层此后只显示已存好的图，不再有任何异步闪烁。
       unawaited(
-        _resolveArtworkForRows(merged, store).then((resolved) {
-          if (mounted) setState(() => _history = resolved);
+        _resolveArtworkForRows(current, store).then((resolved) {
+          if (mounted) {
+            setState(() => _history = store.visibleContinueRows(resolved));
+          }
         }),
       );
     } finally {
       _historyLoadRunning = false;
+      if (_historyReloadRequested && mounted) {
+        _historyReloadRequested = false;
+        unawaited(_loadHistory());
+      }
     }
+  }
+
+  Future<void> _removeFromContinue(WatchState state) async {
+    final store = await WatchStateStore.create();
+    await store.hideFromContinueWatching(state);
+    if (!mounted) return;
+    setState(() => _history = store.visibleContinueRows(_history));
   }
 
   /// The server merge is shared with the full "continue watching" page, so it
@@ -1472,6 +1501,8 @@ class _CinematicHomeState extends State<_CinematicHome>
                                 )
                               : _HistoryStrip(
                                   history: _history,
+                                  localOnly: _historyLocalOnly,
+                                  onRemove: _removeFromContinue,
                                   onChanged: _loadHistory,
                                   controller: _historyScroll,
                                 ),
@@ -1692,7 +1723,7 @@ Future<List<WatchState>> _mergeServerWatchHistory(
   // the local store — e.g. the home shelf right after the full continue list
   // page pops back — flashed that wrong order until a merge had re-run.
   await store.replaceAll(ordered);
-  return continueWatchingRows(ordered);
+  return store.visibleContinueRows(ordered);
 }
 
 /// Orders the reconciled rows for the continue-watching shelf. Rows carrying
@@ -3945,6 +3976,9 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                 SliverFixedExtentList.builder(
                   itemExtent: 396,
                   itemCount: visibleSections.length,
+                  // buildRow 已为每个栏目提供 RepaintBoundary，避免 Sliver
+                  // delegate 再包一层，减少发现页滚动时的冗余 layer。
+                  addRepaintBoundaries: false,
                   itemBuilder: (context, index) => buildRow(index + 1),
                 ),
             ],
@@ -3959,6 +3993,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
           physics: yingjiWheelPhysics,
           padding: const EdgeInsets.fromLTRB(0, 8, 0, 56),
           itemCount: itemCount,
+          addRepaintBoundaries: false,
           itemBuilder: (context, index) => buildRow(index),
         ),
       );
@@ -6732,7 +6767,7 @@ class _SourceHubState extends State<_SourceHub>
                   iconUrl: source.iconUrl,
                   customIcon: source.customIcon,
                 );
-                await store.upsert(current, token);
+                await store.updateIfPresent(current, token);
               }
             } catch (_) {
               // An authenticated media session can work when info is private.
@@ -6772,10 +6807,21 @@ class _SourceHubState extends State<_SourceHub>
     // fully successful automatic pass is considered complete for the session.
     _sessionProbeAt = offline.isEmpty ? now : null;
     if (!mounted) return;
+    // The probe runs concurrently with user actions. Re-read the committed list
+    // before publishing its snapshot, otherwise a slow probe can resurrect a
+    // server that was removed while its request was in flight.
+    final currentSources = store.load();
+    final refreshedById = {for (final source in updated) source.id: source};
+    final currentIds = currentSources.map((source) => source.id).toSet();
+    final visibleSources = currentSources
+        .map((source) => refreshedById[source.id] ?? source)
+        .toList(growable: false);
+    stats.removeWhere((id, _) => !currentIds.contains(id));
+    offline.removeWhere((id) => !currentIds.contains(id));
     setState(() {
       _refreshing = false;
       _lastChecked = now;
-      _sources = updated;
+      _sources = visibleSources;
       _stats
         ..clear()
         ..addAll(stats);
@@ -6852,7 +6898,7 @@ class _SourceHubState extends State<_SourceHub>
       http.close(force: true);
     }
     if (source.iconUrl != null && token != null && token.isNotEmpty) {
-      await store.upsert(baseline, token);
+      await store.updateIfPresent(baseline, token);
     }
     return baseline;
   }
@@ -6876,8 +6922,17 @@ class _SourceHubState extends State<_SourceHub>
       ),
     );
     if (confirmed == true && _store != null) {
-      await _store!.remove(source);
-      await _load();
+      try {
+        await _store!.remove(source);
+        await _load();
+      } catch (error) {
+        if (mounted) {
+          setState(() {
+            _sources = _store!.load();
+            _error = '移除服务器失败：$error';
+          });
+        }
+      }
     }
   }
 
@@ -8198,6 +8253,7 @@ class _CalendarPageState extends State<_CalendarPage>
   void initState() {
     super.initState();
     initSectionTopListener();
+    _traktConnected = TraktConnectionStatus.connected.value ?? false;
     TraktConnectionStatus.connected.addListener(_syncTraktConnection);
     _load();
   }
@@ -8605,7 +8661,8 @@ class _CalendarPageState extends State<_CalendarPage>
                     episode:
                         '第 ${next.seasonNumber} 季 · 第 ${next.episodeNumber} 集 · ${next.title}',
                     airDate: next.airDate,
-                    posterUrl: item.posterUrl ?? next.stillUrl,
+                    posterUrl:
+                        item.posterUrl ?? next.showPosterUrl ?? next.stillUrl,
                     backdropUrl: item.backdropUrl,
                     platform: next.network,
                     platformLogoUrl: next.networkLogoUrl,
@@ -9071,73 +9128,77 @@ class _CalendarDateRailTile extends StatelessWidget {
   final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) => InkWell(
-    onTap: onTap,
-    borderRadius: BorderRadius.circular(16),
-    child: AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
-      width: 64,
-      decoration: BoxDecoration(
-        color: selected
-            ? Colors.white.withValues(alpha: .92)
-            : today
-            ? Colors.white.withValues(alpha: .16)
-            : YingjiGlass.chrome(strength: .58),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
+  Widget build(BuildContext context) => YingjiMotionSurface(
+    borderRadius: 16,
+    selected: selected,
+    child: InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(16),
+      child: AnimatedContainer(
+        duration: MovaMotion.quick,
+        curve: MovaMotion.standardEase,
+        width: 64,
+        decoration: BoxDecoration(
           color: selected
-              ? Colors.white
-              : YingjiGlass.line(strength: today ? 1.7 : .8),
+              ? Colors.white.withValues(alpha: .92)
+              : today
+              ? Colors.white.withValues(alpha: .16)
+              : YingjiGlass.chrome(strength: .58),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: selected
+                ? Colors.white
+                : YingjiGlass.line(strength: today ? 1.7 : .8),
+          ),
+          boxShadow: selected
+              ? const [
+                  BoxShadow(
+                    color: Color(0x3DFFFFFF),
+                    blurRadius: 15,
+                    offset: Offset(0, 5),
+                  ),
+                ]
+              : today
+              ? const [BoxShadow(color: Color(0x2EFFFFFF), blurRadius: 14)]
+              : null,
         ),
-        boxShadow: selected
-            ? const [
-                BoxShadow(
-                  color: Color(0x3DFFFFFF),
-                  blurRadius: 15,
-                  offset: Offset(0, 5),
-                ),
-              ]
-            : today
-            ? const [BoxShadow(color: Color(0x2EFFFFFF), blurRadius: 14)]
-            : null,
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Text(
-            today ? '今天' : weekday,
-            style: TextStyle(
-              fontSize: 10,
-              fontWeight: FontWeight.w700,
-              color: selected ? const Color(0xFF151820) : YingjiColors.quiet,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              today ? '今天' : weekday,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: selected ? const Color(0xFF151820) : YingjiColors.quiet,
+              ),
             ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            '${date.day}',
-            style: TextStyle(
-              fontSize: 20,
-              height: 1,
-              fontWeight: FontWeight.w800,
-              color: selected ? const Color(0xFF101217) : YingjiColors.ink,
+            const SizedBox(height: 2),
+            Text(
+              '${date.day}',
+              style: TextStyle(
+                fontSize: 20,
+                height: 1,
+                fontWeight: FontWeight.w800,
+                color: selected ? const Color(0xFF101217) : YingjiColors.ink,
+              ),
             ),
-          ),
-          const SizedBox(height: 5),
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            width: count > 0 ? 16 : 4,
-            height: 3,
-            decoration: BoxDecoration(
-              color: count > 0
-                  ? (selected
-                        ? const Color(0xFF16191F)
-                        : const Color(0xFF8EE49C))
-                  : Colors.white.withValues(alpha: .18),
-              borderRadius: BorderRadius.circular(99),
+            const SizedBox(height: 5),
+            AnimatedContainer(
+              duration: MovaMotion.quick,
+              width: count > 0 ? 16 : 4,
+              height: 3,
+              decoration: BoxDecoration(
+                color: count > 0
+                    ? (selected
+                          ? const Color(0xFF16191F)
+                          : YingjiColors.success)
+                    : Colors.white.withValues(alpha: .18),
+                borderRadius: BorderRadius.circular(99),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     ),
   );
@@ -9225,218 +9286,230 @@ class _TrackingEventCard extends StatelessWidget {
     final episodeTitle = parts.length > 2
         ? parts.skip(2).where((part) => part != parts[1]).join(' · ')
         : '';
-    return InkWell(
-      onTap: onOpen,
-      borderRadius: BorderRadius.circular(18),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final compact = constraints.maxWidth < 490;
-          final artworkWidth = compact ? 78.0 : 92.0;
-          final actionSize = compact ? 30.0 : 34.0;
-          final platformColumnWidth = compact ? 84.0 : 126.0;
-          return YingjiGlassSurface(
-            radius: 18,
-            strength: 1.25,
-            shadow: false,
-            padding: EdgeInsets.zero,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(18),
-              child: SizedBox(
-                height: 152,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    if (event.backdropUrl != null) ...[
-                      CachedNetworkImage(
-                        imageUrl: _calendarArtworkUrl(
-                          event.backdropUrl!,
-                          size: 'w1280',
-                        ).toString(),
-                        fit: BoxFit.cover,
-                        memCacheWidth:
-                            (constraints.maxWidth *
-                                    MediaQuery.devicePixelRatioOf(context))
-                                .clamp(1.0, 1600.0)
-                                .round(),
-                        errorWidget: (_, _, _) => const SizedBox.shrink(),
+    return YingjiMotionSurface(
+      borderRadius: 18,
+      child: InkWell(
+        onTap: onOpen,
+        borderRadius: BorderRadius.circular(18),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 490;
+            final artworkWidth = compact ? 86.0 : 116.0;
+            final actionSize = compact ? 30.0 : 36.0;
+            final platformColumnWidth = compact ? 78.0 : 112.0;
+            final poster = event.posterUrl == null
+                ? const ColoredBox(
+                    color: YingjiColors.elevated,
+                    child: Center(
+                      child: Icon(
+                        YingjiIcons.calendar,
+                        color: YingjiColors.muted,
+                        size: 28,
                       ),
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.centerLeft,
-                            end: Alignment.centerRight,
-                            colors: [
-                              YingjiColors.canvas.withValues(alpha: .94),
-                              YingjiColors.canvas.withValues(alpha: .78),
-                              YingjiColors.canvas.withValues(alpha: .42),
-                              const Color(0xFF111318).withValues(alpha: .72),
-                            ],
-                            stops: const [0, .36, .68, 1],
-                          ),
+                    ),
+                  )
+                : CachedNetworkImage(
+                    imageUrl: _calendarArtworkUrl(
+                      event.posterUrl!,
+                      size: 'w780',
+                    ).toString(),
+                    fit: BoxFit.cover,
+                    memCacheWidth:
+                        (artworkWidth * MediaQuery.devicePixelRatioOf(context))
+                            .clamp(1.0, 512.0)
+                            .round(),
+                    errorWidget: (_, _, _) => const ColoredBox(
+                      color: YingjiColors.elevated,
+                      child: Center(
+                        child: Icon(
+                          YingjiIcons.calendar,
+                          color: YingjiColors.muted,
                         ),
                       ),
-                    ],
-                    Padding(
-                      padding: const EdgeInsets.all(10),
-                      child: Row(
-                        children: [
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
-                            child: SizedBox(
-                              width: artworkWidth,
-                              height: 132,
-                              child: event.posterUrl == null
-                                  ? const ColoredBox(
-                                      color: YingjiColors.elevated,
-                                      child: Icon(
-                                        YingjiIcons.calendar,
-                                        color: YingjiColors.muted,
-                                        size: 28,
-                                      ),
-                                    )
-                                  : CachedNetworkImage(
-                                      imageUrl: _calendarArtworkUrl(
-                                        event.posterUrl!,
-                                        size: 'w780',
-                                      ).toString(),
-                                      fit: BoxFit.cover,
-                                      memCacheWidth:
-                                          (artworkWidth *
-                                                  MediaQuery.devicePixelRatioOf(
-                                                    context,
-                                                  ))
-                                              .clamp(1.0, 512.0)
-                                              .round(),
-                                      errorWidget: (_, _, _) =>
-                                          const ColoredBox(
-                                            color: YingjiColors.elevated,
-                                            child: Icon(
-                                              YingjiIcons.calendar,
-                                              color: YingjiColors.muted,
-                                            ),
-                                          ),
-                                    ),
+                    ),
+                  );
+            return YingjiGlassSurface(
+              radius: 18,
+              strength: 1.25,
+              shadow: false,
+              padding: EdgeInsets.zero,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: SizedBox(
+                  height: 174,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (event.backdropUrl != null) ...[
+                        CachedNetworkImage(
+                          imageUrl: _calendarArtworkUrl(
+                            event.backdropUrl!,
+                            size: 'w1280',
+                          ).toString(),
+                          fit: BoxFit.cover,
+                          memCacheWidth:
+                              (constraints.maxWidth *
+                                      MediaQuery.devicePixelRatioOf(context))
+                                  .clamp(1.0, 1600.0)
+                                  .round(),
+                          errorWidget: (_, _, _) => const SizedBox.shrink(),
+                        ),
+                        DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.centerLeft,
+                              end: Alignment.centerRight,
+                              colors: [
+                                YingjiColors.canvas.withValues(alpha: .94),
+                                YingjiColors.canvas.withValues(alpha: .78),
+                                YingjiColors.canvas.withValues(alpha: .42),
+                                const Color(0xFF111318).withValues(alpha: .72),
+                              ],
+                              stops: const [0, .36, .68, 1],
                             ),
                           ),
-                          SizedBox(width: compact ? 11 : 16),
-                          Expanded(
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        event.title,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: compact ? 16 : 18,
-                                          height: 1.1,
-                                          fontWeight: FontWeight.w700,
-                                          letterSpacing: -.25,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        seasonEpisode,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: compact ? 12 : 13,
-                                          fontWeight: FontWeight.w600,
-                                          color: YingjiColors.ink,
-                                        ),
-                                      ),
-                                      if (episodeTitle.isNotEmpty) ...[
-                                        const SizedBox(height: 4),
+                        ),
+                      ],
+                      Positioned(
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                        width: artworkWidth,
+                        child: ClipRRect(
+                          borderRadius: const BorderRadius.horizontal(
+                            left: Radius.circular(18),
+                          ),
+                          child: poster,
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          artworkWidth + (compact ? 11 : 16),
+                          10,
+                          10,
+                          10,
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
                                         Text(
-                                          episodeTitle,
+                                          event.title,
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(
-                                            fontSize: compact ? 11 : 12,
-                                            color: YingjiColors.ink.withValues(
-                                              alpha: .78,
-                                            ),
+                                            fontSize: compact ? 16 : 18,
+                                            height: 1.1,
+                                            fontWeight: FontWeight.w700,
+                                            letterSpacing: -.25,
                                           ),
                                         ),
-                                      ],
-                                      if (progress != null) ...[
-                                        const SizedBox(height: 8),
-                                        _CalendarProgressBar(
-                                          progress: progress!,
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          seasonEpisode,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: compact ? 12 : 13,
+                                            fontWeight: FontWeight.w600,
+                                            color: YingjiColors.ink,
+                                          ),
+                                        ),
+                                        if (episodeTitle.isNotEmpty) ...[
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            episodeTitle,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: compact ? 11 : 12,
+                                              color: YingjiColors.ink
+                                                  .withValues(alpha: .78),
+                                            ),
+                                          ),
+                                        ],
+                                        if (progress != null) ...[
+                                          const SizedBox(height: 8),
+                                          _CalendarProgressBar(
+                                            progress: progress!,
+                                            compact: compact,
+                                          ),
+                                        ],
+                                        const Spacer(),
+                                        _CalendarAirtimeBadge(
+                                          label: time,
+                                          known: event.timeKnown,
                                           compact: compact,
                                         ),
                                       ],
-                                      const Spacer(),
-                                      _CalendarAirtimeBadge(
-                                        label: time,
-                                        known: event.timeKnown,
-                                        compact: compact,
-                                      ),
-                                    ],
+                                    ),
                                   ),
-                                ),
-                                SizedBox(width: compact ? 7 : 14),
-                                SizedBox(
-                                  width: platformColumnWidth,
-                                  child: Column(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.spaceBetween,
-                                    children: [
-                                      Expanded(
-                                        child: Center(
-                                          child:
-                                              event.platform?.isNotEmpty == true
-                                              ? _CalendarPlatformLogo(
-                                                  platform: event.platform!,
-                                                  logoUrl:
-                                                      event.platformLogoUrl,
-                                                  compact: compact,
-                                                )
-                                              : const SizedBox.shrink(),
+                                  SizedBox(width: compact ? 7 : 14),
+                                  SizedBox(
+                                    width: platformColumnWidth,
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.spaceBetween,
+                                      children: [
+                                        Expanded(
+                                          child: Center(
+                                            child:
+                                                event.platform?.isNotEmpty ==
+                                                    true
+                                                ? _CalendarPlatformLogo(
+                                                    platform: event.platform!,
+                                                    logoUrl:
+                                                        event.platformLogoUrl,
+                                                    compact: compact,
+                                                  )
+                                                : const SizedBox.shrink(),
+                                          ),
                                         ),
-                                      ),
-                                      Row(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.end,
-                                        children: [
-                                          YingjiMotionIconButton(
-                                            icon: YingjiIcons.bookmark,
-                                            tooltip: inWatchlist
-                                                ? '移出待看'
-                                                : '加入待看',
-                                            selected: inWatchlist,
-                                            size: actionSize,
-                                            onPressed: onToggleWatchlist,
-                                          ),
-                                          const SizedBox(width: 5),
-                                          YingjiMotionIconButton(
-                                            icon: YingjiIcons.forbidden,
-                                            tooltip: dropped ? '取消弃剧' : '弃剧',
-                                            selected: dropped,
-                                            size: actionSize,
-                                            onPressed: onToggleDropped,
-                                          ),
-                                        ],
-                                      ),
-                                    ],
+                                        Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.end,
+                                          children: [
+                                            YingjiMotionIconButton(
+                                              icon: YingjiIcons.bookmark,
+                                              tooltip: inWatchlist
+                                                  ? '移出待看'
+                                                  : '加入待看',
+                                              selected: inWatchlist,
+                                              size: actionSize,
+                                              onPressed: onToggleWatchlist,
+                                            ),
+                                            const SizedBox(width: 5),
+                                            YingjiMotionIconButton(
+                                              icon: YingjiIcons.forbidden,
+                                              tooltip: dropped ? '取消弃剧' : '弃剧',
+                                              selected: dropped,
+                                              size: actionSize,
+                                              onPressed: onToggleDropped,
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -9537,6 +9610,8 @@ class _CalendarPlatformWordmark extends StatelessWidget {
   }
 }
 
+const _calendarProgressAccent = Color(0xFFD99A68);
+
 class _CalendarProgressBar extends StatelessWidget {
   const _CalendarProgressBar({required this.progress, required this.compact});
   final CalendarProgressCounts progress;
@@ -9548,73 +9623,141 @@ class _CalendarProgressBar extends StatelessWidget {
     final fraction = counts.total <= 0
         ? 0.0
         : (counts.watched / counts.total).clamp(0.0, 1.0);
-    final percent = (fraction * 100).round();
+    final compactSize = compact ? 9.0 : 10.0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
         Row(
           children: [
-            Icon(
-              YingjiIcons.play_circle_fill,
-              size: compact ? 12 : 13,
-              color: YingjiGlass.accent.withValues(alpha: .9),
-            ),
-            const SizedBox(width: 5),
-            Text(
-              '追剧进度',
-              style: TextStyle(
-                fontSize: compact ? 9 : 10,
-                fontWeight: FontWeight.w600,
-                color: YingjiColors.muted.withValues(alpha: .9),
+            Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: compact ? 5 : 7,
+                vertical: compact ? 2 : 3,
+              ),
+              decoration: BoxDecoration(
+                color: _calendarProgressAccent.withValues(alpha: .18),
+                borderRadius: BorderRadius.circular(7),
+                border: Border.all(
+                  color: _calendarProgressAccent.withValues(alpha: .52),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    YingjiIcons.checkmark_circle_fill,
+                    size: compact ? 9 : 11,
+                    color: _calendarProgressAccent,
+                  ),
+                  const SizedBox(width: 3),
+                  Text(
+                    '已看 ${counts.watched}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: compactSize,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
               ),
             ),
             const Spacer(),
-            Text(
-              '已看 $percent%',
-              style: TextStyle(
-                fontSize: compact ? 9 : 10,
-                fontWeight: FontWeight.w700,
-                color: YingjiColors.ink,
-                fontFeatures: const [FontFeature.tabularFigures()],
-              ),
-            ),
+            _countLabel('未看 ${counts.unwatched}', compact),
+            const Spacer(),
+            _countLabel('总 ${counts.total}', compact, bold: true),
           ],
         ),
-        const SizedBox(height: 6),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(99),
-          child: SizedBox(
-            height: compact ? 5 : 6,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                ColoredBox(color: YingjiColors.ink.withValues(alpha: .16)),
-                FractionallySizedBox(
-                  alignment: Alignment.centerLeft,
-                  widthFactor: fraction,
-                  child: ColoredBox(color: YingjiGlass.accent),
+        SizedBox(height: compact ? 5 : 6),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final railHeight = compact ? 7.0 : 8.0;
+            final indicatorLeft = (constraints.maxWidth * fraction - 4).clamp(
+              0.0,
+              (constraints.maxWidth - 8).clamp(0.0, double.infinity),
+            );
+            return ClipRRect(
+              borderRadius: BorderRadius.circular(99),
+              child: SizedBox(
+                height: railHeight,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.white.withValues(alpha: .22),
+                            YingjiColors.ink.withValues(alpha: .12),
+                          ],
+                        ),
+                      ),
+                    ),
+                    FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: fraction,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            begin: Alignment.centerLeft,
+                            end: Alignment.centerRight,
+                            colors: [
+                              Color(0xFF9A5738),
+                              Color(0xFFD99A68),
+                              Color(0xFFFFE0B8),
+                            ],
+                            stops: [0, .76, 1],
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: _calendarProgressAccent.withValues(
+                                alpha: .52,
+                              ),
+                              blurRadius: 9,
+                              spreadRadius: -2,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (fraction > 0)
+                      Positioned(
+                        left: indicatorLeft,
+                        top: 1,
+                        bottom: 1,
+                        child: Container(
+                          width: 6,
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(99),
+                            boxShadow: const [
+                              BoxShadow(
+                                color: Color(0xAAFFFFFF),
+                                blurRadius: 5,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      top: 1,
+                      height: 1,
+                      child: ColoredBox(
+                        color: Colors.white.withValues(alpha: .38),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Expanded(child: _countLabel('已看 ${counts.watched}', compact)),
-            Expanded(
-              child: Center(
-                child: _countLabel('未看 ${counts.unwatched}', compact),
               ),
-            ),
-            Expanded(
-              child: Align(
-                alignment: Alignment.centerRight,
-                child: _countLabel('总集 ${counts.total}', compact, bold: true),
-              ),
-            ),
-          ],
+            );
+          },
         ),
       ],
     );
@@ -9879,6 +10022,10 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   Future<void> _load() async {
+    // A tab change can call _load while a slider/toggle save is still queued.
+    // Wait for that write before hydrating controllers, or the just-saved value
+    // can be replaced in the UI by the previous preference snapshot.
+    await _saveQueue;
     final prefs = await SharedPreferences.getInstance();
     if (mounted) {
       setState(() {
@@ -10133,15 +10280,17 @@ class _SettingsPageState extends State<SettingsPage>
             !_sameSettingValue(_persistedSettings[entry.key], entry.value),
       ),
     );
-    final changesDanmaku = changed.keys.any(
-      (key) => key.startsWith('yingji.danmaku.'),
+    final changesDanmakuApi = changed.keys.any(
+      (key) => key == 'yingji.danmaku.url' || key == 'yingji.danmaku.apis',
     );
+    final checksDanmakuApi =
+        changesDanmakuApi || changed.containsKey('yingji.danmaku.enabled');
     final danmakuApis = values['yingji.danmaku.apis']! as List<String>;
-    if (changesDanmaku && _danmakuEnabled && danmakuApis.isEmpty) {
+    if (checksDanmakuApi && _danmakuEnabled && danmakuApis.isEmpty) {
       if (mounted) setState(() => _savedMessage = '请填写弹幕 API 地址，或关闭弹幕');
       return;
     }
-    if (changesDanmaku) {
+    if (changesDanmakuApi && _danmakuEnabled) {
       for (final api in danmakuApis) {
         final candidate = api.replaceAllMapped(
           RegExp(r'\{(?:tmdbId|title|season|episode|url)\}'),
@@ -10158,14 +10307,20 @@ class _SettingsPageState extends State<SettingsPage>
     if (prefs.containsKey('yingji.danmaku.name')) {
       await prefs.remove('yingji.danmaku.name');
     }
+    final savedKeys = <String>{};
     for (final entry in changed.entries) {
-      if (await _writeSetting(prefs, entry.key, entry.value)) {
-        _persistedSettings = {
-          ..._persistedSettings,
-          entry.key: entry.value is List<String>
-              ? List<String>.of(entry.value as List<String>)
-              : entry.value,
-        };
+      try {
+        if (await _writeSetting(prefs, entry.key, entry.value)) {
+          savedKeys.add(entry.key);
+          _persistedSettings = {
+            ..._persistedSettings,
+            entry.key: entry.value is List<String>
+                ? List<String>.of(entry.value as List<String>)
+                : entry.value,
+          };
+        }
+      } catch (_) {
+        // Continue saving independent settings and report partial failure below.
       }
     }
     if (changed.containsKey('yingji.home.carousel-effect')) {
@@ -10174,15 +10329,24 @@ class _SettingsPageState extends State<SettingsPage>
     // 播放器（桌面端是独立进程）不会自己重读偏好：这一页改的「弹幕显示 / 片头
     // 片尾 / 步长」要立刻推给正在跑的播放器，否则设置页显示新值、播放器还按
     // 旧值走（这些值以前只在起播时下发过一次）。
-    if (changed.keys.any(
+    if (savedKeys.any(
       (key) =>
           key.startsWith('yingji.danmaku.') ||
           key.startsWith('yingji.segment.') ||
           _liveSettingKeys.contains(key),
     )) {
-      unawaited(WindowsNativePlayer.pushLiveSettings(keys: changed.keys));
+      try {
+        await WindowsNativePlayer.pushLiveSettings(keys: savedKeys);
+      } catch (_) {
+        if (mounted) setState(() => _savedMessage = '已保存，但播放器未能立即同步');
+        return;
+      }
     }
-    if (feedback && mounted) setState(() => _savedMessage = '已保存');
+    if (mounted && savedKeys.length != changed.length) {
+      setState(() => _savedMessage = '部分设置未能保存，请重试');
+    } else if (feedback && mounted) {
+      setState(() => _savedMessage = '已保存');
+    }
   }
 
   void _applyAppearance() {
@@ -11396,6 +11560,7 @@ class _SettingsPageState extends State<SettingsPage>
                       width: 118,
                       child: TextField(
                         controller: _danmakuApiNameControllers[index],
+                        onChanged: (_) => _save(),
                         decoration: InputDecoration(
                           labelText: '名称',
                           hintText: '弹幕 ${index + 1}',
@@ -11406,6 +11571,7 @@ class _SettingsPageState extends State<SettingsPage>
                     Expanded(
                       child: TextField(
                         controller: _danmakuApiControllers[index],
+                        onChanged: (_) => _save(),
                         keyboardType: TextInputType.url,
                         decoration: InputDecoration(
                           labelText: 'API ${index + 1}',
@@ -11436,10 +11602,15 @@ class _SettingsPageState extends State<SettingsPage>
                         icon: YingjiIcons.trash,
                         tooltip: '移除 API ${index + 1}',
                         size: 38,
-                        onPressed: () => setState(() {
-                          _danmakuApiControllers.removeAt(index).dispose();
-                          _danmakuApiNameControllers.removeAt(index).dispose();
-                        }),
+                        onPressed: () {
+                          setState(() {
+                            _danmakuApiControllers.removeAt(index).dispose();
+                            _danmakuApiNameControllers
+                                .removeAt(index)
+                                .dispose();
+                          });
+                          _save();
+                        },
                       ),
                     ],
                   ],
@@ -11452,19 +11623,23 @@ class _SettingsPageState extends State<SettingsPage>
                   icon: YingjiIcons.plus,
                   tooltip: '添加弹幕 API',
                   size: 38,
-                  onPressed: () => setState(() {
-                    _danmakuApiControllers.add(TextEditingController());
-                    _danmakuApiNameControllers.add(
-                      TextEditingController(
-                        text: '弹幕 ${_danmakuApiControllers.length}',
-                      ),
-                    );
-                  }),
+                  onPressed: () {
+                    setState(() {
+                      _danmakuApiControllers.add(TextEditingController());
+                      _danmakuApiNameControllers.add(
+                        TextEditingController(
+                          text: '弹幕 ${_danmakuApiControllers.length}',
+                        ),
+                      );
+                    });
+                    _save();
+                  },
                 ),
               ),
               const SizedBox(height: 10),
               TextField(
                 controller: _danmakuToken,
+                onChanged: (_) => _save(),
                 obscureText: true,
                 decoration: const InputDecoration(
                   labelText: 'API Token（可选）',
@@ -11703,8 +11878,8 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 8),
               Text(
                 WindowHost.isDesktop
-                    ? '播放时持续预读并持久保存所选容量；下次播放同一视频会复用已缓存区间，范围内快进无需重新下载。'
-                    : '播放时按当前网络预读并保留所选容量；下次播放会复用已缓存区间，移动数据默认不缓存。',
+                    ? '从当前播放点向前缓存，所选容量是前向窗口上限；消耗约一半后继续预读，播完清理本集缓存。'
+                    : '按当前网络从播放点向前缓存；消耗约一半后继续预读，播完清理本集缓存。移动数据默认不缓存。',
                 style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               const SizedBox(height: 10),
@@ -12115,20 +12290,22 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   void _reorderPlayerTool(int oldIndex, int newIndex) {
+    // _persistedSettings retains the prior list snapshot; mutate a copy so _save
+    // can detect the change and write the order used by the player at startup.
+    final order = List<String>.of(_playerToolOrder);
+    final moved = order.removeAt(oldIndex);
+    order.insert(newIndex, moved);
     setState(() {
-      final moved = _playerToolOrder.removeAt(oldIndex);
-      _playerToolOrder.insert(newIndex, moved);
+      _playerToolOrder = order;
     });
     _save();
   }
 
   void _togglePlayerTool(String id, bool enabled) {
     setState(() {
-      if (enabled) {
-        _playerToolHidden.remove(id);
-      } else if (!_playerToolHidden.contains(id)) {
-        _playerToolHidden.add(id);
-      }
+      _playerToolHidden = enabled
+          ? _playerToolHidden.where((tool) => tool != id).toList()
+          : [..._playerToolHidden, if (!_playerToolHidden.contains(id)) id];
     });
     _save();
   }
@@ -12419,6 +12596,24 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
   bool _hovered = false;
 
   @override
+  void initState() {
+    super.initState();
+    yingjiScrollInProgress.addListener(_clearHoverWhileScrolling);
+  }
+
+  void _clearHoverWhileScrolling() {
+    if (yingjiScrollInProgress.value && _hovered && mounted) {
+      setState(() => _hovered = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    yingjiScrollInProgress.removeListener(_clearHoverWhileScrolling);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final selection = _DiscoverFeedSelection.tryParse(widget.source);
     final platformId = selection?.platform ?? 'all';
@@ -12442,8 +12637,14 @@ class _PlatformEntryCardState extends State<_PlatformEntryCard> {
             borderRadius: BorderRadius.circular(14),
             onTap: hasPlatform ? widget.onOpen : widget.onConfigure,
             child: MouseRegion(
-              onEnter: (_) => setState(() => _hovered = true),
-              onExit: (_) => setState(() => _hovered = false),
+              onEnter: (_) {
+                if (!yingjiScrollInProgress.value) {
+                  setState(() => _hovered = true);
+                }
+              },
+              onExit: (_) {
+                if (_hovered) setState(() => _hovered = false);
+              },
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 180),
                 curve: Curves.easeOutCubic,
@@ -13012,7 +13213,7 @@ class _RankTileState extends State<_RankTile>
         _showPreview();
       },
       onExit: (_) {
-        setState(() => _hovered = false);
+        if (_hovered) setState(() => _hovered = false);
         if (!yingjiScrollInProgress.value) unawaited(_hidePreview());
       },
       child: SizedBox(
@@ -13321,6 +13522,7 @@ class _ContinueWatchingPage extends StatefulWidget {
 class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
   final _scroll = ScrollController();
   List<WatchState> _rows = const [];
+  bool _historyLocalOnly = false;
   bool _loading = true;
   bool _busy = false;
 
@@ -13345,20 +13547,25 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
     _busy = true;
     try {
       final store = await WatchStateStore.create();
+      final localOnly = await WatchStateStore.localOnly();
       final local = store.load();
       if (mounted) {
         setState(() {
-          _rows = continueWatchingRows(local);
+          _rows = store.visibleContinueRows(local);
+          _historyLocalOnly = localOnly;
           _loading = false;
         });
       }
       final merged = await _mergeServerWatchHistory(store, local);
-      if (mounted && !_sameWatchStates(_rows, merged)) {
-        setState(() => _rows = merged);
+      final current = store.visibleContinueRows(merged);
+      if (mounted && !_sameWatchStates(_rows, current)) {
+        setState(() => _rows = current);
       }
       unawaited(
-        _resolveArtworkForRows(merged, store).then((resolved) {
-          if (mounted) setState(() => _rows = resolved);
+        _resolveArtworkForRows(current, store).then((resolved) {
+          if (mounted) {
+            setState(() => _rows = store.visibleContinueRows(resolved));
+          }
         }),
       );
     } finally {
@@ -13368,15 +13575,9 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
 
   Future<void> _remove(WatchState state) async {
     final store = await WatchStateStore.create();
-    await store.remove(state.mediaId);
+    await store.hideFromContinueWatching(state);
     if (!mounted) return;
-    // Remove from the visible list only; the server remains authoritative and
-    // will re-import the record the next time the shelf reconciles.
-    setState(
-      () => _rows = _rows
-          .where((row) => row.mediaId != state.mediaId)
-          .toList(growable: false),
-    );
+    setState(() => _rows = store.visibleContinueRows(_rows));
   }
 
   @override
@@ -13477,7 +13678,9 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                                       Positioned.fill(
                                         child: _ContinueTile(
                                           state: state,
+                                          localOnly: _historyLocalOnly,
                                           width: double.infinity,
+                                          onRemove: _remove,
                                           onChanged: _load,
                                         ),
                                       ),
@@ -13513,10 +13716,14 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
 class _HistoryStrip extends StatelessWidget {
   const _HistoryStrip({
     required this.history,
+    required this.localOnly,
+    required this.onRemove,
     required this.onChanged,
     this.controller,
   });
   final List<WatchState> history;
+  final bool localOnly;
+  final ValueChanged<WatchState> onRemove;
   final VoidCallback onChanged;
   final ScrollController? controller;
   @override
@@ -13531,7 +13738,12 @@ class _HistoryStrip extends StatelessWidget {
       separatorBuilder: (_, _) => const SizedBox(width: 16),
       itemBuilder: (_, index) {
         final state = history[index];
-        return _ContinueTile(state: state, onChanged: onChanged);
+        return _ContinueTile(
+          state: state,
+          localOnly: localOnly,
+          onRemove: onRemove,
+          onChanged: onChanged,
+        );
       },
     ),
   );
@@ -13540,117 +13752,284 @@ class _HistoryStrip extends StatelessWidget {
 class _ContinueTile extends StatelessWidget {
   const _ContinueTile({
     required this.state,
+    required this.localOnly,
+    required this.onRemove,
     required this.onChanged,
     this.width = 274,
   });
   final WatchState state;
+  final bool localOnly;
+  final ValueChanged<WatchState> onRemove;
   final VoidCallback onChanged;
   final double width;
   @override
   Widget build(BuildContext context) => SizedBox(
     width: width,
-    child: InkWell(
-      borderRadius: BorderRadius.circular(14),
-      onTap: () => _openWatchDetail(context, state),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: _MediaHover(
-              borderRadius: 14,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  _ContinueArtwork(state: state),
-                  const DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [Colors.transparent, Color(0xB3000000)],
-                        begin: Alignment.center,
-                        end: Alignment.bottomCenter,
+    child: GestureDetector(
+      onSecondaryTapUp: (details) => _continueContextMenu(
+        context,
+        state,
+        onRemove,
+        onChanged,
+        details.globalPosition,
+      ),
+      onLongPressStart: (details) => _continueContextMenu(
+        context,
+        state,
+        onRemove,
+        onChanged,
+        details.globalPosition,
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: () => _openWatchDetail(context, state),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            AspectRatio(
+              aspectRatio: 16 / 9,
+              child: _MediaHover(
+                borderRadius: 14,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    _ContinueArtwork(state: state),
+                    Positioned(
+                      right: 9,
+                      top: 9,
+                      child: AnimatedSwitcher(
+                        duration: MovaMotion.standard,
+                        switchInCurve: MovaMotion.spring,
+                        switchOutCurve: MovaMotion.exit,
+                        transitionBuilder: (child, animation) =>
+                            ScaleTransition(
+                              scale: animation,
+                              child: FadeTransition(
+                                opacity: animation,
+                                child: child,
+                              ),
+                            ),
+                        child: state.isCompleted
+                            ? const Icon(
+                                YingjiIcons.checkmark_circle_fill,
+                                key: ValueKey('played'),
+                                color: Colors.white,
+                              )
+                            : const SizedBox.square(
+                                key: ValueKey('unplayed'),
+                                dimension: 20,
+                              ),
                       ),
                     ),
-                  ),
-                  Positioned(
-                    left: 10,
-                    top: 10,
-                    child: _WatchProgressOriginBadge(state: state),
-                  ),
-                  Positioned(
-                    left: 10,
-                    right: 10,
-                    bottom: 8,
-                    child: Column(
-                      children: [
-                        Row(
-                          children: [
-                            Text(
-                              _duration(state.position),
-                              style: const TextStyle(
-                                fontSize: 10.5,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const Spacer(),
-                            Text(
-                              _duration(state.duration - state.position),
-                              style: const TextStyle(
-                                fontSize: 10.5,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ],
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [Colors.transparent, Color(0xB3000000)],
+                          begin: Alignment.center,
+                          end: Alignment.bottomCenter,
                         ),
-                        const SizedBox(height: 4),
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(99),
-                          child: LinearProgressIndicator(
-                            value: state.progress,
-                            minHeight: 3,
-                            backgroundColor: Colors.white24,
-                            valueColor: const AlwaysStoppedAnimation<Color>(
-                              Colors.white,
+                      ),
+                    ),
+                    Positioned(
+                      left: 10,
+                      top: 10,
+                      child: _WatchProgressOriginBadge(
+                        state: state,
+                        localOnly: localOnly,
+                      ),
+                    ),
+                    Positioned(
+                      left: 10,
+                      right: 10,
+                      bottom: 8,
+                      child: Column(
+                        children: [
+                          Row(
+                            children: [
+                              Text(
+                                _duration(state.position),
+                                style: const TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const Spacer(),
+                              Text(
+                                _duration(state.duration - state.position),
+                                style: const TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(99),
+                            child: LinearProgressIndicator(
+                              value: state.progress,
+                              minHeight: 3,
+                              backgroundColor: Colors.white24,
+                              valueColor: const AlwaysStoppedAnimation<Color>(
+                                Colors.white,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            state.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontSize: 14,
-              height: 1.25,
-              letterSpacing: -.15,
-              fontWeight: FontWeight.w800,
+            const SizedBox(height: 8),
+            Text(
+              state.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 14,
+                height: 1.25,
+                letterSpacing: -.15,
+                fontWeight: FontWeight.w800,
+              ),
             ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            state.episodeTitle?.isNotEmpty == true
-                ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1} · ${state.episodeTitle}'
-                : state.episodeNumber != null
-                ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1}'
-                : '继续上次观看',
-            style: const TextStyle(
-              fontSize: 11.5,
-              height: 1.25,
-              fontWeight: FontWeight.w500,
-              color: Color(0xFFC2C6D0),
+            const SizedBox(height: 4),
+            Text(
+              state.episodeTitle?.isNotEmpty == true
+                  ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1} · ${state.episodeTitle}'
+                  : state.episodeNumber != null
+                  ? 'S${state.seasonNumber ?? 1}E${state.episodeNumber ?? 1}'
+                  : '继续上次观看',
+              style: const TextStyle(
+                fontSize: 11.5,
+                height: 1.25,
+                fontWeight: FontWeight.w500,
+                color: Color(0xFFC2C6D0),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     ),
   );
+}
+
+Future<void> _continueContextMenu(
+  BuildContext context,
+  WatchState state,
+  ValueChanged<WatchState> onRemove,
+  VoidCallback onChanged,
+  Offset position,
+) async {
+  final watched = state.isCompleted;
+  final choice = await showYingjiContextMenu(
+    context: context,
+    position: position,
+    actions: [
+      YingjiContextAction(
+        value: 'played',
+        label: '标记为已播放',
+        icon: YingjiIcons.checkmark_circle_fill,
+        selected: watched,
+      ),
+      YingjiContextAction(
+        value: 'unplayed',
+        label: '标记为未播放',
+        icon: YingjiIcons.refresh,
+        selected: false,
+      ),
+      const YingjiContextAction(
+        value: 'remove',
+        label: '从继续播放中移除',
+        icon: YingjiIcons.trash,
+      ),
+    ],
+  );
+  if (choice == null || !context.mounted) return;
+  if (choice == 'remove') {
+    onRemove(state);
+    return;
+  }
+  final store = await WatchStateStore.create();
+  final played = choice == 'played';
+  await store.save(
+    WatchState(
+      mediaId: state.mediaId,
+      title: state.title,
+      position: played ? state.duration : Duration.zero,
+      duration: state.duration,
+      imageUrl: state.imageUrl,
+      sourceId: state.sourceId,
+      serverItemId: state.serverItemId,
+      tmdbId: state.tmdbId,
+      episodeTitle: state.episodeTitle,
+      seasonNumber: state.seasonNumber,
+      episodeNumber: state.episodeNumber,
+      updatedAt: DateTime.now(),
+      isPlayed: played,
+      progressOrigin: state.progressOrigin,
+      progressOriginName: state.progressOriginName,
+    ),
+  );
+  onChanged();
+  try {
+    if (state.sourceId case final sourceId? when state.serverItemId != null) {
+      final sources = await SourceStore.create();
+      final source = sources
+          .load()
+          .where((value) => value.id == sourceId)
+          .firstOrNull;
+      final token = source == null ? null : sources.tokenFor(source);
+      if (source != null &&
+          token != null &&
+          token.isNotEmpty &&
+          source.kind != SourceKind.webdav) {
+        final client = EmbyClient(
+          proxy: ProxyRouting.serverUsesProxy(source.id),
+        );
+        try {
+          await client.setPlayed(
+            EmbySession(source: source, token: token),
+            state.serverItemId!,
+            played: played,
+          );
+        } finally {
+          client.dispose();
+        }
+      }
+    }
+    if (state.tmdbId case final tmdbId?
+        when tmdbId > 0 &&
+            state.seasonNumber != null &&
+            state.episodeNumber != null) {
+      var credentials = await TraktCredentials.read();
+      try {
+        credentials = await credentials.refreshIfNeeded();
+      } catch (_) {}
+      if (credentials.clientId.isNotEmpty &&
+          credentials.accessToken.isNotEmpty) {
+        final trakt = TraktClient();
+        try {
+          await trakt.setEpisodeWatched(
+            clientId: credentials.clientId,
+            accessToken: credentials.accessToken,
+            tmdbId: tmdbId,
+            season: state.seasonNumber!,
+            episode: state.episodeNumber!,
+            watched: played,
+          );
+        } finally {
+          trakt.dispose();
+        }
+      }
+    }
+  } catch (error) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('本机状态已更新，远端同步失败：$error')));
+    }
+  }
 }
 
 /// 继续观看卡片封面：直接显示记录里「已经解析并落盘好」的图，稳定显示。
@@ -13789,58 +14168,20 @@ Future<String?> _resolvedArtworkFor(WatchState row, TmdbClient client) async {
   return null;
 }
 
-class _WatchProgressOriginBadge extends StatefulWidget {
-  const _WatchProgressOriginBadge({required this.state});
+class _WatchProgressOriginBadge extends StatelessWidget {
+  const _WatchProgressOriginBadge({
+    required this.state,
+    required this.localOnly,
+  });
 
   final WatchState state;
-
-  @override
-  State<_WatchProgressOriginBadge> createState() =>
-      _WatchProgressOriginBadgeState();
-}
-
-class _WatchProgressOriginBadgeState extends State<_WatchProgressOriginBadge> {
-  late Future<(MediaSource, String?)?> _server;
-
-  @override
-  void initState() {
-    super.initState();
-    _server = _loadServer();
-  }
-
-  @override
-  void didUpdateWidget(covariant _WatchProgressOriginBadge oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.state.sourceId != widget.state.sourceId ||
-        oldWidget.state.progressOrigin != widget.state.progressOrigin) {
-      _server = _loadServer();
-    }
-  }
-
-  Future<(MediaSource, String?)?> _loadServer() async {
-    if (widget.state.progressOrigin != 'server' ||
-        widget.state.sourceId == null) {
-      return null;
-    }
-    final store = await SourceStore.create();
-    for (final source in store.load()) {
-      if (source.id == widget.state.sourceId) {
-        return (source, store.tokenFor(source));
-      }
-    }
-    return null;
-  }
+  final bool localOnly;
 
   @override
   Widget build(BuildContext context) {
-    final state = widget.state;
-    final (icon, label) = switch (state.progressOrigin) {
-      'server' => (
-        YingjiIcons.server,
-        state.progressOriginName?.trim().isNotEmpty == true
-            ? state.progressOriginName!.trim()
-            : '服务器',
-      ),
+    final origin = state.visibleProgressOrigin(localOnly: localOnly);
+    final (icon, label) = switch (origin) {
+      'server' => (YingjiIcons.server, '服务器'),
       'trakt' => (YingjiIcons.refresh, 'Trakt'),
       _ => (YingjiIcons.play_rectangle, '本机'),
     };
@@ -13862,18 +14203,7 @@ class _WatchProgressOriginBadgeState extends State<_WatchProgressOriginBadge> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (state.progressOrigin == 'server')
-            FutureBuilder<(MediaSource, String?)?>(
-              future: _server,
-              builder: (context, snapshot) {
-                final server = snapshot.data;
-                return server == null
-                    ? Icon(icon, size: 13, color: Colors.white)
-                    : ServerMark(source: server.$1, token: server.$2, size: 16);
-              },
-            )
-          else
-            Icon(icon, size: 13, color: Colors.white),
+          Icon(icon, size: 13, color: Colors.white),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
@@ -13966,6 +14296,7 @@ class _MediaHover extends StatefulWidget {
 
 class _MediaHoverState extends State<_MediaHover> {
   bool _hovered = false;
+  bool _pressed = false;
 
   @override
   void initState() {
@@ -13974,8 +14305,11 @@ class _MediaHoverState extends State<_MediaHover> {
   }
 
   void _clearHoverWhileScrolling() {
-    if (yingjiScrollInProgress.value && _hovered && mounted) {
-      setState(() => _hovered = false);
+    if (yingjiScrollInProgress.value && (_hovered || _pressed) && mounted) {
+      setState(() {
+        _hovered = false;
+        _pressed = false;
+      });
     }
   }
 
@@ -13987,38 +14321,54 @@ class _MediaHoverState extends State<_MediaHover> {
 
   @override
   Widget build(BuildContext context) => MouseRegion(
+    cursor: SystemMouseCursors.click,
     onEnter: (_) {
       if (!yingjiScrollInProgress.value) setState(() => _hovered = true);
     },
     onExit: (_) {
-      if (_hovered) setState(() => _hovered = false);
+      if (_hovered || _pressed) {
+        setState(() {
+          _hovered = false;
+          _pressed = false;
+        });
+      }
     },
-    child: AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
-      decoration: BoxDecoration(
-        // 不透明底托住圆角海报，合成时不会透出流动背景。
-        color: const Color(0xFF1A1D25),
-        borderRadius: BorderRadius.circular(widget.borderRadius),
-        border: Border.all(
-          color: _hovered
-              ? Colors.white.withValues(alpha: .72)
-              : Colors.transparent,
-          width: 1,
+    child: Listener(
+      onPointerDown: (_) => setState(() => _pressed = true),
+      onPointerUp: (_) => setState(() => _pressed = false),
+      onPointerCancel: (_) => setState(() => _pressed = false),
+      child: AnimatedScale(
+        scale: _pressed ? MovaMotion.pressScaleCard : 1,
+        duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
+        curve: _pressed ? MovaMotion.press : MovaMotion.spring,
+        child: AnimatedContainer(
+          duration: MovaMotion.quick,
+          curve: MovaMotion.standardEase,
+          decoration: BoxDecoration(
+            // 不透明底托住圆角海报，合成时不会透出流动背景。
+            color: const Color(0xFF1A1D25),
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            border: Border.all(
+              color: _hovered
+                  ? Colors.white.withValues(alpha: .72)
+                  : Colors.transparent,
+              width: 1,
+            ),
+            boxShadow: _hovered
+                ? const [
+                    BoxShadow(
+                      color: Color(0x99000000),
+                      blurRadius: 24,
+                      offset: Offset(0, 12),
+                    ),
+                  ]
+                : const [],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            child: widget.child,
+          ),
         ),
-        boxShadow: _hovered
-            ? const [
-                BoxShadow(
-                  color: Color(0x99000000),
-                  blurRadius: 24,
-                  offset: Offset(0, 12),
-                ),
-              ]
-            : const [],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(widget.borderRadius),
-        child: widget.child,
       ),
     ),
   );
@@ -14327,9 +14677,9 @@ Future<void> _showHistoryManager(
                           tooltip: '移除记录',
                           icon: const Icon(YingjiIcons.trash, size: 18),
                           onPressed: () async {
-                            await store.remove(state.mediaId);
+                            await store.hideFromContinueWatching(state);
                             setDialogState(
-                              () => rows = List.of(rows)..removeAt(index),
+                              () => rows = store.visibleContinueRows(rows),
                             );
                             onChanged();
                           },

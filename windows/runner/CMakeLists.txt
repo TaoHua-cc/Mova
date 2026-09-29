@@ -42,6 +42,7 @@ add_dependencies(${BINARY_NAME} flutter_assemble)
 
 add_executable(mova_native_player WIN32
   "../native_player/main.cpp"
+  "NativePlayer.rc"
 )
 apply_standard_settings(mova_native_player)
 target_compile_options(mova_native_player PRIVATE /utf-8)

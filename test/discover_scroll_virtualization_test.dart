@@ -15,6 +15,7 @@ void main() {
 
     expect(embedded, contains('SliverFixedExtentList.builder('));
     expect(embedded, contains('itemExtent: 396'));
+    expect(embedded, contains('addRepaintBoundaries: false'));
     expect(embedded, isNot(contains('sliver: SliverVariedExtentList')));
     expect(embedded, isNot(contains('Column(')));
     expect(source, contains('child: CustomScrollView('));
@@ -56,6 +57,16 @@ void main() {
     expect(shellBackdrop, isNot(contains('CachedNetworkImage')));
     expect(heroBackdrop, contains('CachedNetworkImage'));
     expect(heroBackdrop, contains('stops: [0, .58, .985]'));
+    final cachedArtwork = heroBackdrop.indexOf('return RepaintBoundary(');
+    final scrollOpacity = heroBackdrop.indexOf('opacity: posterOpacity');
+    expect(heroBackdrop, contains('child: ValueListenableBuilder<String?>('));
+    expect(cachedArtwork, isNonNegative);
+    expect(scrollOpacity, greaterThan(cachedArtwork));
+    expect(
+      heroBackdrop,
+      contains('colors: [Colors.white, Colors.white, Colors.transparent]'),
+    );
+    expect(heroBackdrop, isNot(contains('alpha: posterOpacity')));
     expect(heroBackdrop, isNot(contains("skipGlass('shell')")));
     expect(
       mediaCenter,
@@ -159,19 +170,33 @@ void main() {
       source.indexOf('class _RankTileState'),
       source.indexOf('class _ContinueWatchingPage'),
     );
+    final platformCard = source.substring(
+      source.indexOf('class _PlatformEntryCardState'),
+      source.indexOf('class _PlatformArtwork'),
+    );
 
     expect(posterHover, isNot(contains('ValueListenableBuilder<bool>(')));
     expect(posterHover, contains('if (!yingjiScrollInProgress.value)'));
     expect(posterHover, contains('_clearHoverWhileScrolling'));
     expect(
       posterHover,
-      contains('if (yingjiScrollInProgress.value && _hovered && mounted)'),
+      contains(
+        'if (yingjiScrollInProgress.value && (_hovered || _pressed) && mounted)',
+      ),
     );
-    expect(posterHover, isNot(contains('AnimatedScale')));
+    expect(posterHover, contains('AnimatedScale('));
+    expect(posterHover, contains('MovaMotion.pressScaleCard'));
+    expect(posterHover, contains('MovaMotion.spring'));
     expect(posterHover, isNot(contains('Matrix4.translationValues')));
     expect(posterHover, contains('Colors.transparent'));
     expect(rankTile, contains('_dismissPreviewWhileScrolling'));
     expect(rankTile, contains('if (yingjiScrollInProgress.value) return;'));
+    expect(
+      rankTile,
+      contains('if (_hovered) setState(() => _hovered = false)'),
+    );
+    expect(platformCard, contains('_clearHoverWhileScrolling'));
+    expect(platformCard, contains('if (!yingjiScrollInProgress.value)'));
   });
 
   test('discover dialogs keep their glass filters active while scrolling', () {

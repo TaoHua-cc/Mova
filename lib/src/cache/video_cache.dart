@@ -32,6 +32,28 @@ int cacheChunkBytesToWrite({
   required int chunkBytes,
 }) => (targetBytes - writtenBytes).clamp(0, chunkBytes).toInt();
 
+int videoCacheByteOffsetForPosition({
+  required Duration position,
+  required Duration duration,
+  required int mediaTotalBytes,
+}) {
+  if (mediaTotalBytes <= 0 || duration <= Duration.zero) return 0;
+  final ratio = (position.inMicroseconds / duration.inMicroseconds).clamp(
+    0.0,
+    1.0,
+  );
+  return (mediaTotalBytes * ratio)
+      .floor()
+      .clamp(0, mediaTotalBytes - 1)
+      .toInt();
+}
+
+bool videoCacheShouldAdvanceWindow({
+  required int playheadByte,
+  required int windowStartByte,
+  required int windowBytes,
+}) => windowBytes > 0 && playheadByte >= windowStartByte + windowBytes ~/ 2;
+
 /// 视频缓存的上限策略。
 ///
 /// 桌面端只有一份上限；安卓分「无线局域网」和「移动数据」两份 —— 移动数据
@@ -103,8 +125,7 @@ class VideoCachePolicy {
 /// 一次后台缓存任务的句柄。
 ///
 /// 任务本身由 [VideoCacheStore] 持有并推进，这里只暴露「等它结束」和
-/// 「打断它」。打断时**保留**已下载的分片（`.part`），下次接着断点续传 ——
-/// 看两分钟就退出也能留下前两分钟，而不是白下一遍。
+/// 「打断它」。打断时**保留**已下载的窗口分片，同一窗口下次可以续传。
 class VideoCacheDownload {
   VideoCacheDownload._();
 
@@ -143,13 +164,19 @@ class VideoCacheProgress {
     this.receivedBytes = 0,
     this.totalBytes = 0,
     this.mediaTotalBytes = 0,
+    this.startBytes = 0,
+    this.supportsRange = true,
     this.status = VideoCacheStatus.idle,
   });
 
   final int receivedBytes;
   final int totalBytes;
   final int mediaTotalBytes;
+  final int startBytes;
+  final bool supportsRange;
   final VideoCacheStatus status;
+
+  int get cachedEndBytes => startBytes + receivedBytes;
 
   double? get fraction =>
       totalBytes <= 0 ? null : (receivedBytes / totalBytes).clamp(0.0, 1.0);
@@ -188,6 +215,9 @@ class VideoCacheStore {
 
   String _path(String key) => '${_root.path}${Platform.pathSeparator}$key.bin';
 
+  String _windowPath(String key) =>
+      '${_root.path}${Platform.pathSeparator}$key.window.part';
+
   /// A loopback URL which gives mpv a single seekable stream backed by the
   /// persistent prefix on disk and the origin server for cache misses.
   Future<String> playbackUrl(
@@ -225,18 +255,59 @@ class VideoCacheStore {
         return;
       }
       final range = _parseRange(request.headers.value(HttpHeaders.rangeHeader));
-      final part = File('${_path(key)}.part');
-      final cached = await _lengthOf(part);
-      final meta = await _readMeta(key);
-      final total = (meta?['totalBytes'] as num?)?.toInt() ?? 0;
+      final window = File(_windowPath(key));
+      final windowMeta = await _readWindowMeta(key);
+      final legacyPart = File('${_path(key)}.part');
+      final legacyMeta = await _readMeta(key);
+      final full = File(_path(key));
+      final cachedRanges = <_CachedRange>[];
+      if (await window.exists()) {
+        cachedRanges.add(
+          _CachedRange(
+            window,
+            await _lengthOf(window),
+            (windowMeta?['startBytes'] as num?)?.toInt() ?? 0,
+            (windowMeta?['totalBytes'] as num?)?.toInt() ?? 0,
+          ),
+        );
+      }
+      if (await legacyPart.exists()) {
+        cachedRanges.add(
+          _CachedRange(
+            legacyPart,
+            await _lengthOf(legacyPart),
+            (legacyMeta?['startBytes'] as num?)?.toInt() ?? 0,
+            (legacyMeta?['totalBytes'] as num?)?.toInt() ?? 0,
+          ),
+        );
+      }
+      if (await full.exists()) {
+        cachedRanges.add(
+          _CachedRange(
+            full,
+            await _lengthOf(full),
+            0,
+            (legacyMeta?['totalBytes'] as num?)?.toInt() ??
+                await _lengthOf(full),
+          ),
+        );
+      }
+      final localRange = request.method == 'GET'
+          ? _findCachedRange(cachedRanges, range)
+          : null;
+      final total =
+          localRange?.totalBytes ??
+          (windowMeta?['totalBytes'] as num?)?.toInt() ??
+          (legacyMeta?['totalBytes'] as num?)?.toInt() ??
+          0;
       final start = range?.$1 ?? 0;
-      if (request.method == 'GET' && cached > start) {
-        final requestedEnd = range?.$2;
-        final end =
-            (requestedEnd == null
-                    ? cached - 1
-                    : requestedEnd.clamp(start, cached - 1))
-                .toInt();
+      // A growing prefix is not a complete HTTP response. Returning `0-N` for
+      // an open-ended `bytes=0-` request makes mpv treat the current end of the
+      // .part file as end-of-media while the downloader is still appending.
+      // Only answer from the partial file when it fully covers a bounded range;
+      // otherwise let the origin provide one continuous response.
+      if (localRange != null) {
+        final end = range!.$2!;
         final length = end - start + 1;
         request.response.statusCode = HttpStatus.partialContent;
         request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
@@ -245,7 +316,10 @@ class VideoCacheStore {
           'bytes $start-$end/${total > 0 ? total : '*'}',
         );
         request.response.contentLength = length;
-        await request.response.addStream(part.openRead(start, end + 1));
+        final localStart = start - localRange.startBytes;
+        await request.response.addStream(
+          localRange.file.openRead(localStart, localStart + length),
+        );
         await request.response.close();
         return;
       }
@@ -262,7 +336,11 @@ class VideoCacheStore {
       bool transient(int status) =>
           status >= 500 || status == 408 || status == 429;
       HttpClientResponse? origin;
-      for (var attempt = 0; attempt < attemptLimit && origin == null; attempt++) {
+      for (
+        var attempt = 0;
+        attempt < attemptLimit && origin == null;
+        attempt++
+      ) {
         final probe = HttpClient()..findProxy = findNetworkProxy;
         try {
           final opened = await probe.openUrl(
@@ -386,6 +464,20 @@ class VideoCacheStore {
     return removed;
   }
 
+  /// 删除一个剧集的旧完整缓存、旧前缀以及当前滚动窗口。
+  Future<void> deleteEpisode(String url) async {
+    final key = _keyFor(url);
+    for (final path in <String>[
+      _path(key),
+      '${_path(key)}.part',
+      _windowPath(key),
+      '${_root.path}${Platform.pathSeparator}$key.json',
+      _windowMetaPath(key),
+    ]) {
+      await _delete(File(path));
+    }
+  }
+
   /// 按「最久没用」裁剪到 [limitBytes] 以内。
   ///
   /// 分片（`.part`）也参与计数，否则用户看两分钟就退出的那些碎片会堆成
@@ -416,14 +508,15 @@ class VideoCacheStore {
     }
   }
 
-  /// 后台为 [url] 预读至所选容量。返回句柄，调用方可以取消且保留分片。
-  ///
-  /// [limitBytes] is the reusable read-ahead window, not a maximum media size.
-  /// A large movie therefore keeps a persistent prefix up to this size.
+  /// 后台缓存从当前位置向前的有界窗口。调用方在播放消耗约一半窗口后，
+  /// 取消本任务并以新的播放字节位置发起下一窗口。
   VideoCacheDownload download({
     required String url,
     required int limitBytes,
     int? targetBytes,
+    int? startBytes,
+    Duration startPosition = Duration.zero,
+    Duration mediaDuration = Duration.zero,
     Map<String, String> headers = const {},
     String title = '',
   }) {
@@ -438,6 +531,9 @@ class VideoCacheStore {
         url: url,
         limitBytes: limitBytes,
         targetBytes: targetBytes,
+        startBytes: startBytes,
+        startPosition: startPosition,
+        mediaDuration: mediaDuration,
         headers: headers,
         title: title,
       ),
@@ -450,6 +546,9 @@ class VideoCacheStore {
     required String url,
     required int limitBytes,
     required int? targetBytes,
+    required int? startBytes,
+    required Duration startPosition,
+    required Duration mediaDuration,
     required Map<String, String> headers,
     required String title,
   }) async {
@@ -461,19 +560,46 @@ class VideoCacheStore {
       }
       final key = _keyFor(url);
       final target = File(_path(key));
-      if (await target.exists()) return;
-      final part = File('${target.path}.part');
+      if (await target.exists()) {
+        final size = await _lengthOf(target);
+        job._update(
+          VideoCacheProgress(
+            receivedBytes: size,
+            totalBytes: size,
+            mediaTotalBytes: size,
+            status: VideoCacheStatus.complete,
+          ),
+        );
+        return;
+      }
+      final part = File(_windowPath(key));
+      final windowMeta = await _readWindowMeta(key);
+      var windowStart = startBytes ?? 0;
+      var supportsRange = true;
+      var mediaTotalBytes = (windowMeta?['totalBytes'] as num?)?.toInt() ?? 0;
+      if (startBytes == null &&
+          startPosition > Duration.zero &&
+          mediaDuration > Duration.zero) {
+        mediaTotalBytes = await _probeMediaTotal(uri, headers);
+        if (job._cancelled) return;
+        windowStart = videoCacheByteOffsetForPosition(
+          position: startPosition,
+          duration: mediaDuration,
+          mediaTotalBytes: mediaTotalBytes,
+        );
+      }
       var offset = 0;
-      if (await part.exists()) {
-        try {
-          offset = await part.length();
-        } catch (_) {
-          offset = 0;
-        }
+      if (await part.exists() &&
+          (windowMeta?['startBytes'] as num?)?.toInt() == windowStart) {
+        offset = await _lengthOf(part);
+      } else {
+        await _delete(part);
       }
       job._update(
         VideoCacheProgress(
           receivedBytes: offset,
+          mediaTotalBytes: mediaTotalBytes,
+          startBytes: windowStart,
           status: VideoCacheStatus.downloading,
         ),
       );
@@ -486,8 +612,9 @@ class VideoCacheStore {
       for (final entry in headers.entries) {
         request.headers.set(entry.key, entry.value);
       }
-      if (offset > 0) {
-        request.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-');
+      final requestStart = windowStart + offset;
+      if (requestStart > 0) {
+        request.headers.set(HttpHeaders.rangeHeader, 'bytes=$requestStart-');
       }
       final response = await request.close().timeout(
         const Duration(seconds: 30),
@@ -498,30 +625,57 @@ class VideoCacheStore {
         return;
       }
       if (response.statusCode != 200 && response.statusCode != 206) return;
-      // 200 说明服务端没接 Range，分片对不上号，只能从头重写。
-      if (response.statusCode == 200) offset = 0;
+      // 服务端忽略 Range 时回到从头开始的有界窗口，不能把片头字节误记成
+      // 非零播放位置处的缓存。
+      if (response.statusCode == 200 && requestStart > 0) {
+        windowStart = 0;
+        offset = 0;
+        supportsRange = false;
+        await _delete(part);
+      }
+      final responseStart = _contentRangeStart(
+        response.headers.value(HttpHeaders.contentRangeHeader),
+      );
+      if (response.statusCode == 206 &&
+          responseStart != null &&
+          responseStart != requestStart) {
+        await _delete(part);
+        return;
+      }
       final remaining = response.contentLength;
-      final total = remaining > 0 ? offset + remaining : 0;
+      final total =
+          _contentRangeTotal(
+            response.headers.value(HttpHeaders.contentRangeHeader),
+          ) ??
+          (remaining > 0
+              ? (response.statusCode == HttpStatus.partialContent
+                    ? requestStart + remaining
+                    : remaining)
+              : mediaTotalBytes);
+      mediaTotalBytes = total;
       final downloadTargetBytes = cacheDownloadTargetBytes(
         retainLimitBytes: limitBytes,
         requestedBytes: targetBytes,
-        mediaTotalBytes: total,
+        mediaTotalBytes: total > 0 ? total - windowStart : 0,
       );
-      await _writeMeta(
+      await _writeWindowMeta(
         key,
-        url: url,
         title: title,
         bytes: offset,
         totalBytes: total,
+        startBytes: windowStart,
         createdAt: DateTime.now().millisecondsSinceEpoch,
       );
       if (offset >= downloadTargetBytes) {
+        final fullMedia = windowStart == 0 && total > 0 && offset >= total;
         job._update(
           VideoCacheProgress(
             receivedBytes: offset,
             totalBytes: downloadTargetBytes,
             mediaTotalBytes: total,
-            status: total > 0 && offset >= total
+            startBytes: windowStart,
+            supportsRange: supportsRange,
+            status: fullMedia
                 ? VideoCacheStatus.complete
                 : VideoCacheStatus.buffered,
           ),
@@ -556,6 +710,8 @@ class VideoCacheStore {
                 receivedBytes: written,
                 totalBytes: downloadTargetBytes,
                 mediaTotalBytes: total,
+                startBytes: windowStart,
+                supportsRange: supportsRange,
                 status: VideoCacheStatus.downloading,
               ),
             );
@@ -565,7 +721,11 @@ class VideoCacheStore {
           }
         }
         await sink.flush();
-        completed = !job._cancelled && total > 0 && written >= total;
+        completed =
+            !job._cancelled &&
+            windowStart == 0 &&
+            total > 0 &&
+            written >= total;
       } catch (_) {
         // 网络中断或被打断：分片留在磁盘上，下次续传。
         completed = false;
@@ -579,20 +739,34 @@ class VideoCacheStore {
         await _delete(part);
         return;
       }
-      if (completed) await part.rename(target.path);
-      await _writeMeta(
-        key,
-        url: url,
-        title: title,
-        bytes: size,
-        totalBytes: total,
-        createdAt: DateTime.now().millisecondsSinceEpoch,
-      );
+      if (completed) {
+        await part.rename(target.path);
+        await _deleteWindowMeta(key);
+        await _writeMeta(
+          key,
+          url: url,
+          title: title,
+          bytes: size,
+          totalBytes: total,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+        );
+      } else {
+        await _writeWindowMeta(
+          key,
+          title: title,
+          bytes: size,
+          totalBytes: total,
+          startBytes: windowStart,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+        );
+      }
       job._update(
         VideoCacheProgress(
           receivedBytes: size,
           totalBytes: completed ? size : downloadTargetBytes,
           mediaTotalBytes: total,
+          startBytes: windowStart,
+          supportsRange: supportsRange,
           status: completed
               ? VideoCacheStatus.complete
               : VideoCacheStatus.buffered,
@@ -605,6 +779,9 @@ class VideoCacheStore {
         VideoCacheProgress(
           receivedBytes: job.state.receivedBytes,
           totalBytes: job.state.totalBytes,
+          mediaTotalBytes: job.state.mediaTotalBytes,
+          startBytes: job.state.startBytes,
+          supportsRange: job.state.supportsRange,
           status: VideoCacheStatus.unavailable,
         ),
       );
@@ -612,6 +789,59 @@ class VideoCacheStore {
       client?.close(force: true);
       if (!job._completer.isCompleted) job._completer.complete();
       await job._progressController.close();
+    }
+  }
+
+  Future<int> _probeMediaTotal(Uri uri, Map<String, String> headers) async {
+    final client = HttpClient()..findProxy = findNetworkProxy;
+    try {
+      final head = await client
+          .openUrl('HEAD', uri)
+          .timeout(const Duration(seconds: 12));
+      for (final entry in headers.entries) {
+        head.headers.set(entry.key, entry.value);
+      }
+      final response = await head.close().timeout(const Duration(seconds: 20));
+      final total = response.statusCode >= 200 && response.statusCode < 300
+          ? _contentRangeTotal(
+                  response.headers.value(HttpHeaders.contentRangeHeader),
+                ) ??
+                (response.contentLength > 0 ? response.contentLength : 0)
+          : 0;
+      if (total > 0) return total;
+    } catch (_) {
+      // Some media servers do not implement HEAD; probe one ranged byte below.
+    } finally {
+      client.close(force: true);
+    }
+
+    final probe = HttpClient()..findProxy = findNetworkProxy;
+    try {
+      final request = await probe
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 12));
+      for (final entry in headers.entries) {
+        request.headers.set(entry.key, entry.value);
+      }
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-0');
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode != HttpStatus.ok &&
+          response.statusCode != HttpStatus.partialContent) {
+        return 0;
+      }
+      final rangeTotal = _contentRangeTotal(
+        response.headers.value(HttpHeaders.contentRangeHeader),
+      );
+      if (rangeTotal != null) return rangeTotal;
+      return response.statusCode == HttpStatus.ok && response.contentLength > 0
+          ? response.contentLength
+          : 0;
+    } catch (_) {
+      return 0;
+    } finally {
+      probe.close(force: true);
     }
   }
 
@@ -664,6 +894,31 @@ class VideoCacheStore {
     } catch (_) {}
   }
 
+  String _windowMetaPath(String key) =>
+      '${_root.path}${Platform.pathSeparator}$key.window.json';
+
+  Future<void> _writeWindowMeta(
+    String key, {
+    required String title,
+    required int bytes,
+    required int totalBytes,
+    required int startBytes,
+    required int createdAt,
+  }) async {
+    try {
+      await File(_windowMetaPath(key)).writeAsString(
+        jsonEncode(<String, dynamic>{
+          'title': title,
+          'bytes': bytes,
+          'totalBytes': totalBytes,
+          'startBytes': startBytes,
+          'createdAt': createdAt,
+          'lastUsedAt': DateTime.now().millisecondsSinceEpoch,
+        }),
+      );
+    } catch (_) {}
+  }
+
   Future<Map<String, dynamic>?> _readMeta(String key) async {
     final file = File('${_root.path}${Platform.pathSeparator}$key.json');
     if (!await file.exists()) return null;
@@ -673,6 +928,24 @@ class VideoCacheStore {
     } catch (_) {
       return null;
     }
+  }
+
+  Future<Map<String, dynamic>?> _readWindowMeta(String key) async {
+    final file = File(_windowMetaPath(key));
+    if (!await file.exists()) return null;
+    try {
+      final value = jsonDecode(await file.readAsString());
+      return value is Map ? value.cast<String, dynamic>() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _deleteWindowMeta(String key) async {
+    try {
+      final file = File(_windowMetaPath(key));
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
   }
 
   Future<int> _lastUsed(File file) async {
@@ -724,6 +997,47 @@ class VideoCacheStore {
   }
 }
 
+bool videoCacheCoversRange({
+  required int cachedBytes,
+  int startBytes = 0,
+  required (int, int?)? range,
+}) {
+  final start = range?.$1;
+  final end = range?.$2;
+  return start != null &&
+      end != null &&
+      start >= startBytes &&
+      end < startBytes + cachedBytes;
+}
+
+_CachedRange? _findCachedRange(
+  List<_CachedRange> ranges,
+  (int, int?)? requested,
+) {
+  for (final candidate in ranges) {
+    if (videoCacheCoversRange(
+      cachedBytes: candidate.bytes,
+      startBytes: candidate.startBytes,
+      range: requested,
+    )) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+int? _contentRangeStart(String? value) {
+  final match = RegExp(r'^bytes\s+(\d+)-\d+/(?:\d+|\*)$')
+      .firstMatch(value?.trim() ?? '');
+  return int.tryParse(match?.group(1) ?? '');
+}
+
+int? _contentRangeTotal(String? value) {
+  final match = RegExp(r'^bytes\s+\d+-\d+/(\d+)$')
+      .firstMatch(value?.trim() ?? '');
+  return int.tryParse(match?.group(1) ?? '');
+}
+
 class _ProxySource {
   const _ProxySource(this.url, this.headers);
   final String url;
@@ -735,4 +1049,13 @@ class _CacheFile {
   final File file;
   final int length;
   final int lastUsed;
+}
+
+class _CachedRange {
+  const _CachedRange(this.file, this.bytes, this.startBytes, this.totalBytes);
+
+  final File file;
+  final int bytes;
+  final int startBytes;
+  final int totalBytes;
 }

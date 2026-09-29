@@ -469,7 +469,11 @@ class EmbyClient {
         .toList(growable: false);
   }
 
-  Future<List<MediaItem>> search(EmbySession session, String query) async {
+  Future<List<MediaItem>> search(
+    EmbySession session,
+    String query, {
+    String includeItemTypes = 'Movie,Series,Episode',
+  }) async {
     final userId = session.source.userId;
     if (userId == null || userId.isEmpty || query.trim().isEmpty) {
       return const [];
@@ -481,7 +485,7 @@ class EmbyClient {
               .replace(
                 queryParameters: {
                   'SearchTerm': query.trim(),
-                  'IncludeItemTypes': 'Movie,Series,Episode',
+                  'IncludeItemTypes': includeItemTypes,
                   'Recursive': 'true',
                   'Limit': '50',
                   'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters',
@@ -562,7 +566,11 @@ class EmbyClient {
     return _item(session, jsonDecode(response.body) as Map<String, dynamic>);
   }
 
-  Future<List<MediaItem>> findByTmdbId(EmbySession session, int tmdbId) async {
+  Future<List<MediaItem>> findByTmdbId(
+    EmbySession session,
+    int tmdbId, {
+    String includeItemTypes = 'Movie,Series,Episode',
+  }) async {
     if (session.source.userId == null || tmdbId <= 0) return const [];
     final response = await _client
         .get(
@@ -572,7 +580,7 @@ class EmbyClient {
                 queryParameters: {
                   // This Emby 4.9 endpoint uses the `Provider.value` form.
                   'AnyProviderIdEquals': 'Tmdb.$tmdbId',
-                  'IncludeItemTypes': 'Movie,Series,Episode',
+                  'IncludeItemTypes': includeItemTypes,
                   'Recursive': 'true',
                   'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters',
                   'Limit': '50',
@@ -596,40 +604,68 @@ class EmbyClient {
 
   Future<List<MediaItem>> episodesForSeries(
     EmbySession session,
-    String seriesId,
-  ) async {
+    String seriesId, {
+    int? seasonNumber,
+    int? episodeNumber,
+  }) async {
     final userId = session.source.userId;
     if (userId == null || userId.isEmpty || seriesId.isEmpty) {
       return const [];
     }
-    final response = await _client
-        .get(
-          session.source.endpoint
-              .resolve('Shows/$seriesId/Episodes')
-              .replace(
-                queryParameters: {
-                  'UserId': userId,
-                  'SortBy': 'ParentIndexNumber,IndexNumber',
-                  'SortOrder': 'Ascending',
-                  'Limit': '200',
-                  'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,ParentIndexNumber,IndexNumber,Chapters,UserData',
-                  'api_key': session.token,
-                },
-              ),
-          headers: {
-            'Accept': 'application/json',
-            'X-Emby-Token': session.token,
-          },
-        )
-        .timeout(const Duration(seconds: 15));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(_message(response.statusCode, '剧集资源读取失败'));
+    const pageSize = 200;
+    final episodes = <MediaItem>[];
+    final seen = <String>{};
+    var startIndex = 0;
+    while (true) {
+      final response = await _client
+          .get(
+            session.source.endpoint
+                .resolve('Shows/$seriesId/Episodes')
+                .replace(
+                  queryParameters: {
+                    'UserId': userId,
+                    'SortBy': 'ParentIndexNumber,IndexNumber',
+                    'SortOrder': 'Ascending',
+                    'Limit': '200',
+                    'StartIndex': '$startIndex',
+                    if (seasonNumber != null) 'Season': '$seasonNumber',
+                    'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,ParentIndexNumber,IndexNumber,Chapters,UserData',
+                    'api_key': session.token,
+                  },
+                ),
+            headers: {
+              'Accept': 'application/json',
+              'X-Emby-Token': session.token,
+            },
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(_message(response.statusCode, '剧集资源读取失败'));
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final page = (data['Items'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .map((item) => _item(session, item))
+          .toList(growable: false);
+      if (page.isEmpty) break;
+      final before = seen.length;
+      for (final episode in page) {
+        if (seen.add(episode.id) &&
+            (seasonNumber == null || episode.seasonNumber == seasonNumber) &&
+            (episodeNumber == null || episode.episodeNumber == episodeNumber)) {
+          episodes.add(episode);
+        }
+      }
+      if (seen.length == before) break;
+      startIndex += page.length;
+      final total = (data['TotalRecordCount'] as num?)?.toInt();
+      if (total != null && total > 0) {
+        if (startIndex >= total) break;
+      } else if (page.length < pageSize) {
+        break;
+      }
     }
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    return (data['Items'] as List<dynamic>? ?? const [])
-        .whereType<Map<String, dynamic>>()
-        .map((item) => _item(session, item))
-        .toList(growable: false);
+    return episodes;
   }
 
   Future<List<MediaItem>> seasonsForSeries(

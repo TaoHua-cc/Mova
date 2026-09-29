@@ -34,6 +34,29 @@ void main() {
     );
     expect(preferredChineseSubtitle([]), isNull);
   });
+  test('puts Chinese subtitle names before original track labels', () {
+    expect(
+      subtitleTrackLabel(SubtitleTrack('1', 'English SDH', 'eng')),
+      '英语（English SDH）',
+    );
+    expect(subtitleTrackLabel(SubtitleTrack('2', null, 'zh-Hant-TW')), '繁体中文');
+    expect(
+      subtitleTrackLabel(SubtitleTrack('3', 'Greek', 'ell')),
+      '希腊语（Greek）',
+    );
+    expect(
+      subtitleTrackLabel(SubtitleTrack('4', 'English', 'xyz')),
+      '未识别语种（English · xyz）',
+    );
+    expect(
+      subtitleTrackLabel(SubtitleTrack('5', '简体中文字幕', 'zh-Hans')),
+      '简体中文字幕',
+    );
+    expect(
+      subtitleTrackLabel(SubtitleTrack('6', 'English', 'und')),
+      '未标注语言（English）',
+    );
+  });
   test(
     'selects preferred audio language without overriding absent matches',
     () {

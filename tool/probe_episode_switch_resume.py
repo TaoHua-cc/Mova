@@ -30,6 +30,7 @@ import ctypes
 import os
 import sys
 import time
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_autoskip_endfile as autoskip  # noqa: E402
@@ -37,9 +38,9 @@ import probe_interrupt_retry as retry  # noqa: E402
 
 WM_LBUTTONDOWN = 0x0201
 MK_LBUTTON = 0x0001
-# 控件条按 140 的设计稿高反推 DPI 缩放，与 probe_interrupt_retry 同一套换算。
-CONTROLS_DESIGN_HEIGHT = 140.0
-NEXT_EPISODE_X = 141.0   # 「下一集」命中区 center+116..center+166，取中点
+# 原生控件条使用 `kControlsHeight = 112` 设计单位；按它反推 UI 缩放。
+CONTROLS_DESIGN_HEIGHT = 112.0
+EPISODE_SWITCH_OFFSET_X = 141.0  # 上/下一集命中区的中心偏移
 CONTROL_Y = 72.0
 # 第 1 集起播点（= 上一次看到哪儿）。它不该跟着换集跑到第 2 集上去。
 RESUME_SECONDS = 10.0
@@ -76,8 +77,8 @@ def _position_readings(player):
     return found
 
 
-def _click_next_episode():
-    """点控件条右侧的「下一集」。
+def _click_episode(direction):
+    """点控件条上的上一集 / 下一集。
 
     ⚠️ 控件条命中判定用的是**设计坐标**：物理坐标除以 `UiScale()` 之后，宽度
     不足 780 的窗口走 compact 布局 —— 那时「上一集 / 下一集」根本不画，点击也
@@ -93,7 +94,8 @@ def _click_next_episode():
         return False, "读不到控件条尺寸"
     scale = max(1.0, rect.bottom / CONTROLS_DESIGN_HEIGHT) if rect.bottom else 1.0
     width = rect.right / scale
-    x = int(rect.right / 2 + NEXT_EPISODE_X * scale)
+    offset = EPISODE_SWITCH_OFFSET_X * (1 if direction == "next" else -1)
+    x = int(rect.right / 2 + offset * scale)
     y = int(CONTROL_Y * scale)
     note = (f"控件条 {rect.right}x{rect.bottom} 物理 / "
             f"{width:.0f} 设计，点击 ({x}, {y})")
@@ -231,6 +233,158 @@ def run_own_resume_case(exe, workdir, name, wait=30.0):
     return "\n".join(out), ok
 
 
+def run_unaggregated_switch_case(exe, workdir, name, direction):
+    """未聚合的相邻集应回传季集坐标，而不是对空 URL 执行 loadfile。"""
+    origin = retry.FakeOrigin(seconds=LONG_EPISODE_SECONDS)
+    current_index = 0 if direction == "next" else 1
+    target_episode = 2 if direction == "next" else 1
+    urls = [origin.url, ""] if direction == "next" else ["", origin.url]
+    args = [
+        f"--mova-playlist-start={current_index}",
+        "--mova-playlist-title=探针第 1 集",
+        "--mova-playlist-title=待搜索第 2 集",
+        "--mova-playlist-season=1",
+        "--mova-playlist-season=1",
+        "--mova-playlist-episode=1",
+        "--mova-playlist-episode=2",
+    ]
+    # 相邻目标故意保留空 URL，模拟尚未按需聚合的剧集。
+    player = autoskip.Probe(exe, workdir, urls, args)
+    out = [f"=== {name} ==="]
+    ok = True
+    try:
+        time.sleep(2.0)
+        clicked, note = _click_episode(direction)
+        out.append(f"    {note}")
+        if not clicked:
+            ok = False
+            out.append("    VERDICT BAD 无法触发下一集控件")
+        else:
+            deadline = time.time() + 6.0
+            while time.time() < deadline and player.process.poll() is None:
+                if any(line.startswith(f"MOVA_EPISODE=1|{target_episode}|")
+                       for _, line in player.lines):
+                    break
+                time.sleep(0.05)
+            requests = [line for _, line in player.lines
+                        if line.startswith("MOVA_EPISODE=")]
+            out.append("    request = " + (requests[-1] if requests else "<none>"))
+            bad_empty_load = any(
+                line.startswith("MOVA_ENDFILE=4|") for _, line in player.lines)
+            if requests and not bad_empty_load:
+                out.append("    VERDICT OK  已将季集交回应用按需聚合")
+            else:
+                ok = False
+                out.append("    VERDICT BAD 未回传季集，或空 URL 被当作媒体加载")
+    finally:
+        out.append(f"    exit code = {player.close()}")
+        origin.close()
+    return "\n".join(out), ok
+
+
+def run_live_unaggregated_switch_case(exe, workdir, name, resolve=True):
+    """Resolve a missing next episode over stdin without respawning the player."""
+    current = retry.FakeOrigin(seconds=LONG_EPISODE_SECONDS)
+    resolved = retry.FakeOrigin(seconds=LONG_EPISODE_SECONDS)
+    args = [
+        "--mova-live-episode-resolution=yes",
+        "--mova-playlist-start=0",
+        "--mova-playlist-title=探针第 1 集",
+        "--mova-playlist-title=待搜索第 2 集",
+        "--mova-playlist-season=1",
+        "--mova-playlist-season=1",
+        "--mova-playlist-episode=1",
+        "--mova-playlist-episode=2",
+    ]
+    player = autoskip.Probe(exe, workdir, [current.url, ""], args)
+    out = [f"=== {name} ==="]
+    ok = True
+    reason = None
+    try:
+        time.sleep(2.0)
+        window_before = autoskip.base.wait_class(
+            "MovaNativePlayerWindow", timeout=3.0)
+        clicked, note = _click_episode("next")
+        out.append(f"    {note}")
+        if not clicked:
+            reason = "无法触发下一集控件"
+        else:
+            deadline = time.time() + 6.0
+            request = None
+            while time.time() < deadline:
+                request = next((line for _, line in player.lines
+                                if line.startswith("MOVA_EPISODE_REQUEST=")), None)
+                if request:
+                    break
+                time.sleep(0.05)
+            if not request:
+                reason = "未收到动态搜索请求"
+            else:
+                out.append(f"    request = {request}")
+                out.append(f"    search wait: process={'alive' if player.process.poll() is None else 'exited'}")
+                window_during_search = autoskip.base.wait_class(
+                    "MovaNativePlayerWindow", timeout=2.0)
+                if player.process.poll() is not None:
+                    reason = "搜索期间播放器进程已退出"
+                elif not window_before or window_during_search != window_before:
+                    reason = "搜索期间播放器窗口被重建"
+                elif resolve:
+                    player.send(
+                        "MOVA_EPISODE_RESOLVED=1|"
+                        f"{quote(resolved.url, safe='')}||0"
+                    )
+                else:
+                    player.send(
+                        "MOVA_EPISODE_RESOLVE_FAILED=1|"
+                        f"{quote('未找到该集可播放资源', safe='')}"
+                    )
+                if reason is None and resolve:
+                    deadline = time.time() + 8.0
+                    while time.time() < deadline:
+                        loaded = any(
+                            stamp > 1.0 and index == 1 and duration > 0
+                            for stamp, position, duration, index in _position_readings(player)
+                        )
+                        if loaded and resolved.requests:
+                            break
+                        time.sleep(0.05)
+                    still_same_window = autoskip.base.wait_class(
+                        "MovaNativePlayerWindow", timeout=2.0)
+                    loaded = (player.process.poll() is None and
+                              still_same_window == window_before and
+                              bool(resolved.requests) and
+                              any(index == 1 and duration > 0
+                                  for _, _, duration, index in _position_readings(player)))
+                    if loaded:
+                        time.sleep(2.0)
+                        loaded = player.process.poll() is None
+                    if loaded:
+                        out.append("    VERDICT OK  同一窗口收到搜索结果并加载下一集")
+                    else:
+                        reason = "搜索结果未在原窗口加载"
+                elif reason is None:
+                    time.sleep(1.0)
+                    still_same_window = autoskip.base.wait_class(
+                        "MovaNativePlayerWindow", timeout=2.0)
+                    ok = (player.process.poll() is None and
+                          still_same_window == window_before)
+                    if ok:
+                        out.append("    VERDICT OK  搜索未命中后恢复当前集，窗口保持打开")
+                    else:
+                        reason = "搜索未命中后播放器未能恢复"
+        if reason:
+            ok = False
+            out.append(f"    VERDICT BAD {reason}")
+    finally:
+        exit_code = player.close()
+        out.append(f"    exit code = {exit_code}")
+        if exit_code != 0:
+            out += player.tail(24, keep=lambda line: not line.startswith("MOVA_POSITION="))
+        current.close()
+        resolved.close()
+    return "\n".join(out), ok and exit_code == 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", default=r"D:\Mova\MovaNativePlayer.exe")
@@ -239,16 +393,28 @@ def main():
     options = parser.parse_args()
 
     cases = [("01_next_episode_does_not_inherit_resume", run_case),
-             ("02_next_episode_uses_its_own_resume", run_own_resume_case)]
+             ("02_next_episode_uses_its_own_resume", run_own_resume_case),
+             ("03_next_unaggregated_episode_requests_search",
+              lambda exe, workdir, name:
+                  run_unaggregated_switch_case(exe, workdir, name, "next")),
+             ("04_previous_unaggregated_episode_requests_search",
+              lambda exe, workdir, name:
+                  run_unaggregated_switch_case(exe, workdir, name, "previous")),
+             ("05_live_unaggregated_episode_switch",
+              run_live_unaggregated_switch_case),
+             ("06_live_unaggregated_search_failure",
+              lambda exe, workdir, name:
+                  run_live_unaggregated_switch_case(
+                      exe, workdir, name, resolve=False))]
+    selected_cases = [(name, runner) for name, runner in cases
+                      if not options.only or name.startswith(options.only)]
     failed = 0
-    for name, runner in cases:
-        if options.only and not name.startswith(options.only):
-            continue
+    for name, runner in selected_cases:
         text, ok = runner(options.exe, options.workdir, name)
         print(text)
         failed += 0 if ok else 1
     print(f"\nPROBE {'OK' if not failed else 'FAILED'} "
-          f"({len(cases) - failed}/{len(cases)} passed)")
+          f"({len(selected_cases) - failed}/{len(selected_cases)} passed)")
     return 1 if failed else 0
 
 

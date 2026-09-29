@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart' show RenderBox, ScrollCacheExtent;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
 
 import '../brand.dart';
+import '../motion.dart';
 import '../cache/image_prefetch.dart';
 import '../cache/media_cache.dart';
 import '../network/proxy_routing.dart';
@@ -32,9 +34,52 @@ import '../tracking/trakt_auth.dart';
 import 'tmdb_client.dart';
 import 'ratings.dart';
 import 'next_episode.dart';
+import 'episode_search_gate.dart';
 
 String _episodeKey(int? season, int? episode) =>
     '${season ?? 0}:${episode ?? 0}';
+
+class _PlaybackEpisodeOption {
+  const _PlaybackEpisodeOption({
+    this.seasonNumber,
+    this.episodeNumber,
+    this.metadata,
+    this.resource,
+  });
+
+  final int? seasonNumber;
+  final int? episodeNumber;
+  final TmdbEpisode? metadata;
+  final MediaItem? resource;
+
+  String get key => _episodeKey(seasonNumber, episodeNumber);
+}
+
+bool webDavFilenameMatchesEpisode(
+  String filename,
+  Iterable<String> showTitles,
+  int season,
+  int episode,
+) {
+  final name = filename.toLowerCase();
+  final compact = name.replaceAll(RegExp(r'[^\p{L}\p{N}]', unicode: true), '');
+  if (!showTitles.any((title) {
+    final normalized = title.toLowerCase().replaceAll(
+      RegExp(r'[^\p{L}\p{N}]', unicode: true),
+      '',
+    );
+    return normalized.isNotEmpty && compact.contains(normalized);
+  })) {
+    return false;
+  }
+  return RegExp(
+        's0*$season[^0-9]*e0*$episode(?![0-9])',
+        caseSensitive: false,
+      ).hasMatch(name) ||
+      RegExp('(?:^|[^0-9])0*$season\\s*x\\s*0*$episode(?![0-9])')
+          .hasMatch(name) ||
+      RegExp('第\\s*0*$season\\s*季.*第\\s*0*$episode\\s*集').hasMatch(name);
+}
 
 bool _isGenericEpisodeTitle(String value) =>
     value.trim().isEmpty || RegExp(r'^第\s*\d+\s*集$').hasMatch(value.trim());
@@ -80,6 +125,36 @@ List<MediaItem> episodeResourcesForResume(
             resource.episodeNumber == episodeNumber,
       )
       .toList(growable: false);
+}
+
+({int? season, int? episode}) detailInitialEpisode(
+  int tmdbId,
+  List<WatchState> recentFirst,
+  List<TmdbSeason> seasons, {
+  int? initialSeason,
+  int? initialEpisode,
+  MediaItem? media,
+}) {
+  final recent = recentFirst
+      .where(
+        (state) =>
+            state.tmdbId == tmdbId &&
+            state.seasonNumber != null &&
+            state.episodeNumber != null,
+      )
+      .firstOrNull;
+  final ordered = [...seasons]..sort((a, b) => a.number.compareTo(b.number));
+  return (
+    season:
+        recent?.seasonNumber ??
+        initialSeason ??
+        ordered.firstOrNull?.number ??
+        media?.seasonNumber,
+    episode:
+        recent?.episodeNumber ??
+        initialEpisode ??
+        (ordered.isEmpty ? media?.episodeNumber : null),
+  );
 }
 
 String _dateLabel(DateTime? date) => date == null
@@ -135,12 +210,23 @@ class MetadataDetailPage extends StatefulWidget {
         height: 240,
       ).intersect(Offset.zero & overlayBox.size);
     }
+    Alignment? originAlignment;
+    if (origin != null &&
+        overlayBox is RenderBox &&
+        overlayBox.size.width > 0 &&
+        overlayBox.size.height > 0) {
+      final center = origin.center;
+      originAlignment = Alignment(
+        (center.dx / overlayBox.size.width) * 2 - 1,
+        (center.dy / overlayBox.size.height) * 2 - 1,
+      );
+    }
     return navigator.push<void>(
       PageRouteBuilder<void>(
         opaque: true,
         allowSnapshotting: true,
         transitionDuration: const Duration(milliseconds: 300),
-        reverseTransitionDuration: const Duration(milliseconds: 240),
+        reverseTransitionDuration: const Duration(milliseconds: 200),
         pageBuilder: (_, _, _) => MetadataDetailPage(
           item: item,
           media: media,
@@ -148,31 +234,22 @@ class MetadataDetailPage extends StatefulWidget {
           initialEpisodeNumber: initialEpisodeNumber,
         ),
         transitionsBuilder: (context, animation, _, child) {
-          if (origin == null || MediaQuery.disableAnimationsOf(context)) {
+          if (originAlignment == null ||
+              MediaQuery.disableAnimationsOf(context)) {
             return FadeTransition(opacity: animation, child: child);
           }
-          return LayoutBuilder(
-            builder: (context, constraints) {
-              final viewport = constraints.biggest;
-              final center = origin!.center;
-              final alignment = Alignment(
-                (center.dx / viewport.width) * 2 - 1,
-                (center.dy / viewport.height) * 2 - 1,
-              );
-              final curve = CurvedAnimation(
-                parent: animation,
-                curve: Curves.easeOutCubic,
-                reverseCurve: Curves.easeInCubic,
-              );
-              return FadeTransition(
-                opacity: curve,
-                child: ScaleTransition(
-                  alignment: alignment,
-                  scale: Tween<double>(begin: .94, end: 1).animate(curve),
-                  child: RepaintBoundary(child: child),
-                ),
-              );
-            },
+          final curve = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return FadeTransition(
+            opacity: curve,
+            child: ScaleTransition(
+              alignment: originAlignment,
+              scale: Tween<double>(begin: .97, end: 1).animate(curve),
+              child: RepaintBoundary(child: child),
+            ),
           );
         },
       ),
@@ -185,9 +262,14 @@ class MetadataDetailPage extends StatefulWidget {
 
 class _MetadataDetailPageState extends State<MetadataDetailPage> {
   final _pageScroll = ScrollController();
+  final _playlistPickerScroll = ScrollController();
+  final _resourcePickerScroll = ScrollController();
+  final _compactTrackPickerScroll = ScrollController();
   late Future<TmdbItem> _details;
   late Future<TmdbExtras> _extras;
   final _client = TmdbClient();
+  final Map<String, EmbySession> _resolvedEpisodeSessions = {};
+  final Map<String, List<String>> _episodeSeriesIds = {};
   WatchlistStore? _watchlist;
   bool _inWatchlist = false;
   bool _isFavorite = false;
@@ -196,6 +278,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   Map<String, double> _episodeProgress = const <String, double>{};
   Map<int, Uri> _seasonPosters = const {};
   Map<String, TmdbEpisode> _episodeMetadata = const {};
+  List<TmdbSeason> _catalogSeasons = const [];
+  int? _selectedEpisodeNumber;
+  int _searchGeneration = 0;
+  Future<void>? _selectedEpisodeSearch;
   MediaItem? _selectedResource;
   bool _loadingResources = true;
   String? _resourceError;
@@ -229,7 +315,372 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         });
       }
     });
-    _loadResources();
+    if (widget.item.kind == '剧集' && widget.item.id > 0) {
+      _initializeSeriesCatalog();
+    } else {
+      _loadResources();
+    }
+  }
+
+  Future<void> _initializeSeriesCatalog() async {
+    final history = (await WatchStateStore.create()).load();
+    TmdbExtras extras;
+    try {
+      extras = await _extras;
+    } catch (_) {
+      extras = const TmdbExtras();
+    }
+    final seasons = [...extras.seasons]
+      ..sort((a, b) => a.number.compareTo(b.number));
+    final selection = detailInitialEpisode(
+      widget.item.id,
+      history,
+      seasons,
+      initialSeason: widget.initialSeasonNumber,
+      initialEpisode: widget.initialEpisodeNumber,
+      media: widget.media,
+    );
+    final season = selection.season;
+    if (!mounted) return;
+    setState(() {
+      _catalogSeasons = seasons;
+      _seasonPosters = {
+        for (final season in seasons)
+          if (season.posterUrl != null) season.number: season.posterUrl!,
+      };
+      _selectedSeason = season;
+      _selectedEpisodeNumber = selection.episode;
+      if (widget.media?.seasonNumber == season &&
+          widget.media?.episodeNumber == _selectedEpisodeNumber) {
+        _resources = [widget.media!];
+        _selectedResource = widget.media;
+      }
+      _episodeProgress = {
+        for (final state in history.reversed)
+          if (state.tmdbId == widget.item.id &&
+              state.seasonNumber != null &&
+              state.episodeNumber != null)
+            _episodeKey(state.seasonNumber, state.episodeNumber):
+                state.progress,
+      };
+    });
+    if (season == null) {
+      setState(() {
+        _loadingResources = false;
+        _resourceError = '尚未获取到剧集目录，请稍后重试。';
+      });
+      return;
+    }
+    if (_selectedEpisodeNumber != null) {
+      unawaited(_searchSelectedEpisode());
+    }
+    await _loadCatalogSeason(season);
+    if (!mounted || _selectedSeason != season) return;
+    final firstEpisode = _episodeMetadata.values
+        .where((episode) => episode.seasonNumber == season)
+        .map((episode) => episode.episodeNumber)
+        .fold<int?>(
+          null,
+          (first, number) => first == null || number < first ? number : first,
+        );
+    if (_selectedEpisodeNumber == null && firstEpisode != null) {
+      setState(() => _selectedEpisodeNumber = firstEpisode);
+    }
+    if (_selectedEpisodeNumber == null && mounted) {
+      setState(() {
+        _loadingResources = false;
+        _resourceError = '本季暂未公布剧集。';
+      });
+    } else if (_searchGeneration == 0) {
+      await _searchSelectedEpisode();
+    }
+  }
+
+  Future<void> _loadCatalogSeason(int season) async {
+    if (_episodeMetadata.values.any((row) => row.seasonNumber == season)) {
+      return;
+    }
+    try {
+      final episodes = await _client.seasonEpisodes(widget.item.id, season);
+      if (!mounted) return;
+      setState(() {
+        _episodeMetadata = {
+          ..._episodeMetadata,
+          for (final episode in episodes)
+            _episodeKey(season, episode.episodeNumber): episode,
+        };
+      });
+      YingjiImageWarmup.episodes(episodes);
+    } catch (_) {
+      // The catalog stays visible even when one season fails to load.
+    }
+  }
+
+  Future<void> _searchSelectedEpisode() {
+    final future = _runSelectedEpisodeSearch();
+    _selectedEpisodeSearch = future;
+    return future;
+  }
+
+  Future<MediaItem?> _searchSelectedEpisodeForPlayback({
+    required String? preferredSourceId,
+    void Function(List<MediaItem> resources)? onResourcesPublished,
+  }) async {
+    final season = _selectedSeason;
+    final episode = _selectedEpisodeNumber;
+    if (season == null || episode == null) return null;
+    final gate = EpisodeSearchGate<MediaItem>(
+      preferredSourceId: preferredSourceId,
+    );
+    final search = _runSelectedEpisodeSearch(
+      firstPlayable: gate,
+      onResourcesPublished: onResourcesPublished,
+    );
+    _selectedEpisodeSearch = search;
+    final generation = _searchGeneration;
+    unawaited(search);
+    final selected = await gate.result;
+    if (selected != null &&
+        mounted &&
+        generation == _searchGeneration &&
+        _selectedSeason == season &&
+        _selectedEpisodeNumber == episode) {
+      setState(() => _selectedResource = selected);
+    }
+    return selected;
+  }
+
+  Future<void> _runSelectedEpisodeSearch({
+    EpisodeSearchGate<MediaItem>? firstPlayable,
+    void Function(List<MediaItem> resources)? onResourcesPublished,
+  }) async {
+    final season = _selectedSeason;
+    final episode = _selectedEpisodeNumber;
+    if (season == null || episode == null) return;
+    final generation = ++_searchGeneration;
+    if (mounted) {
+      setState(() {
+        _loadingResources = true;
+        _resourceError = null;
+        _resources = const [];
+        _selectedResource = null;
+      });
+    }
+    final results = <MediaItem>[];
+    final updatedSessions = <EmbySession>[];
+    var failedSources = 0;
+
+    void publish(List<MediaItem> found) {
+      if (found.isEmpty || !mounted || generation != _searchGeneration) return;
+      results.addAll(found);
+      final unique = <String, MediaItem>{
+        for (final row in results) '${row.source.id}:${row.id}': row,
+      }.values.toList(growable: false);
+      setState(() {
+        _resources = unique;
+        _selectedResource ??= unique.firstOrNull;
+      });
+      onResourcesPublished?.call(unique);
+      final playable = unique.where(
+        (row) =>
+            row.seasonNumber == season &&
+            row.episodeNumber == episode &&
+            row.playbackUrl != null,
+      );
+      for (final row in playable) {
+        firstPlayable?.offer(row.source.id, row);
+      }
+    }
+
+    try {
+      final store = await SourceStore.create();
+      // The primary TMDB title is already available. Do not wait for optional
+      // metadata before querying the first source; original-title matching is
+      // only needed as a fallback after the stable TMDB-ID lookup misses.
+      final titles = <String>[widget.item.title];
+      await Future.wait(
+        store.load().map((source) async {
+          if (!mounted || generation != _searchGeneration) return;
+          final token = store.tokenFor(source);
+          if (token == null || token.isEmpty) return;
+          if (source.kind == SourceKind.webdav) {
+            try {
+              final credentials = utf8
+                  .decode(base64Url.decode(token))
+                  .split('\u0000');
+              if (credentials.length < 2) return;
+              final client = WebDavClient();
+              try {
+                final rows = await client.list(
+                  source: source,
+                  username: credentials[0],
+                  password: credentials[1],
+                );
+                var matches = rows
+                    .where(
+                      (row) => webDavFilenameMatchesEpisode(
+                        row.title,
+                        titles,
+                        season,
+                        episode,
+                      ),
+                    )
+                    .toList(growable: false);
+                if (matches.isEmpty) {
+                  final extras = await _extras.catchError(
+                    (_) => const TmdbExtras(),
+                  );
+                  final originalTitle = extras.originalTitle?.trim();
+                  if (originalTitle?.isNotEmpty == true &&
+                      originalTitle != widget.item.title) {
+                    matches = rows
+                        .where(
+                          (row) => webDavFilenameMatchesEpisode(
+                            row.title,
+                            [...titles, originalTitle!],
+                            season,
+                            episode,
+                          ),
+                        )
+                        .toList(growable: false);
+                  }
+                }
+                publish(matches);
+              } finally {
+                client.dispose();
+              }
+            } catch (_) {
+              failedSources++;
+            }
+            return;
+          }
+          final client = EmbyClient(
+            proxy: ProxyRouting.serverUsesProxy(source.id),
+          );
+          try {
+            final cacheKey = '${source.id}|$token';
+            final session = _resolvedEpisodeSessions[cacheKey] ??= await client
+                .resolveSession(EmbySession(source: source, token: token));
+            if (session.source.endpoint != source.endpoint) {
+              updatedSessions.add(session);
+            }
+            final seriesKey = '$cacheKey|${widget.item.id}';
+            var seriesIds = _episodeSeriesIds[seriesKey] ?? const <String>[];
+            if (seriesIds.isEmpty) {
+              var found = await client.findByTmdbId(
+                session,
+                widget.item.id,
+                includeItemTypes: 'Series',
+              );
+              if (found.isEmpty) {
+                found = await client.search(
+                  session,
+                  widget.item.title,
+                  includeItemTypes: 'Series',
+                );
+                if (found.isEmpty) {
+                  final extras = await _extras.catchError(
+                    (_) => const TmdbExtras(),
+                  );
+                  final originalTitle = extras.originalTitle?.trim();
+                  if (originalTitle?.isNotEmpty == true &&
+                      originalTitle != widget.item.title) {
+                    found = await client.search(
+                      session,
+                      originalTitle!,
+                      includeItemTypes: 'Series',
+                    );
+                  }
+                }
+              }
+              seriesIds = found
+                  .where((row) => row.type == 'Series')
+                  .map((row) => row.id)
+                  .toList(growable: false);
+              if (seriesIds.isNotEmpty) {
+                _episodeSeriesIds[seriesKey] = seriesIds;
+              }
+            }
+            final sourceResults = <MediaItem>[];
+            for (final seriesId in seriesIds) {
+              sourceResults.addAll(
+                await client.episodesForSeries(
+                  session,
+                  seriesId,
+                  seasonNumber: season,
+                  episodeNumber: episode,
+                ),
+              );
+            }
+            publish(sourceResults);
+          } catch (_) {
+            failedSources++;
+          } finally {
+            client.dispose();
+          }
+        }),
+      );
+      if (!mounted || generation != _searchGeneration) return;
+      final unique = <String, MediaItem>{
+        for (final row in results) '${row.source.id}:${row.id}': row,
+      }.values.toList(growable: false);
+      setState(() {
+        _resources = unique;
+        _selectedResource ??= unique.firstOrNull;
+        _loadingResources = false;
+        _resourceError = failedSources == 0
+            ? null
+            : '$failedSources 个服务器未完成搜索，可点击重新搜索。';
+      });
+      // These writes and derived state are useful, but never gate playback.
+      unawaited(_persistResolvedSessions(store, updatedSessions));
+      unawaited(_refreshEpisodeProgress(unique, generation));
+    } catch (_) {
+      if (!mounted || generation != _searchGeneration) return;
+      setState(() {
+        _loadingResources = false;
+        _resourceError = '当前集搜索失败，请检查连接后重新搜索。';
+      });
+    } finally {
+      firstPlayable?.finish();
+    }
+  }
+
+  Future<void> _persistResolvedSessions(
+    SourceStore store,
+    List<EmbySession> sessions,
+  ) async {
+    for (final session in sessions) {
+      try {
+        await store.upsert(session.source, session.token);
+      } catch (_) {
+        // The in-memory resolved route remains usable for this detail page.
+      }
+    }
+  }
+
+  Future<void> _refreshEpisodeProgress(
+    List<MediaItem> resources,
+    int generation,
+  ) async {
+    try {
+      final history = (await WatchStateStore.create()).load();
+      if (!mounted || generation != _searchGeneration) return;
+      final local = _deriveProgress(resources, history, const {});
+      setState(() {
+        _completedResourceIds = local.completed;
+        _episodeProgress = {..._episodeProgress, ...local.progress};
+      });
+      final traktCompleted = await _traktCompletedEpisodes();
+      if (!mounted || generation != _searchGeneration) return;
+      final combined = _deriveProgress(resources, history, traktCompleted);
+      setState(() {
+        _completedResourceIds = combined.completed;
+        _episodeProgress = {..._episodeProgress, ...combined.progress};
+      });
+    } catch (_) {
+      // Progress sync must never delay or invalidate resource playback.
+    }
   }
 
   String _normaliseTitle(String value) =>
@@ -265,7 +716,6 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   /// 缓存里存的是「已经按标题匹配过的行」，所以这里不需要再走一遍聚合；
   /// 但仍然要过两道筛：来源被删掉、或来源地址改过的行不能再拿来播放。
   Future<bool> _restoreCachedResources() async {
-    if (widget.media != null) return false;
     final snapshot = await MediaDetailCache.load(widget.item);
     if (snapshot == null) return false;
     final store = await SourceStore.create();
@@ -279,7 +729,16 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         })
         .toList(growable: false);
     if (rows.isEmpty) return false;
-    final preferred = await _initialResource(rows);
+    final direct = widget.media;
+    final retained = direct == null
+        ? null
+        : rows
+              .where(
+                (row) =>
+                    row.source.id == direct.source.id && row.id == direct.id,
+              )
+              .firstOrNull;
+    final preferred = retained ?? await _initialResource(rows);
     final history = (await WatchStateStore.create()).load();
     // Trakt 的已看剧集要联网，先用本机记录把进度渲染出来；真正聚合那一步
     // （或冷却期内的进度刷新）会再带上 Trakt 重算一次。
@@ -290,7 +749,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       _seasonPosters = snapshot.seasonPosters;
       _selectedResource = preferred ?? rows.first;
       _completedResourceIds = derived.completed;
-      _episodeProgress = derived.progress;
+      _episodeProgress = widget.item.kind == '剧集'
+          ? {..._episodeProgress, ...derived.progress}
+          : derived.progress;
       _selectedSeason =
           preferred?.seasonNumber ??
           rows.map((row) => row.seasonNumber).whereType<int>().firstOrNull;
@@ -303,7 +764,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   Future<void> _loadResources({bool force = false}) async {
-    if (widget.media != null) {
+    if (widget.media != null && !force) {
       if (mounted) {
         setState(() {
           _resources = [widget.media!];
@@ -321,23 +782,42 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         });
       }
       unawaited(_loadEpisodeMetadata([widget.media!]));
-      return;
+      if (widget.item.kind != '剧集' || widget.item.id <= 0) return;
     }
     // 先用上一次聚合好的快照把页面填满，再决定要不要真的去搜服务器。
-    final restored = await _restoreCachedResources();
-    final cooling =
-        restored && await MediaDetailCache.recentlyScanned(widget.item);
-    if (!force && cooling) {
-      // 冷却期内重复打开同一部剧：资源卡片沿用缓存，只把观看进度按本机
-      // 记录重算一遍，不再把每个服务器都重新翻一遍。
-      await _refreshProgressAfterPlayback();
+    final restored = force && _resources.isNotEmpty
+        ? true
+        : await _restoreCachedResources();
+    // 冷却应覆盖“上次搜索没有命中”的情况。空结果不会生成资源快照，但扫描时间
+    // 仍然有效；否则每次重进都会重新遍历全部服务器并卡在加载态。
+    final cooling = await MediaDetailCache.recentlyScanned(widget.item);
+    if (!force && cooling && (restored || widget.media == null)) {
+      if (restored) {
+        // 冷却期内重复打开同一部剧：资源卡片沿用缓存，只把观看进度按本机
+        // 记录重算一遍，不再把每个服务器都重新翻一遍。
+        await _refreshProgressAfterPlayback();
+      } else if (mounted) {
+        // 上次扫描没有可恢复的结果时直接结束加载；用户仍可通过资源区的
+        // “重试”按钮主动绕过冷却重新搜索。
+        setState(() {
+          _loadingResources = false;
+          _resourceError = '最近一次检查已结束，点击重试可立即重新搜索。';
+        });
+      }
       return;
+    }
+    if (force && mounted) {
+      setState(() {
+        _loadingResources = true;
+        _resourceError = null;
+      });
     }
     try {
       final store = await SourceStore.create();
       final rows = <MediaItem>[];
       final seasonPosters = <int, Uri>{};
-      final matchedSeriesIds = <String>{};
+      final exactEpisodeKeys = <String>{};
+      var failedSources = 0;
       for (final source in store.load()) {
         final token = store.tokenFor(source);
         if (source.kind == SourceKind.webdav) {
@@ -360,6 +840,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               client.dispose();
             }
           } catch (_) {
+            failedSources++;
             // A failed storage source must not hide usable server results.
           }
         } else {
@@ -374,24 +855,34 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             if (session.source.endpoint != source.endpoint) {
               await store.upsert(session.source, token);
             }
-            var found = await client.findByTmdbId(session, widget.item.id);
+            final series = widget.item.kind == '剧集';
+            var found = await client.findByTmdbId(
+              session,
+              widget.item.id,
+              includeItemTypes: series ? 'Series' : 'Movie',
+            );
             // Some Emby libraries omit ProviderIds even though their series
             // title is searchable. Search the server before falling back to
             // unrelated recently-added items, otherwise episode rails lose
             // their parent/season identity and cannot be enriched.
             if (found.isEmpty && widget.item.kind == '剧集') {
-              found = await client.search(session, widget.item.title);
+              found = await client.search(
+                session,
+                widget.item.title,
+                includeItemTypes: 'Series',
+              );
             }
             if (found.isEmpty) {
               rows.addAll(await client.recentlyAdded(session));
             } else {
               for (final match in found) {
                 if (match.type == 'Series' || match.isContainer) {
-                  matchedSeriesIds.add(match.id);
-                  final seasons = await client.seasonsForSeries(
-                    session,
-                    match.id,
-                  );
+                  List<MediaItem> seasons;
+                  try {
+                    seasons = await client.seasonsForSeries(session, match.id);
+                  } catch (_) {
+                    seasons = const [];
+                  }
                   for (final season in seasons) {
                     final number = season.seasonNumber;
                     final image = season.imageUrl;
@@ -399,14 +890,21 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                       seasonPosters.putIfAbsent(number, () => image);
                     }
                   }
-                  rows.addAll(
-                    await client.episodesForSeries(session, match.id),
+                  final episodes = await client.episodesForSeries(
+                    session,
+                    match.id,
+                  );
+                  rows.addAll(episodes);
+                  exactEpisodeKeys.addAll(
+                    episodes.map((episode) => '${source.id}:${episode.id}'),
                   );
                 } else {
                   rows.add(match);
                 }
               }
             }
+          } catch (_) {
+            failedSources++;
           } finally {
             client.dispose();
           }
@@ -418,10 +916,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             // Episode titles normally do not contain the parent series title
             // (for example, “第 1 集”), so preserve episodes fetched from an
             // exact series match before applying the title fallback filter.
-            if (matchedSeriesIds.isNotEmpty &&
-                media.type == 'Episode' &&
-                (matchedSeriesIds.contains(media.seriesId) ||
-                    media.seriesId == null)) {
+            if (media.type == 'Episode' &&
+                exactEpisodeKeys.contains('${media.source.id}:${media.id}')) {
               return true;
             }
             final candidate = _normaliseTitle(media.title);
@@ -435,7 +931,38 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                     (candidate.contains(title) || title.contains(candidate)));
           })
           .toList(growable: false);
-      final preferred = await _initialResource(matches);
+      if (failedSources > 0 && matches.isEmpty && _resources.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            _loadingResources = false;
+            _resourceError = '$failedSources 个服务器连接或读取失败；保留已缓存资源，可重新搜索。';
+          });
+        }
+        await MediaDetailCache.markScanned(widget.item);
+        return;
+      }
+      final previous = _selectedResource;
+      final selectedSeason = _selectedSeason;
+      final retained = previous == null
+          ? null
+          : matches
+                .where(
+                  (row) =>
+                      row.seasonNumber == previous.seasonNumber &&
+                      row.episodeNumber == previous.episodeNumber &&
+                      row.source.id == previous.source.id,
+                )
+                .firstOrNull;
+      final sameSeason = selectedSeason == null
+          ? <MediaItem>[]
+          : matches
+                .where((row) => row.seasonNumber == selectedSeason)
+                .toList(growable: false);
+      final preferred =
+          retained ??
+          (sameSeason.isNotEmpty
+              ? await _preferredResource(sameSeason)
+              : await _initialResource(matches));
       final history = (await WatchStateStore.create()).load();
       final traktCompleted = await _traktCompletedEpisodes();
       final derived = _deriveProgress(matches, history, traktCompleted);
@@ -447,33 +974,43 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           _completedResourceIds = derived.completed;
           _episodeProgress = derived.progress;
           _selectedSeason =
-              preferred?.seasonNumber ??
+              (selectedSeason != null &&
+                      matches.any((row) => row.seasonNumber == selectedSeason)
+                  ? selectedSeason
+                  : preferred?.seasonNumber) ??
               matches
                   .map((item) => item.seasonNumber)
                   .whereType<int>()
                   .firstOrNull;
           _loadingResources = false;
-          _resourceError = null;
+          _resourceError = failedSources == 0
+              ? null
+              : '$failedSources 个服务器连接或读取失败；已显示其他服务器的资源，可重新搜索。';
         });
       }
       unawaited(_loadEpisodeMetadata(matches));
       // 存下这次聚合结果：下次打开先渲染它，再按冷却间隔决定要不要重搜。
-      unawaited(
-        MediaDetailCache.save(
-          widget.item,
-          rows: matches,
-          seasonPosters: seasonPosters,
-        ),
-      );
-      unawaited(MediaDetailCache.markScanned(widget.item));
+      if (failedSources == 0) {
+        unawaited(
+          MediaDetailCache.save(
+            widget.item,
+            rows: matches,
+            seasonPosters: seasonPosters,
+          ),
+        );
+      }
+      await MediaDetailCache.markScanned(widget.item);
       YingjiImageWarmup.urls([
         for (final resource in matches) resource.imageUrl,
       ]);
     } catch (error) {
+      // 失败也记录自动尝试时间，避免每次重进都再次等待同一轮超时；手动重试
+      // 会传 force 并立即执行，不受这个冷却影响。
+      await MediaDetailCache.markScanned(widget.item);
       if (mounted) {
         setState(() {
           _loadingResources = false;
-          _resourceError = error.toString().replaceFirst('Exception: ', '');
+          _resourceError = '服务器搜索未完成，请检查连接后点击重新搜索。';
         });
       }
     }
@@ -504,7 +1041,13 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         )
         .map((resource) => resource.id)
         .toSet();
-    final progress = <String, double>{};
+    final progress = <String, double>{
+      for (final state in history)
+        if (state.tmdbId == widget.item.id &&
+            state.seasonNumber != null &&
+            state.episodeNumber != null)
+          _episodeKey(state.seasonNumber, state.episodeNumber): state.progress,
+    };
     for (final resource in resources) {
       final local = history
           .where(
@@ -612,7 +1155,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               item.episodeNumber == selected.episodeNumber,
         )
         .toList(growable: false);
-    return filtered.isEmpty ? _resources : filtered;
+    return filtered;
   }
 
   List<MediaItem> get _episodeChoices {
@@ -633,6 +1176,98 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }
     return unique.values.toList(growable: false);
   }
+
+  List<TmdbEpisode> get _catalogEpisodeChoices =>
+      _episodeMetadata.values
+          .where((episode) => episode.seasonNumber == _selectedSeason)
+          .toList()
+        ..sort((a, b) => a.episodeNumber.compareTo(b.episodeNumber));
+
+  List<_PlaybackEpisodeOption> _playerEpisodeCatalog(MediaItem current) {
+    final options = <String, _PlaybackEpisodeOption>{};
+    void include({
+      int? season,
+      int? episode,
+      TmdbEpisode? metadata,
+      MediaItem? resource,
+    }) {
+      if (season == null || episode == null) {
+        if (resource == null) return;
+      }
+      final key = _episodeKey(season, episode);
+      final previous = options[key];
+      options[key] = _PlaybackEpisodeOption(
+        seasonNumber: season ?? previous?.seasonNumber,
+        episodeNumber: episode ?? previous?.episodeNumber,
+        metadata: metadata ?? previous?.metadata,
+        resource: resource ?? previous?.resource,
+      );
+    }
+
+    for (final season in _catalogSeasons) {
+      final count = season.episodeCount ?? 0;
+      for (var number = 1; number <= count; number++) {
+        final metadata = _episodeMetadata[_episodeKey(season.number, number)];
+        include(season: season.number, episode: number, metadata: metadata);
+      }
+    }
+    for (final metadata in _episodeMetadata.values) {
+      include(
+        season: metadata.seasonNumber,
+        episode: metadata.episodeNumber,
+        metadata: metadata,
+      );
+    }
+    for (final resource in _resources) {
+      include(
+        season: resource.seasonNumber,
+        episode: resource.episodeNumber,
+        metadata:
+            _episodeMetadata[_episodeKey(
+              resource.seasonNumber,
+              resource.episodeNumber,
+            )],
+        resource: resource,
+      );
+    }
+    include(
+      season: current.seasonNumber,
+      episode: current.episodeNumber,
+      metadata:
+          _episodeMetadata[_episodeKey(
+            current.seasonNumber,
+            current.episodeNumber,
+          )],
+      resource: current,
+    );
+    return options.values.toList()..sort((a, b) {
+      final season = (a.seasonNumber ?? 0).compareTo(b.seasonNumber ?? 0);
+      return season == 0
+          ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
+          : season;
+    });
+  }
+
+  String _catalogEpisodeTitle(
+    _PlaybackEpisodeOption option, {
+    required String seriesTitle,
+  }) {
+    final metadata = option.metadata;
+    final resource = option.resource;
+    if (resource != null) {
+      return _episodeTitle(
+        resource,
+        metadata,
+        option.episodeNumber ?? 1,
+        seriesTitle: seriesTitle,
+      );
+    }
+    final name = metadata?.name.trim() ?? '';
+    return name.isNotEmpty ? name : '第 ${option.episodeNumber ?? 1} 集';
+  }
+
+  Uri? _catalogEpisodeImage(_PlaybackEpisodeOption option) =>
+      option.metadata?.stillUrl ?? option.resource?.imageUrl;
 
   Future<MediaItem?> _preferredResource(List<MediaItem> resources) async {
     if (resources.isEmpty) return null;
@@ -705,6 +1340,36 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   Future<void> _selectSeason(int season) async {
+    if (widget.item.kind == '剧集' && widget.item.id > 0) {
+      ++_searchGeneration;
+      setState(() {
+        _selectedSeason = season;
+        _selectedEpisodeNumber = null;
+        _resources = const [];
+        _selectedResource = null;
+        _loadingResources = true;
+      });
+      await _loadCatalogSeason(season);
+      if (!mounted || _selectedSeason != season) return;
+      final first = _episodeMetadata.values
+          .where((row) => row.seasonNumber == season)
+          .map((row) => row.episodeNumber)
+          .fold<int?>(
+            null,
+            (current, next) =>
+                current == null || next < current ? next : current,
+          );
+      if (first == null) {
+        setState(() {
+          _loadingResources = false;
+          _resourceError = '本季剧集目录暂不可用，请稍后重试。';
+        });
+        return;
+      }
+      setState(() => _selectedEpisodeNumber = first);
+      await _searchSelectedEpisode();
+      return;
+    }
     final candidates = _resources
         .where((resource) => resource.seasonNumber == season)
         .toList(growable: false);
@@ -716,7 +1381,61 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     });
   }
 
+  void _selectCatalogEpisode(TmdbEpisode episode) {
+    ++_searchGeneration;
+    setState(() {
+      _selectedSeason = episode.seasonNumber;
+      _selectedEpisodeNumber = episode.episodeNumber;
+    });
+    unawaited(_searchSelectedEpisode());
+  }
+
+  Future<void> _playSelectedCatalogEpisode(
+    BuildContext context,
+    TmdbEpisode episode,
+  ) async {
+    bool matchesEpisode(MediaItem item) =>
+        item.seasonNumber == episode.seasonNumber &&
+        item.episodeNumber == episode.episodeNumber &&
+        item.playbackUrl != null;
+    MediaItem? playableResource() {
+      final current = _selectedResource;
+      if (current != null && matchesEpisode(current)) return current;
+      return _resources.where(matchesEpisode).firstOrNull;
+    }
+
+    var resource = playableResource();
+    if (resource == null && _loadingResources) {
+      await _selectedEpisodeSearch;
+      if (!mounted || !context.mounted) return;
+      resource = playableResource();
+    }
+    if (resource == null) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            _loadingResources ? '正在搜索本集可播放资源…' : '本集没有找到可播放资源，请重新搜索。',
+          ),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _selectedResource = resource);
+    await _play(context, widget.item);
+  }
+
   Future<void> _selectEpisode(MediaItem episode) async {
+    if (widget.item.kind == '剧集' && widget.item.id > 0) {
+      ++_searchGeneration;
+      setState(() {
+        _selectedSeason = episode.seasonNumber;
+        _selectedEpisodeNumber = episode.episodeNumber;
+      });
+      await _searchSelectedEpisode();
+      return;
+    }
     final candidates = _resources
         .where(
           (resource) =>
@@ -733,7 +1452,6 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   Future<void> _setEpisodeCompleted(MediaItem resource, bool completed) async {
-    final watchStore = await WatchStateStore.create();
     final siblings = _resources
         .where(
           (item) =>
@@ -758,6 +1476,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         _episodeProgress = {..._episodeProgress, episodeKey: completed ? 1 : 0};
       });
     }
+    final watchStore = await WatchStateStore.create();
     for (final version in versions) {
       final mediaId = version.playbackUrl?.toString() ?? version.id;
       if (completed) {
@@ -854,6 +1573,71 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     );
   }
 
+  Future<void> _setCatalogEpisodeCompleted(
+    TmdbEpisode episode,
+    bool completed,
+  ) async {
+    final resource = _resources
+        .where(
+          (item) =>
+              item.seasonNumber == episode.seasonNumber &&
+              item.episodeNumber == episode.episodeNumber,
+        )
+        .firstOrNull;
+    if (resource != null) {
+      await _setEpisodeCompleted(resource, completed);
+      return;
+    }
+    final mediaId =
+        'tmdb:${widget.item.id}:s${episode.seasonNumber}:e${episode.episodeNumber}';
+    if (mounted) {
+      setState(
+        () => _episodeProgress = {
+          ..._episodeProgress,
+          _episodeKey(episode.seasonNumber, episode.episodeNumber): completed
+              ? 1
+              : 0,
+        },
+      );
+    }
+    final store = await WatchStateStore.create();
+    if (completed) {
+      final duration = Duration(minutes: episode.runtime ?? 1);
+      await store.save(
+        WatchState(
+          mediaId: mediaId,
+          tmdbId: widget.item.id,
+          title: widget.item.title,
+          episodeTitle: episode.name,
+          seasonNumber: episode.seasonNumber,
+          episodeNumber: episode.episodeNumber,
+          imageUrl: episode.stillUrl?.toString(),
+          position: duration,
+          duration: duration,
+        ),
+      );
+    } else {
+      await store.remove(mediaId);
+    }
+    if (!mounted) return;
+    if (await WatchStateStore.localOnly()) return;
+    final credentials = await TraktCredentials.read();
+    if (credentials.clientId.isEmpty || credentials.accessToken.isEmpty) return;
+    final trakt = TraktClient();
+    try {
+      await trakt.setEpisodeWatched(
+        clientId: credentials.clientId,
+        accessToken: credentials.accessToken,
+        tmdbId: widget.item.id,
+        season: episode.seasonNumber,
+        episode: episode.episodeNumber,
+        watched: completed,
+      );
+    } finally {
+      trakt.dispose();
+    }
+  }
+
   Future<void> _addToPlaylist(TmdbItem item) async {
     final store = await PlaylistStore.create();
     final playlists = store.load();
@@ -867,25 +1651,35 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       context: context,
       backgroundColor: YingjiGlass.surface(strength: 1.15),
       builder: (context) => SafeArea(
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            const ListTile(
-              title: Text(
-                '加入片单',
-                style: TextStyle(fontWeight: FontWeight.w800),
+        child: YingjiSmoothWheel(
+          controller: _playlistPickerScroll,
+          stableGlass: true,
+          child: ListView(
+            controller: _playlistPickerScroll,
+            physics:
+                yingjiWheelPhysics ??
+                const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
+            shrinkWrap: true,
+            children: [
+              const ListTile(
+                title: Text(
+                  '加入片单',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                subtitle: Text('选择一个本地自定义片单'),
               ),
-              subtitle: Text('选择一个本地自定义片单'),
-            ),
-            ...playlists.map(
-              (playlist) => ListTile(
-                leading: const Icon(YingjiIcons.rectangle_stack),
-                title: Text(playlist.name),
-                subtitle: Text('${playlist.items.length} 部内容'),
-                onTap: () => Navigator.pop(context, playlist),
+              ...playlists.map(
+                (playlist) => ListTile(
+                  leading: const Icon(YingjiIcons.rectangle_stack),
+                  title: Text(playlist.name),
+                  subtitle: Text('${playlist.items.length} 部内容'),
+                  onTap: () => Navigator.pop(context, playlist),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -910,45 +1704,56 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       context: context,
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black54,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
-          child: GlassPanel(
-            radius: 20,
-            padding: const EdgeInsets.all(18),
-            child: ListView(
-              shrinkWrap: true,
-              children: [
-                const Row(
-                  children: [
-                    Icon(YingjiIcons.slider_horizontal_3, size: 18),
-                    SizedBox(width: 8),
-                    Text(
-                      '切换资源',
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w800,
+      builder: (context) => YingjiStableScrollGlass(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+            child: GlassPanel(
+              radius: 20,
+              padding: const EdgeInsets.all(18),
+              child: YingjiSmoothWheel(
+                controller: _resourcePickerScroll,
+                child: ListView(
+                  controller: _resourcePickerScroll,
+                  physics:
+                      yingjiWheelPhysics ??
+                      const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
                       ),
+                  shrinkWrap: true,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(YingjiIcons.slider_horizontal_3, size: 18),
+                        SizedBox(width: 8),
+                        Text(
+                          '切换资源',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ],
                     ),
+                    const SizedBox(height: 5),
+                    const Text(
+                      '选择版本后，播放与音轨信息会同步更新。',
+                      style: TextStyle(color: YingjiColors.muted, fontSize: 12),
+                    ),
+                    const SizedBox(height: 14),
+                    for (final resource in choices) ...[
+                      _ResourcePickerCard(
+                        resource: resource,
+                        selected:
+                            resource.id == _selectedResource?.id &&
+                            resource.source.id == _selectedResource?.source.id,
+                        onTap: () => Navigator.pop(context, resource),
+                      ),
+                      const SizedBox(height: 9),
+                    ],
                   ],
                 ),
-                const SizedBox(height: 5),
-                const Text(
-                  '选择版本后，播放与音轨信息会同步更新。',
-                  style: TextStyle(color: YingjiColors.muted, fontSize: 12),
-                ),
-                const SizedBox(height: 14),
-                for (final resource in choices) ...[
-                  _ResourcePickerCard(
-                    resource: resource,
-                    selected:
-                        resource.id == _selectedResource?.id &&
-                        resource.source.id == _selectedResource?.source.id,
-                    onTap: () => Navigator.pop(context, resource),
-                  ),
-                  const SizedBox(height: 9),
-                ],
-              ],
+              ),
             ),
           ),
         ),
@@ -969,161 +1774,176 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     await showDialog<void>(
       context: context,
       barrierColor: Colors.black.withValues(alpha: .62),
-      builder: (context) => StatefulBuilder(
-        builder: (context, updateDialog) => Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding: const EdgeInsets.all(28),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: 920,
-              maxHeight: math.min(MediaQuery.sizeOf(context).height * .84, 720),
-            ),
-            child: GlassPanel(
-              radius: 20,
-              padding: const EdgeInsets.fromLTRB(22, 20, 22, 22),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const _TrackPickerHeadingIcon(),
-                      const SizedBox(width: 12),
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '预选音轨与字幕',
-                              style: TextStyle(
-                                fontSize: 21,
-                                height: 1.15,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                            SizedBox(height: 5),
-                            Text(
-                              '播放此版本时优先使用；仍可在播放器中随时切换。',
-                              style: TextStyle(
-                                color: YingjiColors.muted,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      YingjiMotionIconButton(
-                        icon: YingjiIcons.xmark,
-                        tooltip: '关闭',
-                        size: 38,
-                        onPressed: () => Navigator.pop(context),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-                  _TrackResourceSummary(resource: resource),
-                  const SizedBox(height: 18),
-                  Expanded(
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final audio = _TrackPickerPane(
-                          icon: YingjiIcons.speaker_2_fill,
-                          title: '音轨',
-                          count: resource.audioTracks.length,
-                          children: [
-                            _TrackPickerOption(
-                              icon: YingjiIcons.sparkles,
-                              title: '自动选择',
-                              detail: '使用服务器默认音轨',
-                              selected: _selectedAudioTrack == null,
-                              onTap: () {
-                                setState(() {
-                                  _selectedAudioTrack = null;
-                                });
-                                updateDialog(() {});
-                              },
-                            ),
-                            for (final track in resource.audioTracks)
-                              _TrackPickerOption(
-                                icon: YingjiIcons.speaker_2_fill,
-                                title: track.title,
-                                detail: _trackSummary(track),
-                                badge: track.isDefault ? '默认' : null,
-                                selected: _selectedAudioTrack == track.index,
-                                onTap: () {
-                                  setState(() {
-                                    _selectedAudioTrack = track.index;
-                                  });
-                                  updateDialog(() {});
-                                },
-                              ),
-                          ],
-                        );
-                        final subtitles = _TrackPickerPane(
-                          icon: YingjiIcons.captions_bubble,
-                          title: '字幕',
-                          count: resource.subtitleTracks.length,
-                          children: [
-                            _TrackPickerOption(
-                              icon: YingjiIcons.sparkles,
-                              title: '自动选择',
-                              detail: '按字幕语言偏好智能选择',
-                              selected: _selectedSubtitleTrack == null,
-                              onTap: () {
-                                setState(() {
-                                  _selectedSubtitleTrack = null;
-                                });
-                                updateDialog(() {});
-                              },
-                            ),
-                            _TrackPickerOption(
-                              icon: YingjiIcons.captions_bubble,
-                              title: '关闭字幕',
-                              detail: '播放时不加载字幕轨道',
-                              selected: _selectedSubtitleTrack == -1,
-                              onTap: () {
-                                setState(() {
-                                  _selectedSubtitleTrack = -1;
-                                });
-                                updateDialog(() {});
-                              },
-                            ),
-                            for (final track in resource.subtitleTracks)
-                              _TrackPickerOption(
-                                icon: YingjiIcons.captions_bubble,
-                                title: track.title,
-                                detail: _trackSummary(track),
-                                badge: track.isDefault ? '默认' : null,
-                                selected: _selectedSubtitleTrack == track.index,
-                                onTap: () {
-                                  setState(() {
-                                    _selectedSubtitleTrack = track.index;
-                                  });
-                                  updateDialog(() {});
-                                },
-                              ),
-                          ],
-                        );
-                        if (constraints.maxWidth < 680) {
-                          return ListView(
+      builder: (context) => YingjiStableScrollGlass(
+        child: StatefulBuilder(
+          builder: (context, updateDialog) => Dialog(
+            backgroundColor: Colors.transparent,
+            insetPadding: const EdgeInsets.all(28),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 920,
+                maxHeight: math.min(
+                  MediaQuery.sizeOf(context).height * .84,
+                  720,
+                ),
+              ),
+              child: GlassPanel(
+                radius: 20,
+                padding: const EdgeInsets.fromLTRB(22, 20, 22, 22),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const _TrackPickerHeadingIcon(),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              SizedBox(height: 360, child: audio),
-                              const SizedBox(height: 14),
-                              SizedBox(height: 360, child: subtitles),
+                              Text(
+                                '预选音轨与字幕',
+                                style: TextStyle(
+                                  fontSize: 21,
+                                  height: 1.15,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              SizedBox(height: 5),
+                              Text(
+                                '播放此版本时优先使用；仍可在播放器中随时切换。',
+                                style: TextStyle(
+                                  color: YingjiColors.muted,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        YingjiMotionIconButton(
+                          icon: YingjiIcons.xmark,
+                          tooltip: '关闭',
+                          size: 38,
+                          onPressed: () => Navigator.pop(context),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    _TrackResourceSummary(resource: resource),
+                    const SizedBox(height: 18),
+                    Expanded(
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final audio = _TrackPickerPane(
+                            icon: YingjiIcons.speaker_2_fill,
+                            title: '音轨',
+                            count: resource.audioTracks.length,
+                            children: [
+                              _TrackPickerOption(
+                                icon: YingjiIcons.sparkles,
+                                title: '自动选择',
+                                detail: '使用服务器默认音轨',
+                                selected: _selectedAudioTrack == null,
+                                onTap: () {
+                                  setState(() {
+                                    _selectedAudioTrack = null;
+                                  });
+                                  updateDialog(() {});
+                                },
+                              ),
+                              for (final track in resource.audioTracks)
+                                _TrackPickerOption(
+                                  icon: YingjiIcons.speaker_2_fill,
+                                  title: track.title,
+                                  detail: _trackSummary(track),
+                                  badge: track.isDefault ? '默认' : null,
+                                  selected: _selectedAudioTrack == track.index,
+                                  onTap: () {
+                                    setState(() {
+                                      _selectedAudioTrack = track.index;
+                                    });
+                                    updateDialog(() {});
+                                  },
+                                ),
                             ],
                           );
-                        }
-                        return Row(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Expanded(child: audio),
-                            const SizedBox(width: 14),
-                            Expanded(child: subtitles),
-                          ],
-                        );
-                      },
+                          final subtitles = _TrackPickerPane(
+                            icon: YingjiIcons.captions_bubble,
+                            title: '字幕',
+                            count: resource.subtitleTracks.length,
+                            children: [
+                              _TrackPickerOption(
+                                icon: YingjiIcons.sparkles,
+                                title: '自动选择',
+                                detail: '按字幕语言偏好智能选择',
+                                selected: _selectedSubtitleTrack == null,
+                                onTap: () {
+                                  setState(() {
+                                    _selectedSubtitleTrack = null;
+                                  });
+                                  updateDialog(() {});
+                                },
+                              ),
+                              _TrackPickerOption(
+                                icon: YingjiIcons.captions_bubble,
+                                title: '关闭字幕',
+                                detail: '播放时不加载字幕轨道',
+                                selected: _selectedSubtitleTrack == -1,
+                                onTap: () {
+                                  setState(() {
+                                    _selectedSubtitleTrack = -1;
+                                  });
+                                  updateDialog(() {});
+                                },
+                              ),
+                              for (final track in resource.subtitleTracks)
+                                _TrackPickerOption(
+                                  icon: YingjiIcons.captions_bubble,
+                                  title: track.title,
+                                  detail: _trackSummary(track),
+                                  badge: track.isDefault ? '默认' : null,
+                                  selected:
+                                      _selectedSubtitleTrack == track.index,
+                                  onTap: () {
+                                    setState(() {
+                                      _selectedSubtitleTrack = track.index;
+                                    });
+                                    updateDialog(() {});
+                                  },
+                                ),
+                            ],
+                          );
+                          if (constraints.maxWidth < 680) {
+                            return YingjiSmoothWheel(
+                              controller: _compactTrackPickerScroll,
+                              child: ListView(
+                                controller: _compactTrackPickerScroll,
+                                physics:
+                                    yingjiWheelPhysics ??
+                                    const BouncingScrollPhysics(
+                                      parent: AlwaysScrollableScrollPhysics(),
+                                    ),
+                                children: [
+                                  SizedBox(height: 360, child: audio),
+                                  const SizedBox(height: 14),
+                                  SizedBox(height: 360, child: subtitles),
+                                ],
+                              ),
+                            );
+                          }
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Expanded(child: audio),
+                              const SizedBox(width: 14),
+                              Expanded(child: subtitles),
+                            ],
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -1228,33 +2048,29 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     return minutes != null && minutes > 0 ? minutes * 60 : null;
   }
 
-  /// 剧集卡片副标题里附在季号之后的「日期 · 时长」，例如「2023-05-12 · 44 分钟」。
-  /// 数据来自 TMDB，缺项就少写一段，不拿服务器首播年份之类的近似值硬凑。
-  String _episodeMetaLine(MediaItem episode, TmdbEpisode? metadata) {
-    final parts = <String>[];
-    final date = metadata?.airDate;
-    if (date != null) {
-      parts.add(
-        '${date.year}-${date.month.toString().padLeft(2, '0')}'
-        '-${date.day.toString().padLeft(2, '0')}',
-      );
-    }
-    final minutes = metadata?.runtime;
-    if (minutes != null && minutes > 0) parts.add('$minutes 分钟');
-    return parts.join(' · ');
-  }
-
   /// 「资源」的候选版本：当前剧集在**全部已连接服务器**上的条目，按分辨率、
   /// 动态范围、码率排序。原生「资源」面板与 Flutter 播放页共用这一份顺序。
   /// 返回条目本身（而不是 PlayerResourceOption），因为重新起播还需要 headers、
   /// videoRange、时长等字段，只有 URL 是重建不出来的。
   List<MediaItem> _resourceVersionsFor(MediaItem episode) {
-    final rows = _resources
+    return _sortResourceVersions(
+      _resources,
+      seasonNumber: episode.seasonNumber,
+      episodeNumber: episode.episodeNumber,
+    );
+  }
+
+  List<MediaItem> _sortResourceVersions(
+    Iterable<MediaItem> resources, {
+    required int? seasonNumber,
+    required int? episodeNumber,
+  }) {
+    final rows = resources
         .where(
           (candidate) =>
               candidate.playbackUrl != null &&
-              candidate.seasonNumber == episode.seasonNumber &&
-              candidate.episodeNumber == episode.episodeNumber,
+              candidate.seasonNumber == seasonNumber &&
+              candidate.episodeNumber == episodeNumber,
         )
         .toList();
     rows.sort((a, b) {
@@ -1268,7 +2084,23 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   List<PlayerResourceOption> _playerResourcesFor(MediaItem episode) {
-    return _resourceVersionsFor(episode)
+    return _playerResourceOptions(
+      _resources,
+      seasonNumber: episode.seasonNumber,
+      episodeNumber: episode.episodeNumber,
+    );
+  }
+
+  List<PlayerResourceOption> _playerResourceOptions(
+    Iterable<MediaItem> resources, {
+    required int? seasonNumber,
+    required int? episodeNumber,
+  }) {
+    return _sortResourceVersions(
+          resources,
+          seasonNumber: seasonNumber,
+          episodeNumber: episodeNumber,
+        )
         .map(
           (candidate) => PlayerResourceOption(
             url: candidate.playbackUrl!.toString(),
@@ -1289,6 +2121,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   @override
   void dispose() {
     _pageScroll.dispose();
+    _playlistPickerScroll.dispose();
+    _resourcePickerScroll.dispose();
+    _compactTrackPickerScroll.dispose();
     _client.dispose();
     super.dispose();
   }
@@ -1456,23 +2291,40 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                               onFavorite: _toggleFavorite,
                             ),
                             const SizedBox(height: 32),
-                            if (_resources.isNotEmpty && item.kind == '剧集') ...[
+                            if (item.kind == '剧集' &&
+                                (_catalogSeasons.isNotEmpty ||
+                                    _resources.isNotEmpty)) ...[
                               _SeasonRail(
                                 resources: _resources,
+                                catalogSeasons: _catalogSeasons,
                                 posters: _seasonPosters,
                                 selectedSeason: _selectedSeason,
                                 onSelect: _selectSeason,
                               ),
                               const SizedBox(height: 24),
-                              _EpisodePreviewRail(
-                                resources: _episodeChoices,
-                                selected: _selectedResource,
-                                completedResourceIds: _completedResourceIds,
-                                metadata: _episodeMetadata,
-                                episodeProgress: _episodeProgress,
-                                onMarkPlayed: _setEpisodeCompleted,
-                                onSelect: _selectEpisode,
-                              ),
+                              if (_catalogEpisodeChoices.isNotEmpty)
+                                _CatalogEpisodeRail(
+                                  episodes: _catalogEpisodeChoices,
+                                  selectedEpisode: _selectedEpisodeNumber,
+                                  progress: _episodeProgress,
+                                  onSelect: _selectCatalogEpisode,
+                                  onPlay: (episode) =>
+                                      _playSelectedCatalogEpisode(
+                                        context,
+                                        episode,
+                                      ),
+                                  onMarkPlayed: _setCatalogEpisodeCompleted,
+                                )
+                              else if (_resources.isNotEmpty)
+                                _EpisodePreviewRail(
+                                  resources: _episodeChoices,
+                                  selected: _selectedResource,
+                                  completedResourceIds: _completedResourceIds,
+                                  metadata: _episodeMetadata,
+                                  episodeProgress: _episodeProgress,
+                                  onMarkPlayed: _setEpisodeCompleted,
+                                  onSelect: _selectEpisode,
+                                ),
                               const SizedBox(height: 30),
                             ],
                             _ResourceSection(
@@ -1480,8 +2332,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                               selected: _selectedResource,
                               loading: _loadingResources,
                               error: _resourceError,
-                              // 手动重试要绕开冷却间隔，立刻重搜。
-                              onRetry: () => _loadResources(force: true),
+                              onRetry: () => item.kind == '剧集' && item.id > 0
+                                  ? _searchSelectedEpisode()
+                                  : _loadResources(force: true),
                               onPicker: (resource) =>
                                   _showResourcePicker(source: resource.source),
                               onSelect: (resource) =>
@@ -1525,23 +2378,154 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         ? remotePosition
         : savedPosition;
     if (!context.mounted) return;
-    final episodeByKey = <String, MediaItem>{};
-    for (final candidate in _resources) {
-      if (candidate.playbackUrl == null || candidate.episodeNumber == null) {
-        continue;
+    // 展示目录来自全部季/集元数据，不以当前只搜索过资源的集数裁剪列表。
+    // 对没有 URL 的目录项，用户选中后才触发该集的服务器聚合。
+    final episodeOptions = _playerEpisodeCatalog(resource);
+    void mergeEpisodeCatalog() {
+      final merged = {for (final option in episodeOptions) option.key: option};
+      for (final fresh in _playerEpisodeCatalog(resource)) {
+        final previous = merged[fresh.key];
+        merged[fresh.key] = _PlaybackEpisodeOption(
+          seasonNumber: fresh.seasonNumber,
+          episodeNumber: fresh.episodeNumber,
+          metadata: fresh.metadata ?? previous?.metadata,
+          resource: fresh.resource ?? previous?.resource,
+        );
       }
-      final key = _episodeKey(candidate.seasonNumber, candidate.episodeNumber);
-      episodeByKey.putIfAbsent(key, () => candidate);
+      episodeOptions
+        ..clear()
+        ..addAll(merged.values)
+        ..sort((a, b) {
+          final season = (a.seasonNumber ?? 0).compareTo(b.seasonNumber ?? 0);
+          return season == 0
+              ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
+              : season;
+        });
     }
-    episodeByKey[_episodeKey(resource.seasonNumber, resource.episodeNumber)] =
-        resource;
-    final episodeOptions = episodeByKey.values.toList()
-      ..sort((a, b) {
-        final season = (a.seasonNumber ?? 0).compareTo(b.seasonNumber ?? 0);
-        return season == 0
-            ? (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0)
-            : season;
+
+    PlayerEpisode playerEpisode(
+      _PlaybackEpisodeOption option, {
+      MediaItem? overrideResource,
+      Duration initialPosition = Duration.zero,
+    }) {
+      final episode = overrideResource ?? option.resource;
+      final savedSeconds = episodeResumeSeconds(
+        progress: _episodeProgress[option.key],
+        duration: episode == null
+            ? (option.metadata?.runtime == null
+                  ? null
+                  : option.metadata!.runtime! * 60)
+            : _episodeSeconds(episode, option.metadata),
+      );
+      final progressPosition = savedSeconds == null
+          ? Duration.zero
+          : Duration(milliseconds: (savedSeconds * 1000).round());
+      final resourcePosition = episode == null || _mediaProgress(episode) >= .95
+          ? Duration.zero
+          : episode.playbackPosition ?? Duration.zero;
+      final resumePosition = [
+        initialPosition,
+        progressPosition,
+        resourcePosition,
+      ].reduce((a, b) => a > b ? a : b);
+      final episodeTitle = _catalogEpisodeTitle(
+        option,
+        seriesTitle: item.title,
+      );
+      return PlayerEpisode(
+        url: episode?.playbackUrl?.toString() ?? '',
+        title: item.title,
+        headers: episode?.headers ?? const {},
+        initialPosition: resumePosition,
+        imageUrl: (_catalogEpisodeImage(option) ?? item.posterUrl)?.toString(),
+        seriesLogoUrl: item.logoUrl?.toString(),
+        episodeTitle: episodeTitle,
+        resourceInfo: episode == null
+            ? '选择后搜索服务器资源'
+            : [
+                episode.source.name,
+                _resourceSummary(episode),
+              ].where((value) => value.isNotEmpty).join(' · '),
+        videoRange: episode?.videoRange,
+        sourceId: episode?.source.id,
+        serverItemId: episode?.id,
+        tmdbId: item.id,
+        seasonNumber: option.seasonNumber,
+        episodeNumber: option.episodeNumber,
+        chapters: episode?.chapters ?? const [],
+        initialAudioTrack: _selectedAudioTrack,
+        initialSubtitleTrack: _selectedSubtitleTrack,
+        resources: episode == null ? const [] : _playerResourcesFor(episode),
+      );
+    }
+
+    Future<PlayerEpisode?> resolvePlayerEpisode(
+      int season,
+      int episode,
+      void Function(List<PlayerResourceOption> resources) onResourcesChanged,
+    ) async {
+      if (!mounted) return null;
+      setState(() {
+        _selectedSeason = season;
+        _selectedEpisodeNumber = episode;
       });
+      mergeEpisodeCatalog();
+      // Episode metadata enriches the catalog but is not required to resolve
+      // the stream URL, so fetch it alongside the server search.
+      unawaited(
+        _loadCatalogSeason(season).then((_) {
+          if (!mounted || _selectedSeason != season) return;
+          mergeEpisodeCatalog();
+        }),
+      );
+      final selected = await _searchSelectedEpisodeForPlayback(
+        preferredSourceId: resource.source.id,
+        onResourcesPublished: (rows) {
+          final target = rows
+              .where(
+                (row) =>
+                    row.seasonNumber == season &&
+                    row.episodeNumber == episode &&
+                    row.playbackUrl != null,
+              )
+              .firstOrNull;
+          if (target != null) {
+            onResourcesChanged(
+              _playerResourceOptions(
+                rows,
+                seasonNumber: season,
+                episodeNumber: episode,
+              ),
+            );
+          }
+        },
+      );
+      if (!mounted || _selectedSeason != season) return null;
+      mergeEpisodeCatalog();
+      if (selected?.seasonNumber != season ||
+          selected?.episodeNumber != episode ||
+          selected?.playbackUrl == null) {
+        return null;
+      }
+      final key = _episodeKey(season, episode);
+      final index = episodeOptions.indexWhere((option) => option.key == key);
+      final option = _PlaybackEpisodeOption(
+        seasonNumber: season,
+        episodeNumber: episode,
+        metadata: _episodeMetadata[key],
+        resource: selected,
+      );
+      if (index >= 0) episodeOptions[index] = option;
+      onResourcesChanged(
+        _playerResourceOptions(
+          _resources,
+          seasonNumber: season,
+          episodeNumber: episode,
+        ),
+      );
+      return playerEpisode(option, overrideResource: selected);
+    }
+
     if (NativeDolbyVisionPlayer.isAvailablePlatform &&
         NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
       final capabilities = await NativeDolbyVisionPlayer.capabilities();
@@ -1609,59 +2593,29 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       // 原生窗口的「资源」面板可以切到当前剧集在任意已连接服务器上的版本。
       // 原生自己换不了 —— 播放列表、headers 与 hwdec 选择都绑在起播时那个
       // 服务器上 —— 所以它把选择交回来，由这里用新资源重新起播。
-      final versions = _resourceVersionsFor(resource);
-      var available = versions;
+      var available = _resourceVersionsFor(resource);
       var activeResource = resource;
-      var activeIndex = available.indexWhere(
-        (candidate) =>
-            candidate.source.id == resource.source.id &&
-            candidate.id == resource.id,
-      );
-      if (activeIndex < 0) {
-        // 当前条目不在聚合列表里（例如从播放历史直接起播）：把它放进列表，免得
-        // 面板把别的版本标成「正在播放」。
-        available = <MediaItem>[resource, ...versions];
-        activeIndex = 0;
-      }
       var startAt = resumePosition;
       // 剧集面板要逐集显示剧照，资源面板要显示服务器图标 —— 两样都必须由应用侧
       // 先取好：原生不联网，也不该持有令牌。图落到本地磁盘缓存后只把路径下发。
-      // 这一步放在重播循环之外，换资源重播时不必重新取图；两者都有时限，起播
-      // 不该被取图拖住，赶不上的单集剧照会退回真实剧集海报，避免整列空白。
-      final episodeImages = await WindowsNativePlayer.cachedImageFiles({
-        for (final episode in episodeOptions)
-          _episodeKey(episode.seasonNumber, episode.episodeNumber):
-              (_episodeImage(
-                        episode,
-                        _episodeMetadata[_episodeKey(
-                          episode.seasonNumber,
-                          episode.episodeNumber,
-                        )],
-                      ) ??
-                      item.posterUrl)
+      // 目录海报只需缓存一次；新选中的季加载元数据后会补缓存该季剧照。
+      Future<Map<String, String?>> cacheEpisodeImages() =>
+          WindowsNativePlayer.cachedImageFiles({
+            for (final option in episodeOptions)
+              option.key: (_catalogEpisodeImage(option) ?? item.posterUrl)
                   ?.toString(),
-      });
-      // 名次取自「按画质排序」的那一份版本列表，和详情页资源卡片上的金 / 银 / 铜
-      // 标记同源。当前条目不在其中时（比如从播放历史直接起播）不排名次。
-      final ranks = <String, int>{
-        for (var index = 0; index < versions.length && index < 3; index++)
-          _resourceKey(versions[index]): index + 1,
-      };
-      // 服务器图标：并发取、整体限时。某台服务器不响应时不能让起播一直等它，
-      // 超时的那几项退回原生按来源类型画的兜底标记，配色仍然是对的。
-      final resourceIcons = <String, String?>{};
-      await Future.wait<void>(
-        available.map((version) async {
-          resourceIcons[_resourceKey(version)] = await cacheServerMarkFile(
-            version.source,
-            version.headers['X-Emby-Token'],
-          );
-        }),
-      ).timeout(const Duration(seconds: 4), onTimeout: () => <void>[]);
-      WindowsNativePlaylistEntry nativeEntry(MediaItem episode) {
-        final key = _episodeKey(episode.seasonNumber, episode.episodeNumber);
-        final metadata = _episodeMetadata[key];
-        final seconds = _episodeSeconds(episode, metadata);
+          });
+      var episodeImages = await cacheEpisodeImages();
+      WindowsNativePlaylistEntry nativeEntry(
+        _PlaybackEpisodeOption option, {
+        MediaItem? overrideResource,
+      }) {
+        final episode = overrideResource ?? option.resource;
+        final key = option.key;
+        final metadata = option.metadata;
+        final seconds = episode == null
+            ? (metadata?.runtime == null ? null : metadata!.runtime! * 60)
+            : _episodeSeconds(episode, metadata);
         final progress = _episodeProgress[key];
         // 这一集自己该从哪儿起播（规则见 episodeResumeSeconds 的注释）。
         final resume = episodeResumeSeconds(
@@ -1669,46 +2623,162 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           duration: seconds,
         );
         return WindowsNativePlaylistEntry(
-          url: episode.playbackUrl.toString(),
-          title: episode.title,
-          headers: episode.headers,
+          url: episode?.playbackUrl?.toString() ?? '',
+          title: episode?.title ?? item.title,
+          headers: episode?.headers ?? const {},
           // 单集剧照缺失是常态：TMDB 剧照优先（与详情页同一套规则），
           // 再退到剧集海报，避免继续观看卡片沦为字母占位块。
-          imageUrl: (_episodeImage(episode, metadata) ?? item.posterUrl)
+          imageUrl: (_catalogEpisodeImage(option) ?? item.posterUrl)
               ?.toString(),
-          sourceId: episode.source.id,
-          serverItemId: episode.id,
+          sourceId: episode?.source.id,
+          serverItemId: episode?.id,
           tmdbId: item.id,
-          episodeTitle: _episodeTitle(
-            episode,
-            metadata,
-            episode.episodeNumber ?? 1,
-            seriesTitle: item.title,
-          ),
-          seasonNumber: episode.seasonNumber,
-          episodeNumber: episode.episodeNumber,
+          episodeTitle: _catalogEpisodeTitle(option, seriesTitle: item.title),
+          seasonNumber: option.seasonNumber,
+          episodeNumber: option.episodeNumber,
           imagePath: episodeImages[key],
           progress: progress,
           duration: seconds,
-          watched: _completedResourceIds.contains(episode.id),
+          watched:
+              (progress ?? 0) >= .95 ||
+              (episode != null && _completedResourceIds.contains(episode.id)),
           resumeSeconds: resume,
-          meta: _episodeMetaLine(episode, metadata),
+          meta: [
+            if (metadata?.airDate case final date?)
+              '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}',
+            if ((metadata?.runtime ?? 0) > 0) '${metadata!.runtime} 分钟',
+          ].join(' · '),
         );
       }
 
+      Future<WindowsNativePlaylistEntry?> resolveNativeEpisode(
+        int season,
+        int episode,
+        void Function(List<WindowsNativeResourceOption>, int)
+        onResourcesChanged,
+      ) async {
+        if (!mounted) return null;
+        setState(() {
+          _selectedSeason = season;
+          _selectedEpisodeNumber = episode;
+        });
+        mergeEpisodeCatalog();
+        unawaited(
+          _loadCatalogSeason(season).then((_) {
+            if (!mounted || _selectedSeason != season) return;
+            mergeEpisodeCatalog();
+          }),
+        );
+
+        var resourceRevision = 0;
+        List<MediaItem> latestRows = const [];
+        void publishResources(List<MediaItem> rows, MediaItem current) {
+          final versions = _sortResourceVersions(
+            rows,
+            seasonNumber: season,
+            episodeNumber: episode,
+          );
+          if (versions.isEmpty) return;
+          // Keep the caller's index-to-resource mapping in lockstep with the
+          // incrementally refreshed native menu, including after this search
+          // callback has already returned to playback.
+          available = versions;
+          final currentIndex = versions.indexWhere(
+            (version) =>
+                version.source.id == current.source.id &&
+                version.id == current.id,
+          );
+          final revision = ++resourceRevision;
+          unawaited(() async {
+            final icons = await Future.wait(
+              versions.map((version) async {
+                try {
+                  return await cacheServerMarkFile(
+                    version.source,
+                    version.headers['X-Emby-Token'],
+                  );
+                } catch (_) {
+                  return null;
+                }
+              }),
+            );
+            if (!mounted || revision != resourceRevision) return;
+            onResourcesChanged([
+              for (var index = 0; index < versions.length; index++)
+                WindowsNativeResourceOption(
+                  source: versions[index].source.name,
+                  detail: _resourceSummary(versions[index]),
+                  iconPath: icons[index],
+                  mark: _serverMarkOf(versions[index].source),
+                  rank: index < 3 ? index + 1 : 0,
+                ),
+            ], currentIndex < 0 ? 0 : currentIndex);
+          }());
+        }
+
+        final selected = await _searchSelectedEpisodeForPlayback(
+          preferredSourceId: activeResource.source.id,
+          onResourcesPublished: (rows) {
+            latestRows = rows;
+            final current = _selectedResource;
+            if (current != null &&
+                current.seasonNumber == season &&
+                current.episodeNumber == episode) {
+              publishResources(rows, current);
+            }
+          },
+        );
+        if (selected == null || !mounted || _selectedSeason != season) {
+          return null;
+        }
+        publishResources(latestRows, selected);
+        final key = _episodeKey(season, episode);
+        final optionIndex = episodeOptions.indexWhere(
+          (option) => option.key == key,
+        );
+        if (optionIndex < 0) return null;
+        activeResource = selected;
+        available = _resourceVersionsFor(selected);
+        final option = episodeOptions[optionIndex];
+        return nativeEntry(option, overrideResource: selected);
+      }
+
       while (true) {
-        // 剧集列表本身跨服务器取自 episodeByKey；只有当前这一集要换成正在播放
-        // 的那个版本，否则换资源之后列表里的选中项还停在旧服务器上。
+        available = _resourceVersionsFor(activeResource);
+        var activeIndex = available.indexWhere(
+          (candidate) =>
+              candidate.source.id == activeResource.source.id &&
+              candidate.id == activeResource.id,
+        );
+        if (activeIndex < 0) {
+          available = <MediaItem>[activeResource, ...available];
+          activeIndex = 0;
+        }
+        final ranks = <String, int>{
+          for (var index = 0; index < available.length && index < 3; index++)
+            _resourceKey(available[index]): index + 1,
+        };
+        final resourceIcons = <String, String?>{};
+        await Future.wait<void>(
+          available.map((version) async {
+            resourceIcons[_resourceKey(version)] = await cacheServerMarkFile(
+              version.source,
+              version.headers['X-Emby-Token'],
+            );
+          }),
+        ).timeout(const Duration(seconds: 4), onTimeout: () => <void>[]);
+        final activeKey = _episodeKey(
+          activeResource.seasonNumber,
+          activeResource.episodeNumber,
+        );
         final playlist = episodeOptions
             .map(
-              (episode) =>
-                  _episodeKey(episode.seasonNumber, episode.episodeNumber) ==
-                      _episodeKey(
-                        activeResource.seasonNumber,
-                        activeResource.episodeNumber,
-                      )
-                  ? activeResource
-                  : episode,
+              (option) => nativeEntry(
+                option,
+                overrideResource: option.key == activeKey
+                    ? activeResource
+                    : null,
+              ),
             )
             .toList(growable: false);
         final activeMetadata =
@@ -1742,14 +2812,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               videoRange: activeResource.videoRange,
               initialAudioTrack: _selectedAudioTrack,
               initialSubtitleTrack: _selectedSubtitleTrack,
-              playlist: playlist.map(nativeEntry).toList(growable: false),
+              playlist: playlist,
               playlistIndex: playlist.indexWhere(
                 (episode) =>
                     _episodeKey(episode.seasonNumber, episode.episodeNumber) ==
-                    _episodeKey(
-                      activeResource.seasonNumber,
-                      activeResource.episodeNumber,
-                    ),
+                    activeKey,
               ),
               resources: available
                   .map(
@@ -1763,8 +2830,76 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                   )
                   .toList(growable: false),
               resourceIndex: activeIndex,
+              onEpisodeMark: (index, completed) async {
+                if (index < 0 || index >= episodeOptions.length) return;
+                final option = episodeOptions[index];
+                if (option.metadata != null) {
+                  await _setCatalogEpisodeCompleted(
+                    option.metadata!,
+                    completed,
+                  );
+                } else if (option.resource != null) {
+                  await _setEpisodeCompleted(option.resource!, completed);
+                }
+              },
+              onResolveEpisode: resolveNativeEpisode,
             ),
           );
+          final requestedSeason = result.episodeSeason;
+          final requestedEpisode = result.episodeNumber;
+          if (requestedSeason != null && requestedEpisode != null) {
+            if (context.mounted) {
+              setState(() {
+                _selectedSeason = requestedSeason;
+                _selectedEpisodeNumber = requestedEpisode;
+              });
+            }
+            await _loadCatalogSeason(requestedSeason);
+            if (!context.mounted) break;
+            mergeEpisodeCatalog();
+            await _searchSelectedEpisode();
+            if (!context.mounted) break;
+            mergeEpisodeCatalog();
+            final selected = _selectedResource;
+            final found =
+                selected?.seasonNumber == requestedSeason &&
+                selected?.episodeNumber == requestedEpisode &&
+                selected?.playbackUrl != null;
+            if (found) {
+              activeResource = selected!;
+              final savedNext = watchStore.load().where((state) {
+                return state.serverItemId == activeResource.id ||
+                    state.mediaId == activeResource.playbackUrl.toString();
+              }).firstOrNull;
+              final remoteNext =
+                  activeResource.playbackPosition ?? Duration.zero;
+              final savedPositionNext = savedNext?.position ?? Duration.zero;
+              startAt = remoteNext > savedPositionNext
+                  ? remoteNext
+                  : savedPositionNext;
+              final key = _episodeKey(requestedSeason, requestedEpisode);
+              final index = episodeOptions.indexWhere(
+                (option) => option.key == key,
+              );
+              if (index >= 0) {
+                episodeOptions[index] = _PlaybackEpisodeOption(
+                  seasonNumber: requestedSeason,
+                  episodeNumber: requestedEpisode,
+                  metadata: _episodeMetadata[key],
+                  resource: activeResource,
+                );
+              }
+              episodeImages = await cacheEpisodeImages();
+              continue;
+            }
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('该集未找到可播放资源，已返回当前集')),
+              );
+            }
+            startAt = result.episodePosition ?? startAt;
+            continue;
+          }
           final picked = result.resourceIndex;
           if (picked == null || picked < 0 || picked >= available.length) {
             break;
@@ -1815,52 +2950,20 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           initialSubtitleTrack: _selectedSubtitleTrack,
           episodes: episodeOptions
               .map(
-                (episode) => PlayerEpisode(
-                  url: episode.playbackUrl!.toString(),
-                  title: item.title,
-                  headers: episode.headers,
-                  imageUrl:
-                      (_episodeImage(
-                                episode,
-                                _episodeMetadata[_episodeKey(
-                                  episode.seasonNumber,
-                                  episode.episodeNumber,
-                                )],
-                              ) ??
-                              item.posterUrl)
-                          ?.toString(),
-                  seriesLogoUrl: item.logoUrl?.toString(),
-                  episodeTitle: _episodeTitle(
-                    episode,
-                    _episodeMetadata[_episodeKey(
-                      episode.seasonNumber,
-                      episode.episodeNumber,
-                    )],
-                    episode.episodeNumber ?? 1,
-                    seriesTitle: item.title,
-                  ),
-                  resourceInfo: [
-                    episode.source.name,
-                    _resourceSummary(episode),
-                  ].where((value) => value.isNotEmpty).join(' · '),
-                  videoRange: episode.videoRange,
-                  sourceId: episode.source.id,
-                  serverItemId: episode.id,
-                  tmdbId: item.id,
-                  seasonNumber: episode.seasonNumber,
-                  episodeNumber: episode.episodeNumber,
-                  chapters: episode.chapters,
+                (option) => playerEpisode(
+                  option,
                   initialPosition:
-                      episode.playbackUrl.toString() ==
-                          resource.playbackUrl.toString()
+                      option.key ==
+                          _episodeKey(
+                            resource.seasonNumber,
+                            resource.episodeNumber,
+                          )
                       ? resumePosition
                       : Duration.zero,
-                  initialAudioTrack: _selectedAudioTrack,
-                  initialSubtitleTrack: _selectedSubtitleTrack,
-                  resources: _playerResourcesFor(episode),
                 ),
               )
               .toList(growable: false),
+          onResolveEpisode: resolvePlayerEpisode,
         ),
         transitionsBuilder: (context, animation, _, child) {
           final curve = CurvedAnimation(
@@ -2320,11 +3423,13 @@ class _DetailActionSurfaceState extends State<_DetailActionSurface> {
 class _SeasonRail extends StatefulWidget {
   const _SeasonRail({
     required this.resources,
+    required this.catalogSeasons,
     required this.posters,
     required this.selectedSeason,
     required this.onSelect,
   });
   final List<MediaItem> resources;
+  final List<TmdbSeason> catalogSeasons;
   final Map<int, Uri> posters;
   final int? selectedSeason;
   final ValueChanged<int> onSelect;
@@ -2348,13 +3453,10 @@ class _SeasonRailState extends State<_SeasonRail> {
     );
   }
 
-  List<int> get _seasons =>
-      widget.resources
-          .map((item) => item.seasonNumber)
-          .whereType<int>()
-          .toSet()
-          .toList()
-        ..sort();
+  List<int> get _seasons => [
+    ...widget.catalogSeasons.map((season) => season.number),
+    ...widget.resources.map((item) => item.seasonNumber),
+  ].whereType<int>().toSet().toList()..sort();
 
   void _centerSelected() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2431,108 +3533,740 @@ class _SeasonRailState extends State<_SeasonRail> {
         const SizedBox(height: 12),
         SizedBox(
           height: 232,
+          child: YingjiSmoothWheel(
+            controller: _controller,
+            stableGlass: true,
+            child: ListView.separated(
+              controller: _controller,
+              scrollDirection: Axis.horizontal,
+              physics:
+                  yingjiWheelPhysics ??
+                  const BouncingScrollPhysics(
+                    parent: AlwaysScrollableScrollPhysics(),
+                  ),
+              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+              itemCount: seasons.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 16),
+              itemBuilder: (context, index) {
+                final season = seasons[index];
+                final active = season == widget.selectedSeason;
+                final artwork = widget.posters[season];
+                return InkWell(
+                  onTap: () => widget.onSelect(season),
+                  borderRadius: BorderRadius.circular(14),
+                  child: _DetailPosterHover(
+                    selected: active,
+                    borderRadius: 14,
+                    child: SizedBox(
+                      width: 140,
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 220),
+                              clipBehavior: Clip.antiAlias,
+                              decoration: BoxDecoration(
+                                color: const Color(0xCC1A1D22),
+                                borderRadius: BorderRadius.circular(14),
+                                // 选中态的白框只保留 _DetailPosterHover 的外层大框；
+                                // 这里再画一圈会形成双描边，未选中保留极淡的分界。
+                                border: Border.all(
+                                  color: active
+                                      ? Colors.transparent
+                                      : Colors.white.withValues(alpha: .12),
+                                  width: active ? 0 : 1,
+                                ),
+                                boxShadow: active
+                                    ? const [
+                                        BoxShadow(
+                                          color: Color(0x66000000),
+                                          blurRadius: 24,
+                                          offset: Offset(0, 12),
+                                        ),
+                                      ]
+                                    : null,
+                              ),
+                              child: artwork == null
+                                  ? const Center(
+                                      child: Icon(
+                                        YingjiIcons.film,
+                                        color: YingjiColors.muted,
+                                      ),
+                                    )
+                                  // 放大 4% 再裁切：季海报素材四周常自带一圈
+                                  // 5~7px 的暗边/暗角，不裁掉的话白描边（已严格
+                                  // 贴住海报边缘，缝隙实测 0px）与画面之间仍会
+                                  // 看成一条黑缝。4% 只吃掉边缘，画面损失极小。
+                                  : Transform.scale(
+                                      scale: 1.04,
+                                      child: CachedNetworkImage(
+                                        fadeInDuration: const Duration(
+                                          milliseconds: 150,
+                                        ),
+                                        imageUrl: artwork.toString(),
+                                        fit: BoxFit.cover,
+                                        // 季海报显示宽 ~190，按物理像素解码即可，
+                                        // 不必用原图——批量解码卡在进页面转场的最后一帧。
+                                        memCacheWidth:
+                                            (320 *
+                                                    MediaQuery.devicePixelRatioOf(
+                                                      context,
+                                                    ))
+                                                .clamp(1.0, 512.0)
+                                                .round(),
+                                        errorWidget: (_, _, _) => const Center(
+                                          child: Icon(YingjiIcons.film),
+                                        ),
+                                      ),
+                                    ),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            '第 $season 季',
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: active
+                                  ? FontWeight.w800
+                                  : FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// TMDB's real episode catalog is independent of server playback availability.
+class _CatalogEpisodeRail extends StatefulWidget {
+  const _CatalogEpisodeRail({
+    required this.episodes,
+    required this.selectedEpisode,
+    required this.progress,
+    required this.onSelect,
+    required this.onPlay,
+    required this.onMarkPlayed,
+  });
+
+  final List<TmdbEpisode> episodes;
+  final int? selectedEpisode;
+  final Map<String, double> progress;
+  final ValueChanged<TmdbEpisode> onSelect;
+  final ValueChanged<TmdbEpisode> onPlay;
+  final Future<void> Function(TmdbEpisode, bool) onMarkPlayed;
+
+  @override
+  State<_CatalogEpisodeRail> createState() => _CatalogEpisodeRailState();
+}
+
+class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
+  static const _episodeCardWidth = 238.0;
+  static const _episodeItemExtent = 256.0;
+  final _controller = ScrollController();
+  final _allEpisodesController = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _centerSelected();
+  }
+
+  void _centerSelected() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_controller.hasClients) return;
+      final index = widget.episodes.indexWhere(
+        (episode) => episode.episodeNumber == widget.selectedEpisode,
+      );
+      if (index < 0) return;
+      final position = _controller.position;
+      final target =
+          6.0 +
+          index * _episodeItemExtent +
+          _episodeCardWidth / 2 -
+          position.viewportDimension / 2;
+      _controller.animateTo(
+        target.clamp(0.0, position.maxScrollExtent),
+        duration: const Duration(milliseconds: 360),
+        curve: Curves.easeOutCubic,
+      );
+    });
+  }
+
+  Future<void> _showMarkMenu(
+    TmdbEpisode episode,
+    Offset position, {
+    ValueChanged<bool>? onChoice,
+  }) async {
+    final played =
+        (widget.progress[_episodeKey(
+              episode.seasonNumber,
+              episode.episodeNumber,
+            )] ??
+            0) >=
+        .92;
+    final choice = await showYingjiContextMenu(
+      context: context,
+      position: position,
+      actions: [
+        YingjiContextAction(
+          value: 'played',
+          label: '标记为已播放',
+          icon: YingjiIcons.checkmark_circle_fill,
+          selected: played,
+        ),
+        YingjiContextAction(
+          value: 'unplayed',
+          label: '标记为未播放',
+          icon: YingjiIcons.refresh,
+          selected: false,
+        ),
+      ],
+    );
+    if (choice != null) {
+      final played = choice == 'played';
+      onChoice?.call(played);
+      await widget.onMarkPlayed(episode, played);
+    }
+  }
+
+  Widget _contextEpisode(
+    TmdbEpisode episode,
+    Widget child, {
+    ValueChanged<bool>? onChoice,
+  }) => Listener(
+    onPointerDown: (event) {
+      if (event.kind == PointerDeviceKind.mouse &&
+          event.buttons & kSecondaryMouseButton != 0) {
+        _showMarkMenu(episode, event.position, onChoice: onChoice);
+      }
+    },
+    child: GestureDetector(
+      onLongPressStart: (details) =>
+          _showMarkMenu(episode, details.globalPosition, onChoice: onChoice),
+      child: child,
+    ),
+  );
+
+  @override
+  void didUpdateWidget(covariant _CatalogEpisodeRail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedEpisode != widget.selectedEpisode ||
+        oldWidget.episodes != widget.episodes) {
+      _centerSelected();
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _allEpisodesController.dispose();
+    super.dispose();
+  }
+
+  void _move(double delta) {
+    if (!_controller.hasClients) return;
+    _controller.animateTo(
+      (_controller.offset + delta).clamp(
+        0,
+        _controller.position.maxScrollExtent,
+      ),
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  Future<void> _showAll() async {
+    final progressByEpisode = Map<String, double>.of(widget.progress);
+    int? dialogSelectedEpisode = widget.selectedEpisode;
+    int? hoveredEpisodeNumber;
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: .58),
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, updateDialog) => YingjiSmoothWheel(
+          controller: _allEpisodesController,
+          stableGlass: true,
+          child: Dialog(
+            backgroundColor: Colors.transparent,
+            insetPadding: const EdgeInsets.all(28),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 720, maxHeight: 760),
+              child: GlassPanel(
+                radius: 22,
+                padding: EdgeInsets.zero,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(22, 20, 14, 16),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '第 ${widget.episodes.first.seasonNumber} 季 · 全部剧集',
+                              style: const TextStyle(
+                                fontSize: 22,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ),
+                          YingjiMotionIconButton(
+                            icon: YingjiIcons.xmark,
+                            tooltip: '关闭',
+                            size: 38,
+                            onPressed: () => Navigator.pop(dialogContext),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+                    Flexible(
+                      child: ScrollConfiguration(
+                        behavior: ScrollConfiguration.of(context)
+                            .copyWith(scrollbars: false),
+                        child: ListView.builder(
+                          controller: _allEpisodesController,
+                          physics: yingjiWheelPhysics,
+                          padding: const EdgeInsets.fromLTRB(14, 12, 14, 16),
+                          itemCount: widget.episodes.length,
+                          itemBuilder: (context, index) {
+                            final episode = widget.episodes[index];
+                            final key = _episodeKey(
+                              episode.seasonNumber,
+                              episode.episodeNumber,
+                            );
+                            final progress = progressByEpisode[key] ?? 0;
+                            final selected =
+                                episode.episodeNumber == dialogSelectedEpisode;
+                            final played = progress >= .92;
+                            final hovered =
+                                hoveredEpisodeNumber == episode.episodeNumber;
+                            final overview = episode.overview?.trim();
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _contextEpisode(
+                                    episode,
+                                    MouseRegion(
+                                      cursor: SystemMouseCursors.click,
+                                      onEnter: (_) => updateDialog(
+                                        () => hoveredEpisodeNumber =
+                                            episode.episodeNumber,
+                                      ),
+                                      onExit: (_) {
+                                        if (hoveredEpisodeNumber ==
+                                            episode.episodeNumber) {
+                                          updateDialog(
+                                            () => hoveredEpisodeNumber = null,
+                                          );
+                                        }
+                                      },
+                                      child: AnimatedContainer(
+                                        duration: MovaMotion.standard,
+                                        curve: MovaMotion.standardEase,
+                                        decoration: BoxDecoration(
+                                          color: selected
+                                              ? Colors.white.withValues(
+                                                  alpha: .12,
+                                                )
+                                              : hovered
+                                              ? Colors.white.withValues(
+                                                  alpha: .055,
+                                                )
+                                              : Colors.transparent,
+                                          borderRadius: BorderRadius.circular(
+                                            14,
+                                          ),
+                                          border: Border.all(
+                                            color: selected
+                                                ? Colors.white.withValues(
+                                                    alpha: .78,
+                                                  )
+                                                : hovered
+                                                ? Colors.white.withValues(
+                                                    alpha: .58,
+                                                  )
+                                                : Colors.transparent,
+                                            width: 1.4,
+                                          ),
+                                        ),
+                                        child: ListTile(
+                                          selected: false,
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              14,
+                                            ),
+                                          ),
+                                          contentPadding:
+                                              const EdgeInsets.symmetric(
+                                                horizontal: 8,
+                                                vertical: 5,
+                                              ),
+                                          leading: SizedBox(
+                                            width: 112,
+                                            height: 64,
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              child: episode.stillUrl == null
+                                                  ? const _EpisodeArtworkFallback()
+                                                  : CachedNetworkImage(
+                                                      imageUrl: episode.stillUrl
+                                                          .toString(),
+                                                      fit: BoxFit.cover,
+                                                      errorWidget: (_, _, _) =>
+                                                          const _EpisodeArtworkFallback(),
+                                                    ),
+                                            ),
+                                          ),
+                                          title: Text(
+                                            '第 ${episode.episodeNumber} 集 · ${episode.name}',
+                                          ),
+                                          subtitle: Text(
+                                            [
+                                                  _dateLabel(episode.airDate),
+                                                  if (episode.runtime != null)
+                                                    '${episode.runtime} 分钟',
+                                                ]
+                                                .where(
+                                                  (part) => part.isNotEmpty,
+                                                )
+                                                .join(' · '),
+                                          ),
+                                          onTap: () {
+                                            if (selected) {
+                                              Navigator.pop(dialogContext);
+                                              widget.onPlay(episode);
+                                            } else {
+                                              dialogSelectedEpisode =
+                                                  episode.episodeNumber;
+                                              widget.onSelect(episode);
+                                              updateDialog(() {});
+                                            }
+                                          },
+                                          trailing: AnimatedSwitcher(
+                                            duration: MovaMotion.standard,
+                                            switchInCurve: MovaMotion.spring,
+                                            switchOutCurve: MovaMotion.exit,
+                                            transitionBuilder:
+                                                (child, animation) =>
+                                                    ScaleTransition(
+                                                      scale: animation,
+                                                      child: FadeTransition(
+                                                        opacity: animation,
+                                                        child: child,
+                                                      ),
+                                                    ),
+                                            child: played
+                                                ? Container(
+                                                    key: const ValueKey(
+                                                      'played',
+                                                    ),
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                          horizontal: 10,
+                                                          vertical: 6,
+                                                        ),
+                                                    decoration: BoxDecoration(
+                                                      color: const Color(
+                                                        0xFF6AD7A1,
+                                                      ).withValues(alpha: .19),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            999,
+                                                          ),
+                                                      border: Border.all(
+                                                        color:
+                                                            const Color(
+                                                              0xFF8CE9B5,
+                                                            ).withValues(
+                                                              alpha: .72,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                    child: const Row(
+                                                      mainAxisSize:
+                                                          MainAxisSize.min,
+                                                      children: [
+                                                        Icon(
+                                                          YingjiIcons
+                                                              .checkmark_circle_fill,
+                                                          size: 16,
+                                                          color: Color(
+                                                            0xFF9BF1BF,
+                                                          ),
+                                                        ),
+                                                        SizedBox(width: 6),
+                                                        Text(
+                                                          '已播放',
+                                                          style: TextStyle(
+                                                            fontSize: 12,
+                                                            fontWeight:
+                                                                FontWeight.w800,
+                                                            color: Color(
+                                                              0xFFB9F6D0,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  )
+                                                : Icon(
+                                                    YingjiIcons.play_circle,
+                                                    key: const ValueKey(
+                                                      'unplayed',
+                                                    ),
+                                                    color: selected
+                                                        ? Colors.white
+                                                        : Colors.white54,
+                                                  ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    onChoice: (played) => updateDialog(
+                                      () => progressByEpisode[key] = played
+                                          ? 1
+                                          : 0,
+                                    ),
+                                  ),
+                                  if (overview != null && overview.isNotEmpty)
+                                    Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                        12,
+                                        5,
+                                        12,
+                                        1,
+                                      ),
+                                      child: YingjiGlassTooltip(
+                                        message: overview,
+                                        child: Text(
+                                          overview,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            color: YingjiColors.muted,
+                                            fontSize: 12,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        children: [
+          const Text(
+            '集',
+            style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            '${widget.episodes.length} 集',
+            style: const TextStyle(color: YingjiColors.muted),
+          ),
+          const Spacer(),
+          YingjiDirectionalArrow(
+            previous: true,
+            tooltip: '上一组剧集',
+            onPressed: () => _move(-720),
+          ),
+          const SizedBox(width: 7),
+          YingjiDirectionalArrow(
+            previous: false,
+            tooltip: '下一组剧集',
+            onPressed: () => _move(720),
+          ),
+          const SizedBox(width: 7),
+          YingjiMotionIconButton(
+            icon: YingjiIcons.rectangle_stack,
+            tooltip: '全部剧集',
+            size: 34,
+            onPressed: _showAll,
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      SizedBox(
+        height: 236,
+        child: YingjiSmoothWheel(
+          controller: _controller,
+          stableGlass: true,
           child: ListView.separated(
             controller: _controller,
             scrollDirection: Axis.horizontal,
-            physics: const BouncingScrollPhysics(),
-            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
-            itemCount: seasons.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 16),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+            itemCount: widget.episodes.length,
+            separatorBuilder: (_, _) =>
+                SizedBox(width: _episodeItemExtent - _episodeCardWidth),
             itemBuilder: (context, index) {
-              final season = seasons[index];
-              final active = season == widget.selectedSeason;
-              final artwork = widget.posters[season];
-              return InkWell(
-                onTap: () => widget.onSelect(season),
-                borderRadius: BorderRadius.circular(14),
-                child: _DetailPosterHover(
-                  selected: active,
-                  borderRadius: 14,
-                  child: SizedBox(
-                    width: 140,
-                    child: Column(
-                      children: [
-                        Expanded(
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 220),
-                            clipBehavior: Clip.antiAlias,
-                            decoration: BoxDecoration(
-                              color: const Color(0xCC1A1D22),
-                              borderRadius: BorderRadius.circular(14),
-                              // 选中态的白框只保留 _DetailPosterHover 的外层大框；
-                              // 这里再画一圈会形成双描边，未选中保留极淡的分界。
-                              border: Border.all(
-                                color: active
-                                    ? Colors.transparent
-                                    : Colors.white.withValues(alpha: .12),
-                                width: active ? 0 : 1,
-                              ),
-                              boxShadow: active
-                                  ? const [
-                                      BoxShadow(
-                                        color: Color(0x66000000),
-                                        blurRadius: 24,
-                                        offset: Offset(0, 12),
+              final episode = widget.episodes[index];
+              final selected = episode.episodeNumber == widget.selectedEpisode;
+              final progress =
+                  widget.progress[_episodeKey(
+                    episode.seasonNumber,
+                    episode.episodeNumber,
+                  )] ??
+                  0;
+              final overview = episode.overview?.trim();
+              return _contextEpisode(
+                episode,
+                SizedBox(
+                  width: _episodeCardWidth,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      InkWell(
+                        borderRadius: BorderRadius.circular(11),
+                        onTap: () => selected
+                            ? widget.onPlay(episode)
+                            : widget.onSelect(episode),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            YingjiMotionSurface(
+                              selected: selected,
+                              borderRadius: 14,
+                              child: SizedBox(
+                                height: 134,
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(14),
+                                  child: Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      if (episode.stillUrl != null)
+                                        CachedNetworkImage(
+                                          imageUrl: episode.stillUrl.toString(),
+                                          fit: BoxFit.cover,
+                                          errorWidget: (_, _, _) =>
+                                              const _EpisodeArtworkFallback(),
+                                        )
+                                      else
+                                        const _EpisodeArtworkFallback(),
+                                      Positioned(
+                                        top: 9,
+                                        right: 9,
+                                        child: AnimatedSwitcher(
+                                          duration: MovaMotion.standard,
+                                          switchInCurve: MovaMotion.spring,
+                                          switchOutCurve: MovaMotion.exit,
+                                          transitionBuilder:
+                                              (child, animation) =>
+                                                  ScaleTransition(
+                                                    scale: animation,
+                                                    child: FadeTransition(
+                                                      opacity: animation,
+                                                      child: child,
+                                                    ),
+                                                  ),
+                                          child: progress >= .92
+                                              ? const Icon(
+                                                  YingjiIcons
+                                                      .checkmark_circle_fill,
+                                                  key: ValueKey('played'),
+                                                  color: Colors.white,
+                                                  size: 23,
+                                                )
+                                              : const SizedBox.square(
+                                                  key: ValueKey('unplayed'),
+                                                  dimension: 23,
+                                                ),
+                                        ),
                                       ),
-                                    ]
-                                  : null,
-                            ),
-                            child: artwork == null
-                                ? const Center(
-                                    child: Icon(
-                                      YingjiIcons.film,
-                                      color: YingjiColors.muted,
-                                    ),
-                                  )
-                                // 放大 4% 再裁切：季海报素材四周常自带一圈
-                                // 5~7px 的暗边/暗角，不裁掉的话白描边（已严格
-                                // 贴住海报边缘，缝隙实测 0px）与画面之间仍会
-                                // 看成一条黑缝。4% 只吃掉边缘，画面损失极小。
-                                : Transform.scale(
-                                    scale: 1.04,
-                                    child: CachedNetworkImage(
-                                      fadeInDuration: const Duration(
-                                        milliseconds: 150,
-                                      ),
-                                      imageUrl: artwork.toString(),
-                                      fit: BoxFit.cover,
-                                      // 季海报显示宽 ~190，按物理像素解码即可，
-                                      // 不必用原图——批量解码卡在进页面转场的最后一帧。
-                                      memCacheWidth:
-                                          (320 *
-                                                  MediaQuery.devicePixelRatioOf(
-                                                    context,
-                                                  ))
-                                              .clamp(1.0, 512.0)
-                                              .round(),
-                                      errorWidget: (_, _, _) => const Center(
-                                        child: Icon(YingjiIcons.film),
-                                      ),
-                                    ),
+                                      if (progress > 0)
+                                        Align(
+                                          alignment: Alignment.bottomCenter,
+                                          child: LinearProgressIndicator(
+                                            value: progress,
+                                            minHeight: 4,
+                                            backgroundColor: Colors.white24,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                    ],
                                   ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 7),
+                            Text(
+                              '第 ${episode.episodeNumber} 集 · ${episode.name}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              [
+                                _dateLabel(episode.airDate),
+                                if (episode.runtime != null)
+                                  '${episode.runtime} 分钟',
+                              ].where((part) => part.isNotEmpty).join(' · '),
+                              style: const TextStyle(
+                                color: YingjiColors.muted,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (overview?.isNotEmpty == true)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(2, 5, 2, 0),
+                          child: YingjiGlassTooltip(
+                            message: overview!,
+                            child: Text(
+                              overview,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: YingjiColors.muted,
+                              ),
+                            ),
                           ),
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '第 $season 季',
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: active
-                                ? FontWeight.w800
-                                : FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                    ),
+                    ],
                   ),
                 ),
               );
             },
           ),
         ),
-      ],
-    );
-  }
+      ),
+    ],
+  );
 }
 
 class _EpisodePreviewRail extends StatefulWidget {
@@ -2559,6 +4293,7 @@ class _EpisodePreviewRail extends StatefulWidget {
 
 class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
   final ScrollController _controller = ScrollController();
+  final ScrollController _episodeDialogScroll = ScrollController();
   int? _hoveredIndex;
 
   void _move(double delta) {
@@ -2602,51 +4337,23 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
     Offset position, {
     ValueChanged<bool>? onChoice,
   }) async {
-    final choice = await showGeneralDialog<String>(
+    final choice = await showYingjiContextMenu(
       context: context,
-      barrierDismissible: true,
-      barrierLabel: '关闭剧集菜单',
-      barrierColor: Colors.transparent,
-      transitionDuration: const Duration(milliseconds: 150),
-      pageBuilder: (dialogContext, _, _) {
-        final size = MediaQuery.sizeOf(dialogContext);
-        final left = position.dx.clamp(12.0, size.width - 268.0);
-        final top = position.dy.clamp(12.0, size.height - 154.0);
-        return Stack(
-          children: [
-            Positioned(
-              left: left,
-              top: top,
-              width: 256,
-              child: Material(
-                color: Colors.transparent,
-                child: GlassPanel(
-                  radius: 16,
-                  padding: const EdgeInsets.all(8),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _EpisodeContextAction(
-                        icon: YingjiIcons.checkmark_circle_fill,
-                        label: '标记为已播放',
-                        selected: completed,
-                        onTap: () => Navigator.pop(dialogContext, 'played'),
-                      ),
-                      const SizedBox(height: 5),
-                      _EpisodeContextAction(
-                        icon: YingjiIcons.refresh,
-                        label: '标记为未播放',
-                        selected: !completed,
-                        onTap: () => Navigator.pop(dialogContext, 'unplayed'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
+      position: position,
+      actions: [
+        YingjiContextAction(
+          value: 'played',
+          label: '标记为已播放',
+          icon: YingjiIcons.checkmark_circle_fill,
+          selected: completed,
+        ),
+        YingjiContextAction(
+          value: 'unplayed',
+          label: '标记为未播放',
+          icon: YingjiIcons.refresh,
+          selected: false,
+        ),
+      ],
     );
     if (!mounted || choice == null) return;
     final markedPlayed = choice == 'played';
@@ -2672,6 +4379,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
   @override
   void dispose() {
     _controller.dispose();
+    _episodeDialogScroll.dispose();
     super.dispose();
   }
 
@@ -2714,240 +4422,276 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
       const SizedBox(height: 8),
       SizedBox(
         height: 236,
-        child: ListView.separated(
+        child: YingjiSmoothWheel(
           controller: _controller,
-          scrollDirection: Axis.horizontal,
-          physics: const BouncingScrollPhysics(),
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-          itemCount: widget.resources.length,
-          separatorBuilder: (_, _) => const SizedBox(width: 18),
-          itemBuilder: (_, index) {
-            final resource = widget.resources[index];
-            final effectiveSeason =
-                resource.seasonNumber ?? widget.selected?.seasonNumber ?? 1;
-            final effectiveEpisode = resource.episodeNumber ?? index + 1;
-            final episodeMetadata =
-                widget.metadata[_episodeKey(effectiveSeason, effectiveEpisode)];
-            final title = _episodeTitle(resource, episodeMetadata, index + 1);
-            final image = _episodeImage(resource, episodeMetadata);
-            final overview = resource.overview?.trim().isNotEmpty == true
-                ? resource.overview!
-                : episodeMetadata?.overview;
-            final published = resource.premiereDate ?? episodeMetadata?.airDate;
-            final runtime =
-                resource.runtime?.inMinutes ?? episodeMetadata?.runtime;
-            final active =
-                resource.seasonNumber == widget.selected?.seasonNumber &&
-                resource.episodeNumber == widget.selected?.episodeNumber;
-            final progress =
-                widget.episodeProgress[_episodeKey(
-                  effectiveSeason,
-                  effectiveEpisode,
-                )] ??
-                0;
-            final completed =
-                widget.completedResourceIds.contains(resource.id) ||
-                progress >= .92;
-            final lifted = active || _hoveredIndex == index;
-            return MouseRegion(
-              onEnter: (_) => setState(() => _hoveredIndex = index),
-              onExit: (_) => setState(() => _hoveredIndex = null),
-              child: InkWell(
-                onTap: () => widget.onSelect(resource),
-                onSecondaryTapUp: (details) => _showMarkMenu(
-                  context,
-                  resource,
-                  completed,
-                  details.globalPosition,
+          stableGlass: true,
+          child: ListView.separated(
+            controller: _controller,
+            scrollDirection: Axis.horizontal,
+            physics:
+                yingjiWheelPhysics ??
+                const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
                 ),
-                borderRadius: BorderRadius.circular(14),
-                child: AnimatedScale(
-                  scale: lifted ? 1.018 : 1,
-                  duration: const Duration(milliseconds: 180),
-                  curve: Curves.easeOutCubic,
-                  child: AnimatedSlide(
-                    offset: lifted ? const Offset(0, -.015) : Offset.zero,
-                    duration: const Duration(milliseconds: 180),
-                    curve: Curves.easeOutCubic,
-                    child: SizedBox(
-                      width: 238,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          SizedBox(
-                            height: 134,
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 220),
-                              clipBehavior: Clip.antiAlias,
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF25292A),
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: Colors.white.withValues(alpha: .1),
-                                ),
-                                boxShadow: lifted
-                                    ? const [
-                                        BoxShadow(
-                                          color: Color(0x8A000000),
-                                          blurRadius: 28,
-                                          offset: Offset(0, 14),
-                                        ),
-                                      ]
-                                    : null,
-                              ),
-                              child: Stack(
-                                fit: StackFit.expand,
-                                children: [
-                                  image == null
-                                      ? const _EpisodeArtworkFallback()
-                                      : CachedNetworkImage(
-                                          fadeInDuration: const Duration(
-                                            milliseconds: 150,
-                                          ),
-                                          imageUrl: image.toString(),
-                                          fit: BoxFit.cover,
-                                          // 剧集静帧显示宽 ~238，按物理像素解码即可，
-                                          // 避免几十张原图在进页面时批量解码卡住转场末帧。
-                                          memCacheWidth:
-                                              (320 *
-                                                      MediaQuery.devicePixelRatioOf(
-                                                        context,
-                                                      ))
-                                                  .clamp(1.0, 512.0)
-                                                  .round(),
-                                          errorWidget: (_, _, _) =>
-                                              const _EpisodeArtworkFallback(),
-                                        ),
-                                  if (completed)
-                                    const Positioned(
-                                      right: 10,
-                                      top: 10,
-                                      child: Icon(
-                                        YingjiIcons.checkmark_circle_fill,
-                                      ),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+            itemCount: widget.resources.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 18),
+            itemBuilder: (_, index) {
+              final resource = widget.resources[index];
+              final effectiveSeason =
+                  resource.seasonNumber ?? widget.selected?.seasonNumber ?? 1;
+              final effectiveEpisode = resource.episodeNumber ?? index + 1;
+              final episodeMetadata = widget
+                  .metadata[_episodeKey(effectiveSeason, effectiveEpisode)];
+              final title = _episodeTitle(resource, episodeMetadata, index + 1);
+              final image = _episodeImage(resource, episodeMetadata);
+              final overview = resource.overview?.trim().isNotEmpty == true
+                  ? resource.overview!
+                  : episodeMetadata?.overview;
+              final published =
+                  resource.premiereDate ?? episodeMetadata?.airDate;
+              final runtime =
+                  resource.runtime?.inMinutes ?? episodeMetadata?.runtime;
+              final active =
+                  resource.seasonNumber == widget.selected?.seasonNumber &&
+                  resource.episodeNumber == widget.selected?.episodeNumber;
+              final progress =
+                  widget.episodeProgress[_episodeKey(
+                    effectiveSeason,
+                    effectiveEpisode,
+                  )] ??
+                  0;
+              final completed =
+                  widget.completedResourceIds.contains(resource.id) ||
+                  progress >= .92;
+              final lifted = active || _hoveredIndex == index;
+              return MouseRegion(
+                onEnter: (_) => setState(() => _hoveredIndex = index),
+                onExit: (_) => setState(() => _hoveredIndex = null),
+                child: GestureDetector(
+                  onSecondaryTapUp: (details) => _showMarkMenu(
+                    context,
+                    resource,
+                    completed,
+                    details.globalPosition,
+                  ),
+                  onLongPressStart: (details) => _showMarkMenu(
+                    context,
+                    resource,
+                    completed,
+                    details.globalPosition,
+                  ),
+                  child: InkWell(
+                    onTap: () => widget.onSelect(resource),
+                    borderRadius: BorderRadius.circular(14),
+                    child: AnimatedScale(
+                      scale: lifted ? 1.018 : 1,
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeOutCubic,
+                      child: AnimatedSlide(
+                        offset: lifted ? const Offset(0, -.015) : Offset.zero,
+                        duration: const Duration(milliseconds: 180),
+                        curve: Curves.easeOutCubic,
+                        child: SizedBox(
+                          width: 238,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // 选中与悬浮描边只包裹剧照，不延伸到集名和日期。
+                              SizedBox(
+                                width: double.infinity,
+                                height: 134,
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 220),
+                                  clipBehavior: Clip.antiAlias,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF25292A),
+                                    borderRadius: BorderRadius.circular(14),
+                                    border: Border.all(
+                                      color: active
+                                          ? Colors.white
+                                          : _hoveredIndex == index
+                                          ? Colors.white.withValues(alpha: .58)
+                                          : Colors.white.withValues(alpha: .1),
+                                      width: active
+                                          ? 2.4
+                                          : _hoveredIndex == index
+                                          ? 1.4
+                                          : 1,
                                     ),
-                                  if (active)
-                                    Positioned.fill(
-                                      child: IgnorePointer(
-                                        child: DecoratedBox(
-                                          decoration: BoxDecoration(
-                                            borderRadius: BorderRadius.circular(
-                                              14,
+                                    boxShadow: lifted
+                                        ? const [
+                                            BoxShadow(
+                                              color: Color(0x8A000000),
+                                              blurRadius: 28,
+                                              offset: Offset(0, 14),
                                             ),
-                                            border: Border.all(
-                                              color: Colors.white,
-                                              width: 2.4,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  if (progress > 0 &&
-                                      !completed &&
-                                      runtime != null)
-                                    Positioned(
-                                      left: 10,
-                                      right: 10,
-                                      bottom: 8,
-                                      child: Column(
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Text(
-                                                _minuteClock(
-                                                  (runtime * progress).round(),
-                                                ),
-                                                style: const TextStyle(
-                                                  fontSize: 10.5,
-                                                  fontWeight: FontWeight.w700,
-                                                ),
+                                          ]
+                                        : null,
+                                  ),
+                                  child: Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      image == null
+                                          ? const _EpisodeArtworkFallback()
+                                          : CachedNetworkImage(
+                                              fadeInDuration: const Duration(
+                                                milliseconds: 150,
                                               ),
-                                              const Spacer(),
-                                              Text(
-                                                _minuteClock(
-                                                  (runtime * (1 - progress))
+                                              imageUrl: image.toString(),
+                                              fit: BoxFit.cover,
+                                              // 剧集静帧显示宽 ~238，按物理像素解码即可，
+                                              // 避免几十张原图在进页面时批量解码卡住转场末帧。
+                                              memCacheWidth:
+                                                  (320 *
+                                                          MediaQuery.devicePixelRatioOf(
+                                                            context,
+                                                          ))
+                                                      .clamp(1.0, 512.0)
                                                       .round(),
+                                              errorWidget: (_, _, _) =>
+                                                  const _EpisodeArtworkFallback(),
+                                            ),
+                                      Positioned(
+                                        right: 10,
+                                        top: 10,
+                                        child: AnimatedSwitcher(
+                                          duration: MovaMotion.standard,
+                                          switchInCurve: MovaMotion.spring,
+                                          switchOutCurve: MovaMotion.exit,
+                                          transitionBuilder:
+                                              (child, animation) =>
+                                                  ScaleTransition(
+                                                    scale: animation,
+                                                    child: FadeTransition(
+                                                      opacity: animation,
+                                                      child: child,
+                                                    ),
+                                                  ),
+                                          child: completed
+                                              ? const Icon(
+                                                  YingjiIcons
+                                                      .checkmark_circle_fill,
+                                                  key: ValueKey('played'),
+                                                  color: Colors.white,
+                                                )
+                                              : const SizedBox.square(
+                                                  key: ValueKey('unplayed'),
+                                                  dimension: 24,
                                                 ),
-                                                style: const TextStyle(
-                                                  fontSize: 10.5,
-                                                  fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      if (progress > 0 &&
+                                          !completed &&
+                                          runtime != null)
+                                        Positioned(
+                                          left: 10,
+                                          right: 10,
+                                          bottom: 8,
+                                          child: Column(
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  Text(
+                                                    _minuteClock(
+                                                      (runtime * progress)
+                                                          .round(),
+                                                    ),
+                                                    style: const TextStyle(
+                                                      fontSize: 10.5,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                    ),
+                                                  ),
+                                                  const Spacer(),
+                                                  Text(
+                                                    _minuteClock(
+                                                      (runtime * (1 - progress))
+                                                          .round(),
+                                                    ),
+                                                    style: const TextStyle(
+                                                      fontSize: 10.5,
+                                                      fontWeight:
+                                                          FontWeight.w700,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const SizedBox(height: 4),
+                                              ClipRRect(
+                                                borderRadius:
+                                                    BorderRadius.circular(99),
+                                                child: LinearProgressIndicator(
+                                                  value: progress,
+                                                  minHeight: 3,
+                                                  backgroundColor:
+                                                      Colors.white24,
+                                                  valueColor:
+                                                      const AlwaysStoppedAnimation<
+                                                        Color
+                                                      >(Colors.white),
                                                 ),
                                               ),
                                             ],
                                           ),
-                                          const SizedBox(height: 4),
-                                          ClipRRect(
-                                            borderRadius: BorderRadius.circular(
-                                              99,
-                                            ),
-                                            child: LinearProgressIndicator(
-                                              value: progress,
-                                              minHeight: 3,
-                                              backgroundColor: Colors.white24,
-                                              valueColor:
-                                                  const AlwaysStoppedAnimation<
-                                                    Color
-                                                  >(Colors.white),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 7),
-                          Text(
-                            '第 $effectiveEpisode 集 · $title',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontWeight: active
-                                  ? FontWeight.w800
-                                  : FontWeight.w700,
-                              fontSize: 13,
-                            ),
-                          ),
-                          const SizedBox(height: 3),
-                          Text(
-                            [
-                              if (_dateLabel(published).isNotEmpty)
-                                _dateLabel(published),
-                              if (runtime != null) '$runtime 分钟',
-                            ].join(' · '),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: YingjiColors.muted,
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          if (overview?.isNotEmpty == true) ...[
-                            const SizedBox(height: 3),
-                            YingjiGlassTooltip(
-                              message: overview!,
-                              child: Text(
-                                overview,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Color(0xFFD5D8DF),
-                                  fontSize: 11,
-                                  height: 1.28,
+                                        ),
+                                    ],
+                                  ),
                                 ),
                               ),
-                            ),
-                          ],
-                        ],
+                              const SizedBox(height: 7),
+                              Text(
+                                '第 $effectiveEpisode 集 · $title',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontWeight: active
+                                      ? FontWeight.w800
+                                      : FontWeight.w700,
+                                  fontSize: 13,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                [
+                                  if (_dateLabel(published).isNotEmpty)
+                                    _dateLabel(published),
+                                  if (runtime != null) '$runtime 分钟',
+                                ].join(' · '),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: YingjiColors.muted,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              if (overview?.isNotEmpty == true) ...[
+                                const SizedBox(height: 3),
+                                YingjiGlassTooltip(
+                                  message: overview!,
+                                  child: Text(
+                                    overview,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Color(0xFFD5D8DF),
+                                      fontSize: 11,
+                                      height: 1.28,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
       ),
     ],
@@ -2984,6 +4728,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
             maxWidth: 1180,
             maxHeight: 820,
             insetPadding: const EdgeInsets.all(24),
+            scrollController: _episodeDialogScroll,
             header: Row(
               children: [
                 Container(
@@ -3009,7 +4754,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                       ),
                       SizedBox(height: 3),
                       Text(
-                        '选择剧集继续播放，右键可更新观看状态',
+                        '选择剧集继续播放，长按 / 右键可更新观看状态',
                         style: TextStyle(
                           color: YingjiColors.muted,
                           fontSize: 12,
@@ -3067,21 +4812,10 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                 const SizedBox(height: 18),
                 LayoutBuilder(
                   builder: (context, constraints) {
-                    final columns = constraints.maxWidth >= 960
-                        ? 3
-                        : constraints.maxWidth >= 620
-                        ? 2
-                        : 1;
-                    return GridView.builder(
+                    return ListView.builder(
                       shrinkWrap: true,
                       physics: const NeverScrollableScrollPhysics(),
                       itemCount: widget.resources.length,
-                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: columns,
-                        mainAxisSpacing: 14,
-                        crossAxisSpacing: 14,
-                        childAspectRatio: columns == 1 ? 2.25 : 1.2,
-                      ),
                       itemBuilder: (_, index) {
                         final episode = widget.resources[index];
                         final metadata =
@@ -3113,7 +4847,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                         final completed =
                             completedIds.contains(episode.id) ||
                             progress >= .92;
-                        return _AllEpisodeCard(
+                        return _AllEpisodeRow(
                           episode: episode,
                           index: index,
                           title: title,
@@ -3131,6 +4865,27 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                             widget.onSelect(episode);
                           },
                           onSecondaryTapUp: (details) => _showMarkMenu(
+                            context,
+                            episode,
+                            completed,
+                            details.globalPosition,
+                            onChoice: (marked) {
+                              updateDialog(() {
+                                final key = _episodeKey(
+                                  episode.seasonNumber,
+                                  episode.episodeNumber,
+                                );
+                                if (marked) {
+                                  completedIds.add(episode.id);
+                                  episodeProgress[key] = 1;
+                                } else {
+                                  completedIds.remove(episode.id);
+                                  episodeProgress[key] = 0;
+                                }
+                              });
+                            },
+                          ),
+                          onLongPressStart: (details) => _showMarkMenu(
                             context,
                             episode,
                             completed,
@@ -3196,8 +4951,8 @@ class _EpisodeStat extends StatelessWidget {
   );
 }
 
-class _AllEpisodeCard extends StatelessWidget {
-  const _AllEpisodeCard({
+class _AllEpisodeRow extends StatelessWidget {
+  const _AllEpisodeRow({
     required this.episode,
     required this.index,
     required this.title,
@@ -3210,6 +4965,7 @@ class _AllEpisodeCard extends StatelessWidget {
     required this.overview,
     required this.onTap,
     required this.onSecondaryTapUp,
+    required this.onLongPressStart,
   });
 
   final MediaItem episode;
@@ -3224,197 +4980,151 @@ class _AllEpisodeCard extends StatelessWidget {
   final String? overview;
   final VoidCallback onTap;
   final GestureTapUpCallback onSecondaryTapUp;
+  final GestureLongPressStartCallback onLongPressStart;
 
   @override
-  Widget build(BuildContext context) => YingjiMotionSurface(
-    selected: selected,
-    borderRadius: 16,
-    child: Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        onSecondaryTapUp: onSecondaryTapUp,
-        borderRadius: BorderRadius.circular(16),
-        child: Ink(
-          decoration: BoxDecoration(
-            color: selected
-                ? YingjiGlass.surface(strength: 1.18)
-                : YingjiGlass.chrome(strength: .66),
-            borderRadius: BorderRadius.circular(16),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: ClipRRect(
-                  borderRadius: const BorderRadius.vertical(
-                    top: Radius.circular(16),
-                  ),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      image == null
-                          ? const _EpisodeArtworkFallback()
-                          : CachedNetworkImage(
-                              fadeInDuration: const Duration(milliseconds: 150),
-                              imageUrl: image.toString(),
-                              fit: BoxFit.cover,
-                              // 资源/剧集卡封面约 300px 宽，按显示分辨率解码。
-                              memCacheWidth:
-                                  (320 * MediaQuery.devicePixelRatioOf(context))
-                                      .clamp(1.0, 512.0)
-                                      .round(),
-                              errorWidget: (_, _, _) =>
-                                  const _EpisodeArtworkFallback(),
-                            ),
-                      const DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [Colors.transparent, Color(0xB8000000)],
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        left: 12,
-                        top: 12,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 9,
-                            vertical: 5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: .62),
-                            borderRadius: BorderRadius.circular(9),
-                          ),
-                          child: Text(
-                            'S${episode.seasonNumber ?? 1} · E${episode.episodeNumber ?? index + 1}',
-                            style: const TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w800,
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Listener(
+          onPointerDown: (event) {
+            if (event.kind == PointerDeviceKind.mouse &&
+                event.buttons & kSecondaryMouseButton != 0) {
+              onSecondaryTapUp(
+                TapUpDetails(
+                  globalPosition: event.position,
+                  kind: PointerDeviceKind.mouse,
+                ),
+              );
+            }
+          },
+          child: GestureDetector(
+            onLongPressStart: onLongPressStart,
+            child: YingjiMotionSurface(
+              selected: selected,
+              borderRadius: 14,
+              child: YingjiGlassSurface(
+                radius: 14,
+                strength: .78,
+                padding: const EdgeInsets.all(8),
+                child: Material(
+                  type: MaterialType.transparency,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(11),
+                    onTap: onTap,
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 124,
+                            height: 70,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(9),
+                              child: image == null
+                                  ? const _EpisodeArtworkFallback()
+                                  : CachedNetworkImage(
+                                      imageUrl: image.toString(),
+                                      fit: BoxFit.cover,
+                                      errorWidget: (_, _, _) =>
+                                          const _EpisodeArtworkFallback(),
+                                    ),
                             ),
                           ),
-                        ),
-                      ),
-                      Positioned(
-                        right: 12,
-                        top: 12,
-                        child: Icon(
-                          completed
-                              ? YingjiIcons.checkmark_circle_fill
-                              : progress > 0
-                              ? YingjiIcons.play_circle_fill
-                              : YingjiIcons.circle,
-                          size: 21,
-                          color: completed || progress > 0
-                              ? Colors.white
-                              : Colors.white54,
-                        ),
-                      ),
-                      if (progress > 0 && !completed)
-                        Positioned(
-                          left: 12,
-                          right: 12,
-                          bottom: 10,
-                          child: Column(
-                            children: [
-                              if (runtime != null)
-                                Row(
-                                  children: [
-                                    Text(
-                                      _minuteClock(
-                                        (runtime! * progress).round(),
-                                      ),
-                                      style: const TextStyle(
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                    const Spacer(),
-                                    Text(
-                                      _minuteClock(
-                                        (runtime! * (1 - progress)).round(),
-                                      ),
-                                      style: const TextStyle(
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ],
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '第 ${episode.episodeNumber ?? index + 1} 集 · $title',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                  ),
                                 ),
-                              const SizedBox(height: 4),
-                              LinearProgressIndicator(
-                                value: progress.clamp(0, 1),
-                                minHeight: 3,
-                                borderRadius: BorderRadius.circular(99),
-                                backgroundColor: Colors.white24,
-                                color: Colors.white,
-                              ),
-                            ],
+                                const SizedBox(height: 4),
+                                Text(
+                                  [
+                                        _dateLabel(published),
+                                        if (runtime != null) '$runtime 分钟',
+                                        if (completed) '已播放',
+                                      ]
+                                      .where((part) => part.isNotEmpty)
+                                      .join(' · '),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                if (progress > 0) ...[
+                                  const SizedBox(height: 8),
+                                  LinearProgressIndicator(
+                                    value: progress.clamp(0, 1),
+                                    minHeight: 3,
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
-                        ),
-                    ],
+                          const SizedBox(width: 8),
+                          AnimatedSwitcher(
+                            duration: MovaMotion.standard,
+                            switchInCurve: MovaMotion.spring,
+                            switchOutCurve: MovaMotion.exit,
+                            transitionBuilder: (child, animation) =>
+                                ScaleTransition(
+                                  scale: animation,
+                                  child: FadeTransition(
+                                    opacity: animation,
+                                    child: child,
+                                  ),
+                                ),
+                            child: completed
+                                ? const Icon(
+                                    YingjiIcons.checkmark_circle_fill,
+                                    key: ValueKey('played'),
+                                    color: Colors.white,
+                                  )
+                                : const Icon(
+                                    YingjiIcons.circle,
+                                    key: ValueKey('unplayed'),
+                                    color: YingjiColors.muted,
+                                  ),
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(13, 11, 13, 13),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '第 ${episode.episodeNumber ?? index + 1} 集 · $title',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 5),
-                    Text(
-                      [
-                        if (_dateLabel(published).isNotEmpty)
-                          _dateLabel(published),
-                        if (runtime != null) '$runtime 分钟',
-                        completed
-                            ? '已播放'
-                            : progress > 0
-                            ? '${(progress * 100).round()}%'
-                            : '未播放',
-                      ].join(' · '),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: YingjiColors.muted,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    if (overview?.trim().isNotEmpty == true) ...[
-                      const SizedBox(height: 6),
-                      YingjiGlassTooltip(
-                        message: overview!,
-                        child: Text(
-                          overview!,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Color(0xFFD5D8DF),
-                            fontSize: 11,
-                            height: 1.3,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ],
+            ),
           ),
         ),
-      ),
+        if (overview?.trim().isNotEmpty == true)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 5, 14, 1),
+            child: YingjiGlassTooltip(
+              message: overview!.trim(),
+              child: Text(
+                overview!.trim(),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: YingjiColors.muted,
+                  fontSize: 12,
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ),
+      ],
     ),
   );
 }
@@ -3430,52 +5140,6 @@ class _EpisodeArtworkFallback extends StatelessWidget {
         YingjiIcons.play_rectangle,
         color: YingjiColors.muted,
         size: 28,
-      ),
-    ),
-  );
-}
-
-class _EpisodeContextAction extends StatelessWidget {
-  const _EpisodeContextAction({
-    required this.icon,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => InkWell(
-    onTap: onTap,
-    borderRadius: BorderRadius.circular(12),
-    child: Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-      decoration: BoxDecoration(
-        color: selected
-            ? Colors.white.withValues(alpha: .13)
-            : Colors.transparent,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: selected ? Colors.white : Colors.transparent,
-          width: selected ? 2.2 : 1,
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, size: 18),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-          ),
-          if (selected) const Icon(YingjiIcons.checkmark_circle_fill, size: 17),
-        ],
       ),
     ),
   );
@@ -3590,6 +5254,7 @@ class _ResourceSection extends StatefulWidget {
 class _ResourceSectionState extends State<_ResourceSection> {
   static const _sortPreferenceKey = 'yingji.detail.resource-sort';
   static const _viewPreferenceKey = 'yingji.detail.resource-view';
+  final _controller = ScrollController();
   String _sort = 'range';
   String _viewMode = 'server';
 
@@ -3625,6 +5290,12 @@ class _ResourceSectionState extends State<_ResourceSection> {
     await prefs.setString(_viewPreferenceKey, value);
   }
 
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
   List<MediaItem> get _sorted {
     final rows = [...widget.resources];
     switch (_sort) {
@@ -3657,15 +5328,30 @@ class _ResourceSectionState extends State<_ResourceSection> {
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        crossAxisAlignment: WrapCrossAlignment.center,
+      Row(
         children: [
           const Text(
             '资源',
             style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
           ),
+          const Spacer(),
+          YingjiGlassPillButton(
+            icon: YingjiIcons.refresh,
+            label: '重新搜索',
+            compactLabel: '重试',
+            tooltip: '重新搜索当前选中内容在所有已连接服务器的资源',
+            busy: widget.loading,
+            height: 40,
+            onPressed: widget.onRetry,
+          ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
           _FilterChip(
             label: '色彩范围',
             icon: YingjiIcons.sparkles,
@@ -3702,34 +5388,42 @@ class _ResourceSectionState extends State<_ResourceSection> {
         ],
       ),
       const SizedBox(height: 14),
-      if (widget.loading)
-        const LinearProgressIndicator(minHeight: 2)
-      else if (widget.error != null)
-        _ResourceMessage(message: widget.error!, onRetry: widget.onRetry)
-      else if (widget.resources.isEmpty)
-        const _ResourceMessage(message: '没有在已连接来源中找到可播放资源。')
-      else
+      if (widget.loading) const LinearProgressIndicator(minHeight: 2),
+      if (widget.error != null) _ResourceMessage(message: widget.error!),
+      if (widget.resources.isNotEmpty)
         SizedBox(
           height: 144,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            itemCount: _displayed.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 14),
-            itemBuilder: (_, index) {
-              final resource = _displayed[index];
-              return _ResourceCard(
-                resource: resource,
-                selected:
-                    resource.id == widget.selected?.id &&
-                    resource.source.id == widget.selected?.source.id,
-                onSelect: () => widget.onSelect(resource),
-                showPicker: _viewMode == 'server',
-                rank: index < 3 ? index + 1 : null,
-                onPicker: () => widget.onPicker(resource),
-              );
-            },
+          child: YingjiSmoothWheel(
+            controller: _controller,
+            stableGlass: true,
+            child: ListView.separated(
+              controller: _controller,
+              scrollDirection: Axis.horizontal,
+              physics:
+                  yingjiWheelPhysics ??
+                  const BouncingScrollPhysics(
+                    parent: AlwaysScrollableScrollPhysics(),
+                  ),
+              itemCount: _displayed.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 14),
+              itemBuilder: (_, index) {
+                final resource = _displayed[index];
+                return _ResourceCard(
+                  resource: resource,
+                  selected:
+                      resource.id == widget.selected?.id &&
+                      resource.source.id == widget.selected?.source.id,
+                  onSelect: () => widget.onSelect(resource),
+                  showPicker: _viewMode == 'server',
+                  rank: index < 3 ? index + 1 : null,
+                  onPicker: () => widget.onPicker(resource),
+                );
+              },
+            ),
           ),
-        ),
+        )
+      else if (!widget.loading && widget.error == null)
+        const _ResourceMessage(message: '没有在已连接来源中找到可播放资源。'),
     ],
   );
 }
@@ -3890,7 +5584,7 @@ class _TrackResourceSummary extends StatelessWidget {
   );
 }
 
-class _TrackPickerPane extends StatelessWidget {
+class _TrackPickerPane extends StatefulWidget {
   const _TrackPickerPane({
     required this.icon,
     required this.title,
@@ -3901,6 +5595,19 @@ class _TrackPickerPane extends StatelessWidget {
   final String title;
   final int count;
   final List<Widget> children;
+
+  @override
+  State<_TrackPickerPane> createState() => _TrackPickerPaneState();
+}
+
+class _TrackPickerPaneState extends State<_TrackPickerPane> {
+  final _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) => Container(
@@ -3916,10 +5623,10 @@ class _TrackPickerPane extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 4),
           child: Row(
             children: [
-              Icon(icon, size: 17),
+              Icon(widget.icon, size: 17),
               const SizedBox(width: 8),
               Text(
-                title,
+                widget.title,
                 style: const TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w800,
@@ -3933,7 +5640,7 @@ class _TrackPickerPane extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Text(
-                  '$count 条',
+                  '${widget.count} 条',
                   style: const TextStyle(
                     color: YingjiColors.muted,
                     fontSize: 11,
@@ -3947,12 +5654,22 @@ class _TrackPickerPane extends StatelessWidget {
         const SizedBox(height: 10),
         Expanded(
           child: Scrollbar(
-            thumbVisibility: children.length > 5,
-            child: ListView.separated(
-              padding: const EdgeInsets.only(right: 4),
-              itemCount: children.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 7),
-              itemBuilder: (_, index) => children[index],
+            controller: _controller,
+            thumbVisibility: widget.children.length > 5,
+            child: YingjiSmoothWheel(
+              controller: _controller,
+              child: ListView.separated(
+                controller: _controller,
+                physics:
+                    yingjiWheelPhysics ??
+                    const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                padding: const EdgeInsets.only(right: 4),
+                itemCount: widget.children.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 7),
+                itemBuilder: (_, index) => widget.children[index],
+              ),
             ),
           ),
         ),
@@ -4680,84 +6397,94 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
             const SizedBox(height: 14),
             SizedBox(
               height: 154,
-              child: ListView.separated(
+              child: YingjiSmoothWheel(
                 controller: _castController,
-                scrollDirection: Axis.horizontal,
-                itemCount: value.cast.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 18),
-                itemBuilder: (context, index) {
-                  final person = value.cast[index];
-                  return InkWell(
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => _PersonPage(person: person),
+                stableGlass: true,
+                child: ListView.separated(
+                  controller: _castController,
+                  scrollDirection: Axis.horizontal,
+                  physics:
+                      yingjiWheelPhysics ??
+                      const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
                       ),
-                    ),
-                    borderRadius: BorderRadius.circular(54),
-                    child: _DetailPosterHover(
-                      borderRadius: 54,
-                      child: SizedBox(
-                        width: 110,
-                        child: Column(
-                          children: [
-                            ClipOval(
-                              child: SizedBox.square(
-                                dimension: 100,
-                                child: person.profileUrl == null
-                                    ? const ColoredBox(
-                                        color: YingjiColors.elevated,
-                                        child: Icon(YingjiIcons.person_fill),
-                                      )
-                                    : CachedNetworkImage(
-                                        fadeInDuration: const Duration(
-                                          milliseconds: 150,
-                                        ),
-                                        imageUrl: person.profileUrl.toString(),
-                                        fit: BoxFit.cover,
-                                        // 演员头像 100px，按显示分辨率解码。
-                                        memCacheWidth:
-                                            (160 *
-                                                    MediaQuery.devicePixelRatioOf(
-                                                      context,
-                                                    ))
-                                                .clamp(1.0, 512.0)
-                                                .round(),
-                                        errorWidget: (_, _, _) =>
-                                            const ColoredBox(
-                                              color: YingjiColors.elevated,
-                                              child: Icon(
-                                                YingjiIcons.person_fill,
-                                              ),
-                                            ),
-                                      ),
-                              ),
-                            ),
-                            const SizedBox(height: 7),
-                            Text(
-                              person.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            Text(
-                              person.role,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 10,
-                                color: YingjiColors.muted,
-                              ),
-                            ),
-                          ],
+                  itemCount: value.cast.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 18),
+                  itemBuilder: (context, index) {
+                    final person = value.cast[index];
+                    return InkWell(
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => _PersonPage(person: person),
                         ),
                       ),
-                    ),
-                  );
-                },
+                      borderRadius: BorderRadius.circular(54),
+                      child: _DetailPosterHover(
+                        borderRadius: 54,
+                        child: SizedBox(
+                          width: 110,
+                          child: Column(
+                            children: [
+                              ClipOval(
+                                child: SizedBox.square(
+                                  dimension: 100,
+                                  child: person.profileUrl == null
+                                      ? const ColoredBox(
+                                          color: YingjiColors.elevated,
+                                          child: Icon(YingjiIcons.person_fill),
+                                        )
+                                      : CachedNetworkImage(
+                                          fadeInDuration: const Duration(
+                                            milliseconds: 150,
+                                          ),
+                                          imageUrl: person.profileUrl
+                                              .toString(),
+                                          fit: BoxFit.cover,
+                                          // 演员头像 100px，按显示分辨率解码。
+                                          memCacheWidth:
+                                              (160 *
+                                                      MediaQuery.devicePixelRatioOf(
+                                                        context,
+                                                      ))
+                                                  .clamp(1.0, 512.0)
+                                                  .round(),
+                                          errorWidget: (_, _, _) =>
+                                              const ColoredBox(
+                                                color: YingjiColors.elevated,
+                                                child: Icon(
+                                                  YingjiIcons.person_fill,
+                                                ),
+                                              ),
+                                        ),
+                                ),
+                              ),
+                              const SizedBox(height: 7),
+                              Text(
+                                person.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                person.role,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: YingjiColors.muted,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ),
             ),
           ],
@@ -4775,57 +6502,69 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
             const SizedBox(height: 14),
             SizedBox(
               height: 184,
-              child: ListView.separated(
+              child: YingjiSmoothWheel(
                 controller: _artworkController,
-                scrollDirection: Axis.horizontal,
-                clipBehavior: Clip.none,
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                itemCount: value.artwork.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 14),
-                itemBuilder: (context, index) {
-                  final artwork = value.artwork[index];
-                  return InkWell(
-                    onTap: () => showDialog<void>(
-                      context: context,
-                      builder: (context) => Dialog(
-                        backgroundColor: Colors.transparent,
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(
-                            maxWidth: 1100,
-                            maxHeight: 720,
+                stableGlass: true,
+                child: ListView.separated(
+                  controller: _artworkController,
+                  scrollDirection: Axis.horizontal,
+                  physics:
+                      yingjiWheelPhysics ??
+                      const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
+                      ),
+                  clipBehavior: Clip.none,
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  itemCount: value.artwork.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 14),
+                  itemBuilder: (context, index) {
+                    final artwork = value.artwork[index];
+                    return InkWell(
+                      onTap: () => showDialog<void>(
+                        context: context,
+                        builder: (context) => Dialog(
+                          backgroundColor: Colors.transparent,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(
+                              maxWidth: 1100,
+                              maxHeight: 720,
+                            ),
+                            child: CachedNetworkImage(
+                              fadeInDuration: const Duration(milliseconds: 150),
+                              imageUrl: artwork.url.toString(),
+                              fit: BoxFit.contain,
+                              // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
+                              memCacheWidth:
+                                  (1280 *
+                                          MediaQuery.devicePixelRatioOf(
+                                            context,
+                                          ))
+                                      .clamp(1.0, 1280.0)
+                                      .round(),
+                            ),
                           ),
+                        ),
+                      ),
+                      child: _DetailPosterHover(
+                        borderRadius: 14,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(14),
                           child: CachedNetworkImage(
                             fadeInDuration: const Duration(milliseconds: 150),
                             imageUrl: artwork.url.toString(),
-                            fit: BoxFit.contain,
-                            // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
+                            width: 300,
+                            fit: BoxFit.cover,
+                            // 艺术图货架缩略图宽 300，按显示分辨率解码。
                             memCacheWidth:
-                                (1280 * MediaQuery.devicePixelRatioOf(context))
-                                    .clamp(1.0, 1280.0)
+                                (320 * MediaQuery.devicePixelRatioOf(context))
+                                    .clamp(1.0, 512.0)
                                     .round(),
                           ),
                         ),
                       ),
-                    ),
-                    child: _DetailPosterHover(
-                      borderRadius: 14,
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(14),
-                        child: CachedNetworkImage(
-                          fadeInDuration: const Duration(milliseconds: 150),
-                          imageUrl: artwork.url.toString(),
-                          width: 300,
-                          fit: BoxFit.cover,
-                          // 艺术图货架缩略图宽 300，按显示分辨率解码。
-                          memCacheWidth:
-                              (320 * MediaQuery.devicePixelRatioOf(context))
-                                  .clamp(1.0, 512.0)
-                                  .round(),
-                        ),
-                      ),
-                    ),
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             ),
           ],
@@ -4843,70 +6582,79 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
             const SizedBox(height: 14),
             SizedBox(
               height: 298,
-              child: ListView.separated(
+              child: YingjiSmoothWheel(
                 controller: _recommendationController,
-                scrollDirection: Axis.horizontal,
-                clipBehavior: Clip.none,
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                itemCount: value.recommendations.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 16),
-                itemBuilder: (context, index) {
-                  final item = value.recommendations[index];
-                  return InkWell(
-                    onTap: () => MetadataDetailPage.open(context, item: item),
-                    borderRadius: BorderRadius.circular(14),
-                    child: _DetailPosterHover(
-                      borderRadius: 14,
-                      child: SizedBox(
-                        width: 164,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(14),
-                              child: SizedBox(
-                                width: 164,
-                                height: 232,
-                                child: item.posterUrl == null
-                                    ? const ColoredBox(
-                                        color: YingjiColors.elevated,
-                                      )
-                                    : CachedNetworkImage(
-                                        fadeInDuration: const Duration(
-                                          milliseconds: 150,
+                stableGlass: true,
+                child: ListView.separated(
+                  controller: _recommendationController,
+                  scrollDirection: Axis.horizontal,
+                  physics:
+                      yingjiWheelPhysics ??
+                      const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
+                      ),
+                  clipBehavior: Clip.none,
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  itemCount: value.recommendations.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 16),
+                  itemBuilder: (context, index) {
+                    final item = value.recommendations[index];
+                    return InkWell(
+                      onTap: () => MetadataDetailPage.open(context, item: item),
+                      borderRadius: BorderRadius.circular(14),
+                      child: _DetailPosterHover(
+                        borderRadius: 14,
+                        child: SizedBox(
+                          width: 164,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(14),
+                                child: SizedBox(
+                                  width: 164,
+                                  height: 232,
+                                  child: item.posterUrl == null
+                                      ? const ColoredBox(
+                                          color: YingjiColors.elevated,
+                                        )
+                                      : CachedNetworkImage(
+                                          fadeInDuration: const Duration(
+                                            milliseconds: 150,
+                                          ),
+                                          imageUrl: item.posterUrl.toString(),
+                                          fit: BoxFit.cover,
+                                          // 相似推荐海报 164px 宽，按显示分辨率解码。
+                                          memCacheWidth:
+                                              (320 *
+                                                      MediaQuery.devicePixelRatioOf(
+                                                        context,
+                                                      ))
+                                                  .clamp(1.0, 512.0)
+                                                  .round(),
+                                          errorWidget: (_, _, _) =>
+                                              const ColoredBox(
+                                                color: YingjiColors.elevated,
+                                              ),
                                         ),
-                                        imageUrl: item.posterUrl.toString(),
-                                        fit: BoxFit.cover,
-                                        // 相似推荐海报 164px 宽，按显示分辨率解码。
-                                        memCacheWidth:
-                                            (320 *
-                                                    MediaQuery.devicePixelRatioOf(
-                                                      context,
-                                                    ))
-                                                .clamp(1.0, 512.0)
-                                                .round(),
-                                        errorWidget: (_, _, _) =>
-                                            const ColoredBox(
-                                              color: YingjiColors.elevated,
-                                            ),
-                                      ),
+                                ),
                               ),
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              item.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w700,
+                              const SizedBox(height: 8),
+                              Text(
+                                item.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             ),
           ],
@@ -4919,14 +6667,19 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
     title: '全部演职人员',
     subtitle: '${cast.length} 位 · 姓名、角色与人物照片来自 TMDB',
     icon: YingjiIcons.person_fill,
-    child: _FilterablePersonGrid(cast: cast),
+    childBuilder: (controller) =>
+        _FilterablePersonGrid(cast: cast, controller: controller),
   );
 
   Future<void> _showArtwork(List<TmdbArtwork> artwork) => _showDetailCollection(
     title: '全部艺术图',
     subtitle: '${artwork.length} 张 · 点击查看 TMDB 原始尺寸图片',
     icon: YingjiIcons.rectangle_stack,
-    child: GridView.builder(
+    childBuilder: (controller) => GridView.builder(
+      controller: controller,
+      physics:
+          yingjiWheelPhysics ??
+          const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
       padding: const EdgeInsets.only(top: 16),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
         maxCrossAxisExtent: 390,
@@ -4945,77 +6698,93 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
         title: '全部相似推荐',
         subtitle: '${rows.length} 部 · 类型、年份、评分与简介',
         icon: YingjiIcons.film,
-        child: _FilterableRecommendationGrid(rows: rows),
+        childBuilder: (controller) =>
+            _FilterableRecommendationGrid(rows: rows, controller: controller),
       );
 
   Future<void> _showDetailCollection({
     required String title,
     required String subtitle,
     required IconData icon,
-    required Widget child,
-  }) => showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    barrierColor: Colors.black.withValues(alpha: .66),
-    builder: (context) => SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: GlassPanel(
-          radius: 22,
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-          child: SizedBox(
-            height: MediaQuery.sizeOf(context).height * .78,
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Icon(icon, size: 22),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+    required Widget Function(ScrollController controller) childBuilder,
+  }) async {
+    final controller = ScrollController();
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        barrierColor: Colors.black.withValues(alpha: .66),
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: YingjiStableScrollGlass(
+              child: GlassPanel(
+                radius: 22,
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                child: SizedBox(
+                  height: MediaQuery.sizeOf(context).height * .78,
+                  child: Column(
+                    children: [
+                      Row(
                         children: [
-                          Text(
-                            title,
-                            style: const TextStyle(
-                              fontSize: 22,
-                              fontWeight: FontWeight.w800,
+                          Icon(icon, size: 22),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  title,
+                                  style: const TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  subtitle,
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 3),
-                          Text(
-                            subtitle,
-                            style: const TextStyle(
-                              color: YingjiColors.muted,
-                              fontSize: 12,
-                            ),
+                          YingjiMotionIconButton(
+                            icon: YingjiIcons.xmark,
+                            tooltip: '关闭',
+                            size: 36,
+                            onPressed: () => Navigator.pop(context),
                           ),
                         ],
                       ),
-                    ),
-                    YingjiMotionIconButton(
-                      icon: YingjiIcons.xmark,
-                      tooltip: '关闭',
-                      size: 36,
-                      onPressed: () => Navigator.pop(context),
-                    ),
-                  ],
+                      const SizedBox(height: 4),
+                      Expanded(
+                        child: YingjiSmoothWheel(
+                          controller: controller,
+                          child: childBuilder(controller),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 4),
-                Expanded(child: child),
-              ],
+              ),
             ),
           ),
         ),
-      ),
-    ),
-  );
+      );
+    } finally {
+      controller.dispose();
+    }
+  }
 }
 
 class _FilterablePersonGrid extends StatefulWidget {
-  const _FilterablePersonGrid({required this.cast});
+  const _FilterablePersonGrid({required this.cast, required this.controller});
   final List<TmdbPerson> cast;
+  final ScrollController controller;
   @override
   State<_FilterablePersonGrid> createState() => _FilterablePersonGridState();
 }
@@ -5065,6 +6834,12 @@ class _FilterablePersonGridState extends State<_FilterablePersonGrid> {
         ),
         Expanded(
           child: GridView.builder(
+            controller: widget.controller,
+            physics:
+                yingjiWheelPhysics ??
+                const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
             padding: const EdgeInsets.only(top: 16),
             gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
               maxCrossAxisExtent: 230,
@@ -5082,8 +6857,12 @@ class _FilterablePersonGridState extends State<_FilterablePersonGrid> {
 }
 
 class _FilterableRecommendationGrid extends StatefulWidget {
-  const _FilterableRecommendationGrid({required this.rows});
+  const _FilterableRecommendationGrid({
+    required this.rows,
+    required this.controller,
+  });
   final List<TmdbItem> rows;
+  final ScrollController controller;
   @override
   State<_FilterableRecommendationGrid> createState() =>
       _FilterableRecommendationGridState();
@@ -5129,6 +6908,12 @@ class _FilterableRecommendationGridState
         ),
         Expanded(
           child: GridView.builder(
+            controller: widget.controller,
+            physics:
+                yingjiWheelPhysics ??
+                const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
             padding: const EdgeInsets.only(top: 16),
             gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
               maxCrossAxisExtent: 420,
@@ -5701,9 +7486,8 @@ class _PersonPageState extends State<_PersonPage> {
 }
 
 class _ResourceMessage extends StatelessWidget {
-  const _ResourceMessage({required this.message, this.onRetry});
+  const _ResourceMessage({required this.message});
   final String message;
-  final VoidCallback? onRetry;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -5722,8 +7506,6 @@ class _ResourceMessage extends StatelessWidget {
             style: const TextStyle(color: YingjiColors.muted),
           ),
         ),
-        if (onRetry != null)
-          TextButton(onPressed: onRetry, child: const Text('重试')),
       ],
     ),
   );

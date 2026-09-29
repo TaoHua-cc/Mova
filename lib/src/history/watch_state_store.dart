@@ -43,6 +43,12 @@ class WatchState {
   /// Where the latest progress value was read from: local, server, or trakt.
   final String progressOrigin;
   final String? progressOriginName;
+
+  /// In synced mode the continue shelf represents one shared server-backed
+  /// history. Local-only mode keeps the actual source visible per row.
+  String visibleProgressOrigin({required bool localOnly}) =>
+      localOnly ? progressOrigin : 'server';
+
   bool get isCompleted =>
       isPlayed || (duration > Duration.zero && progress >= .92);
   double get progress => duration.inMilliseconds == 0
@@ -171,6 +177,7 @@ class WatchStateStore {
   WatchStateStore(this._prefs);
   final SharedPreferences _prefs;
   static const key = 'yingji.watch-states';
+  static const _hiddenContinueKey = 'yingji.continue-hidden';
   static Future<WatchStateStore> create() async =>
       WatchStateStore(await SharedPreferences.getInstance());
 
@@ -214,6 +221,27 @@ class WatchStateStore {
     return sortWatchStatesByRecency(rows);
   }
 
+  /// Projects history onto the continue shelf while respecting locally hidden
+  /// groups. Playback records stay intact so removing a card is reversible.
+  List<WatchState> visibleContinueRows(Iterable<WatchState> history) {
+    final hidden =
+        (_prefs.getStringList(_hiddenContinueKey) ?? const <String>[]).toSet();
+    return continueWatchingRows(
+      history.where(
+        (state) => !_continueWatchingAliases(state).any(hidden.contains),
+      ),
+    );
+  }
+
+  /// Hides a whole grouped title, not just its newest episode row. This keeps
+  /// the card dismissed through history refreshes and server reconciliation.
+  Future<void> hideFromContinueWatching(WatchState state) async {
+    final hidden =
+        (_prefs.getStringList(_hiddenContinueKey) ?? const <String>[]).toSet();
+    hidden.addAll(_continueWatchingAliases(state));
+    await _prefs.setStringList(_hiddenContinueKey, hidden.toList());
+  }
+
   /// Saves [state] so it becomes the most recently watched record. When
   /// [updatedAt] is omitted the current time is used, which is right for this
   /// device's own playback; callers folding server history in can pass the
@@ -229,6 +257,16 @@ class WatchStateStore {
           .map((item) => jsonEncode(item.toJson()))
           .toList(),
     );
+    if (!state.isCompleted && state.position > Duration.zero) {
+      final hidden =
+          (_prefs.getStringList(_hiddenContinueKey) ?? const <String>[])
+              .toSet();
+      final hiddenCount = hidden.length;
+      hidden.removeAll(_continueWatchingAliases(state));
+      if (hidden.length != hiddenCount) {
+        await _prefs.setStringList(_hiddenContinueKey, hidden.toList());
+      }
+    }
   }
 
   Future<void> remove(String mediaId) async => _prefs.setStringList(
@@ -275,7 +313,10 @@ class WatchStateStore {
     );
   }
 
-  Future<void> clear() => _prefs.remove(key);
+  Future<void> clear() async {
+    await _prefs.remove(key);
+    await _prefs.remove(_hiddenContinueKey);
+  }
 
   /// Writes resolved cover URLs back onto their records without touching the
   /// recency order or timestamps — so the artwork upgrade pass never reorders
@@ -369,15 +410,7 @@ List<WatchState> continueWatchingRows(Iterable<WatchState> history) {
   final result = <WatchState>[];
   for (final row in sortWatchStatesByRecency(history)) {
     final episodic = row.episodeNumber != null || row.seasonNumber != null;
-    final name = row.title.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
-    final aliases = <String>[
-      if (row.tmdbId != null && row.tmdbId! > 0)
-        '${episodic ? 'tv' : 'movie'}:${row.tmdbId}',
-      if (episodic && name.isNotEmpty) 'series:$name',
-      if (!episodic) 'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
-      if (episodic && name.isEmpty)
-        'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
-    ];
+    final aliases = _continueWatchingAliases(row);
     // Resolve the latest state per episode before grouping resumable shows.
     // Marking one episode watched must not hide another episode's progress.
     final itemAliases = <String>[
@@ -400,4 +433,17 @@ List<WatchState> continueWatchingRows(Iterable<WatchState> history) {
     result.add(row);
   }
   return result;
+}
+
+List<String> _continueWatchingAliases(WatchState row) {
+  final episodic = row.episodeNumber != null || row.seasonNumber != null;
+  final name = row.title.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
+  return [
+    if (row.tmdbId != null && row.tmdbId! > 0)
+      '${episodic ? 'tv' : 'movie'}:${row.tmdbId}',
+    if (episodic && name.isNotEmpty) 'series:$name',
+    if (!episodic) 'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
+    if (episodic && name.isEmpty)
+      'item:${row.sourceId}:${row.serverItemId ?? row.mediaId}',
+  ];
 }

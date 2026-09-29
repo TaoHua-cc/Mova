@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -22,6 +23,8 @@ import 'danmaku_client.dart';
 import 'dolby_vision_color.dart';
 import 'native_dolby_vision.dart';
 import 'subtitle_preference.dart';
+import 'subtitle_search_dialog.dart';
+import 'subtitle_search_service.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
@@ -170,6 +173,28 @@ class PlayerEpisode {
     initialSubtitleTrack: initialSubtitleTrack,
     resources: resources,
   );
+
+  PlayerEpisode withResources(List<PlayerResourceOption> nextResources) =>
+      PlayerEpisode(
+        url: url,
+        title: title,
+        headers: headers,
+        initialPosition: initialPosition,
+        imageUrl: imageUrl,
+        seriesLogoUrl: seriesLogoUrl,
+        episodeTitle: episodeTitle,
+        resourceInfo: resourceInfo,
+        videoRange: videoRange,
+        sourceId: sourceId,
+        serverItemId: serverItemId,
+        tmdbId: tmdbId,
+        seasonNumber: seasonNumber,
+        episodeNumber: episodeNumber,
+        chapters: chapters,
+        initialAudioTrack: initialAudioTrack,
+        initialSubtitleTrack: initialSubtitleTrack,
+        resources: nextResources,
+      );
 }
 
 /// 播放器正在处理的手势类型。
@@ -213,6 +238,7 @@ class PlayerPage extends StatefulWidget {
     this.initialAudioTrack,
     this.initialSubtitleTrack,
     this.episodes = const [],
+    this.onResolveEpisode,
   });
   final String url;
   final String title;
@@ -231,6 +257,12 @@ class PlayerPage extends StatefulWidget {
   final int? initialAudioTrack;
   final int? initialSubtitleTrack;
   final List<PlayerEpisode> episodes;
+  final Future<PlayerEpisode?> Function(
+    int season,
+    int episode,
+    void Function(List<PlayerResourceOption> resources) onResourcesChanged,
+  )?
+  onResolveEpisode;
 
   @override
   State<PlayerPage> createState() => _PlayerPageState();
@@ -253,6 +285,8 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _settingsOpen = false;
   bool _exitStarted = false;
   bool _switchingEpisode = false;
+  final Map<int, PlayerEpisode> _resolvedEpisodes = {};
+  final Set<String> _downloadedSubtitlePaths = {};
 
   /// The Emby item whose playback session has been announced to the server
   /// (PlaybackStart). Progress reports keep flowing for this item until it
@@ -312,6 +346,8 @@ class _PlayerPageState extends State<PlayerPage> {
   VideoCacheDownload? _videoDownload;
   VideoCacheDownload? _nextEpisodePreload;
   StreamSubscription<VideoCacheProgress>? _videoCacheProgressSubscription;
+  bool _cacheWindowRefreshPending = false;
+  final Set<String> _completedCacheEpisodes = <String>{};
   bool _playingCachedFile = false;
   double _persistentCacheFraction = 0;
   String? _videoCacheStatus;
@@ -323,6 +359,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Timer? _progressTimer;
   Timer? _controlsTimer;
   StreamSubscription<bool>? _playingSubscription;
+  StreamSubscription<bool>? _completedSubscription;
   StreamSubscription<Duration>? _bufferSubscription;
   Duration _lastBufferSample = Duration.zero;
   DateTime? _lastBufferSampleAt;
@@ -440,6 +477,9 @@ class _PlayerPageState extends State<PlayerPage> {
         )
       : widget.episodes[_activeEpisodeIndex];
 
+  PlayerEpisode _episodeAt(int index) =>
+      _resolvedEpisodes[index] ?? widget.episodes[index];
+
   PlayerEpisode get _activeEpisode => _resourceOverride ?? _baseEpisode;
 
   @override
@@ -497,6 +537,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _segmentTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       unawaited(_applySegmentSkip());
       unawaited(_preloadNextIfNeeded());
+      unawaited(_advanceVideoCacheWindowIfNeeded());
     });
     _player.stream.error.listen((value) {
       if (mounted && value.isNotEmpty) setState(() => _error = value);
@@ -515,6 +556,9 @@ class _PlayerPageState extends State<PlayerPage> {
       } else {
         _revealControls();
       }
+    });
+    _completedSubscription = _player.stream.completed.listen((completed) {
+      if (completed) unawaited(_deleteCompletedVideoCache(_activeEpisode.url));
     });
     _bufferSubscription = _player.stream.buffer.listen((buffer) async {
       final now = DateTime.now();
@@ -904,7 +948,10 @@ class _PlayerPageState extends State<PlayerPage> {
     _skipDismissed.clear();
     _skipKind = null;
     _skipTicks = 0;
-    _videoDownload?.cancel();
+    _completedCacheEpisodes.remove(episode.url);
+    final previousDownload = _videoDownload;
+    previousDownload?.cancel();
+    await previousDownload?.done;
     _videoDownload = null;
     await _videoCacheProgressSubscription?.cancel();
     _videoCacheProgressSubscription = null;
@@ -929,7 +976,6 @@ class _PlayerPageState extends State<PlayerPage> {
           httpHeaders: playbackUrl == null ? episode.headers : const {},
         ),
       );
-      unawaited(_cacheCurrentEpisode(episode));
     }
     if (WindowHost.isDesktop) {
       await (_player.platform as dynamic).command(<String>[
@@ -966,6 +1012,7 @@ class _PlayerPageState extends State<PlayerPage> {
         await _player.seek(target);
       }
     }
+    if (cached == null) unawaited(_cacheCurrentEpisode(episode));
     await _player.setVolume(_volume);
   }
 
@@ -1018,21 +1065,31 @@ class _PlayerPageState extends State<PlayerPage> {
     }
   }
 
-  /// 后台把这一集整份存到本机，下次打开直接播本地文件。
-  ///
-  /// 上限为 0（比如移动数据下默认不缓存）时什么都不做；已经在缓存里的，
-  /// [VideoCacheStore.download] 会立刻返回，不会重复下载一遍。
+  /// 后台缓存当前播放点前方的一个有界窗口。
   Future<void> _cacheCurrentEpisode(PlayerEpisode episode) async {
     final store = _videoCache;
-    if (store == null) return;
+    if (!mounted || store == null || _activeEpisode.url != episode.url) return;
     final limit = await VideoCachePolicy.current();
-    if (limit <= 0) return;
+    if (!mounted || limit <= 0 || _activeEpisode.url != episode.url) return;
     final job = store.download(
       url: episode.url,
       limitBytes: limit,
+      startPosition: _player.state.position > episode.initialPosition
+          ? _player.state.position
+          : episode.initialPosition,
+      mediaDuration: _player.state.duration,
       headers: episode.headers,
       title: episode.title,
     );
+    await _watchVideoCacheJob(job, limit);
+  }
+
+  Future<void> _watchVideoCacheJob(VideoCacheDownload job, int limit) async {
+    await _videoCacheProgressSubscription?.cancel();
+    if (!mounted) {
+      job.cancel();
+      return;
+    }
     _videoDownload = job;
     void update(VideoCacheProgress progress) {
       final fraction = progress.fraction;
@@ -1050,7 +1107,80 @@ class _PlayerPageState extends State<PlayerPage> {
 
     update(job.state);
     _videoCacheProgressSubscription = job.progress.listen(update);
-    await job.done;
+  }
+
+  Future<void> _advanceVideoCacheWindowIfNeeded() async {
+    final store = _videoCache;
+    final current = _videoDownload;
+    final state = _player.state;
+    if (!mounted ||
+        store == null ||
+        current == null ||
+        _playingCachedFile ||
+        _cacheWindowRefreshPending ||
+        _completedCacheEpisodes.contains(_activeEpisode.url) ||
+        _switchingEpisode ||
+        !state.playing ||
+        state.duration <= Duration.zero ||
+        current.state.status != VideoCacheStatus.buffered ||
+        !current.state.supportsRange ||
+        current.state.mediaTotalBytes <= 0 ||
+        current.state.cachedEndBytes >= current.state.mediaTotalBytes) {
+      return;
+    }
+    final playheadByte = videoCacheByteOffsetForPosition(
+      position: state.position,
+      duration: state.duration,
+      mediaTotalBytes: current.state.mediaTotalBytes,
+    );
+    if (!videoCacheShouldAdvanceWindow(
+      playheadByte: playheadByte,
+      windowStartByte: current.state.startBytes,
+      windowBytes: current.state.totalBytes,
+    )) {
+      return;
+    }
+
+    _cacheWindowRefreshPending = true;
+    final episode = _activeEpisode;
+    try {
+      final limit = await VideoCachePolicy.current();
+      current.cancel();
+      await current.done;
+      await _videoCacheProgressSubscription?.cancel();
+      if (!mounted ||
+          _switchingEpisode ||
+          _activeEpisode.url != episode.url ||
+          _completedCacheEpisodes.contains(episode.url)) {
+        return;
+      }
+      final next = store.download(
+        url: episode.url,
+        limitBytes: limit,
+        startBytes: playheadByte,
+        headers: episode.headers,
+        title: episode.title,
+      );
+      await _watchVideoCacheJob(next, limit);
+    } finally {
+      _cacheWindowRefreshPending = false;
+    }
+  }
+
+  Future<void> _deleteCompletedVideoCache(String url) async {
+    _completedCacheEpisodes.add(url);
+    if (_activeEpisode.url == url) {
+      _videoDownload?.cancel();
+      await _videoDownload?.done;
+      await _videoCacheProgressSubscription?.cancel();
+    }
+    await _videoCache?.deleteEpisode(url);
+    if (mounted && _activeEpisode.url == url) {
+      setState(() {
+        _persistentCacheFraction = 0;
+        _videoCacheStatus = null;
+      });
+    }
   }
 
   /// Waits for the media to become seekable and returns [target] clamped into
@@ -1144,19 +1274,58 @@ class _PlayerPageState extends State<PlayerPage> {
     _switchingEpisode = true;
     try {
       await _player.pause();
+      final previousEpisode = _activeEpisode;
+      final previousPosition = _player.state.position;
+      final previousDuration = _player.state.duration;
       await _saveWatchState(isPlayed: markCurrentPlayed);
-      try {
-        await _syncProgress(
-          ending: true,
-          positionOverride: markCurrentPlayed ? _player.state.duration : null,
-        ).timeout(const Duration(seconds: 4));
-      } catch (_) {
-        // Local history is authoritative; a server timeout must not block
-        // switching.
+      if (markCurrentPlayed) {
+        unawaited(_deleteCompletedVideoCache(previousEpisode.url));
       }
-      _nextEpisodePreload?.cancel();
+      unawaited(
+        _syncProgress(
+          ending: true,
+          episodeOverride: previousEpisode,
+          positionOverride: markCurrentPlayed
+              ? previousDuration
+              : previousPosition,
+          durationOverride: previousDuration,
+        ).catchError((_) {}),
+      );
+      final preload = _nextEpisodePreload;
+      preload?.cancel();
+      await preload?.done;
       _nextEpisodePreload = null;
-      final target = widget.episodes[index];
+      var target = _episodeAt(index);
+      if (target.url.isEmpty) {
+        final season = target.seasonNumber;
+        final episode = target.episodeNumber;
+        final resolved = season == null || episode == null
+            ? null
+            : await widget.onResolveEpisode?.call(season, episode, (resources) {
+                if (!mounted || _exitStarted) return;
+                final current = _resolvedEpisodes[index] ?? target;
+                final updated = current.withResources(resources);
+                _resolvedEpisodes[index] = updated;
+                if (_activeEpisodeIndex == index) {
+                  setState(() {
+                    _resourceOverride = (_resourceOverride ?? current)
+                        .withResources(resources);
+                  });
+                }
+              });
+        if (resolved == null || resolved.url.isEmpty) {
+          if (mounted && !_exitStarted) {
+            await _player.play();
+            if (!mounted || _exitStarted) return;
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(const SnackBar(content: Text('该集暂无可播放资源，当前播放已恢复')));
+          }
+          return;
+        }
+        target = resolved;
+        _resolvedEpisodes[index] = target;
+      }
       final resume = await _episodeResumePosition(target);
       if (!mounted || _exitStarted) return;
       setState(() {
@@ -1193,7 +1362,7 @@ class _PlayerPageState extends State<PlayerPage> {
         duration - position > Duration(minutes: _preloadLeadMinutes.round())) {
       return;
     }
-    final next = widget.episodes[_activeEpisodeIndex + 1];
+    final next = _episodeAt(_activeEpisodeIndex + 1);
     if (_preloadedUrl == next.url) return;
     _preloadedUrl = next.url;
     final uri = Uri.tryParse(next.url);
@@ -1236,39 +1405,10 @@ class _PlayerPageState extends State<PlayerPage> {
                   row.episodeNumber == episode.episodeNumber),
         )
         .firstOrNull;
-    var position = local?.position ?? episode.initialPosition;
-    if (episode.sourceId == null || episode.serverItemId == null)
-      return position;
-    EmbyClient? client;
-    try {
-      final sources = await SourceStore.create();
-      final source = sources
-          .load()
-          .where((s) => s.id == episode.sourceId)
-          .firstOrNull;
-      if (source == null || source.kind == SourceKind.webdav) return position;
-      final token = sources.tokenFor(source);
-      if (token == null || token.isEmpty) return position;
-      client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
-      final remote = await client
-          .itemById(
-            EmbySession(source: source, token: token),
-            episode.serverItemId!,
-          )
-          .timeout(const Duration(seconds: 3));
-      if (remote.playbackPosition != null &&
-          (local == null ||
-              (remote.lastPlayedAt != null &&
-                  (local.updatedAt == null ||
-                      remote.lastPlayedAt!.isAfter(local.updatedAt!))))) {
-        position = remote.playbackPosition!;
-      }
-    } catch (_) {
-      // Offline switching still resumes the latest saved local position.
-    } finally {
-      client?.dispose();
-    }
-    return position;
+    final localPosition = local?.position ?? Duration.zero;
+    return localPosition > episode.initialPosition
+        ? localPosition
+        : episode.initialPosition;
   }
 
   String get _segmentKey {
@@ -1534,6 +1674,23 @@ class _PlayerPageState extends State<PlayerPage> {
       _error = null;
     });
     await _openCurrentMedia();
+  }
+
+  void _searchOnlineSubtitle() {
+    _openConsoleTab('在线字幕');
+  }
+
+  Future<void> _applyOnlineSubtitle(DownloadedSubtitle subtitle) async {
+    if (!mounted) throw StateError('当前播放已结束，无法应用字幕');
+    _downloadedSubtitlePaths.add(subtitle.path);
+    await _player.setSubtitleTrack(
+      SubtitleTrack.uri(
+        Uri.file(subtitle.path).toString(),
+        title: subtitle.fileName,
+        language: subtitle.language,
+      ),
+    );
+    _subtitleChosen = true;
   }
 
   Future<void> _showEpisodeList() async {
@@ -1859,11 +2016,32 @@ class _PlayerPageState extends State<PlayerPage> {
     _segmentTimer?.cancel();
     _controlsTimer?.cancel();
     _playingSubscription?.cancel();
+    _completedSubscription?.cancel();
     _bufferSubscription?.cancel();
     _focusNode.dispose();
     _danmakuClient?.dispose();
-    _player.dispose();
+    unawaited(_disposePlayerAndSubtitles());
     super.dispose();
+  }
+
+  Future<void> _disposePlayerAndSubtitles() async {
+    try {
+      await _player.dispose();
+    } catch (_) {
+      // Subtitle cleanup still runs if the platform player fails to dispose.
+    }
+    await _deleteDownloadedSubtitles();
+  }
+
+  Future<void> _deleteDownloadedSubtitles() async {
+    for (final path in _downloadedSubtitlePaths) {
+      try {
+        await File(path).delete();
+      } catch (_) {
+        // The operating system may already have removed the session temp file.
+      }
+    }
+    _downloadedSubtitlePaths.clear();
   }
 
   Future<void> _saveWatchState({bool isPlayed = false}) async {
@@ -1927,18 +2105,19 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _syncProgress({
     bool syncTrakt = false,
     bool ending = false,
+    PlayerEpisode? episodeOverride,
     Duration? positionOverride,
+    Duration? durationOverride,
   }) async {
+    final episode = episodeOverride ?? _activeEpisode;
+    final position = positionOverride ?? _player.state.position;
+    final duration = durationOverride ?? _player.state.duration;
     // 「观看记录只保存在本机」时不向媒体服务器与 Trakt 上报任何进度。
     // 本机记录由 _saveWatchState 照常写入，服务器资源也照常播放；读取
     // （服务器继续观看、Trakt 已看）同样不受影响 —— 这里只停回写。
     if (await WatchStateStore.localOnly()) return;
-    // Capture the episode and position up-front: the async hops below (source
-    // lookup, HTTP) can race an in-page episode switch, and the stop for the
-    // *old* item must never target the *new* one.
-    final episode = _activeEpisode;
-    final position = positionOverride ?? _player.state.position;
-    final duration = _player.state.duration;
+    // Captured before any asynchronous work so a background stop report cannot
+    // accidentally target the next episode after an in-place switch.
     if (duration <= Duration.zero) return;
     final sourceId = episode.sourceId;
     final itemId = episode.serverItemId;
@@ -2682,8 +2861,15 @@ class _PlayerPageState extends State<PlayerPage> {
         children: [
           Row(
             children: [
+              if (_consoleTab == '在线字幕')
+                YingjiMotionIconButton(
+                  tooltip: '返回字幕菜单',
+                  onPressed: () => _openConsoleTab('字幕'),
+                  icon: YingjiIcons.chevron_left,
+                  size: 34,
+                ),
               Text(
-                _consoleTab,
+                _consoleTab == '在线字幕' ? '在线搜索字幕' : _consoleTab,
                 style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w700,
@@ -2698,12 +2884,39 @@ class _PlayerPageState extends State<PlayerPage> {
               ),
             ],
           ),
-          const Text(
-            '音轨、音量与音频处理会即时下发给 libmpv。',
-            style: TextStyle(color: Colors.white54, fontSize: 12),
+          if (_consoleTab != '在线字幕') ...[
+            const Text(
+              '音轨、音量与音频处理会即时下发给 libmpv。',
+              style: TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+            const SizedBox(height: 16),
+          ] else
+            const SizedBox(height: 10),
+          Expanded(
+            child: _consoleTab == '在线字幕'
+                ? SubtitleSearchPanel(
+                    query: SubtitleSearchQuery(
+                      title: _activeEpisode.title,
+                      season: _activeEpisode.seasonNumber,
+                      episode: _activeEpisode.episodeNumber,
+                      episodeTitle: _activeEpisode.episodeTitle,
+                      language: _subtitleLanguage,
+                    ),
+                    onApply: _applyOnlineSubtitle,
+                  )
+                : _consoleTab == '全集'
+                ? ListView.builder(
+                    itemCount: widget.episodes.length,
+                    padding: const EdgeInsets.only(bottom: 8),
+                    itemBuilder: (_, index) => Padding(
+                      padding: EdgeInsets.only(
+                        bottom: index == widget.episodes.length - 1 ? 0 : 8,
+                      ),
+                      child: _episodeRow(index),
+                    ),
+                  )
+                : ListView(children: _consoleContent()),
           ),
-          const SizedBox(height: 16),
-          Expanded(child: ListView(children: _consoleContent())),
         ],
       ),
     ),
@@ -2728,6 +2941,17 @@ class _PlayerPageState extends State<PlayerPage> {
             '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
           ]),
           _trackSelector(audio: false),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: YingjiGlassPillButton(
+              icon: YingjiIcons.search,
+              label: '在线搜索字幕',
+              compactLabel: '搜索字幕',
+              tooltip: '搜索当前剧集字幕并下载应用',
+              onPressed: _searchOnlineSubtitle,
+              height: 42,
+            ),
+          ),
         ];
       case '弹幕':
         return [
@@ -2764,7 +2988,7 @@ class _PlayerPageState extends State<PlayerPage> {
       case '资源':
         return [_resourcePanel()];
       case '全集':
-        return [_episodePanel()];
+        return const [];
       default:
         return const [];
     }
@@ -3072,56 +3296,58 @@ class _PlayerPageState extends State<PlayerPage> {
     );
   }
 
-  Widget _episodePanel() => Column(
-    children: [
-      for (var index = 0; index < widget.episodes.length; index++) ...[
-        YingjiMotionSurface(
+  Widget _episodeRow(int index) {
+    final episode = _episodeAt(index);
+    return YingjiMotionSurface(
+      selected: index == _activeEpisodeIndex,
+      borderRadius: 16,
+      child: GlassPanel(
+        radius: 16,
+        padding: EdgeInsets.zero,
+        child: ListTile(
           selected: index == _activeEpisodeIndex,
-          borderRadius: 16,
-          child: GlassPanel(
-            radius: 16,
-            padding: EdgeInsets.zero,
-            child: ListTile(
-              selected: index == _activeEpisodeIndex,
-              leading: SizedBox(
-                width: 86,
-                child: AspectRatio(
-                  aspectRatio: 16 / 9,
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(9),
-                    child: widget.episodes[index].imageUrl?.isNotEmpty == true
-                        ? Image.network(
-                            widget.episodes[index].imageUrl!,
-                            fit: BoxFit.cover,
-                          )
-                        : const ColoredBox(
-                            color: Colors.white10,
-                            child: Icon(YingjiIcons.film),
-                          ),
-                  ),
-                ),
+          leading: SizedBox(
+            width: 86,
+            child: AspectRatio(
+              aspectRatio: 16 / 9,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(9),
+                child: episode.imageUrl?.isNotEmpty == true
+                    ? Image.network(episode.imageUrl!, fit: BoxFit.cover)
+                    : const ColoredBox(
+                        color: Colors.white10,
+                        child: Icon(YingjiIcons.film),
+                      ),
               ),
-              title: Text(
-                '第 ${widget.episodes[index].episodeNumber ?? index + 1} 集 · ${widget.episodes[index].episodeTitle ?? '未命名'}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              subtitle: Text(
-                widget.episodes[index].resourceInfo ?? '点击切换播放',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: index == _activeEpisodeIndex
-                  ? const Icon(YingjiIcons.checkmark_circle_fill)
-                  : null,
-              onTap: () => unawaited(_switchEpisode(index)),
             ),
           ),
+          title: Text(
+            [
+              if ((episode.seasonNumber ?? 0) > 0)
+                '第 ${episode.seasonNumber} 季',
+              '第 ${episode.episodeNumber ?? index + 1} 集',
+              if (episode.episodeTitle?.isNotEmpty == true)
+                episode.episodeTitle!,
+            ].join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          subtitle: Text(
+            episode.resourceInfo ??
+                (episode.url.isEmpty ? '选择后搜索服务器资源' : '点击切换播放'),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: index == _activeEpisodeIndex
+              ? const Icon(YingjiIcons.checkmark_circle_fill)
+              : episode.url.isEmpty
+              ? const Icon(Icons.search_rounded, size: 19)
+              : null,
+          onTap: () => unawaited(_switchEpisode(index)),
         ),
-        if (index != widget.episodes.length - 1) const SizedBox(height: 8),
-      ],
-    ],
-  );
+      ),
+    );
+  }
 
   Widget _consoleAction(IconData icon, String label, VoidCallback onTap) =>
       Padding(
@@ -3536,7 +3762,9 @@ class _PlayerPageState extends State<PlayerPage> {
                 items: choices,
                 labelBuilder: (choice) {
                   final track = audio ? choice.audio : choice.subtitle;
-                  return '${track?.title ?? track?.id}${track?.language == null ? '' : ' · ${track!.language}'}';
+                  if (track == null) return '';
+                  if (!audio) return subtitleTrackLabel(track as SubtitleTrack);
+                  return '${track.title ?? track.id}${track.language == null ? '' : ' · ${track.language}'}';
                 },
                 onChanged: (choice) {
                   if (audio && choice.audio != null) {
@@ -3809,7 +4037,9 @@ class _DanmakuPainter extends CustomPainter {
           : overlay.showBottom;
       if (!enabled) continue;
       final elapsedMs = positionMs - comment.time.inMilliseconds;
-      if (elapsedMs < 0) continue; // not due yet
+      if (elapsedMs < 0) {
+        break; // comments are time-sorted; later ones are not due
+      }
       final lane = Object.hash(comment.content, comment.time.inMilliseconds);
       // A line's effective age is measured from when it started travelling.
       // A scrolling comment seen for the first time with most of its life

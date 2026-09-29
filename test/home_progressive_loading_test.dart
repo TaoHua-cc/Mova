@@ -52,6 +52,17 @@ void main() {
 
   test('carousel loads title logos for the active and upcoming items', () {
     final source = File('lib/src/media_center.dart').readAsStringSync();
+    final carouselTimerStart = source.indexOf('_heroTimer = Timer.periodic');
+    final carouselTimerEnd = source.indexOf(
+      'void didChangeDependencies()',
+      carouselTimerStart,
+    );
+    final carouselTimer = source.substring(
+      carouselTimerStart,
+      carouselTimerEnd,
+    );
+    expect(carouselTimer, contains('yingjiScrollInProgress.value'));
+    expect(carouselTimer, contains('yingjiHomeScrollDepth.value > 0'));
     expect(
       source,
       contains('_selectHero((_hero + 1) % items.length.clamp(1, 8))'),

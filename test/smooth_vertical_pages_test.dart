@@ -62,6 +62,50 @@ void main() {
     }
   });
 
+  test('detail shelves and overflow lists use shared smooth scrolling', () {
+    final source = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    for (final name in [
+      '_SeasonRailState',
+      '_EpisodePreviewRailState',
+      '_ResourceSectionState',
+      '_DetailExtrasSectionState',
+      '_TrackPickerPaneState',
+      '_PersonPageState',
+    ]) {
+      expect(
+        classBody(source, name),
+        contains('YingjiSmoothWheel('),
+        reason: name,
+      );
+    }
+    final collections = source.substring(
+      source.indexOf('Future<void> _showDetailCollection('),
+      source.indexOf('class _FilterablePersonGrid'),
+    );
+    expect(collections, contains('YingjiSmoothWheel('));
+    for (final name in [
+      '_FilterablePersonGridState',
+      '_FilterableRecommendationGridState',
+    ]) {
+      expect(
+        classBody(source, name),
+        contains('controller: widget.controller'),
+      );
+    }
+    final wheel = classBody(
+      File('lib/src/brand.dart').readAsStringSync(),
+      '_YingjiSmoothWheelState',
+    );
+    expect(wheel, contains('position.axisDirection'));
+    expect(
+      wheel,
+      contains('horizontal ? event.scrollDelta.dx : event.scrollDelta.dy'),
+    );
+    expect(wheel, isNot(contains('event.scrollDelta.dx == 0')));
+    expect(wheel, contains('pointerSignalResolver.register(event, (_)'));
+  });
+
   test('discover data updates only the changed shelf', () {
     final source = File('lib/src/media_center.dart').readAsStringSync();
     final body = classBody(source, '_DiscoverPageState');

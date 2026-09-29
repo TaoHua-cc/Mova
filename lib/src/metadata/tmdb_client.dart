@@ -143,10 +143,16 @@ class TmdbArtwork {
 }
 
 class TmdbSeason {
-  const TmdbSeason({required this.number, required this.name, this.posterPath});
+  const TmdbSeason({
+    required this.number,
+    required this.name,
+    this.posterPath,
+    this.episodeCount,
+  });
   final int number;
   final String name;
   final String? posterPath;
+  final int? episodeCount;
   Uri? get posterUrl => posterPath == null
       ? null
       : Uri.parse('https://image.tmdb.org/t/p/w500$posterPath');
@@ -190,6 +196,7 @@ class TmdbUpcomingEpisode {
     this.networkLogoUrl,
     this.totalEpisodes,
     this.showTitle,
+    this.showPosterPath,
     this.stillPath,
     this.timeKnown = false,
     this.source = 'TMDB',
@@ -204,7 +211,11 @@ class TmdbUpcomingEpisode {
   final Uri? networkLogoUrl;
   final int? totalEpisodes;
   final String? showTitle;
+  final String? showPosterPath;
   final String? stillPath;
+  Uri? get showPosterUrl => showPosterPath == null
+      ? null
+      : Uri.parse('https://image.tmdb.org/t/p/w500$showPosterPath');
   Uri? get stillUrl => stillPath == null
       ? null
       : Uri.parse('https://image.tmdb.org/t/p/w780$stillPath');
@@ -217,6 +228,7 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
   DateTime? until,
   int? totalEpisodes,
   String? showTitle,
+  String? showPosterPath,
 }) {
   if (episodes is! List) return const [];
   final candidates = <TmdbUpcomingEpisode>[];
@@ -255,6 +267,7 @@ List<TmdbUpcomingEpisode> upcomingListFromTvmaze(
         networkLogoUrl: logoUrl,
         totalEpisodes: totalEpisodes,
         showTitle: showTitle ?? '${show['name'] ?? ''}',
+        showPosterPath: showPosterPath,
         source: 'TVmaze',
       ),
     );
@@ -277,11 +290,13 @@ class TmdbExtras {
     this.artwork = const [],
     this.recommendations = const [],
     this.seasons = const [],
+    this.originalTitle,
   });
   final List<TmdbPerson> cast;
   final List<TmdbArtwork> artwork;
   final List<TmdbItem> recommendations;
   final List<TmdbSeason> seasons;
+  final String? originalTitle;
 }
 
 class TmdbClient {
@@ -646,6 +661,7 @@ class TmdbClient {
             name:
                 '${row['name'] ?? '第 ${(row['season_number'] as num?)?.toInt() ?? 1} 季'}',
             posterPath: row['poster_path'] as String?,
+            episodeCount: (row['episode_count'] as num?)?.toInt(),
           ),
         )
         .toList(growable: false);
@@ -654,6 +670,8 @@ class TmdbClient {
       artwork: artwork,
       recommendations: recommendations,
       seasons: seasons,
+      originalTitle:
+          (data['original_name'] ?? data['original_title']) as String?,
     );
   }
 
@@ -730,6 +748,7 @@ class TmdbClient {
     final totalEpisodes = (data['number_of_episodes'] as num?)?.toInt();
     final showTitle = '${data['name'] ?? data['original_name'] ?? item.title}'
         .trim();
+    final showPosterPath = data['poster_path'] as String?;
     final exact = <TmdbUpcomingEpisode>[];
     try {
       final ids = data['external_ids'] as Map<String, dynamic>? ?? const {};
@@ -770,6 +789,7 @@ class TmdbClient {
             until: until,
             totalEpisodes: totalEpisodes,
             showTitle: showTitle,
+            showPosterPath: showPosterPath,
           ),
         );
       }
@@ -820,6 +840,7 @@ class TmdbClient {
               networkLogoUrl: networkLogoUrl,
               totalEpisodes: totalEpisodes,
               showTitle: showTitle,
+              showPosterPath: showPosterPath,
               stillPath: episode.stillPath,
             ),
           );
@@ -842,6 +863,7 @@ class TmdbClient {
             networkLogoUrl: networkLogoUrl,
             totalEpisodes: totalEpisodes,
             showTitle: showTitle,
+            showPosterPath: showPosterPath,
             stillPath: nextRow['still_path'] as String?,
           ),
         );
@@ -855,10 +877,15 @@ class TmdbClient {
     if (network.isEmpty || isIqiyiNetwork) {
       try {
         exact.addAll(
-          await _iqiyiUpcomingEpisode(item, showTitle, now, until, [
-            ...dated,
-            ...exact,
-          ], totalEpisodes: totalEpisodes),
+          await _iqiyiUpcomingEpisode(
+            item,
+            showTitle,
+            now,
+            until,
+            [...dated, ...exact],
+            totalEpisodes: totalEpisodes,
+            showPosterPath: showPosterPath,
+          ),
         );
       } catch (_) {
         // The official platform is an optional time source; other schedules
@@ -891,6 +918,10 @@ class TmdbClient {
         timeKnown: timing.timeKnown,
         source: primary.source,
         showTitle: primary.showTitle ?? episode.showTitle ?? previous.showTitle,
+        showPosterPath:
+            primary.showPosterPath ??
+            episode.showPosterPath ??
+            previous.showPosterPath,
         network:
             timing.network ??
             primary.network ??
@@ -971,6 +1002,7 @@ class TmdbClient {
     DateTime until,
     List<TmdbUpcomingEpisode> knownEpisodes, {
     int? totalEpisodes,
+    String? showPosterPath,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final key = 'yingji.schedule.iqiyi.${item.id}';
@@ -1043,6 +1075,7 @@ class TmdbClient {
         networkLogoUrl: existing?.networkLogoUrl,
         totalEpisodes: total,
         showTitle: showTitle,
+        showPosterPath: showPosterPath,
         stillPath: existing?.stillPath,
       ),
     ];

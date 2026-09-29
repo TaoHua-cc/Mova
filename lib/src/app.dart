@@ -239,12 +239,22 @@ class YingjiApp extends StatelessWidget {
           radius: Radius.circular(99),
           thumbColor: WidgetStatePropertyAll(Color(0x55FFFFFF)),
         ),
-        snackBarTheme: const SnackBarThemeData(
-          backgroundColor: Color(0xF0292B31),
-          contentTextStyle: TextStyle(color: YingjiColors.ink),
+        snackBarTheme: SnackBarThemeData(
+          backgroundColor: YingjiColors.surface.withValues(alpha: .9),
+          contentTextStyle: const TextStyle(
+            color: YingjiColors.ink,
+            fontFamily: YingjiFonts.family,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            height: 1.35,
+          ),
+          actionTextColor: YingjiColors.focus,
           behavior: SnackBarBehavior.floating,
+          elevation: 0,
+          insetPadding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(14)),
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(color: YingjiGlass.line(strength: .72)),
           ),
         ),
         dialogTheme: DialogThemeData(

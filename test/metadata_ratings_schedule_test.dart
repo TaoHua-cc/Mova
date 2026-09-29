@@ -139,6 +139,7 @@ void main() {
           return http.Response(
             jsonEncode({
               'external_ids': {'imdb_id': 'tt87654321', 'tvdb_id': 55555},
+              'poster_path': '/tmdb-poster.jpg',
               'networks': [],
               'seasons': [],
               'next_episode_to_air': {
@@ -161,6 +162,10 @@ void main() {
     expect(rows, hasLength(1));
     expect(rows.single.timeKnown, isTrue);
     expect(rows.single.airDate.toUtc().hour, 3);
+    expect(
+      rows.single.showPosterUrl,
+      Uri.parse('https://image.tmdb.org/t/p/w500/tmdb-poster.jpg'),
+    );
     client.dispose();
   });
   test(

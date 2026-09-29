@@ -13,15 +13,18 @@ class DanmakuCacheEntry {
     required this.savedAt,
     this.matchedEpisode,
     this.source,
+    this.coverageStale = false,
   });
 
   final List<DanmakuComment> comments;
   final DateTime savedAt;
   final String? matchedEpisode;
   final String? source;
+  final bool coverageStale;
 
   /// 超过这个时长就值得再拉一次（弹幕会被后来的观众补充）。
   bool get isStale =>
+      coverageStale ||
       DateTime.now().difference(savedAt) > DanmakuCache.refreshAfter;
 }
 
@@ -96,10 +99,9 @@ class DanmakuCache {
       if (data is! Map) return null;
       final raw = data['comments'];
       if (raw is! List) return null;
-      final comments = raw
-          .map(_decodeComment)
-          .whereType<DanmakuComment>()
-          .toList(growable: false);
+      final comments = DanmakuClient.retainTimelineCoverage(
+        raw.map(_decodeComment).whereType<DanmakuComment>(),
+      );
       final saved = data['savedAt'] is int
           ? DateTime.fromMillisecondsSinceEpoch(data['savedAt'] as int)
           : DateTime.now();
@@ -110,6 +112,11 @@ class DanmakuCache {
         savedAt: saved,
         matchedEpisode: matched is String ? matched : null,
         source: source is String ? source : null,
+        // Older builds truncated the beginning of full caches at 10,000. Ask
+        // the source for a timeline-wide sample once, then use that cache.
+        coverageStale:
+            raw.length >= DanmakuClient.maxComments &&
+            data['coverageVersion'] != DanmakuClient.timelineSamplingVersion,
       );
     } catch (_) {
       return null;
@@ -124,12 +131,16 @@ class DanmakuCache {
   }) async {
     if (comments.isEmpty) return;
     try {
+      final boundedComments = DanmakuClient.retainTimelineCoverage(comments);
       await File(_path(key)).writeAsString(
         jsonEncode(<String, dynamic>{
           'savedAt': DateTime.now().millisecondsSinceEpoch,
           'matched': matchedEpisode,
           'source': source,
-          'comments': comments.map(_encodeComment).toList(growable: false),
+          'coverageVersion': DanmakuClient.timelineSamplingVersion,
+          'comments': boundedComments
+              .map(_encodeComment)
+              .toList(growable: false),
         }),
       );
       unawaited(_evictIfNeeded());

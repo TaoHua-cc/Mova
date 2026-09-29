@@ -111,16 +111,36 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
     if (!WindowHost.isDesktop) return;
     final position = _position;
     if (position == null) return;
-    // 横向占优（触控板横滑 / Shift+滚轮）交给内层的横向列表。
-    if (event.scrollDelta.dy.abs() <= event.scrollDelta.dx.abs()) return;
+    final horizontal = switch (position.axisDirection) {
+      AxisDirection.left || AxisDirection.right => true,
+      AxisDirection.up || AxisDirection.down => false,
+    };
+    final delta = horizontal ? event.scrollDelta.dx : event.scrollDelta.dy;
+    // 横向预览货架只响应真正的横向手势；普通鼠标纵向滚轮继续滚动详情页，
+    // 不会意外横移尚未展开的列表。
+    if (delta == 0 ||
+        (!horizontal &&
+            event.scrollDelta.dy.abs() <= event.scrollDelta.dx.abs())) {
+      return;
+    }
+    // 延迟到信号解析器选定最深的可用滚动容器后再推进，避免嵌套页面和
+    // 横向货架同时响应同一滚轮事件。
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      if (!mounted || !widget.controller.hasClients) return;
+      final currentPosition = _position;
+      if (currentPosition == null) return;
+      _scrollBy(currentPosition, delta);
+    });
+  }
 
+  void _scrollBy(ScrollPosition position, double delta) {
     final pixels = position.pixels;
     if (_frame == null || (pixels - _written).abs() > 1) {
       // 上一段滑行已经停稳，或外部（拖拽、程序化定位）动过位置：重新对齐再起步。
       _shown = pixels;
       _goal = pixels;
     }
-    _goal = (_goal + event.scrollDelta.dy * widget.stepScale).clamp(
+    _goal = (_goal + delta * widget.stepScale).clamp(
       position.minScrollExtent,
       position.maxScrollExtent,
     );
@@ -129,8 +149,6 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
       _lastFrame = Duration.zero;
       _scheduleFrame();
     }
-    // 同一次事件若还嵌着别的可滚动视图，别让它再消费一遍。
-    GestureBinding.instance.pointerSignalResolver.register(event, (_) {});
   }
 
   void _onFrame(Duration elapsed) {
@@ -499,9 +517,18 @@ abstract final class YingjiGlass {
   /// 选中态 / 高亮态使用珍珠白，在深色玻璃上保持清晰、克制。
   static const Color accent = Color(0xFFF3F4F7);
 
-  /// 背后画面透过玻璃后的饱和度提升（vibrancy）：玻璃会聚光，透出来的颜色比
-  /// 直接看更浓一点 —— 这是液态玻璃「活」起来的关键。
-  static const double vibrancy = 1.35;
+  /// 已选控件采用更明亮的珍珠面，确保深浅海报上都能衬出深色图标/文字。
+  static const LinearGradient selectionFill = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [
+      Color(0xF5FFFFFF),
+      Color(0xEAF3F5F8),
+      Color(0xDBD5DDE6),
+      Color(0xF2FAFCFF),
+    ],
+    stops: [0, .34, .76, 1],
+  );
 
   static Color surface({double strength = 1}) =>
       frost.withValues(alpha: (alpha * strength).clamp(.07, .18));
@@ -538,42 +565,15 @@ abstract final class YingjiGlass {
     stops: <double>[0, .14, .46, .78, 1],
   );
 
-  /// 液态玻璃的背板滤镜：模糊 + 轻微提饱和（vibrancy）。
-  ///
-  /// 只保留少量色彩活力，不提亮；否则浅色画面会让整块面板过曝。
-  /// 用 `ImageFilter.compose` 而不是叠两层 `BackdropFilter`，省一次全屏回读。
+  /// 液态玻璃的背板滤镜。直接使用高斯模糊，确保 Windows / Android 都应用同一
+  /// 个外观设置值；避免复合颜色滤镜让部分平台只显示半透明底色。
   static ImageFilter backdrop({double? sigma}) {
     final value = sigma ?? blur;
-    final s = vibrancy;
-    return ImageFilter.compose(
-      outer: ImageFilter.blur(sigmaX: value, sigmaY: value),
-      inner: ColorFilter.matrix(<double>[
-        0.213 + 0.787 * s,
-        0.715 - 0.715 * s,
-        0.072 - 0.072 * s,
-        0,
-        0,
-        0.213 - 0.213 * s,
-        0.715 + 0.285 * s,
-        0.072 - 0.072 * s,
-        0,
-        0,
-        0.213 - 0.213 * s,
-        0.715 - 0.715 * s,
-        0.072 + 0.928 * s,
-        0,
-        0,
-        0,
-        0,
-        0,
-        1,
-        0,
-      ]),
-    );
+    return ImageFilter.blur(sigmaX: value, sigmaY: value);
   }
 }
 
-/// 一块液态玻璃表面：模糊背板 + 半透明底 + 厚度沉底，可裁圆角矩形或正圆。
+/// 一块液态玻璃表面：可调高斯模糊背板 + 半透明底 + 厚度沉底，可裁圆角矩形或正圆。
 ///
 /// **所有浮在内容之上的东西都必须走这里** —— 卡片、圆形按钮、药丸选择器、
 /// 下拉菜单、悬浮提示、播放页控件。原因只有一个：「设置 → 外观 → 模糊程度」
@@ -617,11 +617,17 @@ class YingjiGlassSurface extends StatelessWidget {
   final bool shadow;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: yingjiAppearance,
+    child: child,
+    builder: (context, child) => _buildSurface(context, child),
+  );
+
+  Widget _buildSurface(BuildContext context, Widget? content) {
     final rounded = BorderRadius.circular(radius);
     final shape = circle ? BoxShape.circle : BoxShape.rectangle;
     final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
-    Widget inner = child ?? const SizedBox.shrink();
+    Widget inner = content ?? const SizedBox.shrink();
     if (padding != null) inner = Padding(padding: padding!, child: inner);
     if (depth) {
       inner = DecoratedBox(
@@ -647,17 +653,20 @@ class YingjiGlassSurface extends StatelessWidget {
     final skipFilter =
         FrameTrace.skipGlass('glass') ||
         FrameTrace.skipGlass(circle ? 'circle' : 'rect');
+    // These surfaces overlap (dialog shell + episode rows), and the app does
+    // not provide a BackdropGroup above dialog routes. Use independent
+    // backdrops so every surface samples the actual scene behind it.
     final surface = skipFilter
         ? body
         : stableFilter
-        ? BackdropFilter.grouped(
+        ? BackdropFilter(
             filter: YingjiGlass.backdrop(sigma: sigma),
             child: body,
           )
         : ValueListenableBuilder<bool>(
             valueListenable: yingjiScrollInProgress,
             child: body,
-            builder: (context, scrolling, child) => BackdropFilter.grouped(
+            builder: (context, scrolling, child) => BackdropFilter(
               filter: YingjiGlass.backdrop(sigma: sigma),
               enabled: !scrolling,
               child: child,
@@ -1201,15 +1210,21 @@ class YingjiGlassMenu extends StatelessWidget {
     builder: (context, controller, _) => YingjiMotionSurface(
       borderRadius: borderRadius,
       selected: controller.isOpen,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(borderRadius),
+      child: GestureDetector(
+        onLongPressStart: secondaryOnly
+            ? (details) => controller.open(position: details.localPosition)
+            : null,
         onSecondaryTapUp: secondaryOnly
             ? (details) => controller.open(position: details.localPosition)
             : null,
-        onTap: secondaryOnly
-            ? null
-            : () => controller.isOpen ? controller.close() : controller.open(),
-        child: child,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(borderRadius),
+          onTap: secondaryOnly
+              ? null
+              : () =>
+                    controller.isOpen ? controller.close() : controller.open(),
+          child: child,
+        ),
       ),
     ),
   );
@@ -1255,9 +1270,11 @@ class _YingjiMotionSurfaceState extends State<YingjiMotionSurface> {
           onPointerUp: (_) => setState(() => _pressed = false),
           onPointerCancel: (_) => setState(() => _pressed = false),
           child: AnimatedScale(
-            scale: _pressed ? .975 : (active ? 1.012 : 1),
-            duration: MovaMotion.tapDown,
-            curve: MovaMotion.standardEase,
+            // Hover is expressed through the edge and shadow below instead of
+            // scaling a backdrop-filtered surface (which can shimmer at 125% DPI).
+            scale: _pressed ? MovaMotion.pressScaleCard : 1,
+            duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
+            curve: _pressed ? MovaMotion.press : MovaMotion.spring,
             child: AnimatedContainer(
               duration: MovaMotion.quick,
               curve: MovaMotion.standardEase,
@@ -1405,6 +1422,7 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
     return YingjiGlassTooltip(
       message: widget.tooltip,
       child: MouseRegion(
+        cursor: SystemMouseCursors.click,
         onEnter: (_) => setState(() => _hovered = true),
         onExit: (_) => setState(() {
           _hovered = false;
@@ -1455,17 +1473,7 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                                 DecoratedBox(
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                      colors: [
-                                        Color(0x66FFFFFF),
-                                        Color(0x48F4F7FB),
-                                        Color(0x36D5DEE9),
-                                        Color(0x55F8FAFC),
-                                      ],
-                                      stops: [0, .34, .76, 1],
-                                    ),
+                                    gradient: YingjiGlass.selectionFill,
                                   ),
                                 ),
                                 DecoratedBox(
@@ -1582,7 +1590,7 @@ class _YingjiGlassPillButtonState extends State<YingjiGlassPillButton> {
   @override
   Widget build(BuildContext context) {
     final active = widget.selected || _hovered;
-    final foreground = widget.selected ? const Color(0xFF111824) : Colors.white;
+    final foreground = widget.selected ? const Color(0xFF202923) : Colors.white;
     final compact =
         widget.compactLabel != null &&
         MediaQuery.sizeOf(context).width < widget.compactBelow;
@@ -1624,29 +1632,56 @@ class _YingjiGlassPillButtonState extends State<YingjiGlassPillButton> {
                   sigma: YingjiGlass.blur * .55,
                   strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
                   shadow: active,
-                  padding: const EdgeInsets.symmetric(horizontal: 18),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
+                  child: Stack(
+                    alignment: Alignment.center,
                     children: [
-                      if (widget.busy)
-                        SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: foreground,
+                      Positioned.fill(
+                        child: AnimatedContainer(
+                          duration: MovaMotion.quick,
+                          curve: MovaMotion.standardEase,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(
+                              widget.height / 2,
+                            ),
+                            gradient: widget.selected
+                                ? YingjiGlass.selectionFill
+                                : null,
                           ),
-                        )
-                      else
-                        Icon(widget.icon, size: 18, color: foreground),
-                      const SizedBox(width: 9),
-                      Text(
-                        label,
-                        style: TextStyle(
-                          color: foreground,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          height: 1,
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 18),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (widget.busy)
+                              SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: foreground,
+                                ),
+                              )
+                            else
+                              Icon(
+                                widget.icon,
+                                size: 18,
+                                color: widget.selected
+                                    ? YingjiColors.success
+                                    : foreground,
+                              ),
+                            const SizedBox(width: 9),
+                            Text(
+                              label,
+                              style: TextStyle(
+                                color: foreground,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                                height: 1,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
@@ -1714,6 +1749,136 @@ class GlassPanel extends StatelessWidget {
       YingjiGlassCard(padding: padding, radius: radius, child: child);
 }
 
+class YingjiContextAction {
+  const YingjiContextAction({
+    required this.value,
+    required this.label,
+    required this.icon,
+    this.selected = false,
+  });
+
+  final String value;
+  final String label;
+  final IconData icon;
+  final bool selected;
+}
+
+/// Shared right-click / long-press menu for content cards.
+Future<String?> showYingjiContextMenu({
+  required BuildContext context,
+  required Offset position,
+  required List<YingjiContextAction> actions,
+  double width = 248,
+}) => showGeneralDialog<String>(
+  context: context,
+  barrierDismissible: true,
+  barrierLabel: '关闭快捷菜单',
+  barrierColor: Colors.transparent,
+  transitionDuration: MovaMotion.quick,
+  pageBuilder: (dialogContext, _, _) {
+    final size = MediaQuery.sizeOf(dialogContext);
+    final left = position.dx.clamp(
+      12.0,
+      math.max(12.0, size.width - width - 12).toDouble(),
+    );
+    final top = position.dy.clamp(
+      12.0,
+      math.max(12.0, size.height - 180).toDouble(),
+    );
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => Navigator.pop(dialogContext),
+          ),
+        ),
+        Positioned(
+          left: left,
+          top: top,
+          width: width,
+          child: Material(
+            type: MaterialType.transparency,
+            child: DefaultTextStyle.merge(
+              style: const TextStyle(
+                color: YingjiColors.ink,
+                fontSize: 14,
+                height: 1.2,
+                decoration: TextDecoration.none,
+              ),
+              child: GlassPanel(
+                radius: 17,
+                padding: const EdgeInsets.all(7),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final action in actions)
+                      _YingjiContextActionTile(
+                        action: action,
+                        onTap: () => Navigator.pop(dialogContext, action.value),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  },
+  transitionBuilder: (context, animation, secondaryAnimation, child) =>
+      FadeTransition(
+        opacity: animation,
+        child: ScaleTransition(
+          scale: Tween<double>(begin: .96, end: 1).animate(
+            CurvedAnimation(parent: animation, curve: MovaMotion.enter),
+          ),
+          child: child,
+        ),
+      ),
+);
+
+class _YingjiContextActionTile extends StatelessWidget {
+  const _YingjiContextActionTile({required this.action, required this.onTap});
+
+  final YingjiContextAction action;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 2),
+    child: YingjiMotionSurface(
+      selected: action.selected,
+      borderRadius: 11,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(11),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
+          child: Row(
+            children: [
+              Icon(
+                action.icon,
+                size: 17,
+                color: Colors.white.withValues(alpha: .9),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  action.label,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+              if (action.selected)
+                const Icon(YingjiIcons.checkmark_circle_fill, size: 15),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 /// Shared modal shell for forms and lists whose content can overflow.
 /// Header and actions stay visible while only the middle region scrolls.
 class YingjiPinnedDialog extends StatelessWidget {
@@ -1725,6 +1890,7 @@ class YingjiPinnedDialog extends StatelessWidget {
     this.maxWidth = 720,
     this.maxHeight = 760,
     this.insetPadding = const EdgeInsets.all(28),
+    this.scrollController,
   });
 
   final Widget header;
@@ -1733,47 +1899,63 @@ class YingjiPinnedDialog extends StatelessWidget {
   final double maxWidth;
   final double maxHeight;
   final EdgeInsets insetPadding;
+  final ScrollController? scrollController;
 
   @override
-  Widget build(BuildContext context) => Dialog(
-    backgroundColor: Colors.transparent,
-    insetPadding: insetPadding,
-    child: ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: maxHeight),
-      child: GlassPanel(
-        radius: 22,
-        padding: EdgeInsets.zero,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
-              child: header,
-            ),
-            Divider(height: 1, color: YingjiGlass.line(strength: .85)),
-            Flexible(
-              child: ScrollConfiguration(
-                behavior: ScrollConfiguration.of(context)
-                    .copyWith(scrollbars: false),
-                child: SingleChildScrollView(
-                  primary: false,
-                  padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
-                  child: body,
-                ),
-              ),
-            ),
-            if (actions != null) ...[
-              Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+  Widget build(BuildContext context) {
+    final scrollView = ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: SingleChildScrollView(
+        controller: scrollController,
+        physics: scrollController == null ? null : yingjiWheelPhysics,
+        primary: false,
+        padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
+        child: body,
+      ),
+    );
+    final dialog = Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: insetPadding,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: maxHeight),
+        child: GlassPanel(
+          radius: 22,
+          padding: EdgeInsets.zero,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(22, 14, 22, 18),
-                child: actions!,
+                padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
+                child: header,
               ),
+              Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+              Flexible(
+                child: scrollController == null
+                    ? scrollView
+                    : YingjiSmoothWheel(
+                        controller: scrollController!,
+                        stableGlass: true,
+                        child: scrollView,
+                      ),
+              ),
+              if (actions != null) ...[
+                Divider(height: 1, color: YingjiGlass.line(strength: .85)),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(22, 14, 22, 18),
+                  child: actions!,
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
-    ),
-  );
+    );
+    // 稳定材质需要覆盖弹窗玻璃外壳，而不是只包住里面的滚动内容；否则
+    // 全局滚动状态仍会在外层 GlassPanel 上关掉 BackdropFilter。
+    return scrollController == null
+        ? dialog
+        : YingjiStableScrollGlass(child: dialog);
+  }
 }
 
 class YingjiMark extends StatelessWidget {

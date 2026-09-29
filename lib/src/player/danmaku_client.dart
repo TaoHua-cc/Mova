@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -29,6 +30,9 @@ class DanmakuComment {
 }
 
 class DanmakuClient {
+  static const int maxComments = 10000;
+  static const int timelineSamplingVersion = 1;
+
   DanmakuClient({http.Client? client})
     : _client = client ?? createNetworkHttpClient();
   final http.Client _client;
@@ -102,10 +106,9 @@ class DanmakuClient {
         );
       }
       final list = _findList(decoded);
-      return list
-          .map(_parseComment)
-          .whereType<DanmakuComment>()
-          .toList(growable: false);
+      return retainTimelineCoverage(
+        list.map(_parseComment).whereType<DanmakuComment>(),
+      );
     } on TimeoutException {
       throw Exception('弹幕 API 请求超时，请检查地址或网络');
     } on HandshakeException {
@@ -127,6 +130,29 @@ class DanmakuClient {
   }
 
   void dispose() => _client.close();
+
+  /// Keeps a bounded, repeatable sample from the entire source instead of
+  /// silently keeping only its first [maxComments] entries. Popular episodes
+  /// can exceed that limit in their opening minutes, leaving resumed playback
+  /// with no comments if the tail was discarded.
+  static List<DanmakuComment> retainTimelineCoverage(
+    Iterable<DanmakuComment> comments,
+  ) {
+    final retained = <DanmakuComment>[];
+    final random = Random(0x4D6F7661);
+    var seen = 0;
+    for (final comment in comments) {
+      seen++;
+      if (retained.length < maxComments) {
+        retained.add(comment);
+        continue;
+      }
+      final slot = random.nextInt(seen);
+      if (slot < maxComments) retained[slot] = comment;
+    }
+    retained.sort((left, right) => left.time.compareTo(right.time));
+    return retained;
+  }
 
   Future<dynamic> _fetchTaoHua(
     Uri base,

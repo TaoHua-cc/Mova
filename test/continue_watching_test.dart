@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:yingji/src/history/watch_state_store.dart';
 
@@ -29,6 +30,55 @@ void main() {
     expect(continueWatchingRows(history).single.mediaId, 'new-url');
     expect(history.length, 2);
   });
+  test(
+    'removing a series hides all its episodes until new playback progress',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final store = await WatchStateStore.create();
+      final first = episode('s1e1', 400, 1);
+      final latest = episode('s1e2', 500, 2, number: 2);
+      await store.replaceAll([first, latest]);
+      final staleRefreshSnapshot = store.visibleContinueRows(store.load());
+
+      await store.hideFromContinueWatching(latest);
+      expect(store.visibleContinueRows(store.load()), isEmpty);
+      expect(store.visibleContinueRows(staleRefreshSnapshot), isEmpty);
+      expect(store.load(), hasLength(2));
+
+      final serverReplica = WatchState(
+        mediaId: 'server-playback-url',
+        title: '示例剧',
+        position: const Duration(seconds: 600),
+        duration: const Duration(seconds: 1000),
+        sourceId: 'server-a',
+        serverItemId: 'item-2',
+        seasonNumber: 1,
+        episodeNumber: 3,
+        progressOrigin: 'server',
+      );
+      final restoredStore = await WatchStateStore.create();
+      expect(
+        restoredStore.visibleContinueRows([
+          ...restoredStore.load(),
+          serverReplica,
+        ]),
+        isEmpty,
+      );
+
+      await restoredStore.save(
+        episode('new-playback', 100, 3, number: 3),
+        updatedAt: DateTime(2027),
+      );
+      expect(
+        restoredStore.visibleContinueRows(restoredStore.load()),
+        hasLength(1),
+      );
+      expect(
+        restoredStore.visibleContinueRows(restoredStore.load()).single.mediaId,
+        'new-playback',
+      );
+    },
+  );
   test('marking episode one watched preserves episode two resume progress', () {
     final history = [
       episode('episode-one-old', 400, 1),
@@ -86,6 +136,24 @@ void main() {
     expect(restored.progressOrigin, 'server');
     expect(restored.progressOriginName, '客厅服务器');
   });
+
+  test(
+    'continue origin is shared in sync mode and distinct in local-only mode',
+    () {
+      WatchState row(String origin) => WatchState(
+        mediaId: origin,
+        title: '示例剧',
+        position: const Duration(minutes: 8),
+        duration: const Duration(minutes: 45),
+        progressOrigin: origin,
+      );
+
+      for (final origin in ['local', 'server', 'trakt']) {
+        expect(row(origin).visibleProgressOrigin(localOnly: false), 'server');
+        expect(row(origin).visibleProgressOrigin(localOnly: true), origin);
+      }
+    },
+  );
 
   test('dated rows lead by time, then undated rows use source priority', () {
     WatchState row(String id, String origin, {DateTime? time}) => WatchState(
@@ -202,10 +270,13 @@ void main() {
 
     final healed = [
       row('e2-url', '叛逆的女仆', 2),
-      normalizeWatchState(row('e1-url', '博登家的女儿', 1).withEpisodeMetadata(
-        title: '叛逆的女仆',
-        episodeTitle: '博登家的女儿',
-      )),
+      normalizeWatchState(
+        row(
+          'e1-url',
+          '博登家的女儿',
+          1,
+        ).withEpisodeMetadata(title: '叛逆的女仆', episodeTitle: '博登家的女儿'),
+      ),
     ];
     final visible = continueWatchingRows(healed);
     expect(visible, hasLength(1));

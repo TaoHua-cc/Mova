@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yingji/src/brand.dart';
 
@@ -95,7 +96,42 @@ void main() {
     expect(YingjiGlass.surface().a, inInclusiveRange(.07, .18));
     expect(YingjiGlass.chrome().a, inInclusiveRange(.11, .24));
     expect(YingjiGlass.hud().a, inInclusiveRange(.14, .30));
-    expect(YingjiGlass.vibrancy, inInclusiveRange(1.2, 1.5));
+  });
+
+  test('shared glass samples its backdrop without a missing group', () {
+    final brand = File('lib/src/brand.dart').readAsStringSync();
+    final surface = brand.substring(
+      brand.indexOf('class YingjiGlassSurface'),
+      brand.indexOf('class _YingjiGlassEdgePainter'),
+    );
+    expect(surface, contains('BackdropFilter('));
+    expect(surface, isNot(contains('BackdropFilter.grouped')));
+  });
+
+  testWidgets('shared glass updates its blur when appearance changes', (
+    tester,
+  ) async {
+    final previous = yingjiAppearance.glassBlur;
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Center(
+          child: YingjiGlassSurface(child: SizedBox.square(dimension: 80)),
+        ),
+      ),
+    );
+    final filterBefore = tester
+        .widget<BackdropFilter>(find.byType(BackdropFilter))
+        .filter;
+
+    yingjiAppearance.apply(glassBlur: previous == 0 ? 30 : 0);
+    await tester.pump();
+    final filterAfter = tester
+        .widget<BackdropFilter>(find.byType(BackdropFilter))
+        .filter;
+    expect(filterAfter, isNot(same(filterBefore)));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    yingjiAppearance.apply(glassBlur: previous);
   });
 
   test('shared glass edge stays aligned to physical pixels', () {
@@ -121,10 +157,12 @@ void main() {
     expect(brand, contains('static const Color accent = Color(0xFFF3F4F7)'));
     expect(selected, contains('LinearGradient'));
     expect(selected, contains('RadialGradient'));
-    expect(selected, contains('Color(0x36D5DEE9)'));
+    expect(selected, contains('gradient: YingjiGlass.selectionFill'));
+    expect(brand, contains('Color(0xF5FFFFFF)'));
     expect(selected, isNot(contains('Color(0x48D99A68)')));
     expect(brand, contains('Colors.white.withValues(alpha: .92)'));
     expect(brand, contains('const Color(0xFF111824)'));
+    expect(brand, contains('gradient: YingjiGlass.selectionFill'));
   });
 
   test('player dock draws a full-bleed progress bar without a backdrop plate', () {

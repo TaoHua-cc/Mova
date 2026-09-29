@@ -34,9 +34,6 @@ abstract final class MediaDetailCache {
   /// 同一部剧的重新聚合间隔：这段时间内反复开关详情页都只用缓存。
   static const Duration scanCooldown = Duration(minutes: 10);
 
-  /// 单部剧最多缓存多少行，避免长篇剧把偏好文件撑得过大。
-  static const int _maxRows = 800;
-
   static const String _rowsPrefix = 'yingji.detail.res.v1.';
   static const String _scanPrefix = 'yingji.detail.scan.v1.';
 
@@ -92,13 +89,10 @@ abstract final class MediaDetailCache {
     if (item.id <= 0 || rows.isEmpty) return;
     try {
       final prefs = await SharedPreferences.getInstance();
-      final capped = rows.length > _maxRows
-          ? rows.take(_maxRows).toList(growable: false)
-          : rows;
       final key = _key(_rowsPrefix, item);
       final body = jsonEncode({
         'savedAt': DateTime.now().toIso8601String(),
-        'rows': capped.map(_mediaItemToJson).toList(growable: false),
+        'rows': rows.map(_mediaItemToJson).toList(growable: false),
         'posters': {
           for (final entry in seasonPosters.entries)
             '${entry.key}': entry.value.toString(),
@@ -122,7 +116,7 @@ abstract final class MediaDetailCache {
     }
   }
 
-  /// 上次聚合是否还在冷却期内。
+  /// 最近一次自动搜索尝试是否还在冷却期内（无结果或失败也会记录）。
   static Future<bool> recentlyScanned(TmdbItem item) async {
     if (item.id <= 0) return false;
     try {
@@ -138,6 +132,8 @@ abstract final class MediaDetailCache {
     }
   }
 
+  /// Records an automatic scan attempt, whether it found resources or failed.
+  /// Manual retries bypass this timestamp in the detail page.
   static Future<void> markScanned(TmdbItem item) async {
     if (item.id <= 0) return;
     try {

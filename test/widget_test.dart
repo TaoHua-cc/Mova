@@ -176,6 +176,39 @@ void main() {
     expect(prefs.containsKey('yingji.appearance.theme'), isFalse);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+  testWidgets('reordering player tools persists the order for playback', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    tester.view.physicalSize = const Size(1440, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      const MaterialApp(home: Scaffold(body: SettingsPage())),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, '播放器按钮').first);
+    await tester.pumpAndSettle();
+
+    final firstTool = find.byKey(const ValueKey('声音'));
+    final thirdTool = find.byKey(const ValueKey('剧集'));
+    final dragHandle = find.descendant(
+      of: firstTool,
+      matching: find.byType(ReorderableDragStartListener),
+    );
+    await tester.dragFrom(
+      tester.getCenter(dragHandle),
+      tester.getCenter(thirdTool) - tester.getCenter(dragHandle),
+    );
+    await tester.pumpAndSettle();
+
+    final prefs = await SharedPreferences.getInstance();
+    final savedOrder = prefs.getStringList('yingji.player.tool-order');
+    expect(savedOrder, isNotNull);
+    expect(savedOrder!.take(2), ['字幕', '声音']);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
   testWidgets('discover shelves can be shown and persist their layout', (
     tester,
   ) async {

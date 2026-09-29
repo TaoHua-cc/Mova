@@ -3,12 +3,152 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:yingji/src/brand.dart';
+import 'package:yingji/src/cache/media_cache.dart';
 import 'package:yingji/src/metadata/metadata_detail_page.dart';
 import 'package:yingji/src/metadata/tmdb_client.dart';
 import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  test(
+    'episode played-state action supports touch and desktop context input',
+    () {
+      final detail = File('lib/src/metadata/metadata_detail_page.dart')
+          .readAsStringSync();
+      final previewRail = detail.substring(
+        detail.indexOf('class _EpisodePreviewRailState'),
+        detail.indexOf('class _EpisodeStat'),
+      );
+      final allEpisodeCard = detail.substring(
+        detail.indexOf('class _AllEpisodeCard'),
+        detail.indexOf('class _EpisodeContextAction'),
+      );
+
+      expect(previewRail, contains('onLongPressStart'));
+      expect(previewRail, contains('onSecondaryTapUp'));
+      expect(allEpisodeCard, contains('onLongPressStart'));
+      expect(allEpisodeCard, contains('onSecondaryTapUp'));
+      expect(previewRail, contains('长按 / 右键可更新观看状态'));
+    },
+  );
+
+  test('selected episode frame wraps the poster only', () {
+    final detail = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final previewRail = detail.substring(
+      detail.indexOf('class _EpisodePreviewRailState'),
+      detail.indexOf('class _EpisodeStat'),
+    );
+    final list = previewRail.substring(
+      previewRail.indexOf('ListView.separated'),
+    );
+    final poster = list.indexOf('height: 134,');
+    final title = list.indexOf(r"'第 $effectiveEpisode 集 · $title'");
+    final synopsis = list.indexOf('if (overview?.isNotEmpty == true) ...[');
+    final posterFrame = list.substring(poster, title);
+    final episodeText = list.substring(title, synopsis);
+
+    expect(posterFrame, contains('border: Border.all('));
+    expect(posterFrame, contains('color: active'));
+    expect(episodeText, contains('_dateLabel(published)'));
+    expect(episodeText, isNot(contains('border: Border.all(')));
+    expect(episodeText, isNot(contains('overview')));
+  });
+
+  test('catalog episode selection surface wraps the poster only', () {
+    final detail = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final catalogRail = detail.substring(
+      detail.indexOf('class _CatalogEpisodeRailState'),
+      detail.indexOf('class _EpisodePreviewRail'),
+    );
+    final list = catalogRail.substring(
+      catalogRail.indexOf('ListView.separated'),
+    );
+    final frame = list.indexOf('YingjiMotionSurface(');
+    final poster = list.indexOf('height: 134,', frame);
+    final title = list.indexOf(
+      r"'第 ${episode.episodeNumber} 集 · ${episode.name}'",
+      poster,
+    );
+    final episodeText = list.substring(title);
+
+    expect(frame, greaterThanOrEqualTo(0));
+    expect(poster, greaterThan(frame));
+    expect(title, greaterThan(poster));
+    expect(episodeText, isNot(contains('YingjiMotionSurface(')));
+  });
+
+  test('mark-unplayed stays neutral and clears stored playback progress', () {
+    final detail = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final mediaCenter = File('lib/src/media_center.dart').readAsStringSync();
+    final unplayedAction = RegExp(
+      r"YingjiContextAction\(\s*value: 'unplayed',[^)]*selected: false[^)]*\)",
+      dotAll: true,
+    );
+
+    expect(unplayedAction.allMatches(detail), hasLength(2));
+    expect(unplayedAction.allMatches(mediaCenter), hasLength(1));
+    // Detail actions remove local resume rows; the continue-watching action
+    // overwrites the row at zero so it no longer carries stale progress.
+    expect(detail, contains('await watchStore.remove(mediaId)'));
+    expect(detail, contains('await store.remove(mediaId)'));
+    expect(
+      mediaCenter,
+      contains('position: played ? state.duration : Duration.zero'),
+    );
+  });
+
+  test('empty detail scans still suppress repeated automatic searches', () async {
+    SharedPreferences.setMockInitialValues({});
+    const item = TmdbItem(id: 42, title: '测试剧集', kind: '剧集');
+
+    expect(await MediaDetailCache.load(item), isNull);
+    await MediaDetailCache.markScanned(item);
+    expect(await MediaDetailCache.recentlyScanned(item), isTrue);
+
+    final source = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final loading = source.substring(
+      source.indexOf('Future<void> _loadResources('),
+      source.indexOf('/// Derives per-episode progress'),
+    );
+    expect(
+      loading,
+      contains(
+        'final cooling = await MediaDetailCache.recentlyScanned(widget.item);',
+      ),
+    );
+    expect(loading, isNot(contains('restored && await')));
+    expect(loading, contains('if (restored) {'));
+    expect(loading, contains('_loadingResources = false;'));
+    expect(
+      loading,
+      contains('await MediaDetailCache.markScanned(widget.item);'),
+    );
+    expect(loading, contains('最近一次检查已结束，点击重试可立即重新搜索。'));
+  });
+
+  test('resource section has a right-aligned server aggregation retry', () {
+    final source = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final resourceSection = source.substring(
+      source.indexOf('class _ResourceSection extends StatefulWidget'),
+      source.indexOf('class _FilterChip extends StatefulWidget'),
+    );
+    final detailBuild = source.substring(
+      source.indexOf('Widget build(BuildContext context) => Scaffold('),
+      source.indexOf('Future<void> _play('),
+    );
+
+    expect(resourceSection, contains("label: '重新搜索'"));
+    expect(resourceSection, contains('onPressed: widget.onRetry'));
+    expect(detailBuild, contains('onRetry: () => item.kind =='));
+    expect(detailBuild, contains('_searchSelectedEpisode()'));
+  });
+
   test(
     'resume detail selection matches season and episode across versions',
     () {
@@ -91,8 +231,59 @@ void main() {
     expect(route, contains('allowSnapshotting: true'));
     expect(route, contains('ScaleTransition('));
     expect(route, contains('RepaintBoundary(child: child)'));
+    expect(route, contains('originAlignment'));
+    expect(route, isNot(contains('LayoutBuilder(')));
     expect(route, isNot(contains('Rect.lerp(')));
     expect(route, isNot(contains('FittedBox(')));
+  });
+
+  testWidgets('detail episode list opts into smooth modal scrolling', (
+    tester,
+  ) async {
+    final source = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final allEpisodes = source.substring(
+      source.indexOf('Future<void> _showAllEpisodes()'),
+      source.indexOf('class _EpisodeStat'),
+    );
+    expect(allEpisodes, contains('scrollController: _episodeDialogScroll'));
+
+    final controller = ScrollController();
+    addTearDown(controller.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: YingjiPinnedDialog(
+            header: const Text('全部剧集'),
+            body: const SizedBox(height: 700),
+            scrollController: controller,
+            maxWidth: 420,
+            maxHeight: 360,
+            insetPadding: EdgeInsets.zero,
+          ),
+        ),
+      ),
+    );
+    expect(find.byType(YingjiSmoothWheel), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  test('season episode catalog uses the shared glass dialog shell', () {
+    final source = File('lib/src/metadata/metadata_detail_page.dart')
+        .readAsStringSync();
+    final showAllStart = source.indexOf('Future<void> _showAll()');
+    final showAll = source.substring(
+      showAllStart,
+      source.indexOf('void _move(', showAllStart),
+    );
+
+    // The screenshot's “第 N 季 · 全部剧集” entry lives in this seasonal rail,
+    // separate from MetadataDetailPage._showAllEpisodes(). Keep it on the same
+    // preference-driven blur surface instead of Material's plain AlertDialog.
+    expect(showAll, contains('YingjiStableScrollGlass('));
+    expect(showAll, contains('GlassPanel('));
+    expect(showAll, contains('ListView.builder('));
+    expect(showAll, isNot(contains('AlertDialog(')));
   });
 
   testWidgets(

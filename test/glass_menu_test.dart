@@ -1,8 +1,10 @@
 import 'dart:ui' show PointerDeviceKind;
 
+import 'package:flutter/gestures.dart' show kSecondaryMouseButton;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:yingji/src/brand.dart';
+import 'package:yingji/src/motion.dart';
 
 void main() {
   testWidgets('motion surface responds to hover and press without relayout', (
@@ -23,10 +25,12 @@ void main() {
     await mouse.addPointer(location: Offset.zero);
     await mouse.moveTo(tester.getCenter(find.byKey(target)));
     await tester.pump(const Duration(milliseconds: 200));
-    expect(
-      tester.widget<AnimatedScale>(find.byType(AnimatedScale)).scale,
-      1.012,
+    expect(tester.widget<AnimatedScale>(find.byType(AnimatedScale)).scale, 1);
+    final hoverOutline = tester.widget<AnimatedContainer>(
+      find.byType(AnimatedContainer),
     );
+    final outline = hoverOutline.foregroundDecoration! as BoxDecoration;
+    expect(outline.border, isNotNull);
 
     final press = await tester.startGesture(
       tester.getCenter(find.byKey(target)),
@@ -34,7 +38,7 @@ void main() {
     await tester.pump();
     expect(
       tester.widget<AnimatedScale>(find.byType(AnimatedScale)).scale,
-      .975,
+      MovaMotion.pressScaleCard,
     );
     expect(tester.getSize(find.byKey(target)), originalSize);
     await press.up();
@@ -70,10 +74,9 @@ void main() {
     yingjiAppearance.apply(glassBlur: 0);
     await tester.pump();
     final filter = tester.widget<BackdropFilter>(menuGlass);
-    // 背板滤镜是「模糊 + vibrancy」的 compose，不再是一个裸的 blur
-    // （compose 的 toString 不会展开内层 blur，所以只断言到这一层）。
+    // 直接使用平台原生高斯模糊，避免只剩透明色底。
     expect(yingjiAppearance.glassBlur, 0);
-    expect(filter.filter.toString(), contains('ImageFilter.compose'));
+    expect(filter.filter.toString(), contains('ImageFilter.blur'));
     await tester.tap(find.text('two'));
     await tester.pumpAndSettle();
     expect(selection, 'two');
@@ -81,6 +84,104 @@ void main() {
     expect(find.byType(BackdropFilter), findsOneWidget);
     expect(tester.takeException(), isNull);
     yingjiAppearance.apply(glassBlur: 24);
+  });
+
+  testWidgets('secondary-only context menu also opens on long press', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: YingjiGlassMenu(
+            secondaryOnly: true,
+            entries: const [Text('上下文操作')],
+            child: const SizedBox(width: 120, height: 52, child: Text('项目')),
+          ),
+        ),
+      ),
+    );
+
+    await tester.longPress(find.text('项目'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('上下文操作'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'secondary-only context menu opens on a Windows-style right click',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: YingjiGlassMenu(
+              secondaryOnly: true,
+              entries: const [Text('右键菜单')],
+              child: const SizedBox(width: 120, height: 52, child: Text('项目')),
+            ),
+          ),
+        ),
+      );
+
+      final rightClick = await tester.startGesture(
+        tester.getCenter(find.text('项目')),
+        kind: PointerDeviceKind.mouse,
+        buttons: kSecondaryMouseButton,
+      );
+      await rightClick.up();
+      await tester.pumpAndSettle();
+
+      expect(find.text('右键菜单'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('shared content context menu keeps material text and glass', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => showYingjiContextMenu(
+              context: context,
+              position: const Offset(20, 20),
+              actions: const [
+                YingjiContextAction(
+                  value: 'played',
+                  label: '标记为已播放',
+                  icon: YingjiIcons.checkmark_circle_fill,
+                ),
+              ],
+            ),
+            child: const Text('打开'),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('打开'));
+    await tester.pumpAndSettle();
+
+    final action = find.text('标记为已播放');
+    expect(action, findsOneWidget);
+    expect(
+      find.ancestor(of: action, matching: find.byType(Material)),
+      findsWidgets,
+    );
+    expect(
+      find.ancestor(of: action, matching: find.byType(GlassPanel)),
+      findsOneWidget,
+    );
+    expect(
+      find.ancestor(of: action, matching: find.byType(BackdropFilter)),
+      findsOneWidget,
+    );
+    final style = DefaultTextStyle.of(tester.element(action)).style;
+    expect(style.fontSize, 14);
+    expect(style.color, YingjiColors.ink);
+    expect(style.decoration, TextDecoration.none);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('scrolling dialog keeps header and actions pinned', (
@@ -128,5 +229,31 @@ void main() {
     expect(tester.getTopLeft(find.byKey(headerKey)), headerBefore);
     expect(tester.getTopLeft(find.byKey(actionKey)), actionBefore);
     expect(find.text('滚动内容 20'), findsOneWidget);
+  });
+
+  testWidgets('smooth pinned dialog keeps its shell in stable glass scope', (
+    tester,
+  ) async {
+    final controller = ScrollController();
+    addTearDown(controller.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: YingjiPinnedDialog(
+          header: const Text('全部剧集'),
+          body: const SizedBox(height: 900),
+          scrollController: controller,
+          maxHeight: 360,
+          insetPadding: EdgeInsets.zero,
+        ),
+      ),
+    );
+
+    final shellGlass = find.ancestor(
+      of: find.byType(GlassPanel).first,
+      matching: find.byType(YingjiStableScrollGlass),
+    );
+    expect(shellGlass, findsOneWidget);
+    expect(find.byType(YingjiSmoothWheel), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }
