@@ -187,6 +187,18 @@ class MetadataDetailPage extends StatefulWidget {
     Offset? tapPosition,
   }) {
     final navigator = Navigator.of(sourceContext);
+    if (WindowHost.isAndroid) {
+      return navigator.push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => MetadataDetailPage(
+            item: item,
+            media: media,
+            initialSeasonNumber: initialSeasonNumber,
+            initialEpisodeNumber: initialEpisodeNumber,
+          ),
+        ),
+      );
+    }
     final sourceBox = sourceContext.findRenderObject();
     final overlayBox = navigator.overlay?.context.findRenderObject();
     Rect? origin;
@@ -1661,6 +1673,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }
     final selected = await showModalBottomSheet<YingjiPlaylist>(
       context: context,
+      sheetAnimationStyle: MovaMotion.dialogAnimationStyle(context),
       backgroundColor: YingjiGlass.surface(strength: 1.15),
       builder: (context) => YingjiStableScrollGlass(
         child: SafeArea(
@@ -1715,6 +1728,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (choices.isEmpty) return;
     final selected = await showModalBottomSheet<MediaItem>(
       context: context,
+      sheetAnimationStyle: MovaMotion.dialogAnimationStyle(context),
       backgroundColor: Colors.transparent,
       barrierColor: Colors.black54,
       builder: (context) => YingjiStableScrollGlass(
@@ -1786,6 +1800,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (resource == null) return;
     await showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       barrierColor: Colors.black.withValues(alpha: .62),
       builder: (context) => YingjiStableScrollGlass(
         child: StatefulBuilder(
@@ -1969,6 +1984,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   Future<void> _showMore(TmdbItem item) async {
     final action = await showModalBottomSheet<String>(
       context: context,
+      sheetAnimationStyle: MovaMotion.dialogAnimationStyle(context),
       backgroundColor: YingjiGlass.surface(strength: 1.15),
       builder: (context) => SafeArea(
         child: Wrap(
@@ -2957,6 +2973,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           onResolveEpisode: resolvePlayerEpisode,
         ),
         transitionsBuilder: (context, animation, _, child) {
+          if (MediaQuery.disableAnimationsOf(context)) {
+            return child;
+          }
+          if (WindowHost.isAndroid) {
+            return FadeTransition(opacity: animation, child: child);
+          }
           final curve = CurvedAnimation(
             parent: animation,
             curve: Curves.easeOutCubic,
@@ -2995,6 +3017,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     final controller = TextEditingController();
     final query = await showDialog<String>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (dialogContext) => AlertDialog(
         title: const Text('搜索资源'),
         content: TextField(
@@ -3780,6 +3803,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
     int? hoveredEpisodeNumber;
     await showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       barrierColor: Colors.black.withValues(alpha: .58),
       builder: (dialogContext) => YingjiStableScrollGlass(
         child: StatefulBuilder(
@@ -4706,6 +4730,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
     final episodeProgress = Map<String, double>.of(widget.episodeProgress);
     return showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       barrierColor: Colors.black.withValues(alpha: .72),
       builder: (context) => StatefulBuilder(
         builder: (context, updateDialog) {
@@ -6526,6 +6551,9 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                     return InkWell(
                       onTap: () => showDialog<void>(
                         context: context,
+                        animationStyle: MovaMotion.dialogAnimationStyle(
+                          context,
+                        ),
                         builder: (context) => Dialog(
                           backgroundColor: Colors.transparent,
                           child: ConstrainedBox(
@@ -6716,6 +6744,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
     try {
       await showModalBottomSheet<void>(
         context: context,
+        sheetAnimationStyle: MovaMotion.dialogAnimationStyle(context),
         isScrollControlled: true,
         backgroundColor: Colors.transparent,
         barrierColor: Colors.black.withValues(alpha: .66),
@@ -7029,6 +7058,7 @@ class _ArtworkDetailCard extends StatelessWidget {
   Widget build(BuildContext context) => InkWell(
     onTap: () => showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (context) => Dialog(
         backgroundColor: Colors.transparent,
         child: Stack(

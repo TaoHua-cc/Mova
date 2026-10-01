@@ -67,5 +67,7 @@ void main() {
 
     expect(find.byKey(const ValueKey('home')), findsOneWidget);
     expect(find.text('Mova'), findsNothing);
+    await tester.pumpAndSettle();
+    expect(tester.binding.hasScheduledFrame, isFalse);
   });
 }

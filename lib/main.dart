@@ -22,11 +22,14 @@ Future<void> main() async {
   PaintingBinding.instance.imageCache.maximumSizeBytes = 96 << 20;
   configureNetworkHttpOverrides();
   MediaKit.ensureInitialized();
-  // Desktop window APIs must be ready before the first frame. Preferences and
-  // proxy state are intentionally loaded after runApp so they cannot delay it.
+  // Desktop window APIs must be ready before the first frame. Android keeps
+  // preferences/proxy initialization behind its single native launch splash.
   await WindowHost.ensureInitialized();
   final startup = _loadStartupSettings();
-  runApp(YingjiApp(startup: startup));
+  // Android already owns the centered-icon splash until Flutter's first frame.
+  // Initialize behind that splash, rather than presenting a second animation.
+  if (WindowHost.isAndroid) await startup.catchError((_) {});
+  runApp(YingjiApp(startup: WindowHost.isAndroid ? null : startup));
 
   WidgetsBinding.instance.addPostFrameCallback((_) {
     unawaited(

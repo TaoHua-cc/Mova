@@ -20,6 +20,7 @@ import '../motion.dart';
 import '../history/watch_state_store.dart';
 import '../network/proxy_routing.dart';
 import 'danmaku_client.dart';
+import 'danmaku_timeline.dart';
 import 'dolby_vision_color.dart';
 import 'native_dolby_vision.dart';
 import 'subtitle_preference.dart';
@@ -287,6 +288,7 @@ class _PlayerPageState extends State<PlayerPage> {
   StreamSubscription<dynamic>? _exoEventSubscription;
   String? _exoPlaybackUrl;
   Map<String, String> _exoHeaders = const {};
+  String? _exoTrackSignature;
   late final FocusNode _focusNode;
   late int _activeEpisodeIndex;
   bool _showControls = true;
@@ -321,7 +323,7 @@ class _PlayerPageState extends State<PlayerPage> {
   /// URL when the session starts. Not mandatory (the server falls back to the
   /// item's default source) but sent for parity with official clients.
   final Map<String, String> _sessionMediaSourceIds = {};
-  String _consoleTab = '音轨与字幕';
+  String _consoleTab = '声音';
   double? _sliderSeekPreview;
   bool _hardware = true;
   bool _hdr = true;
@@ -448,7 +450,6 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 上一次单击的时间，用于自实现的双击判定。
   DateTime? _lastTapAt;
-  DateTime? _ignoreTapUntil;
 
   // ── 右下角工具按钮的顺序与显隐（设置页保存）────────────────────
   /// 用户排好的顺序；缺省是 [YingjiPlayerTools.all] 的声明顺序。
@@ -578,11 +579,15 @@ class _PlayerPageState extends State<PlayerPage> {
       if (mounted) setState(() => _error = error);
       return;
     }
+    final trackSignature = jsonEncode(event['tracks']);
+    final tracksChanged = trackSignature != _exoTrackSignature;
+    _exoTrackSignature = trackSignature;
     final audio = <AudioTrack>[];
     final subtitle = <SubtitleTrack>[];
     var selectedAudio = const AudioTrack('auto', null, null);
     var selectedSubtitle = const SubtitleTrack('auto', null, null);
-    for (final raw in (event['tracks'] as List? ?? const [])) {
+    for (final raw
+        in (tracksChanged ? event['tracks'] as List? ?? const [] : const [])) {
       if (raw is! Map) continue;
       final type = raw['type'] as String?;
       final id = '${raw['index'] ?? -1}';
@@ -598,8 +603,12 @@ class _PlayerPageState extends State<PlayerPage> {
         if (raw['selected'] == true) selectedSubtitle = track;
       }
     }
-    final tracks = Tracks(audio: audio, subtitle: subtitle);
-    final selected = Track(audio: selectedAudio, subtitle: selectedSubtitle);
+    final tracks = tracksChanged
+        ? Tracks(audio: audio, subtitle: subtitle)
+        : _exoState.tracks;
+    final selected = tracksChanged
+        ? Track(audio: selectedAudio, subtitle: selectedSubtitle)
+        : _exoState.track;
     final position = Duration(
       milliseconds: (event['positionMs'] as num?)?.toInt() ?? 0,
     );
@@ -630,7 +639,12 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     if (previous.tracks != tracks) _exoTracksController.add(tracks);
     if (previous.track != selected) _exoTrackController.add(selected);
-    if (mounted) setState(() {});
+    if (mounted &&
+        (tracksChanged ||
+            previous.duration != duration ||
+            previous.buffering != _exoState.buffering)) {
+      setState(() {});
+    }
   }
 
   @override
@@ -698,6 +712,7 @@ class _PlayerPageState extends State<PlayerPage> {
     });
     _playingSubscription = _playingStream.listen((playing) {
       if (!mounted || _switchingEpisode) return;
+      setState(() {});
       if (playing) {
         // 至少真正播过一次，之后暂停才在画面中央显示「继续播放」；
         // 否则开片缓冲阶段也会顶着一个大播放键。
@@ -769,12 +784,6 @@ class _PlayerPageState extends State<PlayerPage> {
   // 发滞。改为自己维护 280ms 的双击窗口，单击零延迟响应。
   void _handleTap() {
     final now = DateTime.now();
-    final ignoreTapUntil = _ignoreTapUntil;
-    _ignoreTapUntil = null;
-    if (ignoreTapUntil != null && now.isBefore(ignoreTapUntil)) {
-      _lastTapAt = null;
-      return;
-    }
     final previous = _lastTapAt;
     final isDoubleTap =
         previous != null &&
@@ -1005,7 +1014,6 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   void _openConsoleTab(String tab) {
-    if (tab == '声音' || tab == '字幕') tab = '音轨与字幕';
     setState(() {
       if (_settingsOpen && _consoleTab == tab) {
         _settingsOpen = false;
@@ -2521,7 +2529,7 @@ class _PlayerPageState extends State<PlayerPage> {
           onExit: (_) =>
               _scheduleControlsHide(delay: const Duration(milliseconds: 250)),
           child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
+            behavior: HitTestBehavior.opaque,
             // 单击呼出控件、双击播放 / 暂停，见 _handleTap。
             onTap: _handleTap,
             // 拖动调参只在移动端注册：桌面端用鼠标拖拽会误触亮度和音量，
@@ -2559,17 +2567,19 @@ class _PlayerPageState extends State<PlayerPage> {
                         !_gestureVisible,
                   )
                 else if (_usesAndroidExo && _exoPlaybackUrl != null)
-                  AndroidView(
-                    key: ValueKey<String>('exo:$_exoPlaybackUrl'),
-                    viewType: 'mova/exo-video',
-                    onPlatformViewCreated: _attachExoView,
-                    creationParams: {
-                      'url': _exoPlaybackUrl,
-                      'headers': _exoHeaders,
-                      'container': widget.container,
-                      'positionMs': _state.position.inMilliseconds,
-                    },
-                    creationParamsCodec: const StandardMessageCodec(),
+                  IgnorePointer(
+                    child: AndroidView(
+                      key: ValueKey<String>('exo:$_exoPlaybackUrl'),
+                      viewType: 'mova/exo-video',
+                      onPlatformViewCreated: _attachExoView,
+                      creationParams: {
+                        'url': _exoPlaybackUrl,
+                        'headers': _exoHeaders,
+                        'container': widget.container,
+                        'positionMs': _state.position.inMilliseconds,
+                      },
+                      creationParamsCodec: const StandardMessageCodec(),
+                    ),
                   )
                 else if (!_usesAndroidExo)
                   Video(
@@ -2581,6 +2591,8 @@ class _PlayerPageState extends State<PlayerPage> {
                   Positioned.fill(
                     child: _DanmakuOverlay(
                       positionStream: _positionStream,
+                      playing: _state.playing && !_state.buffering,
+                      playbackRate: _speed,
                       comments: _danmakuComments,
                       opacity: _danmakuOpacity,
                       area: _danmakuArea,
@@ -2590,6 +2602,7 @@ class _PlayerPageState extends State<PlayerPage> {
                       showScroll: _danmakuScroll,
                       showTop: _danmakuTop,
                       showBottom: _danmakuBottom,
+                      topInset: MediaQuery.paddingOf(context).top + 84,
                     ),
                   ),
                 if (_error != null)
@@ -2630,22 +2643,6 @@ class _PlayerPageState extends State<PlayerPage> {
                           ),
                         ],
                       ),
-                    ),
-                  ),
-                if (!WindowHost.isDesktop &&
-                    !_showControls &&
-                    !_settingsOpen &&
-                    _error == null)
-                  Positioned.fill(
-                    child: Listener(
-                      behavior: HitTestBehavior.opaque,
-                      onPointerDown: (_) {
-                        _ignoreTapUntil = DateTime.now().add(
-                          const Duration(milliseconds: 400),
-                        );
-                        _lastTapAt = null;
-                        _revealControls();
-                      },
                     ),
                   ),
                 IgnorePointer(
@@ -3170,8 +3167,8 @@ class _PlayerPageState extends State<PlayerPage> {
             children: [
               if (_consoleTab == '在线字幕')
                 YingjiMotionIconButton(
-                  tooltip: '返回音轨与字幕',
-                  onPressed: () => _openConsoleTab('音轨与字幕'),
+                  tooltip: '返回字幕',
+                  onPressed: () => _openConsoleTab('字幕'),
                   icon: YingjiIcons.chevron_left,
                   size: 34,
                 ),
@@ -3230,23 +3227,6 @@ class _PlayerPageState extends State<PlayerPage> {
 
   List<Widget> _consoleContent() {
     switch (_consoleTab) {
-      case '音轨与字幕':
-        return [
-          _trackSelector(audio: true),
-          _trackSelector(audio: false),
-          _consoleGroup('同步', [
-            '音频延迟  ${(_audioDelay * 1000).round()} ms',
-            '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
-          ]),
-          YingjiGlassPillButton(
-            icon: YingjiIcons.search,
-            label: '在线搜索字幕',
-            compactLabel: '搜索字幕',
-            tooltip: '搜索当前剧集字幕并下载应用',
-            onPressed: _searchOnlineSubtitle,
-            height: 44,
-          ),
-        ];
       case '声音':
         return [
           _consoleGroup('音轨', [
@@ -3822,10 +3802,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _ => YingjiMotionIconButton(
       icon: tool.icon,
       tooltip: tool.id,
-      selected:
-          _settingsOpen &&
-          (_consoleTab == tool.id ||
-              (_consoleTab == '音轨与字幕' && (tool.id == '声音' || tool.id == '字幕'))),
+      selected: _settingsOpen && _consoleTab == tool.id,
       size: 40,
       onPressed: () => _openConsoleTab(tool.id),
     ),
@@ -4217,6 +4194,8 @@ class _StateChip extends StatelessWidget {
 class _DanmakuOverlay extends StatefulWidget {
   const _DanmakuOverlay({
     required this.positionStream,
+    required this.playing,
+    required this.playbackRate,
     required this.comments,
     required this.opacity,
     required this.area,
@@ -4226,12 +4205,16 @@ class _DanmakuOverlay extends StatefulWidget {
     required this.showScroll,
     required this.showTop,
     required this.showBottom,
+    required this.topInset,
   });
 
   final Stream<Duration> positionStream;
+  final bool playing;
+  final double playbackRate;
   final List<DanmakuComment> comments;
   final double opacity, area, density, fontSize, speed;
   final bool showScroll, showTop, showBottom;
+  final double topInset;
 
   @override
   State<_DanmakuOverlay> createState() => _DanmakuOverlayState();
@@ -4247,18 +4230,8 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
   /// layout happens once and every frame afterwards only paints the canvas.
   final Map<int, TextPainter> _glyphs = <int, TextPainter>{};
   static const _maxGlyphs = 512;
-
-  /// Playhead (ms) at which each scrolling comment first started travelling,
-  /// keyed by its lane hash. A comment that becomes visible only after the
-  /// list finished loading (or after a seek) has an elapsed time already in
-  /// the middle of its lifetime; anchoring it at first sight makes it enter
-  /// from the right edge instead of popping in mid-screen.
-  final Map<int, double> _spawnMs = <int, double>{};
-
-  /// A comment seen this far into its lifetime is treated as a late catch-up
-  /// (danmaku arrived after playback had begun) and re-anchored to the right
-  /// edge; anything younger is a normal entry and keeps its own time base.
-  static const _catchUpGraceMs = 480.0;
+  DanmakuLaneScheduler? _lanes;
+  Size? _layoutSize;
 
   /// Effective playhead handed to the painter each frame.
   Duration _position = Duration.zero;
@@ -4269,28 +4242,18 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
   Duration _samplePos = Duration.zero;
   Duration? _sampleAt;
   Duration _tickAt = Duration.zero;
-  double _mediaRate = 0;
+  Duration? _previousTick;
 
   @override
   void initState() {
     super.initState();
     _positionSub = widget.positionStream.listen((value) {
       final now = _tickAt;
-      final at = _sampleAt;
-      if (at != null && now > at) {
-        final gapMs = now.inMilliseconds - at.inMilliseconds;
-        final deltaMs = value.inMilliseconds - _samplePos.inMilliseconds;
-        final jumped = deltaMs.abs() > 3000;
-        if (!jumped && gapMs > 0 && gapMs < 2000) {
-          _mediaRate = deltaMs / gapMs;
-        } else {
-          // A seek or a pause/resume boundary: anchor without extrapolating.
-          _mediaRate = 0;
-        }
-      }
-      if ((value - _samplePos).inMilliseconds.abs() > 3000) {
-        _spawnMs.clear();
+      if (_sampleAt == null ||
+          (value - _position).inMilliseconds > 1000 ||
+          (value - _position).inMilliseconds < -150) {
         _position = value;
+        _lanes = null;
       }
       _samplePos = value;
       _sampleAt = now;
@@ -4300,21 +4263,29 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
 
   void _onTick(Duration elapsed) {
     _tickAt = elapsed;
-    var effective = _samplePos;
+    final previousTick = _previousTick;
+    _previousTick = elapsed;
+    var effective = _position;
     final at = _sampleAt;
-    if (at != null && _mediaRate > 0) {
-      final since = elapsed - at;
-      if (since > Duration.zero) {
-        effective += Duration(
-          milliseconds: (_mediaRate * math.min(since.inMilliseconds, 250))
-              .round(),
-        );
-      }
+    if (at != null &&
+        previousTick != null &&
+        widget.playing &&
+        (elapsed - at).inMilliseconds < 750) {
+      final delta =
+          (elapsed - previousTick).inMicroseconds / 1000 * widget.playbackRate;
+      final target =
+          _samplePos.inMicroseconds / 1000 +
+          (elapsed - at).inMicroseconds / 1000 * widget.playbackRate;
+      final next = _position.inMicroseconds / 1000 + delta;
+      // Correct sampling jitter gradually; never stop at each 250ms sample.
+      final correction = (target - next).clamp(-delta * .05, delta * .05);
+      effective = Duration(microseconds: ((next + correction) * 1000).round());
+    } else if (!widget.playing) {
+      effective = _samplePos;
     }
     if (effective == _lastPainted) return;
     // Small interpolation corrections are not seeks. Keep motion monotonic;
     // real seeks reset the anchor in the position listener above.
-    if (effective < _position) effective = _position;
     _lastPainted = effective;
     _position = effective;
     // A ValueNotifier bump only repaints this overlay's layer; nothing else in
@@ -4326,12 +4297,17 @@ class _DanmakuOverlayState extends State<_DanmakuOverlay>
   void didUpdateWidget(covariant _DanmakuOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.comments != widget.comments ||
-        oldWidget.fontSize != widget.fontSize) {
+        oldWidget.fontSize != widget.fontSize ||
+        oldWidget.area != widget.area ||
+        oldWidget.density != widget.density ||
+        oldWidget.speed != widget.speed ||
+        oldWidget.showScroll != widget.showScroll ||
+        oldWidget.showTop != widget.showTop ||
+        oldWidget.showBottom != widget.showBottom) {
       _clearGlyphs();
-      // New timeline (another episode) or different metrics: old spawn anchors
-      // no longer apply, so every line enters fresh from the right edge.
-      _spawnMs.clear();
+      _lanes = null;
     }
+    _frame.value++;
   }
 
   void _clearGlyphs() {
@@ -4379,61 +4355,30 @@ class _DanmakuPainter extends CustomPainter {
     if (speed <= 0) return;
     final lifetimeMs = 8000.0 / speed;
     final fontSize = overlay.fontSize;
-    final laneHeight = fontSize + 12;
+    final laneHeight = fontSize * 1.15 + 12;
+    final topInset = overlay.topInset;
+    final scrollTop = topInset + (overlay.showTop ? laneHeight : 0);
+    final scrollBottom = math.min(
+      size.height - 150 - (overlay.showBottom ? 3 * laneHeight : 0),
+      topInset + size.height * overlay.area,
+    );
     final laneCount = math.max(
       1,
-      (size.height * overlay.area / laneHeight).floor(),
+      ((scrollBottom - scrollTop) / laneHeight).floor(),
     );
-    final cap = (3 + overlay.density * 10).round();
+    if (state._layoutSize != size) {
+      state._layoutSize = size;
+      state._lanes = null;
+      state._clearGlyphs();
+    }
+    final lanes = state._lanes ??= DanmakuLaneScheduler(
+      screenWidth: size.width,
+      lifetimeMs: lifetimeMs,
+      lanes: laneCount,
+      topLanes: 1,
+    );
     final glyphs = state._glyphs;
-    final background = Paint()
-      ..color = Colors.black.withValues(alpha: .42 * overlay.opacity);
-    var shown = 0;
-    for (final comment in overlay.comments) {
-      final mode = comment.mode;
-      final enabled = mode == DanmakuMode.scroll
-          ? overlay.showScroll
-          : mode == DanmakuMode.top
-          ? overlay.showTop
-          : overlay.showBottom;
-      if (!enabled) continue;
-      final elapsedMs = positionMs - comment.time.inMilliseconds;
-      if (elapsedMs < 0) {
-        break; // comments are time-sorted; later ones are not due
-      }
-      final lane = Object.hash(comment.content, comment.time.inMilliseconds);
-      // A line's effective age is measured from when it started travelling.
-      // A scrolling comment seen for the first time with most of its life
-      // already spent (the danmaku list finished loading seconds into
-      // playback, or the user seeked into the middle) is anchored at the
-      // current playhead so it enters from the right edge instead of popping
-      // in mid-screen. Fixed comments always gate on their media time.
-      double ageMs;
-      if (mode == DanmakuMode.scroll) {
-        final anchored = state._spawnMs[lane];
-        if (anchored == null) {
-          if (elapsedMs > lifetimeMs) continue; // expired before first sight
-          if (elapsedMs > _DanmakuOverlayState._catchUpGraceMs) {
-            state._spawnMs[lane] = positionMs;
-            ageMs = 0;
-          } else {
-            state._spawnMs[lane] = comment.time.inMilliseconds.toDouble();
-            ageMs = elapsedMs;
-          }
-        } else {
-          ageMs = positionMs - anchored;
-          if (ageMs > lifetimeMs) {
-            state._spawnMs.remove(lane);
-            continue;
-          }
-          if (ageMs < 0) ageMs = 0;
-        }
-      } else {
-        if (elapsedMs > lifetimeMs) continue;
-        ageMs = elapsedMs;
-      }
-      if (shown >= cap) break;
-      shown++;
+    TextPainter glyphFor(DanmakuComment comment) {
       final color = comment.color == null
           ? Colors.white
           : Color(0xff000000 | (comment.color! & 0xffffff));
@@ -4441,10 +4386,7 @@ class _DanmakuPainter extends CustomPainter {
       var glyph = glyphs[key];
       if (glyph == null) {
         if (glyphs.length >= _DanmakuOverlayState._maxGlyphs) {
-          for (final stale in glyphs.values) {
-            stale.dispose();
-          }
-          glyphs.clear();
+          glyphs.remove(glyphs.keys.first)?.dispose();
         }
         glyph = TextPainter(
           text: TextSpan(
@@ -4452,29 +4394,55 @@ class _DanmakuPainter extends CustomPainter {
             style: TextStyle(
               color: color,
               fontSize: fontSize,
+              height: 1.15,
               fontWeight: FontWeight.w600,
-              shadows: const [Shadow(color: Colors.black, blurRadius: 3)],
             ),
           ),
           maxLines: 1,
           ellipsis: '…',
           textDirection: TextDirection.ltr,
-        )..layout();
+        )..layout(maxWidth: math.max(1, size.width - _paddingH * 2));
         glyphs[key] = glyph;
       }
+      return glyph;
+    }
+
+    final background = Paint()
+      ..color = Colors.black.withValues(alpha: .42 * overlay.opacity);
+    final candidates =
+        activeDanmakuComments(
+          overlay.comments,
+          positionMs: positionMs,
+          lifetimeMs: lifetimeMs,
+          density: overlay.density,
+        ).where(
+          (comment) => switch (comment.mode) {
+            DanmakuMode.scroll => overlay.showScroll,
+            DanmakuMode.top => overlay.showTop,
+            DanmakuMode.bottom => overlay.showBottom,
+          },
+        );
+    for (final entry in lanes.update(
+      candidates,
+      positionMs: positionMs,
+      measureWidth: (comment) => glyphFor(comment).width + _paddingH * 2,
+    )) {
+      final comment = entry.comment;
+      final glyph = glyphFor(comment);
+      final elapsedMs = positionMs - comment.time.inMilliseconds;
+      final mode = comment.mode;
       final boxWidth = glyph.width + _paddingH * 2;
       final boxHeight = glyph.height + _paddingV * 2;
       double left;
       double top;
       if (mode == DanmakuMode.scroll) {
-        final progress = (ageMs / lifetimeMs).clamp(0.0, 1.0);
-        left = size.width - progress * (size.width + boxWidth);
-        top = 82 + (lane % laneCount) * laneHeight;
+        left = size.width - elapsedMs * lanes.velocity;
+        top = scrollTop + entry.lane * laneHeight;
       } else {
         left = (size.width - boxWidth) / 2;
         top = mode == DanmakuMode.top
-            ? 82 + (lane % 3) * laneHeight
-            : size.height - 150 - (lane % 3) * laneHeight;
+            ? topInset + entry.lane * laneHeight
+            : size.height - 150 - entry.lane * laneHeight;
       }
       final box = RRect.fromRectAndRadius(
         Rect.fromLTWH(left, top, boxWidth, boxHeight),

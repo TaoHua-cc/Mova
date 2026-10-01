@@ -11,6 +11,8 @@ import 'package:flutter/services.dart';
 
 /// 时长与曲线的单一真源。
 abstract final class MovaMotion {
+  /// Use the platform dialog animation; scrolling is optimized separately.
+  static AnimationStyle? dialogAnimationStyle(BuildContext context) => null;
   // ── 时长 ────────────────────────────────────────────────────────────
   /// 数值跟随：音量条、进度这类每帧都在变的量。
   static const Duration instant = Duration(milliseconds: 90);
@@ -561,6 +563,16 @@ class MovaPageTransitionsBuilder extends PageTransitionsBuilder {
     Animation<double> secondaryAnimation,
     Widget child,
   ) {
+    if (MediaQuery.disableAnimationsOf(context)) return child;
+    if (Theme.of(context).platform == TargetPlatform.android) {
+      return const ZoomPageTransitionsBuilder().buildTransitions(
+        route,
+        context,
+        animation,
+        secondaryAnimation,
+        child,
+      );
+    }
     final forward = CurvedAnimation(
       parent: animation,
       curve: MovaMotion.enter,

@@ -681,6 +681,13 @@ abstract final class YingjiGlass {
 /// 界面是玻璃，别处还是黑塑料」——这正是之前反复出现的问题。
 ///
 /// 轮廓仅保留低对比内边和短促顶部反射，不使用刺眼的整圈白边。
+class _YingjiGlassBackdropScope extends InheritedWidget {
+  const _YingjiGlassBackdropScope({required super.child});
+
+  @override
+  bool updateShouldNotify(_YingjiGlassBackdropScope oldWidget) => false;
+}
+
 class YingjiGlassSurface extends StatelessWidget {
   const YingjiGlassSurface({
     super.key,
@@ -725,10 +732,21 @@ class YingjiGlassSurface extends StatelessWidget {
   );
 
   Widget _buildSurface(BuildContext context, Widget? content) {
+    final stableFilter = YingjiStableScrollGlass.enabled(context);
+    final sharesBackdrop =
+        stableFilter &&
+        context
+                .dependOnInheritedWidgetOfExactType<
+                  _YingjiGlassBackdropScope
+                >() !=
+            null;
     final rounded = BorderRadius.circular(radius);
     final shape = circle ? BoxShape.circle : BoxShape.rectangle;
     final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
     Widget inner = content ?? const SizedBox.shrink();
+    if (stableFilter && sampleBackdrop) {
+      inner = _YingjiGlassBackdropScope(child: inner);
+    }
     if (padding != null) inner = Padding(padding: padding!, child: inner);
     if (depth) {
       inner = DecoratedBox(
@@ -754,9 +772,9 @@ class YingjiGlassSurface extends StatelessWidget {
     );
     // 归因开关命中时整条跳过离屏背板模糊，而不只是把 sigma 归零 ——
     // 后者仍会插一层离屏 layer 并做一次全屏回读，量不出通道本身的代价。
-    final stableFilter = YingjiStableScrollGlass.enabled(context);
     final skipFilter =
         !sampleBackdrop ||
+        sharesBackdrop ||
         FrameTrace.skipGlass('glass') ||
         FrameTrace.skipGlass(circle ? 'circle' : 'rect');
     // These surfaces overlap (dialog shell + episode rows), and the app does
@@ -765,9 +783,18 @@ class YingjiGlassSurface extends StatelessWidget {
     final surface = skipFilter
         ? body
         : stableFilter
-        ? BackdropFilter(
-            filter: YingjiGlass.backdrop(sigma: sigma),
-            child: body,
+        ? Stack(
+            children: [
+              Positioned.fill(
+                child: RepaintBoundary(
+                  child: BackdropFilter(
+                    filter: YingjiGlass.backdrop(sigma: sigma),
+                    child: const SizedBox.expand(),
+                  ),
+                ),
+              ),
+              RepaintBoundary(child: body),
+            ],
           )
         : ValueListenableBuilder<bool>(
             valueListenable: yingjiScrollInProgress,

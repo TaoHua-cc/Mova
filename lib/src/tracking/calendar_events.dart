@@ -1,5 +1,35 @@
 import 'trakt_client.dart';
 
+/// Presentation-only grouping; individual episode schedules remain intact.
+List<List<TraktEvent>> groupCalendarEvents(Iterable<TraktEvent> events) {
+  final groups = <String, List<TraktEvent>>{};
+  for (final event in mergeCalendarEvents(events)) {
+    final date = event.airDate.toLocal();
+    final show = event.tmdbId?.toString() ?? event.title.trim().toLowerCase();
+    final key = '$show:${date.year}:${date.month}:${date.day}';
+    (groups[key] ??= []).add(event);
+  }
+  return groups.values.toList(growable: false);
+}
+
+String calendarEpisodeSummary(List<TraktEvent> events) {
+  if (events.length == 1) return events.first.episode;
+  final seasons = events.map(_calendarSeason).toSet();
+  final numbers =
+      events.map(_calendarEpisodeNumber).whereType<int>().toSet().toList()
+        ..sort();
+  if (seasons.length == 1 &&
+      seasons.first != null &&
+      numbers.length == events.length) {
+    final consecutive = numbers.last - numbers.first + 1 == numbers.length;
+    final label = consecutive
+        ? '${numbers.first}–${numbers.last}'
+        : numbers.join('、');
+    return '第 ${seasons.first} 季 · 第 $label 集 · 更新 ${events.length} 集';
+  }
+  return '更新 ${events.length} 集';
+}
+
 class CalendarProgressCounts {
   const CalendarProgressCounts({
     required this.watched,

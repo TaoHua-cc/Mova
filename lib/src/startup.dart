@@ -36,7 +36,8 @@ class _MovaStartupGateState extends State<MovaStartupGate>
     _pulse = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1050),
-    )..repeat(reverse: true);
+    );
+    if (widget.startup != null) _pulse.repeat(reverse: true);
     unawaited(_finishStartup());
   }
 

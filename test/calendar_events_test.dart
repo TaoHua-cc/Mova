@@ -3,6 +3,34 @@ import 'package:yingji/src/tracking/calendar_events.dart';
 import 'package:yingji/src/tracking/trakt_client.dart';
 
 void main() {
+  test('same-day show cards retain six episodes without inventing ranges', () {
+    TraktEvent episode(int number, {int day = 4, int id = 282326}) =>
+        TraktEvent(
+          title: '兰香如故',
+          tmdbId: id,
+          seasonNumber: 1,
+          episodeNumber: number,
+          episode: '第 1 季 · 第 $number 集',
+          airDate: DateTime(2026, 10, day, 18),
+          timeKnown: true,
+        );
+    final rows = [for (var i = 42; i <= 47; i++) episode(i)];
+    final groups = groupCalendarEvents([
+      ...rows,
+      episode(42),
+      episode(48, day: 5),
+      episode(1, id: 10),
+    ]);
+    expect(groups.length, 3);
+    expect(groups.first.length, 6);
+    expect(calendarEpisodeSummary(groups.first), '第 1 季 · 第 42–47 集 · 更新 6 集');
+    expect(
+      calendarEpisodeSummary([episode(42), episode(44)]),
+      '第 1 季 · 第 42、44 集 · 更新 2 集',
+    );
+    expect(groupCalendarEvents([]), isEmpty);
+    expect(calendarEpisodeSummary([episode(42)]), episode(42).episode);
+  });
   test(
     'calendar progress uses announced total while retaining aired floor',
     () {

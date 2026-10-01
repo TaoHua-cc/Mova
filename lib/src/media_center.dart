@@ -2826,39 +2826,35 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       suffix++;
       title = '新列表 $suffix';
     }
-    final visibleCount = _sections
-        .where((item) => !_hiddenSections.contains(item))
-        .length;
-    setState(() {
-      _sections.insert(visibleCount, title);
-      _sectionSources[title] = const _DiscoverFeedSelection(
-        provider: 'tmdb',
-        mediaType: 'movie',
-        genre: 'all',
-        heat: 'popularity.desc',
-      ).encoded;
-      _cardStyles[title] = 0;
-      _items = _trackItems(_loadSections());
-    });
-    await _persistLayout();
-    if (mounted) await _showSectionSettings(title);
+    await _showSectionSettings(title, isNew: true);
   }
 
-  Future<void> _showSectionSettings(String initialSection) async {
-    if (!_sections.contains(initialSection)) return;
+  Future<void> _showSectionSettings(
+    String initialSection, {
+    bool isNew = false,
+  }) async {
+    if (!isNew && !_sections.contains(initialSection)) return;
     var titleDraft = initialSection;
-    var source = _normalizedSource(
-      _sectionSources[initialSection] ?? initialSection,
-    );
+    var source = isNew
+        ? const _DiscoverFeedSelection(
+            provider: 'tmdb',
+            mediaType: 'movie',
+            genre: 'all',
+            heat: 'popularity.desc',
+          ).encoded
+        : _normalizedSource(_sectionSources[initialSection] ?? initialSection);
     var previewItems = _loadSection(source, 1);
-    var style =
-        _cardStyles[initialSection] ?? _sections.indexOf(initialSection) % 4;
+    var style = isNew
+        ? 0
+        : _cardStyles[initialSection] ?? _sections.indexOf(initialSection) % 4;
     var visible = !_hiddenSections.contains(initialSection);
     String? error;
     var deleted = false;
     var changed = false;
+    var saved = false;
     await showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (dialogContext) => StatefulBuilder(
         builder: (context, updateDialog) => YingjiStableScrollGlass(
           child: YingjiPinnedDialog(
@@ -3031,6 +3027,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                       return;
                     }
                     changed = true;
+                    saved = true;
                     Navigator.pop(dialogContext);
                   },
                   child: const Text('保存当前列表'),
@@ -3041,7 +3038,8 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         ),
       ),
     );
-    if (!changed || !mounted) return;
+    if (!changed || (!saved && !deleted) || !mounted) return;
+    if (isNew && deleted) return;
     final title = titleDraft.trim();
     setState(() {
       if (deleted) {
@@ -3050,6 +3048,12 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         _cardStyles.remove(initialSection);
         _hiddenSections.remove(initialSection);
       } else {
+        if (isNew) {
+          final index = _sections
+              .where((item) => !_hiddenSections.contains(item))
+              .length;
+          _sections.insert(index, initialSection);
+        }
         if (title != initialSection) {
           final index = _sections.indexOf(initialSection);
           _sections[index] = title;
@@ -3115,6 +3119,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
 
     await showDialog<void>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (dialogContext) => YingjiStableScrollGlass(
         child: StatefulBuilder(
           builder: (context, updateDialog) => Dialog(
@@ -6759,6 +6764,7 @@ class _SourceHubState extends State<_SourceHub>
 
   Future<void> _showTraktConnection() => showDialog<void>(
     context: context,
+    animationStyle: MovaMotion.dialogAnimationStyle(context),
     builder: (dialogContext) => YingjiPinnedDialog(
       maxWidth: 480,
       header: Row(
@@ -7025,6 +7031,7 @@ class _SourceHubState extends State<_SourceHub>
   Future<void> _remove(MediaSource source) async {
     final confirmed = await showDialog<bool>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (context) => AlertDialog(
         title: const Text('移除服务器？'),
         content: Text('“${source.name}”的登录凭据与本地设置会一并移除。'),
@@ -7058,6 +7065,7 @@ class _SourceHubState extends State<_SourceHub>
   Future<void> _add() async {
     final added = await showDialog<bool>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (_) => const _AddSourceDialog(),
     );
     if (added == true) {
@@ -7069,6 +7077,7 @@ class _SourceHubState extends State<_SourceHub>
   Future<void> _edit(MediaSource source) async {
     final changed = await showDialog<bool>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (_) => _AddSourceDialog(existing: source),
     );
     if (changed == true) {
@@ -7084,6 +7093,7 @@ class _SourceHubState extends State<_SourceHub>
     if (!mounted) return;
     final icon = await showDialog<String>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (_) => _ServerIconDialog(source: source, token: token),
     );
     if (icon == null) return;
@@ -8123,6 +8133,7 @@ class _PlaylistsPageState extends State<_PlaylistsPage>
     final controller = TextEditingController();
     final name = await showDialog<String>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (dialogContext) => Dialog(
         backgroundColor: Colors.transparent,
         child: SizedBox(
@@ -8653,6 +8664,7 @@ class _CalendarPageState extends State<_CalendarPage>
     try {
       final token = await showDialog<TraktOAuthToken>(
         context: context,
+        animationStyle: MovaMotion.dialogAnimationStyle(context),
         barrierDismissible: false,
         builder: (_) => TraktAuthDialog(clientId: credentials.clientId),
       );
@@ -8671,6 +8683,7 @@ class _CalendarPageState extends State<_CalendarPage>
 
   Future<void> _showTraktAccount() => showDialog<void>(
     context: context,
+    animationStyle: MovaMotion.dialogAnimationStyle(context),
     builder: (dialogContext) => YingjiPinnedDialog(
       maxWidth: 470,
       header: Row(
@@ -8899,6 +8912,7 @@ class _CalendarPageState extends State<_CalendarPage>
   /// 恢复入口按需打开，不再占据日期轨与当天内容之间的主要空间。
   Future<void> _showDropped() => showDialog<void>(
     context: context,
+    animationStyle: MovaMotion.dialogAnimationStyle(context),
     builder: (dialogContext) => YingjiPinnedDialog(
       maxWidth: 460,
       header: Row(
@@ -8959,6 +8973,7 @@ class _CalendarPageState extends State<_CalendarPage>
             .toList()
           ..sort((a, b) => a.airDate.compareTo(b.airDate));
     final dates = _scheduleDates();
+    final selectedGroups = groupCalendarEvents(selectedEvents);
     final now = DateTime.now();
     final traktButton = traktConnectButtonState(
       connected: _traktConnected,
@@ -9073,7 +9088,7 @@ class _CalendarPageState extends State<_CalendarPage>
           const SizedBox(height: 28),
           _SectionHeader(
             title:
-                '${_eventTime(_selectedDate)} · ${selectedEvents.length} 项更新',
+                '${_eventTime(_selectedDate)} · ${selectedGroups.length} 部 · ${selectedEvents.length} 集更新',
             subtitle: _calendarLoading
                 ? (_events.isEmpty ? '正在读取 Trakt 日历…' : '先显示已缓存日历，正在更新…')
                 : (_traktMessage != null &&
@@ -9095,12 +9110,14 @@ class _CalendarPageState extends State<_CalendarPage>
                 return Wrap(
                   spacing: 16,
                   runSpacing: 16,
-                  children: selectedEvents
-                      .map(
-                        (event) => SizedBox(
+                  children: selectedGroups
+                      .map((episodes) {
+                        final event = episodes.first;
+                        return SizedBox(
                           width: width,
                           child: _TrackingEventCard(
                             event: event,
+                            episodes: episodes,
                             progress: _progressForEvent(event),
                             inWatchlist: _inWatchlist(event),
                             dropped: _isDropped(event.title),
@@ -9111,8 +9128,8 @@ class _CalendarPageState extends State<_CalendarPage>
                               _isDropped(event.title) ? 'none' : 'dropped',
                             ),
                           ),
-                        ),
-                      )
+                        );
+                      })
                       .toList(growable: false),
                 );
               },
@@ -9370,6 +9387,7 @@ class _DroppedChip extends StatelessWidget {
 class _TrackingEventCard extends StatelessWidget {
   const _TrackingEventCard({
     required this.event,
+    required this.episodes,
     required this.progress,
     required this.inWatchlist,
     required this.dropped,
@@ -9378,6 +9396,7 @@ class _TrackingEventCard extends StatelessWidget {
     required this.onToggleDropped,
   });
   final TraktEvent event;
+  final List<TraktEvent> episodes;
   final CalendarProgressCounts? progress;
 
   /// 是否已在待看列表里 —— 与详情页的「加入待看」共用同一份数据。
@@ -9396,13 +9415,16 @@ class _TrackingEventCard extends StatelessWidget {
         ? '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}'
         : '时刻未公布';
     final parts = event.episode.split(' · ');
-    final seasonEpisode =
-        event.seasonNumber != null && event.episodeNumber != null
+    final seasonEpisode = episodes.length > 1
+        ? calendarEpisodeSummary(episodes)
+        : event.seasonNumber != null && event.episodeNumber != null
         ? '第 ${event.seasonNumber} 季 · 第 ${event.episodeNumber} 集'
         : parts.length >= 2
         ? parts.take(2).join(' · ')
         : event.episode;
-    final episodeTitle = parts.length > 2
+    final episodeTitle = episodes.length > 1
+        ? '当日更新 ${episodes.length} 集 · 长按查看各集安排'
+        : parts.length > 2
         ? parts.skip(2).where((part) => part != parts[1]).join(' · ')
         : '';
     return YingjiMotionSurface(
@@ -9416,6 +9438,7 @@ class _TrackingEventCard extends StatelessWidget {
             final artworkWidth = compact ? 86.0 : 116.0;
             final actionSize = compact ? 30.0 : 36.0;
             final platformColumnWidth = compact ? 78.0 : 112.0;
+            final backdrop = event.backdropUrl ?? event.posterUrl;
             final poster = event.posterUrl == null
                 ? const ColoredBox(
                     color: YingjiColors.elevated,
@@ -9459,19 +9482,34 @@ class _TrackingEventCard extends StatelessWidget {
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      if (event.backdropUrl != null) ...[
+                      if (backdrop != null) ...[
                         CachedNetworkImage(
                           imageUrl: _calendarArtworkUrl(
-                            event.backdropUrl!,
+                            backdrop,
                             size: 'w1280',
                           ).toString(),
                           fit: BoxFit.cover,
+                          imageBuilder: (_, provider) =>
+                              _calendarProgressiveBackdrop(provider),
                           memCacheWidth:
                               (constraints.maxWidth *
                                       MediaQuery.devicePixelRatioOf(context))
                                   .clamp(1.0, 1600.0)
                                   .round(),
-                          errorWidget: (_, _, _) => const SizedBox.shrink(),
+                          errorWidget: (_, _, _) => event.posterUrl == null
+                              ? const SizedBox.shrink()
+                              : CachedNetworkImage(
+                                  imageUrl: _calendarArtworkUrl(
+                                    event.posterUrl!,
+                                    size: 'w780',
+                                  ).toString(),
+                                  fit: BoxFit.cover,
+                                  imageBuilder: (_, provider) =>
+                                      _calendarProgressiveBackdrop(provider),
+                                  memCacheWidth: 780,
+                                  errorWidget: (_, _, _) =>
+                                      const SizedBox.shrink(),
+                                ),
                         ),
                         DecoratedBox(
                           decoration: BoxDecoration(
@@ -9479,10 +9517,10 @@ class _TrackingEventCard extends StatelessWidget {
                               begin: Alignment.centerLeft,
                               end: Alignment.centerRight,
                               colors: [
-                                YingjiColors.canvas.withValues(alpha: .94),
-                                YingjiColors.canvas.withValues(alpha: .78),
-                                YingjiColors.canvas.withValues(alpha: .42),
-                                const Color(0xFF111318).withValues(alpha: .72),
+                                YingjiColors.canvas.withValues(alpha: .86),
+                                YingjiColors.canvas.withValues(alpha: .68),
+                                YingjiColors.canvas.withValues(alpha: .30),
+                                const Color(0xFF111318).withValues(alpha: .48),
                               ],
                               stops: const [0, .36, .68, 1],
                             ),
@@ -9530,14 +9568,19 @@ class _TrackingEventCard extends StatelessWidget {
                                           ),
                                         ),
                                         const SizedBox(height: 6),
-                                        Text(
-                                          seasonEpisode,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle(
-                                            fontSize: compact ? 12 : 13,
-                                            fontWeight: FontWeight.w600,
-                                            color: YingjiColors.ink,
+                                        YingjiGlassTooltip(
+                                          message: episodes
+                                              .map((e) => e.episode)
+                                              .join('\n'),
+                                          child: Text(
+                                            seasonEpisode,
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: compact ? 12 : 13,
+                                              fontWeight: FontWeight.w600,
+                                              color: YingjiColors.ink,
+                                            ),
                                           ),
                                         ),
                                         if (episodeTitle.isNotEmpty) ...[
@@ -9643,6 +9686,36 @@ Uri _calendarArtworkUrl(Uri source, {required String size}) {
   return source.replace(path: path);
 }
 
+Widget _calendarProgressiveBackdrop(ImageProvider provider) {
+  final blur = YingjiGlass.blur.clamp(0.0, 18.0);
+  return RepaintBoundary(
+    child: Stack(
+      fit: StackFit.expand,
+      children: [
+        Image(image: provider, fit: BoxFit.cover),
+        if (blur > 0)
+          ShaderMask(
+            blendMode: BlendMode.dstIn,
+            shaderCallback: (bounds) => const LinearGradient(
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+              colors: [Colors.transparent, Colors.white, Colors.white],
+              stops: [0, .62, 1],
+            ).createShader(bounds),
+            child: ImageFiltered(
+              imageFilter: ImageFilter.blur(
+                sigmaX: blur,
+                sigmaY: blur,
+                tileMode: TileMode.clamp,
+              ),
+              child: Image(image: provider, fit: BoxFit.cover),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
 class _CalendarPlatformLogo extends StatelessWidget {
   const _CalendarPlatformLogo({
     required this.platform,
@@ -9656,74 +9729,65 @@ class _CalendarPlatformLogo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final normalizedPlatform = platform.toLowerCase();
-    final needsLightLogo =
-        normalizedPlatform.contains('hbo') ||
-        normalizedPlatform == 'max' ||
-        normalizedPlatform.contains('apple tv');
-    Widget logo = logoUrl == null
-        ? _CalendarPlatformWordmark(platform: platform, compact: compact)
+    final name = platform.toLowerCase();
+    final tencent = name.contains('tencent') || name.contains('腾讯');
+    final apple = name.contains('apple tv');
+    final tintMonochrome = apple || name.contains('hbo') || name == 'max';
+    final Widget logo = logoUrl == null
+        ? const Icon(Icons.live_tv_rounded, color: YingjiColors.ink, size: 28)
         : Semantics(
             label: platform,
             image: true,
             child: CachedNetworkImage(
               imageUrl: logoUrl.toString(),
               fit: BoxFit.contain,
-              errorWidget: (_, _, _) => _CalendarPlatformWordmark(
-                platform: platform,
-                compact: compact,
+              placeholder: (_, _) => const Icon(
+                Icons.live_tv_rounded,
+                color: YingjiColors.ink,
+                size: 28,
+              ),
+              errorWidget: (_, _, _) => const Icon(
+                Icons.live_tv_rounded,
+                color: YingjiColors.ink,
+                size: 28,
               ),
             ),
           );
-    if (needsLightLogo) {
-      logo = ColorFiltered(
-        colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn),
-        child: logo,
-      );
-    }
     return YingjiGlassTooltip(
       message: platform,
       child: SizedBox(
-        width: compact ? 76 : 116,
-        height: compact ? 40 : 58,
-        child: logo,
-      ),
-    );
-  }
-}
-
-class _CalendarPlatformWordmark extends StatelessWidget {
-  const _CalendarPlatformWordmark({
-    required this.platform,
-    required this.compact,
-  });
-
-  final String platform;
-  final bool compact;
-
-  @override
-  Widget build(BuildContext context) {
-    final normalized = platform.toLowerCase().replaceAll('+', ' plus ');
-    final hbo = normalized.contains('hbo') || normalized.trim() == 'max';
-    final color = normalized.contains('iqiyi') || platform.contains('爱奇艺')
-        ? const Color(0xFF7CE36B)
-        : normalized.contains('netflix')
-        ? const Color(0xFFE50914)
-        : Colors.white;
-    return Center(
-      child: Text(
-        hbo ? (normalized.contains('hbo') ? 'HBO max' : 'max') : platform,
-        maxLines: 2,
-        textAlign: TextAlign.center,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          fontSize: compact ? 12 : 15,
-          height: 1.05,
-          fontWeight: FontWeight.w800,
-          letterSpacing: hbo ? -0.8 : 0,
-          color: color,
-          shadows: const [Shadow(color: Colors.black87, blurRadius: 7)],
-        ),
+        width: compact ? 76 : 104,
+        height: compact ? 40 : 52,
+        child: tencent
+            ? ShaderMask(
+                blendMode: BlendMode.srcATop,
+                shaderCallback: (bounds) => const LinearGradient(
+                  colors: [
+                    Colors.transparent,
+                    Colors.transparent,
+                    Color(0xFFC7E9FF),
+                    Color(0xFFC7E9FF),
+                  ],
+                  stops: [0, .25, .30, 1],
+                ).createShader(bounds),
+                child: logo,
+              )
+            : tintMonochrome
+            ? ShaderMask(
+                blendMode: BlendMode.srcIn,
+                shaderCallback: (bounds) => LinearGradient(
+                  colors: apple
+                      ? const [
+                          Color(0xFFFFA673),
+                          Color(0xFFF083BE),
+                          Color(0xFF91B8FF),
+                          Color(0xFF83D8C5),
+                        ]
+                      : const [Color(0xFFC8ACFF), Color(0xFF8EBFFF)],
+                ).createShader(bounds),
+                child: logo,
+              )
+            : logo,
       ),
     );
   }
@@ -10661,6 +10725,7 @@ class _SettingsPageState extends State<SettingsPage>
   Future<void> _clearWatchHistory() async {
     final confirmed = await showDialog<bool>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (context) => AlertDialog(
         title: const Text('清空观看记录？'),
         content: const Text('这会移除本机保存的继续观看进度，不会删除媒体服务器上的数据。'),
@@ -14774,6 +14839,7 @@ Future<void> _resumePlayback(BuildContext context, WatchState state) async {
   if (prompt && state.position > const Duration(seconds: 5)) {
     final choice = await showDialog<String>(
       context: context,
+      animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (context) => AlertDialog(
         title: const Text('继续观看？'),
         content: Text('上次看到 ${_duration(state.position)}，要从这里继续吗？'),
@@ -14873,6 +14939,7 @@ Future<void> _showDiscoverItems(
 ) async {
   await showDialog<void>(
     context: context,
+    animationStyle: MovaMotion.dialogAnimationStyle(context),
     builder: (dialogContext) => AlertDialog(
       title: Text(title),
       content: SizedBox(
@@ -14932,6 +14999,7 @@ Future<void> _showHistoryManager(
   if (!context.mounted) return;
   await showDialog<void>(
     context: context,
+    animationStyle: MovaMotion.dialogAnimationStyle(context),
     builder: (dialogContext) {
       var rows = List<WatchState>.of(history);
       return StatefulBuilder(
