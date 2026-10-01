@@ -36,7 +36,7 @@ android {
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        manifestPlaceholders["movaLabel"] = if (localTestBuild) "Mova · 测试" else "Mova"
+        manifestPlaceholders["movaLabel"] = "Mova"
 
         // 不要在这里设 ndk.abiFilters：与下面的 splits.abi 同时存在会直接报错
         // "Conflicting configuration ... in ndk abiFilters cannot be present

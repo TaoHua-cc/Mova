@@ -5,12 +5,60 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:yingji/src/brand.dart';
 import 'package:yingji/src/cache/media_cache.dart';
+import 'package:yingji/src/cache/preblurred_backdrop.dart';
 import 'package:yingji/src/metadata/metadata_detail_page.dart';
 import 'package:yingji/src/metadata/tmdb_client.dart';
 import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  testWidgets('detail depth blends without rebuilding poster or blur', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    const item = TmdbItem(
+      id: 0,
+      title: '测试作品',
+      kind: '电影',
+      backdropPath: '/test-detail.jpg',
+    );
+    await tester.pumpWidget(MaterialApp(home: MetadataDetailPage(item: item)));
+    await tester.pumpAndSettle();
+    final blendFinder = find.byWidgetPredicate(
+      (widget) =>
+          widget is ValueListenableBuilder<double> &&
+          widget.child is AnimatedBuilder,
+    );
+    final blend = tester.widget<ValueListenableBuilder<double>>(blendFinder);
+    final depth = blend.valueListenable as ValueNotifier<double>;
+    final clearFinder = find.byKey(
+      ValueKey('detail-clear-${item.backdropUrl}'),
+    );
+    final clear = tester.widget(clearFinder);
+    final filter = tester.widget<PreblurredBackdrop>(
+      find.byType(PreblurredBackdrop),
+    );
+    expect(find.byType(ImageFiltered), findsNothing);
+    for (final value in [.2, .5, .8, 1.0, .3, 0.0]) {
+      depth.value = value;
+      await tester.pump();
+      expect(identical(tester.widget(clearFinder), clear), isTrue);
+      expect(
+        identical(
+          tester.widget<PreblurredBackdrop>(find.byType(PreblurredBackdrop)),
+          filter,
+        ),
+        isTrue,
+      );
+      final opacity = find.descendant(
+        of: blendFinder,
+        matching: find.byType(Opacity),
+      );
+      expect(tester.widget<Opacity>(opacity.first).opacity, value);
+    }
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   test(
     'episode played-state action supports touch and desktop context input',
     () {
@@ -66,7 +114,7 @@ void main() {
     final list = catalogRail.substring(
       catalogRail.indexOf('ListView.separated'),
     );
-    final frame = list.indexOf('YingjiMotionSurface(');
+    final frame = list.indexOf('_DetailPosterHover(');
     final poster = list.indexOf('height: 134,', frame);
     final title = list.indexOf(
       r"'第 ${episode.episodeNumber} 集 · ${episode.name}'",
@@ -146,7 +194,7 @@ void main() {
     expect(resourceSection, contains("label: '重新搜索'"));
     expect(resourceSection, contains('onPressed: widget.onRetry'));
     expect(detailBuild, contains('onRetry: () => item.kind =='));
-    expect(detailBuild, contains('_searchSelectedEpisode()'));
+    expect(detailBuild, contains('_searchSelectedEpisode(force: true)'));
   });
 
   test(

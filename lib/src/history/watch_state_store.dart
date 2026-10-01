@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../tracking/tracking_status_store.dart';
+
 /// How many watch-state rows the local store retains. Emby resume rails can
 /// return up to 50 rows (server-side `Limit=50`), so the cache must be able
 /// to hold a full rail; the visible shelf is no longer truncated to this size
@@ -252,6 +254,11 @@ class WatchStateStore {
   /// server's real last-played time so remote records do not masquerade as
   /// freshly watched here.
   Future<void> save(WatchState state, {DateTime? updatedAt}) async {
+    if (updatedAt == null &&
+        state.seasonNumber != null &&
+        (state.position > Duration.zero || state.isCompleted)) {
+      await TrackingStatusStore.resume(_prefs, state.title, state.tmdbId);
+    }
     final rows = load().where((item) => item.mediaId != state.mediaId).toList()
       ..insert(0, state.withUpdatedAt(updatedAt ?? DateTime.now()));
     await _prefs.setStringList(

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
@@ -16,6 +15,7 @@ import '../brand.dart';
 import '../motion.dart';
 import '../cache/image_prefetch.dart';
 import '../cache/media_cache.dart';
+import '../cache/preblurred_backdrop.dart';
 import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
 import '../player/android_player.dart';
@@ -295,6 +295,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   int? _selectedEpisodeNumber;
   int _searchGeneration = 0;
   Future<void>? _selectedEpisodeSearch;
+  final _episodeSearchTasks = <String, Future<void>>{};
+  final _episodeSearchRevisions = <String, int>{};
+  final _episodeSearchResults =
+      <String, ({List<MediaItem> rows, String? error})>{};
   MediaItem? _selectedResource;
   bool _loadingResources = true;
   String? _resourceError;
@@ -306,7 +310,6 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     super.initState();
     _pageScroll.addListener(_syncPageBackdropDepth);
     WatchStateStore.revision.addListener(_refreshLocalProgress);
-    yingjiScrollInProgress.addListener(_syncPageBackdropDepth);
     _details =
         widget.item.id > 0 &&
             (widget.item.kind == '剧集' || widget.item.kind == '电影')
@@ -339,10 +342,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   void _syncPageBackdropDepth() {
-    if (!_pageScroll.hasClients ||
-        (WindowHost.isDesktop && yingjiScrollInProgress.value)) {
-      return;
-    }
+    if (!_pageScroll.hasClients) return;
     final next = yingjiScrollDepth(_pageScroll.position);
     if (_pageBackdropDepth.value != next) _pageBackdropDepth.value = next;
   }
@@ -441,8 +441,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }
   }
 
-  Future<void> _searchSelectedEpisode() {
-    final future = _runSelectedEpisodeSearch();
+  Future<void> _searchSelectedEpisode({bool force = false}) {
+    final future = _runSelectedEpisodeSearch(force: force);
     _selectedEpisodeSearch = future;
     return future;
   }
@@ -476,13 +476,64 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   Future<void> _runSelectedEpisodeSearch({
+    bool force = false,
+    EpisodeSearchGate<MediaItem>? firstPlayable,
+    void Function(List<MediaItem> resources)? onResourcesPublished,
+  }) async {
+    final season = _selectedSeason;
+    final episode = _selectedEpisodeNumber;
+    if (season == null || episode == null) {
+      firstPlayable?.finish();
+      return;
+    }
+    final key = _episodeKey(season, episode);
+    final generation = ++_searchGeneration;
+    final existing = force ? null : _episodeSearchTasks[key];
+    if (existing == null) _episodeSearchRevisions[key] = generation;
+    if (existing != null &&
+        !_episodeSearchResults.containsKey(key) &&
+        mounted) {
+      setState(() {
+        _resources = const [];
+        _selectedResource = null;
+        _resourceError = null;
+        _loadingResources = true;
+      });
+    }
+    final task =
+        existing ??
+        _performSelectedEpisodeSearch(
+          generation: generation,
+          firstPlayable: firstPlayable,
+          onResourcesPublished: onResourcesPublished,
+        );
+    _episodeSearchTasks[key] = task;
+    await task;
+    final result = _episodeSearchResults[key];
+    if (mounted && generation == _searchGeneration && result != null) {
+      setState(() {
+        _resources = result.rows;
+        _selectedResource = result.rows.firstOrNull;
+        _resourceError = result.error;
+        _loadingResources = false;
+      });
+      unawaited(_refreshEpisodeProgress(result.rows, _searchGeneration));
+      onResourcesPublished?.call(result.rows);
+      for (final row in result.rows.where((row) => row.playbackUrl != null)) {
+        firstPlayable?.offer(row.source.id, row);
+      }
+    }
+    firstPlayable?.finish();
+  }
+
+  Future<void> _performSelectedEpisodeSearch({
+    required int generation,
     EpisodeSearchGate<MediaItem>? firstPlayable,
     void Function(List<MediaItem> resources)? onResourcesPublished,
   }) async {
     final season = _selectedSeason;
     final episode = _selectedEpisodeNumber;
     if (season == null || episode == null) return;
-    final generation = ++_searchGeneration;
     if (mounted) {
       setState(() {
         _loadingResources = true;
@@ -496,11 +547,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     var failedSources = 0;
 
     void publish(List<MediaItem> found) {
-      if (found.isEmpty || !mounted || generation != _searchGeneration) return;
+      if (found.isEmpty || !mounted) return;
       results.addAll(found);
       final unique = <String, MediaItem>{
         for (final row in results) '${row.source.id}:${row.id}': row,
       }.values.toList(growable: false);
+      if (generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
         _selectedResource ??= unique.firstOrNull;
@@ -525,7 +577,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       final titles = <String>[widget.item.title];
       await Future.wait(
         store.load().map((source) async {
-          if (!mounted || generation != _searchGeneration) return;
+          if (!mounted) return;
           final token = store.tokenFor(source);
           if (token == null || token.isEmpty) return;
           if (source.kind == SourceKind.webdav) {
@@ -645,10 +697,18 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           }
         }),
       );
-      if (!mounted || generation != _searchGeneration) return;
       final unique = <String, MediaItem>{
         for (final row in results) '${row.source.id}:${row.id}': row,
       }.values.toList(growable: false);
+      if (_episodeSearchRevisions[_episodeKey(season, episode)] == generation) {
+        _episodeSearchResults[_episodeKey(season, episode)] = (
+          rows: unique,
+          error: failedSources == 0
+              ? null
+              : '$failedSources 个服务器未完成搜索，可点击重新搜索。',
+        );
+      }
+      if (!mounted || generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
         _selectedResource ??= unique.firstOrNull;
@@ -661,6 +721,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       unawaited(_persistResolvedSessions(store, updatedSessions));
       unawaited(_refreshEpisodeProgress(unique, generation));
     } catch (_) {
+      if (_episodeSearchRevisions[_episodeKey(season, episode)] == generation) {
+        _episodeSearchResults[_episodeKey(season, episode)] = (
+          rows: List<MediaItem>.of(results),
+          error: '当前集搜索失败，请检查连接后重新搜索。',
+        );
+      }
       if (!mounted || generation != _searchGeneration) return;
       setState(() {
         _loadingResources = false;
@@ -2171,7 +2237,6 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   void dispose() {
     _pageScroll.removeListener(_syncPageBackdropDepth);
     WatchStateStore.revision.removeListener(_refreshLocalProgress);
-    yingjiScrollInProgress.removeListener(_syncPageBackdropDepth);
     _pageBackdropDepth.dispose();
     _pageScroll.dispose();
     _playlistPickerScroll.dispose();
@@ -2202,82 +2267,77 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                       // 详情页背景与首页同一套逻辑：**顶部是清晰的海报，往下滚才
                       // 逐渐变糊**。以前这里是无条件 `blur(glassBlur * .5)`，一进
                       // 详情页背景就已经糊死，和首页的观感对不上；现在深度由
-                      // [yingjiScrollDepth] 给出，清晰层与模糊层叠加。桌面滚轮运动
-                      // 期间冻结深度，只在停稳时更新，避免每帧重合成整屏滤镜。
-                      ValueListenableBuilder<double>(
-                        valueListenable: _pageBackdropDepth,
-                        builder: (context, depth, _) {
-                          return Stack(
-                            fit: StackFit.expand,
-                            children: [
-                              RepaintBoundary(
-                                child: CachedNetworkImage(
-                                  key: ValueKey(
-                                    'detail-clear-${item.backdropUrl}',
-                                  ),
-                                  imageUrl: item.backdropUrl.toString(),
-                                  fit: BoxFit.cover,
-                                  // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成
-                                  // （正好压在进页面的转场上），背景直接显示。
-                                  fadeInDuration: Duration.zero,
-                                  fadeOutDuration: Duration.zero,
-                                  memCacheWidth: 1280,
-                                  errorWidget: (_, _, _) =>
-                                      const SizedBox.shrink(),
-                                ),
-                              ),
-                              Opacity(
-                                opacity: depth,
-                                child: RepaintBoundary(
-                                  child: ImageFiltered(
-                                    imageFilter: ImageFilter.blur(
-                                      sigmaX: YingjiGlass.blur,
-                                      sigmaY: YingjiGlass.blur,
-                                    ),
-                                    child: CachedNetworkImage(
-                                      key: ValueKey(
-                                        'detail-blur-${item.backdropUrl}',
+                      // [yingjiScrollDepth] 给出，清晰层与固定模糊层叠加。
+                      // 滚动时实时更新混合比例，不重新计算模糊强度。
+                      Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          RepaintBoundary(
+                            child: CachedNetworkImage(
+                              key: ValueKey('detail-clear-${item.backdropUrl}'),
+                              imageUrl: item.backdropUrl.toString(),
+                              fit: BoxFit.cover,
+                              // 默认 500ms 淡入会让全屏大图逐帧做 alpha 合成
+                              // （正好压在进页面的转场上），背景直接显示。
+                              fadeInDuration: Duration.zero,
+                              fadeOutDuration: Duration.zero,
+                              memCacheWidth: 1280,
+                              errorWidget: (_, _, _) => const SizedBox.shrink(),
+                            ),
+                          ),
+                          ValueListenableBuilder<double>(
+                            valueListenable: _pageBackdropDepth,
+                            builder: (context, depth, blurred) =>
+                                Opacity(opacity: depth, child: blurred),
+                            child: AnimatedBuilder(
+                              animation: yingjiAppearance,
+                              builder: (context, _) => RepaintBoundary(
+                                child: LayoutBuilder(
+                                  builder: (context, size) =>
+                                      PreblurredBackdrop(
+                                        key: ValueKey(
+                                          'detail-blur-${item.backdropUrl}',
+                                        ),
+                                        viewport: size.biggest,
+                                        sigma: YingjiGlass.blur,
+                                        image: ResizeImage(
+                                          CachedNetworkImageProvider(
+                                            item.backdropUrl.toString(),
+                                          ),
+                                          // 反正会被糊掉：模糊拉得很低时这层不再是
+                                          // 「氛围光」，改按原分辨率解码，免得出现一层
+                                          // 低清放大图压在清晰背景上的发虚重影。
+                                          width: YingjiGlass.blur >= 10
+                                              ? 320
+                                              : 1280,
+                                          height: YingjiGlass.blur >= 10
+                                              ? 320
+                                              : 1280,
+                                          policy: ResizeImagePolicy.fit,
+                                        ),
                                       ),
-                                      imageUrl: item.backdropUrl.toString(),
-                                      fit: BoxFit.cover,
-                                      fadeInDuration: Duration.zero,
-                                      fadeOutDuration: Duration.zero,
-                                      // 反正会被糊掉：模糊拉得很低时这层不再是
-                                      // 「氛围光」，改按原分辨率解码，免得出现一层
-                                      // 低清放大图压在清晰背景上的发虚重影。
-                                      memCacheWidth: YingjiGlass.blur >= 10
-                                          ? 320
-                                          : 1280,
-                                      errorWidget: (_, _, _) =>
-                                          const SizedBox.shrink(),
-                                    ),
-                                  ),
                                 ),
                               ),
-                              const DecoratedBox(
-                                decoration: BoxDecoration(
-                                  gradient: RadialGradient(
-                                    center: Alignment.topRight,
-                                    radius: 1.15,
-                                    colors: [
-                                      Color(0x553B6A4D),
-                                      Color(0x9907090D),
-                                    ],
-                                  ),
-                                ),
+                            ),
+                          ),
+                          const DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: RadialGradient(
+                                center: Alignment.topRight,
+                                radius: 1.15,
+                                colors: [Color(0x553B6A4D), Color(0x9907090D)],
                               ),
-                              // 下滑时整体再压暗一档，保证滚动进来的卡片、文字
-                              // 始终压得住海报（与首页 depth 驱动压暗同一目的）。
-                              DecoratedBox(
-                                decoration: BoxDecoration(
-                                  color: Colors.black.withValues(
-                                    alpha: .12 * depth,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          );
-                        },
+                            ),
+                          ),
+                          // 下滑时整体再压暗一档，保证滚动进来的卡片、文字
+                          // 始终压得住海报（与首页 depth 驱动压暗同一目的）。
+                          ValueListenableBuilder<double>(
+                            valueListenable: _pageBackdropDepth,
+                            child: const ColoredBox(color: Colors.black),
+                            builder: (context, depth, shade) =>
+                                Opacity(opacity: .12 * depth, child: shade),
+                          ),
+                        ],
                       ),
                   ],
                 ),
@@ -2285,9 +2345,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
               SafeArea(
                 child: Column(
                   children: [
-                    _DetailTopBar(
-                      onBack: () => Navigator.pop(context),
-                      onSearch: () => _showResourceSearch(context),
+                    RepaintBoundary(
+                      child: _DetailTopBar(
+                        onBack: () => Navigator.pop(context),
+                        onSearch: () => _showResourceSearch(context),
+                      ),
                     ),
                     Expanded(
                       child: YingjiSmoothWheel(
@@ -2386,7 +2448,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                               loading: _loadingResources,
                               error: _resourceError,
                               onRetry: () => item.kind == '剧集' && item.id > 0
-                                  ? _searchSelectedEpisode()
+                                  ? _searchSelectedEpisode(force: true)
                                   : _loadResources(force: true),
                               onPicker: (resource) =>
                                   _showResourcePicker(source: resource.source),
@@ -3476,18 +3538,6 @@ class _SeasonRail extends StatefulWidget {
 class _SeasonRailState extends State<_SeasonRail> {
   final ScrollController _controller = ScrollController();
 
-  void _move(double delta) {
-    if (!_controller.hasClients) return;
-    _controller.animateTo(
-      (_controller.offset + delta).clamp(
-        0,
-        _controller.position.maxScrollExtent,
-      ),
-      duration: const Duration(milliseconds: 320),
-      curve: Curves.easeOutCubic,
-    );
-  }
-
   List<int> get _seasons => [
     ...widget.catalogSeasons.map((season) => season.number),
     ...widget.resources.map((item) => item.seasonNumber),
@@ -3550,19 +3600,7 @@ class _SeasonRailState extends State<_SeasonRail> {
               style: const TextStyle(color: YingjiColors.muted),
             ),
             const Spacer(),
-            YingjiDirectionalArrow(
-              previous: true,
-              tooltip: '上一组季',
-              size: 34,
-              onPressed: () => _move(-470),
-            ),
             const SizedBox(width: 7),
-            YingjiDirectionalArrow(
-              previous: false,
-              tooltip: '下一组季',
-              size: 34,
-              onPressed: () => _move(470),
-            ),
           ],
         ),
         const SizedBox(height: 12),
@@ -3571,107 +3609,111 @@ class _SeasonRailState extends State<_SeasonRail> {
           child: YingjiSmoothWheel(
             controller: _controller,
             stableGlass: true,
-            child: ListView.separated(
-              controller: _controller,
-              scrollDirection: Axis.horizontal,
-              physics:
-                  yingjiWheelPhysics ??
-                  const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
-                  ),
-              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
-              itemCount: seasons.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 16),
-              itemBuilder: (context, index) {
-                final season = seasons[index];
-                final active = season == widget.selectedSeason;
-                final artwork = widget.posters[season];
-                return InkWell(
-                  onTap: () => widget.onSelect(season),
-                  borderRadius: BorderRadius.circular(14),
-                  child: _DetailPosterHover(
-                    selected: active,
-                    borderRadius: 14,
-                    child: SizedBox(
-                      width: 140,
-                      child: Column(
-                        children: [
-                          Expanded(
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 220),
-                              clipBehavior: Clip.antiAlias,
-                              decoration: BoxDecoration(
-                                color: const Color(0xCC1A1D22),
-                                borderRadius: BorderRadius.circular(14),
-                                // 选中态的白框只保留 _DetailPosterHover 的外层大框；
-                                // 这里再画一圈会形成双描边，未选中保留极淡的分界。
-                                border: Border.all(
-                                  color: active
-                                      ? Colors.transparent
-                                      : Colors.white.withValues(alpha: .12),
-                                  width: active ? 0 : 1,
+            child: MovaHorizontalDrag(
+              child: ListView.separated(
+                controller: _controller,
+                scrollDirection: Axis.horizontal,
+
+                physics:
+                    yingjiWheelPhysics ??
+                    const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+                itemCount: seasons.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 16),
+                itemBuilder: (context, index) {
+                  final season = seasons[index];
+                  final active = season == widget.selectedSeason;
+                  final artwork = widget.posters[season];
+                  return InkWell(
+                    onTap: () => widget.onSelect(season),
+                    borderRadius: BorderRadius.circular(14),
+                    child: _DetailPosterHover(
+                      selected: active,
+                      borderRadius: 14,
+                      child: SizedBox(
+                        width: 140,
+                        child: Column(
+                          children: [
+                            Expanded(
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 220),
+                                clipBehavior: Clip.antiAlias,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xCC1A1D22),
+                                  borderRadius: BorderRadius.circular(14),
+                                  // 选中态的白框只保留 _DetailPosterHover 的外层大框；
+                                  // 这里再画一圈会形成双描边，未选中保留极淡的分界。
+                                  border: Border.all(
+                                    color: active
+                                        ? Colors.transparent
+                                        : Colors.white.withValues(alpha: .12),
+                                    width: active ? 0 : 1,
+                                  ),
+                                  boxShadow: active
+                                      ? const [
+                                          BoxShadow(
+                                            color: Color(0x66000000),
+                                            blurRadius: 24,
+                                            offset: Offset(0, 12),
+                                          ),
+                                        ]
+                                      : null,
                                 ),
-                                boxShadow: active
-                                    ? const [
-                                        BoxShadow(
-                                          color: Color(0x66000000),
-                                          blurRadius: 24,
-                                          offset: Offset(0, 12),
+                                child: artwork == null
+                                    ? const Center(
+                                        child: Icon(
+                                          YingjiIcons.film,
+                                          color: YingjiColors.muted,
                                         ),
-                                      ]
-                                    : null,
+                                      )
+                                    // 放大 4% 再裁切：季海报素材四周常自带一圈
+                                    // 5~7px 的暗边/暗角，不裁掉的话白描边（已严格
+                                    // 贴住海报边缘，缝隙实测 0px）与画面之间仍会
+                                    // 看成一条黑缝。4% 只吃掉边缘，画面损失极小。
+                                    : Transform.scale(
+                                        scale: 1.04,
+                                        child: CachedNetworkImage(
+                                          fadeInDuration: const Duration(
+                                            milliseconds: 150,
+                                          ),
+                                          imageUrl: artwork.toString(),
+                                          fit: BoxFit.cover,
+                                          // 季海报显示宽 ~190，按物理像素解码即可，
+                                          // 不必用原图——批量解码卡在进页面转场的最后一帧。
+                                          memCacheWidth:
+                                              (320 *
+                                                      MediaQuery.devicePixelRatioOf(
+                                                        context,
+                                                      ))
+                                                  .clamp(1.0, 512.0)
+                                                  .round(),
+                                          errorWidget: (_, _, _) =>
+                                              const Center(
+                                                child: Icon(YingjiIcons.film),
+                                              ),
+                                        ),
+                                      ),
                               ),
-                              child: artwork == null
-                                  ? const Center(
-                                      child: Icon(
-                                        YingjiIcons.film,
-                                        color: YingjiColors.muted,
-                                      ),
-                                    )
-                                  // 放大 4% 再裁切：季海报素材四周常自带一圈
-                                  // 5~7px 的暗边/暗角，不裁掉的话白描边（已严格
-                                  // 贴住海报边缘，缝隙实测 0px）与画面之间仍会
-                                  // 看成一条黑缝。4% 只吃掉边缘，画面损失极小。
-                                  : Transform.scale(
-                                      scale: 1.04,
-                                      child: CachedNetworkImage(
-                                        fadeInDuration: const Duration(
-                                          milliseconds: 150,
-                                        ),
-                                        imageUrl: artwork.toString(),
-                                        fit: BoxFit.cover,
-                                        // 季海报显示宽 ~190，按物理像素解码即可，
-                                        // 不必用原图——批量解码卡在进页面转场的最后一帧。
-                                        memCacheWidth:
-                                            (320 *
-                                                    MediaQuery.devicePixelRatioOf(
-                                                      context,
-                                                    ))
-                                                .clamp(1.0, 512.0)
-                                                .round(),
-                                        errorWidget: (_, _, _) => const Center(
-                                          child: Icon(YingjiIcons.film),
-                                        ),
-                                      ),
-                                    ),
                             ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            '第 $season 季',
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: active
-                                  ? FontWeight.w800
-                                  : FontWeight.w600,
+                            const SizedBox(height: 8),
+                            Text(
+                              '第 $season 季',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: active
+                                    ? FontWeight.w800
+                                    : FontWeight.w600,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         ),
@@ -3681,6 +3723,81 @@ class _SeasonRailState extends State<_SeasonRail> {
 }
 
 /// TMDB's real episode catalog is independent of server playback availability.
+class _PublishedEpisodeNumbers extends StatelessWidget {
+  const _PublishedEpisodeNumbers({
+    required this.episodes,
+    required this.selected,
+    required this.onSelect,
+  });
+  final List<TmdbEpisode> episodes;
+  final int? selected;
+  final ValueChanged<TmdbEpisode> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final tomorrow = DateTime(now.year, now.month, now.day + 1);
+    final published = episodes
+        .where(
+          (episode) =>
+              episode.airDate != null && episode.airDate!.isBefore(tomorrow),
+        )
+        .toList(growable: false);
+    if (published.isEmpty) return const SizedBox.shrink();
+    return SizedBox(
+      height: 48,
+      child: MovaHorizontalDrag(
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          physics: const BouncingScrollPhysics(),
+          itemCount: published.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 4),
+          itemBuilder: (context, index) {
+            final episode = published[index];
+            return Center(
+              child: Semantics(
+                label: '第 ${episode.episodeNumber} 集，已发布',
+                selected: selected == episode.episodeNumber,
+                child: SizedBox(
+                  width: 44,
+                  height: 44,
+                  child: Transform.scale(
+                    scale: .82,
+                    transformHitTests: false,
+                    child: YingjiMotionSurface(
+                      selected: selected == episode.episodeNumber,
+                      borderRadius: 22,
+                      child: YingjiGlassSurface(
+                        circle: true,
+                        depth: false,
+                        strength: selected == episode.episodeNumber
+                            ? 1.28
+                            : .86,
+                        child: InkWell(
+                          onTap: () => onSelect(episode),
+                          customBorder: const CircleBorder(),
+                          child: Center(
+                            child: Text(
+                              '${episode.episodeNumber}',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
 class _CatalogEpisodeRail extends StatefulWidget {
   const _CatalogEpisodeRail({
     required this.episodes,
@@ -3794,7 +3911,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
   void didUpdateWidget(covariant _CatalogEpisodeRail oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.selectedEpisode != widget.selectedEpisode ||
-        oldWidget.episodes != widget.episodes) {
+        (oldWidget.episodes.isEmpty && widget.episodes.isNotEmpty)) {
       _centerSelected();
     }
   }
@@ -3804,18 +3921,6 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
     _controller.dispose();
     _allEpisodesController.dispose();
     super.dispose();
-  }
-
-  void _move(double delta) {
-    if (!_controller.hasClients) return;
-    _controller.animateTo(
-      (_controller.offset + delta).clamp(
-        0,
-        _controller.position.maxScrollExtent,
-      ),
-      duration: const Duration(milliseconds: 320),
-      curve: Curves.easeOutCubic,
-    );
   }
 
   Future<void> _showAll() async {
@@ -4143,17 +4248,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
             style: const TextStyle(color: YingjiColors.muted),
           ),
           const Spacer(),
-          YingjiDirectionalArrow(
-            previous: true,
-            tooltip: '上一组剧集',
-            onPressed: () => _move(-720),
-          ),
           const SizedBox(width: 7),
-          YingjiDirectionalArrow(
-            previous: false,
-            tooltip: '下一组剧集',
-            onPressed: () => _move(720),
-          ),
           const SizedBox(width: 7),
           YingjiMotionIconButton(
             icon: YingjiIcons.rectangle_stack,
@@ -4164,153 +4259,164 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
         ],
       ),
       const SizedBox(height: 8),
+      _PublishedEpisodeNumbers(
+        episodes: widget.episodes,
+        selected: widget.selectedEpisode,
+        onSelect: widget.onSelect,
+      ),
       SizedBox(
         height: 236,
+        key: const ValueKey('catalog-episode-previews'),
         child: YingjiSmoothWheel(
           controller: _controller,
           stableGlass: true,
-          child: ListView.separated(
-            controller: _controller,
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-            itemCount: widget.episodes.length,
-            separatorBuilder: (_, _) =>
-                SizedBox(width: _episodeItemExtent - _episodeCardWidth),
-            itemBuilder: (context, index) {
-              final episode = widget.episodes[index];
-              final selected = episode.episodeNumber == widget.selectedEpisode;
-              final progress =
-                  widget.progress[_episodeKey(
-                    episode.seasonNumber,
-                    episode.episodeNumber,
-                  )] ??
-                  0;
-              final overview = episode.overview?.trim();
-              return _contextEpisode(
-                episode,
-                SizedBox(
-                  width: _episodeCardWidth,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      InkWell(
-                        borderRadius: BorderRadius.circular(11),
-                        onTap: () => selected
-                            ? widget.onPlay(episode)
-                            : widget.onSelect(episode),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            YingjiMotionSurface(
-                              selected: selected,
-                              borderRadius: 14,
-                              child: SizedBox(
-                                height: 134,
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(14),
-                                  child: Stack(
-                                    fit: StackFit.expand,
-                                    children: [
-                                      if (episode.stillUrl != null)
-                                        CachedNetworkImage(
-                                          imageUrl: episode.stillUrl.toString(),
-                                          fit: BoxFit.cover,
-                                          errorWidget: (_, _, _) =>
-                                              const _EpisodeArtworkFallback(),
-                                        )
-                                      else
-                                        const _EpisodeArtworkFallback(),
-                                      Positioned(
-                                        top: 9,
-                                        right: 9,
-                                        child: AnimatedSwitcher(
-                                          duration: MovaMotion.standard,
-                                          switchInCurve: MovaMotion.spring,
-                                          switchOutCurve: MovaMotion.exit,
-                                          transitionBuilder:
-                                              (child, animation) =>
-                                                  ScaleTransition(
-                                                    scale: animation,
-                                                    child: FadeTransition(
-                                                      opacity: animation,
-                                                      child: child,
+          child: MovaHorizontalDrag(
+            child: ListView.separated(
+              controller: _controller,
+              scrollDirection: Axis.horizontal,
+
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+              itemCount: widget.episodes.length,
+              separatorBuilder: (_, _) =>
+                  SizedBox(width: _episodeItemExtent - _episodeCardWidth),
+              itemBuilder: (context, index) {
+                final episode = widget.episodes[index];
+                final selected =
+                    episode.episodeNumber == widget.selectedEpisode;
+                final progress =
+                    widget.progress[_episodeKey(
+                      episode.seasonNumber,
+                      episode.episodeNumber,
+                    )] ??
+                    0;
+                final overview = episode.overview?.trim();
+                return _contextEpisode(
+                  episode,
+                  SizedBox(
+                    width: _episodeCardWidth,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        InkWell(
+                          borderRadius: BorderRadius.circular(11),
+                          onTap: () => selected
+                              ? widget.onPlay(episode)
+                              : widget.onSelect(episode),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _DetailPosterHover(
+                                selected: selected,
+                                borderRadius: 14,
+                                child: SizedBox(
+                                  height: 134,
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(14),
+                                    child: Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        if (episode.stillUrl != null)
+                                          CachedNetworkImage(
+                                            imageUrl: episode.stillUrl
+                                                .toString(),
+                                            fit: BoxFit.cover,
+                                            errorWidget: (_, _, _) =>
+                                                const _EpisodeArtworkFallback(),
+                                          )
+                                        else
+                                          const _EpisodeArtworkFallback(),
+                                        Positioned(
+                                          top: 9,
+                                          right: 9,
+                                          child: AnimatedSwitcher(
+                                            duration: MovaMotion.standard,
+                                            switchInCurve: MovaMotion.spring,
+                                            switchOutCurve: MovaMotion.exit,
+                                            transitionBuilder:
+                                                (child, animation) =>
+                                                    ScaleTransition(
+                                                      scale: animation,
+                                                      child: FadeTransition(
+                                                        opacity: animation,
+                                                        child: child,
+                                                      ),
                                                     ),
+                                            child: progress >= .92
+                                                ? const Icon(
+                                                    YingjiIcons
+                                                        .checkmark_circle_fill,
+                                                    key: ValueKey('played'),
+                                                    color: Colors.white,
+                                                    size: 23,
+                                                  )
+                                                : const SizedBox.square(
+                                                    key: ValueKey('unplayed'),
+                                                    dimension: 23,
                                                   ),
-                                          child: progress >= .92
-                                              ? const Icon(
-                                                  YingjiIcons
-                                                      .checkmark_circle_fill,
-                                                  key: ValueKey('played'),
-                                                  color: Colors.white,
-                                                  size: 23,
-                                                )
-                                              : const SizedBox.square(
-                                                  key: ValueKey('unplayed'),
-                                                  dimension: 23,
-                                                ),
-                                        ),
-                                      ),
-                                      if (progress > 0)
-                                        Align(
-                                          alignment: Alignment.bottomCenter,
-                                          child: LinearProgressIndicator(
-                                            value: progress,
-                                            minHeight: 4,
-                                            backgroundColor: Colors.white24,
-                                            color: Colors.white,
                                           ),
                                         ),
-                                    ],
+                                        if (progress > 0)
+                                          Align(
+                                            alignment: Alignment.bottomCenter,
+                                            child: LinearProgressIndicator(
+                                              value: progress,
+                                              minHeight: 4,
+                                              backgroundColor: Colors.white24,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
-                            const SizedBox(height: 7),
-                            Text(
-                              '第 ${episode.episodeNumber} 集 · ${episode.name}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w800,
+                              const SizedBox(height: 7),
+                              Text(
+                                '第 ${episode.episodeNumber} 集 · ${episode.name}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w800,
+                                ),
                               ),
-                            ),
-                            const SizedBox(height: 3),
-                            Text(
-                              [
-                                _dateLabel(episode.airDate),
-                                if (episode.runtime != null)
-                                  '${episode.runtime} 分钟',
-                              ].where((part) => part.isNotEmpty).join(' · '),
-                              style: const TextStyle(
-                                color: YingjiColors.muted,
-                                fontSize: 11,
+                              const SizedBox(height: 3),
+                              Text(
+                                [
+                                  _dateLabel(episode.airDate),
+                                  if (episode.runtime != null)
+                                    '${episode.runtime} 分钟',
+                                ].where((part) => part.isNotEmpty).join(' · '),
+                                style: const TextStyle(
+                                  color: YingjiColors.muted,
+                                  fontSize: 11,
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                      if (overview?.isNotEmpty == true)
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(2, 5, 2, 0),
-                          child: YingjiGlassTooltip(
-                            message: overview!,
-                            child: Text(
-                              overview,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: YingjiColors.muted,
+                        if (overview?.isNotEmpty == true)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(2, 5, 2, 0),
+                            child: YingjiGlassTooltip(
+                              message: overview!,
+                              child: Text(
+                                overview,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: YingjiColors.muted,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              );
-            },
+                );
+              },
+            ),
           ),
         ),
       ),
@@ -4344,18 +4450,6 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
   final ScrollController _controller = ScrollController();
   final ScrollController _episodeDialogScroll = ScrollController();
   int? _hoveredIndex;
-
-  void _move(double delta) {
-    if (!_controller.hasClients) return;
-    _controller.animateTo(
-      (_controller.offset + delta).clamp(
-        0,
-        _controller.position.maxScrollExtent,
-      ),
-      duration: const Duration(milliseconds: 320),
-      curve: Curves.easeOutCubic,
-    );
-  }
 
   void _centerSelected() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4448,17 +4542,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
             style: const TextStyle(color: YingjiColors.muted),
           ),
           const Spacer(),
-          YingjiDirectionalArrow(
-            previous: true,
-            tooltip: '上一组剧集',
-            onPressed: () => _move(-720),
-          ),
           const SizedBox(width: 7),
-          YingjiDirectionalArrow(
-            previous: false,
-            tooltip: '下一组剧集',
-            onPressed: () => _move(720),
-          ),
           const SizedBox(width: 7),
           YingjiMotionIconButton(
             icon: YingjiIcons.rectangle_stack,
@@ -4474,272 +4558,284 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
         child: YingjiSmoothWheel(
           controller: _controller,
           stableGlass: true,
-          child: ListView.separated(
-            controller: _controller,
-            scrollDirection: Axis.horizontal,
-            physics:
-                yingjiWheelPhysics ??
-                const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
-                ),
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-            itemCount: widget.resources.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 18),
-            itemBuilder: (_, index) {
-              final resource = widget.resources[index];
-              final effectiveSeason =
-                  resource.seasonNumber ?? widget.selected?.seasonNumber ?? 1;
-              final effectiveEpisode = resource.episodeNumber ?? index + 1;
-              final episodeMetadata = widget
-                  .metadata[_episodeKey(effectiveSeason, effectiveEpisode)];
-              final title = _episodeTitle(resource, episodeMetadata, index + 1);
-              final image = _episodeImage(resource, episodeMetadata);
-              final overview = resource.overview?.trim().isNotEmpty == true
-                  ? resource.overview!
-                  : episodeMetadata?.overview;
-              final published =
-                  resource.premiereDate ?? episodeMetadata?.airDate;
-              final runtime =
-                  resource.runtime?.inMinutes ?? episodeMetadata?.runtime;
-              final active =
-                  resource.seasonNumber == widget.selected?.seasonNumber &&
-                  resource.episodeNumber == widget.selected?.episodeNumber;
-              final progress =
-                  widget.episodeProgress[_episodeKey(
-                    effectiveSeason,
-                    effectiveEpisode,
-                  )] ??
-                  0;
-              final completed =
-                  widget.completedResourceIds.contains(resource.id) ||
-                  progress >= .92;
-              final lifted = active || _hoveredIndex == index;
-              return MouseRegion(
-                onEnter: (_) => setState(() => _hoveredIndex = index),
-                onExit: (_) => setState(() => _hoveredIndex = null),
-                child: GestureDetector(
-                  onSecondaryTapUp: (details) => _showMarkMenu(
-                    context,
-                    resource,
-                    completed,
-                    details.globalPosition,
+          child: MovaHorizontalDrag(
+            child: ListView.separated(
+              controller: _controller,
+              scrollDirection: Axis.horizontal,
+
+              physics:
+                  yingjiWheelPhysics ??
+                  const BouncingScrollPhysics(
+                    parent: AlwaysScrollableScrollPhysics(),
                   ),
-                  onLongPressStart: (details) => _showMarkMenu(
-                    context,
-                    resource,
-                    completed,
-                    details.globalPosition,
-                  ),
-                  child: InkWell(
-                    onTap: () => widget.onSelect(resource),
-                    borderRadius: BorderRadius.circular(14),
-                    child: AnimatedScale(
-                      scale: lifted ? 1.018 : 1,
-                      duration: const Duration(milliseconds: 180),
-                      curve: Curves.easeOutCubic,
-                      child: AnimatedSlide(
-                        offset: lifted ? const Offset(0, -.015) : Offset.zero,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+              itemCount: widget.resources.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 18),
+              itemBuilder: (_, index) {
+                final resource = widget.resources[index];
+                final effectiveSeason =
+                    resource.seasonNumber ?? widget.selected?.seasonNumber ?? 1;
+                final effectiveEpisode = resource.episodeNumber ?? index + 1;
+                final episodeMetadata = widget
+                    .metadata[_episodeKey(effectiveSeason, effectiveEpisode)];
+                final title = _episodeTitle(
+                  resource,
+                  episodeMetadata,
+                  index + 1,
+                );
+                final image = _episodeImage(resource, episodeMetadata);
+                final overview = resource.overview?.trim().isNotEmpty == true
+                    ? resource.overview!
+                    : episodeMetadata?.overview;
+                final published =
+                    resource.premiereDate ?? episodeMetadata?.airDate;
+                final runtime =
+                    resource.runtime?.inMinutes ?? episodeMetadata?.runtime;
+                final active =
+                    resource.seasonNumber == widget.selected?.seasonNumber &&
+                    resource.episodeNumber == widget.selected?.episodeNumber;
+                final progress =
+                    widget.episodeProgress[_episodeKey(
+                      effectiveSeason,
+                      effectiveEpisode,
+                    )] ??
+                    0;
+                final completed =
+                    widget.completedResourceIds.contains(resource.id) ||
+                    progress >= .92;
+                final lifted = active || _hoveredIndex == index;
+                return MouseRegion(
+                  onEnter: (_) => setState(() => _hoveredIndex = index),
+                  onExit: (_) => setState(() => _hoveredIndex = null),
+                  child: GestureDetector(
+                    onSecondaryTapUp: (details) => _showMarkMenu(
+                      context,
+                      resource,
+                      completed,
+                      details.globalPosition,
+                    ),
+                    onLongPressStart: (details) => _showMarkMenu(
+                      context,
+                      resource,
+                      completed,
+                      details.globalPosition,
+                    ),
+                    child: InkWell(
+                      onTap: () => widget.onSelect(resource),
+                      borderRadius: BorderRadius.circular(14),
+                      child: AnimatedScale(
+                        scale: lifted ? 1.018 : 1,
                         duration: const Duration(milliseconds: 180),
                         curve: Curves.easeOutCubic,
-                        child: SizedBox(
-                          width: 238,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              // 选中与悬浮描边只包裹剧照，不延伸到集名和日期。
-                              SizedBox(
-                                width: double.infinity,
-                                height: 134,
-                                child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 220),
-                                  clipBehavior: Clip.antiAlias,
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF25292A),
-                                    borderRadius: BorderRadius.circular(14),
-                                    border: Border.all(
-                                      color: active
-                                          ? Colors.white
-                                          : _hoveredIndex == index
-                                          ? Colors.white.withValues(alpha: .58)
-                                          : Colors.white.withValues(alpha: .1),
-                                      width: active
-                                          ? 2.4
-                                          : _hoveredIndex == index
-                                          ? 1.4
-                                          : 1,
-                                    ),
-                                    boxShadow: lifted
-                                        ? const [
-                                            BoxShadow(
-                                              color: Color(0x8A000000),
-                                              blurRadius: 28,
-                                              offset: Offset(0, 14),
-                                            ),
-                                          ]
-                                        : null,
-                                  ),
-                                  child: Stack(
-                                    fit: StackFit.expand,
-                                    children: [
-                                      image == null
-                                          ? const _EpisodeArtworkFallback()
-                                          : CachedNetworkImage(
-                                              fadeInDuration: const Duration(
-                                                milliseconds: 150,
+                        child: AnimatedSlide(
+                          offset: lifted ? const Offset(0, -.015) : Offset.zero,
+                          duration: const Duration(milliseconds: 180),
+                          curve: Curves.easeOutCubic,
+                          child: SizedBox(
+                            width: 238,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                // 选中与悬浮描边只包裹剧照，不延伸到集名和日期。
+                                SizedBox(
+                                  width: double.infinity,
+                                  height: 134,
+                                  child: AnimatedContainer(
+                                    duration: const Duration(milliseconds: 220),
+                                    clipBehavior: Clip.antiAlias,
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF25292A),
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(
+                                        color: active
+                                            ? Colors.white
+                                            : _hoveredIndex == index
+                                            ? Colors.white.withValues(
+                                                alpha: .58,
+                                              )
+                                            : Colors.white.withValues(
+                                                alpha: .1,
                                               ),
-                                              imageUrl: image.toString(),
-                                              fit: BoxFit.cover,
-                                              // 剧集静帧显示宽 ~238，按物理像素解码即可，
-                                              // 避免几十张原图在进页面时批量解码卡住转场末帧。
-                                              memCacheWidth:
-                                                  (320 *
-                                                          MediaQuery.devicePixelRatioOf(
-                                                            context,
-                                                          ))
-                                                      .clamp(1.0, 512.0)
-                                                      .round(),
-                                              errorWidget: (_, _, _) =>
-                                                  const _EpisodeArtworkFallback(),
-                                            ),
-                                      Positioned(
-                                        right: 10,
-                                        top: 10,
-                                        child: AnimatedSwitcher(
-                                          duration: MovaMotion.standard,
-                                          switchInCurve: MovaMotion.spring,
-                                          switchOutCurve: MovaMotion.exit,
-                                          transitionBuilder:
-                                              (child, animation) =>
-                                                  ScaleTransition(
-                                                    scale: animation,
-                                                    child: FadeTransition(
-                                                      opacity: animation,
-                                                      child: child,
-                                                    ),
-                                                  ),
-                                          child: completed
-                                              ? const Icon(
-                                                  YingjiIcons
-                                                      .checkmark_circle_fill,
-                                                  key: ValueKey('played'),
-                                                  color: Colors.white,
-                                                )
-                                              : const SizedBox.square(
-                                                  key: ValueKey('unplayed'),
-                                                  dimension: 24,
-                                                ),
-                                        ),
+                                        width: active
+                                            ? 2.4
+                                            : _hoveredIndex == index
+                                            ? 1.4
+                                            : 1,
                                       ),
-                                      if (progress > 0 &&
-                                          !completed &&
-                                          runtime != null)
-                                        Positioned(
-                                          left: 10,
-                                          right: 10,
-                                          bottom: 8,
-                                          child: Column(
-                                            children: [
-                                              Row(
-                                                children: [
-                                                  Text(
-                                                    _minuteClock(
-                                                      (runtime * progress)
-                                                          .round(),
-                                                    ),
-                                                    style: const TextStyle(
-                                                      fontSize: 10.5,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                  ),
-                                                  const Spacer(),
-                                                  Text(
-                                                    _minuteClock(
-                                                      (runtime * (1 - progress))
-                                                          .round(),
-                                                    ),
-                                                    style: const TextStyle(
-                                                      fontSize: 10.5,
-                                                      fontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                  ),
-                                                ],
+                                      boxShadow: lifted
+                                          ? const [
+                                              BoxShadow(
+                                                color: Color(0x8A000000),
+                                                blurRadius: 28,
+                                                offset: Offset(0, 14),
                                               ),
-                                              const SizedBox(height: 4),
-                                              ClipRRect(
-                                                borderRadius:
-                                                    BorderRadius.circular(99),
-                                                child: LinearProgressIndicator(
-                                                  value: progress,
-                                                  minHeight: 3,
-                                                  backgroundColor:
-                                                      Colors.white24,
-                                                  valueColor:
-                                                      const AlwaysStoppedAnimation<
-                                                        Color
-                                                      >(Colors.white),
+                                            ]
+                                          : null,
+                                    ),
+                                    child: Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        image == null
+                                            ? const _EpisodeArtworkFallback()
+                                            : CachedNetworkImage(
+                                                fadeInDuration: const Duration(
+                                                  milliseconds: 150,
                                                 ),
+                                                imageUrl: image.toString(),
+                                                fit: BoxFit.cover,
+                                                // 剧集静帧显示宽 ~238，按物理像素解码即可，
+                                                // 避免几十张原图在进页面时批量解码卡住转场末帧。
+                                                memCacheWidth:
+                                                    (320 *
+                                                            MediaQuery.devicePixelRatioOf(
+                                                              context,
+                                                            ))
+                                                        .clamp(1.0, 512.0)
+                                                        .round(),
+                                                errorWidget: (_, _, _) =>
+                                                    const _EpisodeArtworkFallback(),
                                               ),
-                                            ],
+                                        Positioned(
+                                          right: 10,
+                                          top: 10,
+                                          child: AnimatedSwitcher(
+                                            duration: MovaMotion.standard,
+                                            switchInCurve: MovaMotion.spring,
+                                            switchOutCurve: MovaMotion.exit,
+                                            transitionBuilder:
+                                                (child, animation) =>
+                                                    ScaleTransition(
+                                                      scale: animation,
+                                                      child: FadeTransition(
+                                                        opacity: animation,
+                                                        child: child,
+                                                      ),
+                                                    ),
+                                            child: completed
+                                                ? const Icon(
+                                                    YingjiIcons
+                                                        .checkmark_circle_fill,
+                                                    key: ValueKey('played'),
+                                                    color: Colors.white,
+                                                  )
+                                                : const SizedBox.square(
+                                                    key: ValueKey('unplayed'),
+                                                    dimension: 24,
+                                                  ),
                                           ),
                                         ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 7),
-                              Text(
-                                '第 $effectiveEpisode 集 · $title',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontWeight: active
-                                      ? FontWeight.w800
-                                      : FontWeight.w700,
-                                  fontSize: 13,
-                                ),
-                              ),
-                              const SizedBox(height: 3),
-                              Text(
-                                [
-                                  if (_dateLabel(published).isNotEmpty)
-                                    _dateLabel(published),
-                                  if (runtime != null) '$runtime 分钟',
-                                ].join(' · '),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: YingjiColors.muted,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              if (overview?.isNotEmpty == true) ...[
-                                const SizedBox(height: 3),
-                                YingjiGlassTooltip(
-                                  message: overview!,
-                                  child: Text(
-                                    overview,
-                                    maxLines: 2,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Color(0xFFD5D8DF),
-                                      fontSize: 11,
-                                      height: 1.28,
+                                        if (progress > 0 &&
+                                            !completed &&
+                                            runtime != null)
+                                          Positioned(
+                                            left: 10,
+                                            right: 10,
+                                            bottom: 8,
+                                            child: Column(
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    Text(
+                                                      _minuteClock(
+                                                        (runtime * progress)
+                                                            .round(),
+                                                      ),
+                                                      style: const TextStyle(
+                                                        fontSize: 10.5,
+                                                        fontWeight:
+                                                            FontWeight.w700,
+                                                      ),
+                                                    ),
+                                                    const Spacer(),
+                                                    Text(
+                                                      _minuteClock(
+                                                        (runtime *
+                                                                (1 - progress))
+                                                            .round(),
+                                                      ),
+                                                      style: const TextStyle(
+                                                        fontSize: 10.5,
+                                                        fontWeight:
+                                                            FontWeight.w700,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                                const SizedBox(height: 4),
+                                                ClipRRect(
+                                                  borderRadius:
+                                                      BorderRadius.circular(99),
+                                                  child: LinearProgressIndicator(
+                                                    value: progress,
+                                                    minHeight: 3,
+                                                    backgroundColor:
+                                                        Colors.white24,
+                                                    valueColor:
+                                                        const AlwaysStoppedAnimation<
+                                                          Color
+                                                        >(Colors.white),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                      ],
                                     ),
                                   ),
                                 ),
+                                const SizedBox(height: 7),
+                                Text(
+                                  '第 $effectiveEpisode 集 · $title',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontWeight: active
+                                        ? FontWeight.w800
+                                        : FontWeight.w700,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  [
+                                    if (_dateLabel(published).isNotEmpty)
+                                      _dateLabel(published),
+                                    if (runtime != null) '$runtime 分钟',
+                                  ].join(' · '),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: YingjiColors.muted,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                if (overview?.isNotEmpty == true) ...[
+                                  const SizedBox(height: 3),
+                                  YingjiGlassTooltip(
+                                    message: overview!,
+                                    child: Text(
+                                      overview,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Color(0xFFD5D8DF),
+                                        fontSize: 11,
+                                        height: 1.28,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ],
-                            ],
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
-                ),
-              );
-            },
+                );
+              },
+            ),
           ),
         ),
       ),
@@ -5456,29 +5552,32 @@ class _ResourceSectionState extends State<_ResourceSection> {
           child: YingjiSmoothWheel(
             controller: _controller,
             stableGlass: true,
-            child: ListView.separated(
-              controller: _controller,
-              scrollDirection: Axis.horizontal,
-              physics:
-                  yingjiWheelPhysics ??
-                  const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
-                  ),
-              itemCount: _displayed.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 14),
-              itemBuilder: (_, index) {
-                final resource = _displayed[index];
-                return _ResourceCard(
-                  resource: resource,
-                  selected:
-                      resource.id == widget.selected?.id &&
-                      resource.source.id == widget.selected?.source.id,
-                  onSelect: () => widget.onSelect(resource),
-                  showPicker: _viewMode == 'server',
-                  rank: index < 3 ? index + 1 : null,
-                  onPicker: () => widget.onPicker(resource),
-                );
-              },
+            child: MovaHorizontalDrag(
+              child: ListView.separated(
+                controller: _controller,
+                scrollDirection: Axis.horizontal,
+
+                physics:
+                    yingjiWheelPhysics ??
+                    const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                itemCount: _displayed.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 14),
+                itemBuilder: (_, index) {
+                  final resource = _displayed[index];
+                  return _ResourceCard(
+                    resource: resource,
+                    selected:
+                        resource.id == widget.selected?.id &&
+                        resource.source.id == widget.selected?.source.id,
+                    onSelect: () => widget.onSelect(resource),
+                    showPicker: _viewMode == 'server',
+                    rank: index < 3 ? index + 1 : null,
+                    onPicker: () => widget.onPicker(resource),
+                  );
+                },
+              ),
             ),
           ),
         )
@@ -6460,90 +6559,93 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
               child: YingjiSmoothWheel(
                 controller: _castController,
                 stableGlass: true,
-                child: ListView.separated(
-                  controller: _castController,
-                  scrollDirection: Axis.horizontal,
-                  physics:
-                      yingjiWheelPhysics ??
-                      const BouncingScrollPhysics(
-                        parent: AlwaysScrollableScrollPhysics(),
-                      ),
-                  itemCount: value.cast.length,
-                  separatorBuilder: (_, _) => const SizedBox(width: 18),
-                  itemBuilder: (context, index) {
-                    final person = value.cast[index];
-                    return InkWell(
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => _PersonPage(person: person),
-                        ),
-                      ),
-                      borderRadius: BorderRadius.circular(54),
-                      child: _DetailPosterHover(
-                        borderRadius: 54,
-                        child: SizedBox(
-                          width: 110,
-                          child: Column(
-                            children: [
-                              ClipOval(
-                                child: SizedBox.square(
-                                  dimension: 100,
-                                  child: person.profileUrl == null
-                                      ? const ColoredBox(
-                                          color: YingjiColors.elevated,
-                                          child: Icon(YingjiIcons.person_fill),
-                                        )
-                                      : CachedNetworkImage(
-                                          fadeInDuration: const Duration(
-                                            milliseconds: 150,
-                                          ),
-                                          imageUrl: person.profileUrl
-                                              .toString(),
-                                          fit: BoxFit.cover,
-                                          // 演员头像 100px，按显示分辨率解码。
-                                          memCacheWidth:
-                                              (160 *
-                                                      MediaQuery.devicePixelRatioOf(
-                                                        context,
-                                                      ))
-                                                  .clamp(1.0, 512.0)
-                                                  .round(),
-                                          errorWidget: (_, _, _) =>
-                                              const ColoredBox(
-                                                color: YingjiColors.elevated,
-                                                child: Icon(
-                                                  YingjiIcons.person_fill,
-                                                ),
-                                              ),
-                                        ),
-                                ),
-                              ),
-                              const SizedBox(height: 7),
-                              Text(
-                                person.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              Text(
-                                person.role,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: YingjiColors.muted,
-                                ),
-                              ),
-                            ],
+                child: MovaHorizontalDrag(
+                  child: ListView.separated(
+                    controller: _castController,
+                    scrollDirection: Axis.horizontal,
+
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    itemCount: value.cast.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 18),
+                    itemBuilder: (context, index) {
+                      final person = value.cast[index];
+                      return InkWell(
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => _PersonPage(person: person),
                           ),
                         ),
-                      ),
-                    );
-                  },
+                        borderRadius: BorderRadius.circular(54),
+                        child: _DetailPosterHover(
+                          borderRadius: 54,
+                          child: SizedBox(
+                            width: 110,
+                            child: Column(
+                              children: [
+                                ClipOval(
+                                  child: SizedBox.square(
+                                    dimension: 100,
+                                    child: person.profileUrl == null
+                                        ? const ColoredBox(
+                                            color: YingjiColors.elevated,
+                                            child: Icon(
+                                              YingjiIcons.person_fill,
+                                            ),
+                                          )
+                                        : CachedNetworkImage(
+                                            fadeInDuration: const Duration(
+                                              milliseconds: 150,
+                                            ),
+                                            imageUrl: person.profileUrl
+                                                .toString(),
+                                            fit: BoxFit.cover,
+                                            // 演员头像 100px，按显示分辨率解码。
+                                            memCacheWidth:
+                                                (160 *
+                                                        MediaQuery.devicePixelRatioOf(
+                                                          context,
+                                                        ))
+                                                    .clamp(1.0, 512.0)
+                                                    .round(),
+                                            errorWidget: (_, _, _) =>
+                                                const ColoredBox(
+                                                  color: YingjiColors.elevated,
+                                                  child: Icon(
+                                                    YingjiIcons.person_fill,
+                                                  ),
+                                                ),
+                                          ),
+                                  ),
+                                ),
+                                const SizedBox(height: 7),
+                                Text(
+                                  person.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                Text(
+                                  person.role,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 10,
+                                    color: YingjiColors.muted,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
@@ -6565,68 +6667,71 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
               child: YingjiSmoothWheel(
                 controller: _artworkController,
                 stableGlass: true,
-                child: ListView.separated(
-                  controller: _artworkController,
-                  scrollDirection: Axis.horizontal,
-                  physics:
-                      yingjiWheelPhysics ??
-                      const BouncingScrollPhysics(
-                        parent: AlwaysScrollableScrollPhysics(),
-                      ),
-                  clipBehavior: Clip.none,
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  itemCount: value.artwork.length,
-                  separatorBuilder: (_, _) => const SizedBox(width: 14),
-                  itemBuilder: (context, index) {
-                    final artwork = value.artwork[index];
-                    return InkWell(
-                      onTap: () => showDialog<void>(
-                        context: context,
-                        animationStyle: MovaMotion.dialogAnimationStyle(
-                          context,
-                        ),
-                        builder: (context) => Dialog(
-                          backgroundColor: Colors.transparent,
-                          child: ConstrainedBox(
-                            constraints: const BoxConstraints(
-                              maxWidth: 1100,
-                              maxHeight: 720,
+                child: MovaHorizontalDrag(
+                  child: ListView.separated(
+                    controller: _artworkController,
+                    scrollDirection: Axis.horizontal,
+
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    clipBehavior: Clip.none,
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    itemCount: value.artwork.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 14),
+                    itemBuilder: (context, index) {
+                      final artwork = value.artwork[index];
+                      return InkWell(
+                        onTap: () => showDialog<void>(
+                          context: context,
+                          animationStyle: MovaMotion.dialogAnimationStyle(
+                            context,
+                          ),
+                          builder: (context) => Dialog(
+                            backgroundColor: Colors.transparent,
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(
+                                maxWidth: 1100,
+                                maxHeight: 720,
+                              ),
+                              child: CachedNetworkImage(
+                                fadeInDuration: const Duration(
+                                  milliseconds: 150,
+                                ),
+                                imageUrl: artwork.url.toString(),
+                                fit: BoxFit.contain,
+                                // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
+                                memCacheWidth:
+                                    (1280 *
+                                            MediaQuery.devicePixelRatioOf(
+                                              context,
+                                            ))
+                                        .clamp(1.0, 1280.0)
+                                        .round(),
+                              ),
                             ),
+                          ),
+                        ),
+                        child: _DetailPosterHover(
+                          borderRadius: 14,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(14),
                             child: CachedNetworkImage(
                               fadeInDuration: const Duration(milliseconds: 150),
                               imageUrl: artwork.url.toString(),
-                              fit: BoxFit.contain,
-                              // 艺术图大图弹窗（maxWidth 1100），按显示分辨率解码。
+                              width: 300,
+                              fit: BoxFit.cover,
+                              // 艺术图货架缩略图宽 300，按显示分辨率解码。
                               memCacheWidth:
-                                  (1280 *
-                                          MediaQuery.devicePixelRatioOf(
-                                            context,
-                                          ))
-                                      .clamp(1.0, 1280.0)
+                                  (320 * MediaQuery.devicePixelRatioOf(context))
+                                      .clamp(1.0, 512.0)
                                       .round(),
                             ),
                           ),
                         ),
-                      ),
-                      child: _DetailPosterHover(
-                        borderRadius: 14,
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(14),
-                          child: CachedNetworkImage(
-                            fadeInDuration: const Duration(milliseconds: 150),
-                            imageUrl: artwork.url.toString(),
-                            width: 300,
-                            fit: BoxFit.cover,
-                            // 艺术图货架缩略图宽 300，按显示分辨率解码。
-                            memCacheWidth:
-                                (320 * MediaQuery.devicePixelRatioOf(context))
-                                    .clamp(1.0, 512.0)
-                                    .round(),
-                          ),
-                        ),
-                      ),
-                    );
-                  },
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
@@ -6648,75 +6753,77 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
               child: YingjiSmoothWheel(
                 controller: _recommendationController,
                 stableGlass: true,
-                child: ListView.separated(
-                  controller: _recommendationController,
-                  scrollDirection: Axis.horizontal,
-                  physics:
-                      yingjiWheelPhysics ??
-                      const BouncingScrollPhysics(
-                        parent: AlwaysScrollableScrollPhysics(),
-                      ),
-                  clipBehavior: Clip.none,
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  itemCount: value.recommendations.length,
-                  separatorBuilder: (_, _) => const SizedBox(width: 16),
-                  itemBuilder: (context, index) {
-                    final item = value.recommendations[index];
-                    return InkWell(
-                      onTap: () => MetadataDetailPage.open(context, item: item),
-                      borderRadius: BorderRadius.circular(14),
-                      child: _DetailPosterHover(
-                        borderRadius: 14,
-                        child: SizedBox(
-                          width: 164,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(14),
-                                child: SizedBox(
-                                  width: 164,
-                                  height: 232,
-                                  child: item.posterUrl == null
-                                      ? const ColoredBox(
-                                          color: YingjiColors.elevated,
-                                        )
-                                      : CachedNetworkImage(
-                                          fadeInDuration: const Duration(
-                                            milliseconds: 150,
+                child: MovaHorizontalDrag(
+                  child: ListView.separated(
+                    controller: _recommendationController,
+                    scrollDirection: Axis.horizontal,
+
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    clipBehavior: Clip.none,
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    itemCount: value.recommendations.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 16),
+                    itemBuilder: (context, index) {
+                      final item = value.recommendations[index];
+                      return InkWell(
+                        onTap: () =>
+                            MetadataDetailPage.open(context, item: item),
+                        borderRadius: BorderRadius.circular(14),
+                        child: _DetailPosterHover(
+                          borderRadius: 14,
+                          child: SizedBox(
+                            width: 164,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(14),
+                                  child: SizedBox(
+                                    width: 164,
+                                    height: 232,
+                                    child: item.posterUrl == null
+                                        ? const ColoredBox(
+                                            color: YingjiColors.elevated,
+                                          )
+                                        : CachedNetworkImage(
+                                            fadeInDuration: const Duration(
+                                              milliseconds: 150,
+                                            ),
+                                            imageUrl: item.posterUrl.toString(),
+                                            fit: BoxFit.cover,
+                                            // 相似推荐海报 164px 宽，按显示分辨率解码。
+                                            memCacheWidth:
+                                                (320 *
+                                                        MediaQuery.devicePixelRatioOf(
+                                                          context,
+                                                        ))
+                                                    .clamp(1.0, 512.0)
+                                                    .round(),
+                                            errorWidget: (_, _, _) =>
+                                                const ColoredBox(
+                                                  color: YingjiColors.elevated,
+                                                ),
                                           ),
-                                          imageUrl: item.posterUrl.toString(),
-                                          fit: BoxFit.cover,
-                                          // 相似推荐海报 164px 宽，按显示分辨率解码。
-                                          memCacheWidth:
-                                              (320 *
-                                                      MediaQuery.devicePixelRatioOf(
-                                                        context,
-                                                      ))
-                                                  .clamp(1.0, 512.0)
-                                                  .round(),
-                                          errorWidget: (_, _, _) =>
-                                              const ColoredBox(
-                                                color: YingjiColors.elevated,
-                                              ),
-                                        ),
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                item.title,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w700,
+                                const SizedBox(height: 8),
+                                Text(
+                                  item.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
-                      ),
-                    );
-                  },
+                      );
+                    },
+                  ),
                 ),
               ),
             ),
@@ -7273,17 +7380,17 @@ class _DetailSectionTitle extends StatelessWidget {
   final Widget? trailing;
 
   @override
-  Widget build(BuildContext context) => Wrap(
-    spacing: 14,
-    runSpacing: 8,
-    crossAxisAlignment: WrapCrossAlignment.center,
+  Widget build(BuildContext context) => Row(
     children: [
-      Text(
-        title,
-        style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+      Expanded(
+        child: Text(
+          title,
+          style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
+        ),
       ),
       if (empty) ...[
         const Text('暂无数据', style: TextStyle(color: YingjiColors.muted)),
+        const SizedBox(width: 14),
       ],
       trailing ?? const SizedBox.shrink(),
     ],
@@ -7304,17 +7411,7 @@ class _SectionShelfControls extends StatelessWidget {
   Widget build(BuildContext context) => Row(
     mainAxisSize: MainAxisSize.min,
     children: [
-      YingjiDirectionalArrow(
-        previous: true,
-        tooltip: '向左浏览',
-        onPressed: onPrevious,
-      ),
       const SizedBox(width: 7),
-      YingjiDirectionalArrow(
-        previous: false,
-        tooltip: '向右浏览',
-        onPressed: onNext,
-      ),
       const SizedBox(width: 7),
       YingjiMotionIconButton(
         icon: YingjiIcons.rectangle_stack,

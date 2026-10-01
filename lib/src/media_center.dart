@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
+import 'package:flutter/foundation.dart' show mapEquals, setEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart'
     show RenderAbstractViewport, ScrollCacheExtent;
@@ -23,6 +24,7 @@ import 'cache/danmaku_cache.dart';
 import 'cache/discover_snapshot_cache.dart';
 import 'cache/image_prefetch.dart';
 import 'cache/media_cache.dart';
+import 'cache/scroll_snapshot.dart';
 import 'cache/video_cache.dart';
 import 'cache/windows_metadata_cache.dart';
 import 'diagnostics/frame_trace.dart';
@@ -49,6 +51,7 @@ import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
 import 'tracking/calendar_events.dart';
+import 'tracking/tracking_status_store.dart';
 import 'tracking/trakt_auth.dart';
 import 'tracking/trakt_watchlist_sync.dart';
 import 'update/update_checker.dart';
@@ -643,7 +646,9 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
                   if (_showDiscover)
                     SliverPadding(
                       // 与原独立“发现”页在壳层中收到的边距保持一致
-                      padding: YingjiLayout.pageInset,
+                      padding: YingjiLayout.pageInset.copyWith(
+                        right: _PageScrollCue.width,
+                      ),
                       sliver: _DiscoverPage(
                         embedded: true,
                         sectionLimit: _discoverSectionLimit,
@@ -657,7 +662,7 @@ class _HomeFeedPageState extends State<_HomeFeedPage>
             ),
           ),
           Positioned(
-            right: 28,
+            right: 0,
             bottom: 30,
             child: AnimatedOpacity(
               opacity: _hasMoreBelow ? 1 : 0,
@@ -748,46 +753,48 @@ class _HomeHeroBackdrop extends StatelessWidget {
             return const SizedBox.expand();
           }
           return RepaintBoundary(
-            child: ShaderMask(
-              blendMode: BlendMode.dstIn,
-              shaderCallback: (bounds) => const LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Colors.white, Colors.white, Colors.transparent],
-                // 固定遮罩与滚动无关，可在海报 URL / 转场变化时重绘一次。
-                stops: [0, .58, .985],
-              ).createShader(bounds),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  AnimatedSwitcher(
-                    duration: effect == 'instant'
-                        ? Duration.zero
-                        : const Duration(milliseconds: 900),
-                    layoutBuilder: (currentChild, previousChildren) => Stack(
-                      fit: StackFit.expand,
-                      children: [...previousChildren, ?currentChild],
-                    ),
-                    transitionBuilder: (child, animation) =>
-                        _transition(effect, child, animation),
-                    child: CachedNetworkImage(
-                      key: ValueKey('hero-$imageUrl'),
-                      imageUrl: imageUrl,
-                      fit: BoxFit.cover,
-                      memCacheWidth: 1280,
-                      errorWidget: (_, _, _) => const SizedBox.shrink(),
-                    ),
-                  ),
-                  const DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.centerLeft,
-                        end: Alignment.centerRight,
-                        colors: [Color(0xB307090D), Color(0x0007090D)],
+            child: ScrollSnapshot(
+              child: ShaderMask(
+                blendMode: BlendMode.dstIn,
+                shaderCallback: (bounds) => const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.white, Colors.white, Colors.transparent],
+                  // 固定遮罩与滚动无关，可在海报 URL / 转场变化时重绘一次。
+                  stops: [0, .58, .985],
+                ).createShader(bounds),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    AnimatedSwitcher(
+                      duration: effect == 'instant'
+                          ? Duration.zero
+                          : const Duration(milliseconds: 900),
+                      layoutBuilder: (currentChild, previousChildren) => Stack(
+                        fit: StackFit.expand,
+                        children: [...previousChildren, ?currentChild],
+                      ),
+                      transitionBuilder: (child, animation) =>
+                          _transition(effect, child, animation),
+                      child: CachedNetworkImage(
+                        key: ValueKey('hero-$imageUrl'),
+                        imageUrl: imageUrl,
+                        fit: BoxFit.cover,
+                        memCacheWidth: 1280,
+                        errorWidget: (_, _, _) => const SizedBox.shrink(),
                       ),
                     ),
-                  ),
-                ],
+                    const DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                          colors: [Color(0xB307090D), Color(0x0007090D)],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           );
@@ -944,6 +951,7 @@ class _RailDot extends StatelessWidget {
 /// commits, so the higher navigation threshold remains discoverable.
 class _PageScrollCue extends StatelessWidget {
   const _PageScrollCue({required this.progress});
+  static const double width = 30;
   final double progress;
 
   @override
@@ -956,7 +964,7 @@ class _PageScrollCue extends StatelessWidget {
         child: Transform.translate(
           offset: Offset(0, -progress * 12),
           child: Container(
-            width: 30,
+            width: width,
             height: 54,
             decoration: BoxDecoration(
               color: YingjiGlass.chrome(strength: .72),
@@ -1031,12 +1039,14 @@ class _CinematicHomeState extends State<_CinematicHome>
   /// 元数据后台刷新后的重读消抖计时器。
   Timer? _revisionDebounce;
   bool _metadataRefreshPending = false;
+  late final AppLifecycleListener _lifecycle;
 
   @override
   void initState() {
     super.initState();
     _trending = _loadCarouselItems();
     _loadHomePreferences();
+    _lifecycle = AppLifecycleListener(onStateChange: (_) => _syncHeroTimer());
     _loadHistory();
     yingjiHomeFocusTick.addListener(_handleHomeFocus);
     WatchStateStore.revision.addListener(_refreshLocalWatchHistory);
@@ -1052,6 +1062,9 @@ class _CinematicHomeState extends State<_CinematicHome>
 
   bool get _canAdvanceHero =>
       mounted &&
+      (WidgetsBinding.instance.lifecycleState == null ||
+          WidgetsBinding.instance.lifecycleState ==
+              AppLifecycleState.resumed) &&
       _autoCarousel &&
       _trendingValue.length > 1 &&
       yingjiSectionFocus.value == 'home' &&
@@ -1287,23 +1300,12 @@ class _CinematicHomeState extends State<_CinematicHome>
     yingjiScrollInProgress.removeListener(_syncHeroTimer);
     _revisionDebounce?.cancel();
     yingjiRouteObserver.unsubscribe(this);
+    _lifecycle.dispose();
     _heroTimer?.cancel();
     _heroProgress.dispose();
     _historyScroll.dispose();
     _tmdb.dispose();
     super.dispose();
-  }
-
-  void _moveHistory(double delta) {
-    if (!_historyScroll.hasClients) return;
-    _historyScroll.animateTo(
-      (_historyScroll.offset + delta).clamp(
-        0,
-        _historyScroll.position.maxScrollExtent,
-      ),
-      duration: const Duration(milliseconds: 420),
-      curve: Curves.easeOutCubic,
-    );
   }
 
   void _openHeroDetails(BuildContext context, TmdbItem item, Offset? tap) {
@@ -1593,28 +1595,18 @@ class _CinematicHomeState extends State<_CinematicHome>
                           actionIcon: YingjiIcons.rectangle_stack,
                           onAction: _history.isEmpty
                               ? null
-                              : () => Navigator.push(
-                                  context,
-                                  MaterialPageRoute(
-                                    builder: (_) =>
-                                        const _ContinueWatchingPage(),
-                                  ),
-                                ).then((_) => _loadHistory()),
-                          trailingActions: _history.length > 1
-                              ? [
-                                  YingjiDirectionalArrow(
-                                    previous: true,
-                                    tooltip: '向左浏览继续播放',
-                                    onPressed: () => _moveHistory(-560),
-                                  ),
-                                  const SizedBox(width: 7),
-                                  YingjiDirectionalArrow(
-                                    previous: false,
-                                    tooltip: '向右浏览继续播放',
-                                    onPressed: () => _moveHistory(560),
-                                  ),
-                                ]
-                              : const [],
+                              : () async {
+                                  final route = MovaListRoute<void>(
+                                    builder: (_) => _ContinueWatchingPage(
+                                      initialRows: _history,
+                                      localOnly: _historyLocalOnly,
+                                    ),
+                                  );
+                                  await Navigator.push(context, route);
+                                  await route.completed;
+                                  if (mounted) await _loadHistory();
+                                },
+                          trailingActions: const [],
                         ),
                         const SizedBox(height: 12),
                         Expanded(
@@ -5012,6 +5004,26 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
   int _page = 1;
   bool _loadingMore = false;
 
+  Future<void> _loadMore() async {
+    if (_loadingMore ||
+        widget.variant == 3 ||
+        _items.length >= discoverPreviewLimit)
+      return;
+    _loadingMore = true;
+    try {
+      final next = await widget.loadPage(_page + 1);
+      if (!mounted || next.isEmpty) return;
+      final ids = _items.map((item) => '${item.kind}:${item.id}').toSet();
+      final unique = next.where((item) => ids.add('${item.kind}:${item.id}'));
+      setState(() {
+        _page++;
+        _items.addAll(unique.take(discoverPreviewLimit - _items.length));
+      });
+    } finally {
+      _loadingMore = false;
+    }
+  }
+
   @override
   bool get wantKeepAlive => true;
 
@@ -5030,36 +5042,18 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
     }
   }
 
-  Future<void> _moveNext() async {
-    _shelf.move(560);
-    if (_loadingMore || _items.length >= discoverPreviewLimit) return;
-    _loadingMore = true;
-    try {
-      final next = await widget.loadPage(_page + 1);
-      if (!mounted || next.isEmpty) return;
-      final ids = _items.map((item) => '${item.kind}:${item.id}').toSet();
-      final unique = next.where((item) => ids.add('${item.kind}:${item.id}'));
-      setState(() {
-        _page++;
-        _items.addAll(unique.take(discoverPreviewLimit - _items.length));
-      });
-    } finally {
-      _loadingMore = false;
-    }
-  }
-
   Future<void> _openAllItems() async {
-    await Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => _DiscoverListPage(
-          title: widget.title,
-          items: discoverPreviewItems(_items),
-          source: widget.source,
-          loadSourcePage: widget.loadSourcePage,
-        ),
+    final route = MovaListRoute<void>(
+      builder: (_) => _DiscoverListPage(
+        title: widget.title,
+        items: discoverPreviewItems(_items),
+        source: widget.source,
+        loadSourcePage: widget.loadSourcePage,
       ),
     );
+    await Navigator.push(context, route);
+    await route.completed;
+    if (!mounted) return;
     final refreshed = await widget.loadPage(1);
     if (!mounted) return;
     setState(() {
@@ -5075,37 +5069,19 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
     final title = widget.title;
     final items = _items;
     final variant = widget.variant;
-    final platformCount =
-        _DiscoverFeedSelection.tryParse(widget.source)?.platforms.length ?? 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SectionHeader(
           title: title,
           subtitle: widget.sourceLabel,
+          fixedGlass: true,
           titleAction: YingjiMotionIconButton(
             icon: YingjiIcons.slider_horizontal_3,
             tooltip: '设置$title',
             size: 30,
             onPressed: widget.onConfigure,
           ),
-          trailingActions: [
-            if (variant != 3 || platformCount > 1) ...[
-              YingjiDirectionalArrow(
-                previous: true,
-                tooltip: '向左浏览',
-                size: 34,
-                onPressed: () => _shelf.move(-560),
-              ),
-              const SizedBox(width: 7),
-              YingjiDirectionalArrow(
-                previous: false,
-                tooltip: '向右浏览',
-                size: 34,
-                onPressed: _moveNext,
-              ),
-            ],
-          ],
           action: variant == 3 ? null : '打开$title完整列表',
           onAction: variant == 3
               ? null
@@ -5113,7 +5089,7 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
                   if (title == '排行榜') {
                     Navigator.push(
                       context,
-                      MaterialPageRoute(
+                      MovaListRoute(
                         builder: (_) => _RankingPage(initialItems: items),
                       ),
                     );
@@ -5123,20 +5099,32 @@ class _DiscoverBlockState extends State<_DiscoverBlock>
                 },
         ),
         const SizedBox(height: 14),
-        if (variant == 1)
-          _LandscapeStrip(items: items, shelf: _shelf)
-        else if (variant == 2)
-          _RankStrip(items: items, shelf: _shelf)
-        else if (variant == 3)
-          _PlatformEntryStrip(
-            items: items,
-            source: widget.source,
-            shelf: _shelf,
-            loadSourcePage: widget.loadSourcePage,
-            onConfigure: widget.onConfigure,
-          )
-        else
-          _PosterStrip(items: items, shelf: _shelf),
+        NotificationListener<ScrollUpdateNotification>(
+          onNotification: (notification) {
+            if (notification.metrics.axis == Axis.horizontal &&
+                notification.metrics.extentAfter < 240) {
+              unawaited(_loadMore());
+            }
+            return false;
+          },
+          child: ClipRect(
+            child: ScrollSnapshot(
+              child: variant == 1
+                  ? _LandscapeStrip(items: items, shelf: _shelf)
+                  : variant == 2
+                  ? _RankStrip(items: items, shelf: _shelf)
+                  : variant == 3
+                  ? _PlatformEntryStrip(
+                      items: items,
+                      source: widget.source,
+                      shelf: _shelf,
+                      loadSourcePage: widget.loadSourcePage,
+                      onConfigure: widget.onConfigure,
+                    )
+                  : _PosterStrip(items: items, shelf: _shelf),
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -5324,7 +5312,13 @@ class _RankingPageState extends State<_RankingPage> {
     };
     _snapshotLabels.addAll(charts.keys);
     charts.putIfAbsent('院线热映', () => widget.initialItems);
-    unawaited(_refreshCharts());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await MovaMotion.afterPageTransition(context);
+      if (mounted && ModalRoute.of(context)?.isCurrent != false) {
+        unawaited(_refreshCharts());
+      }
+    });
     return charts;
   }
 
@@ -5798,7 +5792,13 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     _items = List.of(widget.items);
     _platform = _selection?.platform ?? 'all';
     _genre = _selection?.genre ?? 'all';
-    YingjiImageWarmup.items(_items);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await MovaMotion.afterPageTransition(context);
+      if (mounted && ModalRoute.of(context)?.isCurrent != false) {
+        YingjiImageWarmup.items(_items);
+      }
+    });
     _controller.addListener(_onScroll);
     unawaited(_restoreFilters());
   }
@@ -7397,32 +7397,45 @@ class _SourceHubState extends State<_SourceHub>
         else ...[
           _SectionHeader(title: '已连接', subtitle: _statusSubtitle),
           const SizedBox(height: 14),
-          ..._sources.map(
-            (source) => Align(
-              alignment: Alignment.centerLeft,
-              child: Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: _SourceCard(
-                  source: source,
-                  stats: _stats[source.id],
-                  iconToken: _store?.tokenFor(source),
-                  onPickIcon: () => _pickIcon(source),
-                  offline: _offline.contains(source.id),
-                  onRemove: () => _remove(source),
-                  onEdit: () => _edit(source),
-                  testing: _testing == source.id,
-                  onTest: () => _test(source),
-                  onOpen: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => EmbyLibraryPage(source: source),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              const gap = 12.0;
+              final cardWidth = YingjiLayout.sourceCardWidth(
+                constraints.maxWidth,
+                _sources.length,
+                compact: WindowHost.isAndroid,
+              );
+              return Wrap(
+                spacing: gap,
+                runSpacing: gap,
+                children: [
+                  for (final source in _sources)
+                    SizedBox(
+                      width: cardWidth,
+                      child: _SourceCard(
+                        key: ValueKey(source.id),
+                        source: source,
+                        stats: _stats[source.id],
+                        iconToken: _store?.tokenFor(source),
+                        onPickIcon: () => _pickIcon(source),
+                        offline: _offline.contains(source.id),
+                        onRemove: () => _remove(source),
+                        onEdit: () => _edit(source),
+                        testing: _testing == source.id,
+                        onTest: () => _test(source),
+                        onOpen: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => EmbyLibraryPage(source: source),
+                          ),
+                        ),
+                        onSwitchEndpoint: (endpoint) =>
+                            _switchEndpoint(source, endpoint),
+                      ),
                     ),
-                  ),
-                  onSwitchEndpoint: (endpoint) =>
-                      _switchEndpoint(source, endpoint),
-                ),
-              ),
-            ),
+                ],
+              );
+            },
           ),
         ],
         const SizedBox(height: 34),
@@ -8370,6 +8383,47 @@ class _CalendarPageState extends State<_CalendarPage>
   bool _traktConnected = false;
   bool _traktAuthorizing = false;
   bool _calendarLoadedOnce = false;
+  Timer? _calendarInputsTimer;
+  Set<int> _calendarHistoryIds = {};
+
+  Future<void> _calendarWatchChanged() async {
+    final rows = (await WatchStateStore.create()).load();
+    if (!mounted) return;
+    final ids = rows
+        .where((row) => row.seasonNumber != null)
+        .map((row) => row.tmdbId)
+        .whereType<int>()
+        .toSet();
+    if (!setEquals(ids, _calendarHistoryIds)) {
+      _calendarHistoryIds = ids;
+      _calendarInputsChanged();
+    }
+    final completed = <int, Set<String>>{};
+    for (final row in rows) {
+      if (row.tmdbId == null ||
+          row.seasonNumber == null ||
+          row.episodeNumber == null ||
+          !row.isCompleted) {
+        continue;
+      }
+      completed
+          .putIfAbsent(row.tmdbId!, () => <String>{})
+          .add('${row.seasonNumber}:${row.episodeNumber}');
+    }
+    final counts = {
+      for (final entry in completed.entries) entry.key: entry.value.length,
+    };
+    if (!mapEquals(counts, _localWatchedByShow)) {
+      setState(() => _localWatchedByShow = counts);
+    }
+  }
+
+  void _calendarInputsChanged() {
+    _calendarInputsTimer?.cancel();
+    _calendarInputsTimer = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) unawaited(_load());
+    });
+  }
 
   @override
   ScrollController get sectionTopController => _pageScroll;
@@ -8395,6 +8449,8 @@ class _CalendarPageState extends State<_CalendarPage>
     initSectionTopListener();
     _traktConnected = TraktConnectionStatus.connected.value ?? false;
     TraktConnectionStatus.connected.addListener(_syncTraktConnection);
+    TrackingStatusStore.revision.addListener(_calendarInputsChanged);
+    WatchStateStore.revision.addListener(_calendarWatchChanged);
     _load();
   }
 
@@ -8432,6 +8488,12 @@ class _CalendarPageState extends State<_CalendarPage>
     final watchlist = await WatchlistStore.create();
     final watchStates = await WatchStateStore.create();
     final watchStateRows = watchStates.load();
+    if (generation != _calendarGeneration) return;
+    _calendarHistoryIds = watchStateRows
+        .where((row) => row.seasonNumber != null)
+        .map((row) => row.tmdbId)
+        .whereType<int>()
+        .toSet();
     final watchedEpisodesByShow = <int, Set<String>>{};
     for (final state in watchStateRows) {
       final id = state.tmdbId ?? 0;
@@ -8466,11 +8528,17 @@ class _CalendarPageState extends State<_CalendarPage>
     final traktCached = connected
         ? _readCachedEvents(prefs, key: 'yingji.tracking.calendar-trakt-cache')
         : const <TraktEvent>[];
-    final cachedShowIds = watchlist
-        .load()
-        .where((item) => item.kind == '剧集' && item.id > 0)
-        .map((item) => item.id)
-        .toSet();
+    final cachedShowIds = {
+      ...watchStateRows
+          .where((state) => state.seasonNumber != null)
+          .map((state) => state.tmdbId)
+          .whereType<int>(),
+      ...watchlist
+          .load()
+          .where((item) => item.kind == '剧集' && item.id > 0)
+          .map((item) => item.id)
+          .toSet(),
+    };
     final cachedAll = filterCalendarEventsByShowIds(
       _readCachedEvents(prefs, key: 'yingji.tracking.calendar-trakt-all-cache'),
       cachedShowIds,
@@ -8480,7 +8548,7 @@ class _CalendarPageState extends State<_CalendarPage>
       ...cachedAll,
       ...traktCached,
     ]);
-    if (mounted) {
+    if (mounted && generation == _calendarGeneration) {
       setState(() {
         _events = cached;
         _localWatchedByShow = localWatchedByShow;
@@ -8517,11 +8585,7 @@ class _CalendarPageState extends State<_CalendarPage>
       for (final item in watchlist.load())
         if (item.kind == '剧集' && item.id > 0) item.id: item,
     };
-    final watchlistShowIds = watchlist
-        .load()
-        .where((item) => item.kind == '剧集' && item.id > 0)
-        .map((item) => item.id)
-        .toSet();
+    final watchlistShowIds = tracked.keys.toSet();
     final localEventsFuture = _localWatchlistEvents(tracked.values.toList());
     final allCalendarFuture = watchlistShowIds.isEmpty
         ? Future.value(const <TraktEvent>[])
@@ -8586,9 +8650,15 @@ class _CalendarPageState extends State<_CalendarPage>
     if (mounted && generation == _calendarGeneration) {
       final visibleEvents = events;
       // 缓存里留着全部事件（含已弃剧的），只是不显示 —— 取消弃剧立刻回来。
-      final status = _readTrackingStatus(statusJson);
+      final status = TrackingStatusStore.read(prefs);
       final shownEvents = visibleEvents
-          .where((event) => status[event.title] != 'dropped')
+          .where(
+            (event) => !TrackingStatusStore.isDropped(
+              status,
+              event.title,
+              event.tmdbId,
+            ),
+          )
           .toList(growable: false);
       final selectedHasEvent = shownEvents.any(
         (event) => _sameDate(event.airDate.toLocal(), _selectedDate),
@@ -8824,25 +8894,9 @@ class _CalendarPageState extends State<_CalendarPage>
     return result;
   }
 
-  Future<void> _setTrackingStatus(String title, String status) async {
-    final next = Map<String, String>.from(_trackingStatus);
-    if (status == 'none') {
-      next.remove(title);
-    } else {
-      next[title] = status;
-    }
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('yingji.tracking.status', jsonEncode(next));
-    if (mounted) setState(() => _trackingStatus = next);
-  }
-
   /// 弃剧 = 这部剧的更新不再进日历。
-  bool _isDropped(String title) => _trackingStatus[title] == 'dropped';
-
-  List<String> get _droppedTitles => _trackingStatus.entries
-      .where((entry) => entry.value == 'dropped')
-      .map((entry) => entry.key)
-      .toList(growable: false);
+  bool _isDropped(String title, [int? id]) =>
+      TrackingStatusStore.isDropped(_trackingStatus, title, id);
 
   /// 「待看」按钮的状态取自待看列表本身（详情页点「加入待看」也是这一份）。
   /// TMDB 编号优先，编号缺失时退回片名比对。
@@ -8919,49 +8973,13 @@ class _CalendarPageState extends State<_CalendarPage>
     return path.isEmpty ? null : path;
   }
 
-  /// 恢复入口按需打开，不再占据日期轨与当天内容之间的主要空间。
-  Future<void> _showDropped() => showDialog<void>(
-    context: context,
-    animationStyle: MovaMotion.dialogAnimationStyle(context),
-    builder: (dialogContext) => YingjiPinnedDialog(
-      maxWidth: 460,
-      header: Row(
-        children: [
-          const Expanded(
-            child: Text(
-              '已弃剧',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-            ),
-          ),
-          YingjiMotionIconButton(
-            icon: YingjiIcons.xmark,
-            tooltip: '关闭',
-            onPressed: () => Navigator.pop(dialogContext),
-          ),
-        ],
-      ),
-      body: Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: _droppedTitles
-            .map(
-              (title) => _DroppedChip(
-                title: title,
-                onRestore: () {
-                  Navigator.pop(dialogContext);
-                  _setTrackingStatus(title, 'none');
-                },
-              ),
-            )
-            .toList(growable: false),
-      ),
-    ),
-  );
-
   @override
   void dispose() {
     disposeSectionTopListener();
     TraktConnectionStatus.connected.removeListener(_syncTraktConnection);
+    TrackingStatusStore.revision.removeListener(_calendarInputsChanged);
+    WatchStateStore.revision.removeListener(_calendarWatchChanged);
+    _calendarInputsTimer?.cancel();
     _calendarRail.dispose();
     _pageScroll.dispose();
     _trakt.dispose();
@@ -8975,7 +8993,7 @@ class _CalendarPageState extends State<_CalendarPage>
     super.build(context);
     // 已弃剧的剧集不进日历，但缓存里还留着，取消弃剧即可立刻恢复。
     final visibleEvents = _events
-        .where((event) => !_isDropped(event.title))
+        .where((event) => !_isDropped(event.title, event.tmdbId))
         .toList(growable: false);
     final selectedEvents =
         visibleEvents
@@ -9036,14 +9054,6 @@ class _CalendarPageState extends State<_CalendarPage>
                 tooltip: '刷新播出安排',
                 onPressed: _load,
               ),
-              if (_droppedTitles.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                YingjiMotionIconButton(
-                  icon: YingjiIcons.forbidden,
-                  tooltip: '管理已弃剧（${_droppedTitles.length}）',
-                  onPressed: _showDropped,
-                ),
-              ],
             ],
           ),
           const SizedBox(height: 24),
@@ -9058,32 +9068,36 @@ class _CalendarPageState extends State<_CalendarPage>
               Expanded(
                 child: SizedBox(
                   height: 82,
-                  child: ListView.separated(
-                    controller: _calendarRail,
-                    scrollDirection: Axis.horizontal,
-                    // Date cards must stay within the rail. Allowing the list to
-                    // paint outside its viewport lets the final date overlap the
-                    // next-arrow control at the far right.
-                    clipBehavior: Clip.hardEdge,
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    itemCount: dates.length,
-                    separatorBuilder: (_, _) => const SizedBox(width: 9),
-                    itemBuilder: (context, index) {
-                      final date = dates[index];
-                      final count = visibleEvents
-                          .where(
-                            (event) => _sameDate(event.airDate.toLocal(), date),
-                          )
-                          .length;
-                      return _CalendarDateRailTile(
-                        date: date,
-                        count: count,
-                        selected: _sameDate(date, _selectedDate),
-                        today: _sameDate(date, now),
-                        weekday: _weekday(date),
-                        onTap: () => setState(() => _selectedDate = date),
-                      );
-                    },
+                  child: MovaHorizontalDrag(
+                    child: ListView.separated(
+                      controller: _calendarRail,
+                      scrollDirection: Axis.horizontal,
+
+                      // Date cards must stay within the rail. Allowing the list to
+                      // paint outside its viewport lets the final date overlap the
+                      // next-arrow control at the far right.
+                      clipBehavior: Clip.hardEdge,
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      itemCount: dates.length,
+                      separatorBuilder: (_, _) => const SizedBox(width: 9),
+                      itemBuilder: (context, index) {
+                        final date = dates[index];
+                        final count = visibleEvents
+                            .where(
+                              (event) =>
+                                  _sameDate(event.airDate.toLocal(), date),
+                            )
+                            .length;
+                        return _CalendarDateRailTile(
+                          date: date,
+                          count: count,
+                          selected: _sameDate(date, _selectedDate),
+                          today: _sameDate(date, now),
+                          weekday: _weekday(date),
+                          onTap: () => setState(() => _selectedDate = date),
+                        );
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -9133,10 +9147,13 @@ class _CalendarPageState extends State<_CalendarPage>
                             dropped: _isDropped(event.title),
                             onOpen: () => _openTrackingDetail(event),
                             onToggleWatchlist: () => _toggleWatchlist(event),
-                            onToggleDropped: () => _setTrackingStatus(
-                              event.title,
-                              _isDropped(event.title) ? 'none' : 'dropped',
-                            ),
+                            onToggleDropped: () async {
+                              await TrackingStatusStore.setDropped(
+                                await SharedPreferences.getInstance(),
+                                event.title,
+                                event.tmdbId,
+                              );
+                            },
                           ),
                         );
                       })
@@ -9343,50 +9360,6 @@ class _CalendarDateRailTile extends StatelessWidget {
                 borderRadius: BorderRadius.circular(99),
               ),
             ),
-          ],
-        ),
-      ),
-    ),
-  );
-}
-
-/// 已弃剧剧集的恢复入口：一颗带「撤回」图标的玻璃小胶囊。
-class _DroppedChip extends StatelessWidget {
-  const _DroppedChip({required this.title, required this.onRestore});
-
-  final String title;
-  final VoidCallback onRestore;
-
-  @override
-  Widget build(BuildContext context) => YingjiGlassTooltip(
-    message: '恢复追剧',
-    child: InkWell(
-      borderRadius: BorderRadius.circular(999),
-      onTap: onRestore,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        decoration: BoxDecoration(
-          color: YingjiGlass.chrome(),
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(color: YingjiGlass.line(strength: .75)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 220),
-              child: Text(
-                title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            const SizedBox(width: 7),
-            const Icon(YingjiIcons.refresh, size: 14, color: Colors.white70),
           ],
         ),
       ),
@@ -12650,58 +12623,61 @@ class _SettingsPageState extends State<SettingsPage>
     height: 38,
     child: ValueListenableBuilder<int>(
       valueListenable: _activeSetting,
-      builder: (context, active, _) => ListView.separated(
-        controller: _chipScroll,
-        scrollDirection: Axis.horizontal,
-        itemCount: labels.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, index) {
-          final selected = active == index;
-          return MovaPress(
-            key: _settingChipKey(index),
-            onTap: () => _jumpToSetting(index, keys[index]),
-            behavior: HitTestBehavior.opaque,
-            scale: .94,
-            hoverScale: 1.03,
-            semanticLabel: labels[index].$1,
-            child: AnimatedContainer(
-              duration: MovaMotion.quick,
-              curve: MovaMotion.standardEase,
-              height: 38,
-              padding: const EdgeInsets.symmetric(horizontal: 14),
-              decoration: BoxDecoration(
-                color: selected ? YingjiGlass.accent : Colors.transparent,
-                borderRadius: BorderRadius.circular(19),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    labels[index].$2,
-                    size: 16,
-                    color: selected
-                        ? Colors.white
-                        : Theme.of(context).colorScheme.onSurface
-                              .withValues(alpha: .66),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    labels[index].$1,
-                    style: TextStyle(
-                      fontSize: 13,
-                      height: 1,
-                      fontWeight: FontWeight.w600,
+      builder: (context, active, _) => MovaHorizontalDrag(
+        child: ListView.separated(
+          controller: _chipScroll,
+          scrollDirection: Axis.horizontal,
+
+          itemCount: labels.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 8),
+          itemBuilder: (context, index) {
+            final selected = active == index;
+            return MovaPress(
+              key: _settingChipKey(index),
+              onTap: () => _jumpToSetting(index, keys[index]),
+              behavior: HitTestBehavior.opaque,
+              scale: .94,
+              hoverScale: 1.03,
+              semanticLabel: labels[index].$1,
+              child: AnimatedContainer(
+                duration: MovaMotion.quick,
+                curve: MovaMotion.standardEase,
+                height: 38,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  color: selected ? YingjiGlass.accent : Colors.transparent,
+                  borderRadius: BorderRadius.circular(19),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      labels[index].$2,
+                      size: 16,
                       color: selected
                           ? Colors.white
                           : Theme.of(context).colorScheme.onSurface
                                 .withValues(alpha: .66),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    Text(
+                      labels[index].$1,
+                      style: TextStyle(
+                        fontSize: 13,
+                        height: 1,
+                        fontWeight: FontWeight.w600,
+                        color: selected
+                            ? Colors.white
+                            : Theme.of(context).colorScheme.onSurface
+                                  .withValues(alpha: .66),
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     ),
   );
@@ -12743,17 +12719,20 @@ class _PosterStripState extends State<_PosterStrip> {
     height: 296,
     child: _withoutScrollbars(
       context,
-      ListView.separated(
-        controller: _controller,
-        scrollDirection: Axis.horizontal,
-        clipBehavior: Clip.none,
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        physics: const BouncingScrollPhysics(
-          parent: AlwaysScrollableScrollPhysics(),
+      MovaHorizontalDrag(
+        child: ListView.separated(
+          controller: _controller,
+          scrollDirection: Axis.horizontal,
+
+          clipBehavior: Clip.none,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
+          itemCount: widget.items.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 14),
+          itemBuilder: (_, i) => _PosterTile(item: widget.items[i]),
         ),
-        itemCount: widget.items.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 14),
-        itemBuilder: (_, i) => _PosterTile(item: widget.items[i]),
       ),
     ),
   );
@@ -12788,17 +12767,20 @@ class _LandscapeStripState extends State<_LandscapeStrip> {
     height: 184,
     child: _withoutScrollbars(
       context,
-      ListView.separated(
-        controller: _controller,
-        scrollDirection: Axis.horizontal,
-        clipBehavior: Clip.none,
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        physics: const BouncingScrollPhysics(
-          parent: AlwaysScrollableScrollPhysics(),
+      MovaHorizontalDrag(
+        child: ListView.separated(
+          controller: _controller,
+          scrollDirection: Axis.horizontal,
+
+          clipBehavior: Clip.none,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
+          itemCount: widget.items.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 14),
+          itemBuilder: (_, i) => _LandscapeTile(item: widget.items[i]),
         ),
-        itemCount: widget.items.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 14),
-        itemBuilder: (_, i) => _LandscapeTile(item: widget.items[i]),
       ),
     ),
   );
@@ -12855,41 +12837,45 @@ class _PlatformEntryStripState extends State<_PlatformEntryStrip> {
       height: 258,
       child: _withoutScrollbars(
         context,
-        ListView.separated(
-          controller: _controller,
-          scrollDirection: Axis.horizontal,
-          clipBehavior: Clip.none,
-          physics: const BouncingScrollPhysics(),
-          itemCount: platforms.length,
-          separatorBuilder: (_, _) => const SizedBox(width: 16),
-          itemBuilder: (context, index) {
-            final platformSource = selection
-                .withPlatform(platforms[index])
-                .encoded;
-            return FutureBuilder<List<TmdbItem>>(
-              future: widget.loadSourcePage(platformSource, 1),
-              builder: (context, snapshot) {
-                final items = snapshot.data ?? const <TmdbItem>[];
-                return _PlatformEntryCard(
-                  items: items,
-                  source: platformSource,
-                  onConfigure: widget.onConfigure,
-                  onOpen: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => _DiscoverListPage(
-                        title:
-                            _resolvedPlatformLabels[platforms[index]] ?? '平台内容',
-                        items: items,
-                        source: platformSource,
-                        loadSourcePage: widget.loadSourcePage,
+        MovaHorizontalDrag(
+          child: ListView.separated(
+            controller: _controller,
+            scrollDirection: Axis.horizontal,
+
+            clipBehavior: Clip.none,
+            physics: const BouncingScrollPhysics(),
+            itemCount: platforms.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 16),
+            itemBuilder: (context, index) {
+              final platformSource = selection
+                  .withPlatform(platforms[index])
+                  .encoded;
+              return FutureBuilder<List<TmdbItem>>(
+                future: widget.loadSourcePage(platformSource, 1),
+                builder: (context, snapshot) {
+                  final items = snapshot.data ?? const <TmdbItem>[];
+                  return _PlatformEntryCard(
+                    items: items,
+                    source: platformSource,
+                    onConfigure: widget.onConfigure,
+                    onOpen: () => Navigator.push(
+                      context,
+                      MovaListRoute(
+                        builder: (_) => _DiscoverListPage(
+                          title:
+                              _resolvedPlatformLabels[platforms[index]] ??
+                              '平台内容',
+                          items: items,
+                          source: platformSource,
+                          loadSourcePage: widget.loadSourcePage,
+                        ),
                       ),
                     ),
-                  ),
-                );
-              },
-            );
-          },
+                  );
+                },
+              );
+            },
+          ),
         ),
       ),
     );
@@ -13179,17 +13165,20 @@ class _RankStripState extends State<_RankStrip> {
     height: 252,
     child: _withoutScrollbars(
       context,
-      ListView.separated(
-        controller: _controller,
-        scrollDirection: Axis.horizontal,
-        clipBehavior: Clip.none,
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-        physics: const BouncingScrollPhysics(
-          parent: AlwaysScrollableScrollPhysics(),
+      MovaHorizontalDrag(
+        child: ListView.separated(
+          controller: _controller,
+          scrollDirection: Axis.horizontal,
+
+          clipBehavior: Clip.none,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
+          itemCount: widget.items.length,
+          separatorBuilder: (_, _) => const SizedBox(width: 12),
+          itemBuilder: (_, i) => _RankTile(index: i + 1, item: widget.items[i]),
         ),
-        itemCount: widget.items.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 12),
-        itemBuilder: (_, i) => _RankTile(index: i + 1, item: widget.items[i]),
       ),
     ),
   );
@@ -13424,6 +13413,7 @@ class _RankTileState extends State<_RankTile>
   final _link = LayerLink();
   OverlayEntry? _preview;
   bool _hovered = false;
+  bool _pointerInside = false;
   late final AnimationController _previewController = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 190),
@@ -13437,7 +13427,13 @@ class _RankTileState extends State<_RankTile>
   }
 
   void _dismissPreviewWhileScrolling() {
-    if (!yingjiScrollInProgress.value) return;
+    if (!yingjiScrollInProgress.value) {
+      if (mounted && _pointerInside) {
+        setState(() => _hovered = true);
+        _showPreview();
+      }
+      return;
+    }
     if (_hovered && mounted) setState(() => _hovered = false);
     _previewController.stop();
     _preview?.remove();
@@ -13531,11 +13527,13 @@ class _RankTileState extends State<_RankTile>
     link: _link,
     child: MouseRegion(
       onEnter: (_) {
+        _pointerInside = true;
         if (yingjiScrollInProgress.value) return;
         setState(() => _hovered = true);
         _showPreview();
       },
       onExit: (_) {
+        _pointerInside = false;
         if (_hovered) setState(() => _hovered = false);
         if (!yingjiScrollInProgress.value) unawaited(_hidePreview());
       },
@@ -13836,7 +13834,12 @@ class _RankHoverPreview extends StatelessWidget {
 /// current poster through [YingjiBackdrop], softened just enough for scanable
 /// text, instead of replacing the cinematic field with a blank route.
 class _ContinueWatchingPage extends StatefulWidget {
-  const _ContinueWatchingPage();
+  const _ContinueWatchingPage({
+    this.initialRows = const [],
+    this.localOnly = false,
+  });
+  final List<WatchState> initialRows;
+  final bool localOnly;
 
   @override
   State<_ContinueWatchingPage> createState() => _ContinueWatchingPageState();
@@ -13852,6 +13855,8 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
   @override
   void initState() {
     super.initState();
+    _rows = List.of(widget.initialRows);
+    _historyLocalOnly = widget.localOnly;
     _load();
   }
 
@@ -14052,22 +14057,25 @@ class _HistoryStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) => _withoutScrollbars(
     context,
-    ListView.separated(
-      controller: controller,
-      scrollDirection: Axis.horizontal,
-      clipBehavior: Clip.none,
-      padding: const EdgeInsets.only(bottom: 4),
-      itemCount: history.length,
-      separatorBuilder: (_, _) => const SizedBox(width: 16),
-      itemBuilder: (_, index) {
-        final state = history[index];
-        return _ContinueTile(
-          state: state,
-          localOnly: localOnly,
-          onRemove: onRemove,
-          onChanged: onChanged,
-        );
-      },
+    MovaHorizontalDrag(
+      child: ListView.separated(
+        controller: controller,
+        scrollDirection: Axis.horizontal,
+
+        clipBehavior: Clip.none,
+        padding: const EdgeInsets.only(bottom: 4),
+        itemCount: history.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 16),
+        itemBuilder: (_, index) {
+          final state = history[index];
+          return _ContinueTile(
+            state: state,
+            localOnly: localOnly,
+            onRemove: onRemove,
+            onChanged: onChanged,
+          );
+        },
+      ),
     ),
   );
 }
@@ -14619,6 +14627,7 @@ class _MediaHover extends StatefulWidget {
 
 class _MediaHoverState extends State<_MediaHover> {
   bool _hovered = false;
+  bool _pointerInside = false;
   bool _pressed = false;
 
   @override
@@ -14628,6 +14637,11 @@ class _MediaHoverState extends State<_MediaHover> {
   }
 
   void _clearHoverWhileScrolling() {
+    if (!yingjiScrollInProgress.value &&
+        mounted &&
+        _hovered != _pointerInside) {
+      setState(() => _hovered = _pointerInside);
+    }
     if (yingjiScrollInProgress.value && (_hovered || _pressed) && mounted) {
       setState(() {
         _hovered = false;
@@ -14646,9 +14660,11 @@ class _MediaHoverState extends State<_MediaHover> {
   Widget build(BuildContext context) => MouseRegion(
     cursor: SystemMouseCursors.click,
     onEnter: (_) {
+      _pointerInside = true;
       if (!yingjiScrollInProgress.value) setState(() => _hovered = true);
     },
     onExit: (_) {
+      _pointerInside = false;
       if (_hovered || _pressed) {
         setState(() {
           _hovered = false;
@@ -15114,6 +15130,7 @@ class _SectionHeader extends StatelessWidget {
     this.actionIcon,
     this.titleAction,
     this.trailingActions = const [],
+    this.fixedGlass = false,
   });
   final String title;
   final String subtitle;
@@ -15122,58 +15139,64 @@ class _SectionHeader extends StatelessWidget {
   final IconData? actionIcon;
   final Widget? titleAction;
   final List<Widget> trailingActions;
+  final bool fixedGlass;
   @override
-  Widget build(BuildContext context) => Row(
-    children: [
-      Expanded(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(
-                  child: Text(
-                    title,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 25,
-                      height: 1.08,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -.3,
+  Widget build(BuildContext context) {
+    final header = Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      title,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 25,
+                        height: 1.08,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -.3,
+                      ),
                     ),
                   ),
-                ),
-                if (titleAction != null) ...[
-                  const SizedBox(width: 8),
-                  titleAction!,
+                  if (titleAction != null) ...[
+                    const SizedBox(width: 8),
+                    titleAction!,
+                  ],
                 ],
-              ],
-            ),
-            const SizedBox(height: 4),
-            Text(
-              subtitle,
-              style: const TextStyle(
-                color: YingjiColors.muted,
-                fontSize: 12,
-                height: 1.35,
               ),
-            ),
-          ],
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: const TextStyle(
+                  color: YingjiColors.muted,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
+              ),
+            ],
+          ),
         ),
-      ),
-      ...trailingActions,
-      if (trailingActions.isNotEmpty && action != null)
-        const SizedBox(width: 8),
-      if (action != null)
-        YingjiMotionIconButton(
-          onPressed: onAction ?? () {},
-          icon: actionIcon ?? YingjiIcons.rectangle_stack,
-          tooltip: action!,
-          size: 38,
-        ),
-    ],
-  );
+        ...trailingActions,
+        if (trailingActions.isNotEmpty && action != null)
+          const SizedBox(width: 8),
+        if (action != null)
+          YingjiMotionIconButton(
+            onPressed: onAction ?? () {},
+            icon: actionIcon ?? YingjiIcons.rectangle_stack,
+            tooltip: action!,
+            size: 38,
+          ),
+      ],
+    );
+    return fixedGlass
+        ? ScrollSnapshot(child: YingjiFixedGlass(light: true, child: header))
+        : header;
+  }
 }
 
 class _HeroProgressDots extends StatelessWidget {
@@ -15471,6 +15494,7 @@ String _networkError(Object? error) {
 
 class _SourceCard extends StatefulWidget {
   const _SourceCard({
+    super.key,
     required this.source,
     required this.stats,
     required this.iconToken,
@@ -15607,7 +15631,7 @@ class _SourceCardState extends State<_SourceCard> {
     onTap: widget.onOpen,
     borderRadius: BorderRadius.circular(18),
     child: SizedBox(
-      width: 388,
+      width: double.infinity,
       child: _FrostSurface(
         borderRadius: 18,
         padding: const EdgeInsets.fromLTRB(14, 13, 12, 12),

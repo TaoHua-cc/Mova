@@ -51,6 +51,13 @@ void main() {
     expect(detail, contains('detail-blur-'));
     // 模糊层的不透明度必须由深度驱动，不能再是一个常量。
     expect(detail, contains('opacity: depth'));
+    final updateDepth = detail.substring(
+      detail.indexOf('void _syncPageBackdropDepth()'),
+      detail.indexOf('Future<void> _initializeSeriesCatalog()'),
+    );
+    expect(updateDepth, contains('yingjiScrollDepth(_pageScroll.position)'));
+    expect(updateDepth, isNot(contains('yingjiScrollInProgress')));
+    expect(detail, contains('_pageScroll.addListener(_syncPageBackdropDepth)'));
   });
 
   test('home and detail page share one scroll depth curve', () {

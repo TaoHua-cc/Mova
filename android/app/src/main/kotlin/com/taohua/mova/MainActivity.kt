@@ -1,6 +1,8 @@
 package com.taohua.mova
 
 import android.content.Context
+import android.content.ComponentCallbacks2
+import android.util.Log
 import android.media.AudioManager
 import android.content.Intent
 import android.app.PictureInPictureParams
@@ -43,6 +45,21 @@ class MainActivity : FlutterActivity() {
     }
 
     private var pendingDolbyVisionResult: MethodChannel.Result? = null
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        if (packageName.endsWith(".debug")) {
+            Log.i("MovaMemory", "trim=$level pid=${android.os.Process.myPid()}")
+        }
+        // UI_HIDDEN is a visibility notification, not an actual memory shortage.
+        // Flutter's delegate maps >=10 to a VM/engine/cache purge, including 20.
+        if (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            flutterEngine?.renderer?.onTrimMemory(level)
+            flutterEngine?.platformViewsController?.onTrimMemory(level)
+            return
+        }
+        super.onTrimMemory(level)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)

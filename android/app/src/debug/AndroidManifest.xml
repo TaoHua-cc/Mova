@@ -1,4 +1,4 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <application android:label="Mova · 测试" tools:replace="android:label" />
+    <application android:label="Mova" tools:replace="android:label" />
 </manifest>

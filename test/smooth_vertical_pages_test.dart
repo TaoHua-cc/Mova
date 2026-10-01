@@ -138,7 +138,7 @@ void main() {
   });
 
   test(
-    'Windows detail scroll pauses glass while episode dialog keeps blur',
+    'Windows detail scroll updates backdrop while episode dialog keeps blur',
     () {
       final source = File('lib/src/metadata/metadata_detail_page.dart')
           .readAsStringSync();
@@ -147,7 +147,9 @@ void main() {
       expect(detail, contains('ValueListenableBuilder<double>'));
       expect(
         detail,
-        contains('(WindowHost.isDesktop && yingjiScrollInProgress.value)'),
+        isNot(
+          contains('(WindowHost.isDesktop && yingjiScrollInProgress.value)'),
+        ),
       );
 
       final episodeRail = classBody(source, '_CatalogEpisodeRailState');
@@ -176,6 +178,14 @@ void main() {
     final card = classBody(source, '_SourceCardState');
     expect(card, contains('constraints: const BoxConstraints(minHeight: 144)'));
     expect(card, isNot(contains('height: 128')));
+    expect(card, contains('width: double.infinity'));
+    expect(card, isNot(contains('width: 388')));
+    final hub = classBody(source, '_SourceHubState');
+    expect(hub, contains('YingjiLayout.sourceCardWidth('));
+    expect(hub, contains('compact: WindowHost.isAndroid'));
+    expect(hub, contains('width: cardWidth'));
+    expect(hub, contains('runSpacing: gap'));
+    expect(hub, contains('key: ValueKey(source.id)'));
   });
 
   test('settings scroll uses cached section offsets while scrolling', () {

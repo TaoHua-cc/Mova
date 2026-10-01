@@ -1,8 +1,10 @@
 import 'dart:convert';
 
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart';
 
 import '../metadata/tmdb_client.dart';
+import '../tracking/tracking_status_store.dart';
 
 class WatchlistStore {
   WatchlistStore(this._prefs);
@@ -24,6 +26,9 @@ class WatchlistStore {
     final rows = load().where((value) => value.id != item.id).toList();
     rows.insert(0, item);
     await _save(rows);
+    if (item.kind == '剧集') {
+      await TrackingStatusStore.resume(_prefs, item.title, item.id);
+    }
   }
 
   /// 移出待看。
@@ -52,9 +57,11 @@ class WatchlistStore {
   }
 
   Future<void> _save(List<TmdbItem> rows) async {
-    await _prefs.setStringList(
-      _key,
-      rows.map((value) => jsonEncode(value.toJson())).toList(),
-    );
+    final next = rows.map((value) => jsonEncode(value.toJson())).toList();
+    if (listEquals(_prefs.getStringList(_key) ?? const <String>[], next)) {
+      return;
+    }
+    await _prefs.setStringList(_key, next);
+    TrackingStatusStore.revision.value++;
   }
 }

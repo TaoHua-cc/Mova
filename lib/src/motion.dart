@@ -4,13 +4,59 @@
 // 并且「数值跟着手指走，位移跟着曲线走」。业务代码不要再手写 Duration /
 // Curve，一律引用这里的常量。
 
+import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+/// Native drag arbitration keeps card taps intact until a horizontal drag wins.
+class MovaHorizontalScrollBehavior extends MaterialScrollBehavior {
+  const MovaHorizontalScrollBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+    ...super.dragDevices,
+    PointerDeviceKind.mouse,
+  };
+}
+
+class MovaHorizontalDrag extends StatelessWidget {
+  const MovaHorizontalDrag({super.key, required this.child});
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => ScrollConfiguration(
+    behavior: ScrollConfiguration.of(context).copyWith(
+      dragDevices: {
+        ...ScrollConfiguration.of(context).dragDevices,
+        PointerDeviceKind.mouse,
+      },
+    ),
+    child: child,
+  );
+}
+
 /// 时长与曲线的单一真源。
 abstract final class MovaMotion {
+  /// Keep optional I/O off a list route's entering frames.
+  static Future<void> afterPageTransition(BuildContext context) async {
+    final route = ModalRoute.of(context);
+    final animation = route?.animation;
+    if (animation != null && animation.status == AnimationStatus.forward) {
+      final completed = Completer<void>();
+      void listener(AnimationStatus status) {
+        if (status != AnimationStatus.forward) {
+          animation.removeStatusListener(listener);
+          completed.complete();
+        }
+      }
+
+      animation.addStatusListener(listener);
+      await completed.future;
+    }
+  }
+
   /// Use the platform dialog animation; scrolling is optimized separately.
   static AnimationStyle? dialogAnimationStyle(BuildContext context) => null;
   // ── 时长 ────────────────────────────────────────────────────────────
@@ -552,6 +598,70 @@ abstract final class MovaToast {
 
 /// 统一的页面转场：新页面从右侧滑入并淡入，底下的页面跟着往左让一点。
 /// 全平台一致（桌面也走这一套），取代 Material 默认的缩放淡入。
+/// Animate a cached page instead of repainting every poster and glass layer.
+class MovaListRoute<T> extends MaterialPageRoute<T> {
+  MovaListRoute({required super.builder, super.settings});
+
+  @override
+  DelegatedTransitionBuilder? get delegatedTransition =>
+      const ZoomPageTransitionsBuilder().delegatedTransition;
+
+  @override
+  Widget buildTransitions(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    if (MediaQuery.disableAnimationsOf(context)) return child;
+    return const ZoomPageTransitionsBuilder().buildTransitions(
+      this,
+      context,
+      animation,
+      secondaryAnimation,
+      child,
+    );
+  }
+}
+
+/// Stop decorative tickers while Android hands the app surface to the launcher.
+class MovaLifecycleScope extends StatefulWidget {
+  const MovaLifecycleScope({super.key, required this.child});
+  final Widget child;
+
+  @override
+  State<MovaLifecycleScope> createState() => _MovaLifecycleScopeState();
+}
+
+class _MovaLifecycleScopeState extends State<MovaLifecycleScope>
+    with WidgetsBindingObserver {
+  bool _active =
+      WidgetsBinding.instance.lifecycleState == null ||
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed;
+    if (active != _active) setState(() => _active = active);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      TickerMode(enabled: _active, child: widget.child);
+}
+
 class MovaPageTransitionsBuilder extends PageTransitionsBuilder {
   const MovaPageTransitionsBuilder();
 

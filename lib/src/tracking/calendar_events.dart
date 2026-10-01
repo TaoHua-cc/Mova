@@ -21,10 +21,7 @@ String calendarEpisodeSummary(List<TraktEvent> events) {
   if (seasons.length == 1 &&
       seasons.first != null &&
       numbers.length == events.length) {
-    final consecutive = numbers.last - numbers.first + 1 == numbers.length;
-    final label = consecutive
-        ? '${numbers.first}–${numbers.last}'
-        : numbers.join('、');
+    final label = '${numbers.first}–${numbers.last}';
     return '第 ${seasons.first} 季 · 第 $label 集 · 更新 ${events.length} 集';
   }
   return '更新 ${events.length} 集';
@@ -134,15 +131,27 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
           : previous.title.trim().toLowerCase() ==
                 event.title.trim().toLowerCase();
       if (!sameShow) return false;
-      final previousAbsolute = calendarAbsoluteEpisode(previous);
-      final nextAbsolute = calendarAbsoluteEpisode(event);
-      if (previousAbsolute != null && nextAbsolute != null) {
-        return previousAbsolute == nextAbsolute;
-      }
       final previousSeason = _calendarSeason(previous);
       final nextSeason = _calendarSeason(event);
       final previousEpisode = _calendarEpisodeNumber(previous);
       final nextEpisode = _calendarEpisodeNumber(event);
+      // Same-season episode identity wins over inconsistent number_abs.
+      // Trakt can report S01E43/absolute41; it must not replace S01E41.
+      if (previousSeason != null &&
+          previousSeason == nextSeason &&
+          previousEpisode != null &&
+          nextEpisode != null) {
+        return previousEpisode == nextEpisode;
+      }
+      final previousAbsolute = calendarAbsoluteEpisode(previous);
+      final nextAbsolute = calendarAbsoluteEpisode(event);
+      if (previousAbsolute != null &&
+          nextAbsolute != null &&
+          previousSeason != null &&
+          nextSeason != null &&
+          previousSeason != nextSeason) {
+        return previousAbsolute == nextAbsolute;
+      }
       if (previousEpisode != null && nextEpisode != null) {
         if (previousSeason != null && nextSeason != null) {
           return previousSeason == nextSeason && previousEpisode == nextEpisode;
@@ -165,17 +174,17 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
     final timed = previous.timeKnown ? previous : event;
     merged[index] = TraktEvent(
       title: _preferredCalendarTitle(previous.title, event.title),
-      episode: event.episode.isNotEmpty ? event.episode : previous.episode,
+      episode: previous.episode.isNotEmpty ? previous.episode : event.episode,
       airDate: timed.airDate,
       timeKnown: timed.timeKnown,
       posterUrl: event.posterUrl ?? previous.posterUrl,
       backdropUrl: event.backdropUrl ?? previous.backdropUrl,
       platform: timed.platform ?? event.platform ?? previous.platform,
       tmdbId: event.tmdbId ?? previous.tmdbId,
-      seasonNumber: event.seasonNumber ?? previous.seasonNumber,
-      episodeNumber: event.episodeNumber ?? previous.episodeNumber,
+      seasonNumber: previous.seasonNumber ?? event.seasonNumber,
+      episodeNumber: previous.episodeNumber ?? event.episodeNumber,
       absoluteEpisodeNumber:
-          calendarAbsoluteEpisode(event) ?? calendarAbsoluteEpisode(previous),
+          calendarAbsoluteEpisode(previous) ?? calendarAbsoluteEpisode(event),
       totalEpisodes: [
         event.totalEpisodes,
         previous.totalEpisodes,

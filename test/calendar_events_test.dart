@@ -3,7 +3,66 @@ import 'package:yingji/src/tracking/calendar_events.dart';
 import 'package:yingji/src/tracking/trakt_client.dart';
 
 void main() {
-  test('same-day show cards retain six episodes without inventing ranges', () {
+  test(
+    'Trakt conflicting absolute numbers cannot swap same-season episodes',
+    () {
+      TraktEvent local(int n, int day) => TraktEvent(
+        tmdbId: 282326,
+        title: '兰香如故',
+        seasonNumber: 1,
+        episodeNumber: n,
+        episode: '第 1 季 · 第 $n 集',
+        airDate: DateTime(2026, 10, day, 18),
+        timeKnown: true,
+      );
+      final rows = mergeCalendarEvents([
+        local(40, 2),
+        local(41, 3),
+        for (var n = 42; n <= 47; n++) local(n, 4),
+        for (final pair in [
+          (40, 40),
+          (43, 41),
+          (44, 42),
+          (41, 43),
+          (45, 44),
+          (46, 45),
+          (47, 46),
+          (42, 47),
+        ])
+          TraktEvent(
+            tmdbId: 282326,
+            title: 'Against the Current',
+            seasonNumber: 1,
+            episodeNumber: pair.$1,
+            absoluteEpisodeNumber: pair.$2,
+            episode: '第 1 季 · 第 ${pair.$1} 集 · Episode ${pair.$1}',
+            airDate: DateTime(
+              2026,
+              10,
+              pair.$2 <= 42
+                  ? 2
+                  : pair.$2 <= 46
+                  ? 3
+                  : 4,
+              21,
+              30,
+            ),
+            timeKnown: true,
+          ),
+      ]);
+      expect(rows, hasLength(8));
+      expect(rows.where((e) => e.airDate.day == 2).single.episodeNumber, 40);
+      expect(rows.where((e) => e.airDate.day == 3).single.episodeNumber, 41);
+      final last = rows.where((e) => e.airDate.day == 4).toList();
+      expect(last.map((e) => e.episodeNumber), [42, 43, 44, 45, 46, 47]);
+      expect(calendarEpisodeSummary(last), '第 1 季 · 第 42–47 集 · 更新 6 集');
+      expect(
+        mergeCalendarEvents(rows).map((e) => e.episodeNumber),
+        rows.map((e) => e.episodeNumber),
+      );
+    },
+  );
+  test('same-day show cards summarize ranges and retain actual episodes', () {
     TraktEvent episode(int number, {int day = 4, int id = 282326}) =>
         TraktEvent(
           title: '兰香如故',
@@ -26,7 +85,7 @@ void main() {
     expect(calendarEpisodeSummary(groups.first), '第 1 季 · 第 42–47 集 · 更新 6 集');
     expect(
       calendarEpisodeSummary([episode(42), episode(44)]),
-      '第 1 季 · 第 42、44 集 · 更新 2 集',
+      '第 1 季 · 第 42–44 集 · 更新 2 集',
     );
     expect(groupCalendarEvents([]), isEmpty);
     expect(calendarEpisodeSummary([episode(42)]), episode(42).episode);

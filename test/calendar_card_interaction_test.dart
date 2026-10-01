@@ -33,6 +33,11 @@ void main() {
     );
     final fill = find.descendant(of: glass, matching: find.byType(Stack));
     expect(tester.getSize(fill).width, tester.getSize(glass).width);
+    expect(tester.getSize(fill).height, 46);
+    expect(
+      tester.getCenter(find.text('Trakt 已连接')).dy,
+      tester.getCenter(glass).dy,
+    );
   });
 
   testWidgets('共享表面悬停不缩放，按压与按钮共用回弹令牌', (tester) async {
@@ -106,10 +111,7 @@ void main() {
     final localEventsStart = source.indexOf(
       'Future<List<TraktEvent>> _localWatchlistEvents',
     );
-    final localEventsEnd = source.indexOf(
-      'Future<void> _setTrackingStatus',
-      localEventsStart,
-    );
+    final localEventsEnd = source.indexOf('bool _isDropped', localEventsStart);
     final localEvents = source.substring(localEventsStart, localEventsEnd);
     expect(localEvents, contains('next.showPosterUrl ?? next.stillUrl'));
   });

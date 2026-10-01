@@ -3347,14 +3347,14 @@ class _PlayerPageState extends State<PlayerPage> {
           _consoleGroup('倍速', ['播放速度  ${_speed.toStringAsFixed(2)}x']),
         ];
       case '章节':
+      case '片头片尾':
         return [
+          _segmentPanel(),
           if (_activeEpisode.chapters.isEmpty)
             _consoleGroup('章节', ['当前媒体未提供章节信息'])
           else
             _chapterGroup(),
         ];
-      case '片头片尾':
-        return [_segmentPanel()];
       case '资源':
         return [_resourcePanel()];
       case '全集':

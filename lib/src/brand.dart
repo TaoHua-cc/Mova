@@ -158,6 +158,9 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
       position.minScrollExtent,
       position.maxScrollExtent,
     );
+    // At either edge no pixels can move. Do not repeatedly enter/exit scroll
+    // mode: that regenerates snapshots and restarts backdrop animations.
+    if (_frame == null && _goal == pixels) return;
     beginYingjiScrollActivity(this);
     if (_frame == null) {
       _lastFrame = Duration.zero;
@@ -371,13 +374,12 @@ final yingjiHomeScrollDepth = ValueNotifier<double>(0);
 /// 滚动深度：0 = 停在顶部（清晰），1 = 已滚过一屏（全糊）。
 ///
 /// 首页与详情页共用这一份 —— 「顶部清晰、下滑变糊」必须是同一套曲线，否则两页
-/// 手感对不上（详情页原来干脆是无条件糊死，一进去就糊）。量化成 1/24 步进，
-/// 避免滚动过程中每帧重建模糊层。
+/// 手感对不上（详情页原来干脆是无条件糊死，一进去就糊）。保持连续值，避免
+/// 背景混合比例逐档跳变；模糊纹理的生成与混合比例更新分离。
 double yingjiScrollDepth(ScrollPosition position) {
   final viewport = position.viewportDimension;
   if (viewport <= 0) return 0;
-  final raw = (position.pixels / viewport).clamp(0.0, 1.0);
-  return (raw * 24).roundToDouble() / 24;
+  return (position.pixels / viewport).clamp(0.0, 1.0);
 }
 
 /// 贯穿全部页面的统一栅格。
@@ -410,6 +412,22 @@ abstract final class YingjiLayout {
 
   /// 正文区右锚点。
   static double get pageRight => WindowHost.isDesktop ? 40 : 18;
+
+  /// Android cards stay compact even when only one server is connected.
+  static double sourceCardWidth(
+    double availableWidth,
+    int itemCount, {
+    required bool compact,
+  }) {
+    const gap = 12.0;
+    final preferred = compact ? 340.0 : 388.0;
+    final columns = ((availableWidth + gap) / (preferred + gap)).floor().clamp(
+      1,
+      itemCount < 1 ? 1 : itemCount,
+    );
+    final width = (availableWidth - gap * (columns - 1)) / columns;
+    return compact ? width.clamp(0.0, preferred) : width;
+  }
 }
 
 class YingjiBackdrop extends StatefulWidget {
@@ -447,6 +465,8 @@ class _YingjiBackdropState extends State<YingjiBackdrop>
   void initState() {
     super.initState();
     yingjiScrollInProgress.addListener(_syncFlowWithScroll);
+    yingjiHomeScrollDepth.addListener(_syncFlowWithScroll);
+    yingjiSectionFocus.addListener(_syncFlowWithScroll);
   }
 
   @override
@@ -462,7 +482,9 @@ class _YingjiBackdropState extends State<YingjiBackdrop>
   }
 
   void _syncFlowWithScroll() {
-    if (!_animateBackdrop || yingjiScrollInProgress.value) {
+    final showingDiscover =
+        yingjiSectionFocus.value == 'home' && yingjiHomeScrollDepth.value > 0;
+    if (!_animateBackdrop || yingjiScrollInProgress.value || showingDiscover) {
       // 两张超出视口的大渐变层持续平移时，滚动列表无法复用已经合成的背板。
       // 滚轮滑行期间冻结在当前相位；列表停稳后从同一位置继续，不会跳色。
       _flow.stop(canceled: false);
@@ -474,6 +496,8 @@ class _YingjiBackdropState extends State<YingjiBackdrop>
   @override
   void dispose() {
     yingjiScrollInProgress.removeListener(_syncFlowWithScroll);
+    yingjiHomeScrollDepth.removeListener(_syncFlowWithScroll);
+    yingjiSectionFocus.removeListener(_syncFlowWithScroll);
     _flow.dispose();
     super.dispose();
   }
@@ -579,7 +603,6 @@ abstract final class YingjiPlayerTools {
     YingjiPlayerTool('弹幕', YingjiIcons.danmaku),
     YingjiPlayerTool('画面', YingjiIcons.film),
     YingjiPlayerTool('倍速', YingjiIcons.gauge),
-    YingjiPlayerTool('章节', YingjiIcons.bookmark),
     YingjiPlayerTool('片头片尾', YingjiIcons.scissors),
     YingjiPlayerTool('资源', YingjiIcons.server),
   ];
@@ -683,10 +706,13 @@ abstract final class YingjiGlass {
 /// 轮廓仅保留低对比内边和短促顶部反射，不使用刺眼的整圈白边。
 /// Player chrome uses the existing fixed material, never a video backdrop.
 class YingjiFixedGlass extends InheritedWidget {
-  const YingjiFixedGlass({super.key, required super.child});
+  const YingjiFixedGlass({super.key, this.light = false, required super.child});
+
+  final bool light;
 
   @override
-  bool updateShouldNotify(YingjiFixedGlass oldWidget) => false;
+  bool updateShouldNotify(YingjiFixedGlass oldWidget) =>
+      light != oldWidget.light;
 }
 
 class _YingjiGlassBackdropScope extends InheritedWidget {
@@ -740,9 +766,9 @@ class YingjiGlassSurface extends StatelessWidget {
   );
 
   Widget _buildSurface(BuildContext context, Widget? content) {
-    final sampleBackdrop =
-        this.sampleBackdrop &&
-        context.dependOnInheritedWidgetOfExactType<YingjiFixedGlass>() == null;
+    final fixedGlass = context
+        .dependOnInheritedWidgetOfExactType<YingjiFixedGlass>();
+    final sampleBackdrop = this.sampleBackdrop && fixedGlass == null;
     final stableFilter = YingjiStableScrollGlass.enabled(context);
     final sharesBackdrop =
         stableFilter &&
@@ -775,6 +801,8 @@ class YingjiGlassSurface extends StatelessWidget {
         shape: shape,
         color: sampleBackdrop
             ? YingjiGlass.surface(strength: strength)
+            : fixedGlass?.light == true
+            ? YingjiGlass.chrome(strength: strength)
             : YingjiColors.elevated.withValues(
                 alpha: (.72 + YingjiGlass.blur / 200).clamp(.72, .94),
               ),
@@ -1781,59 +1809,62 @@ class _YingjiGlassPillButtonState extends State<YingjiGlassPillButton> {
                   sigma: YingjiGlass.blur * .55,
                   strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
                   shadow: active,
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      Positioned.fill(
-                        child: AnimatedContainer(
-                          duration: MovaMotion.quick,
-                          curve: MovaMotion.standardEase,
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(
-                              widget.height / 2,
+                  child: SizedBox(
+                    height: widget.height,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Positioned.fill(
+                          child: AnimatedContainer(
+                            duration: MovaMotion.quick,
+                            curve: MovaMotion.standardEase,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(
+                                widget.height / 2,
+                              ),
+                              gradient: widget.selected
+                                  ? YingjiGlass.selectionFill
+                                  : null,
                             ),
-                            gradient: widget.selected
-                                ? YingjiGlass.selectionFill
-                                : null,
                           ),
                         ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 18),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (widget.busy)
-                              SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: foreground,
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 18),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (widget.busy)
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: foreground,
+                                  ),
+                                )
+                              else
+                                Icon(
+                                  widget.icon,
+                                  size: 18,
+                                  color: widget.selected
+                                      ? YingjiColors.success
+                                      : foreground,
                                 ),
-                              )
-                            else
-                              Icon(
-                                widget.icon,
-                                size: 18,
-                                color: widget.selected
-                                    ? YingjiColors.success
-                                    : foreground,
+                              const SizedBox(width: 9),
+                              Text(
+                                label,
+                                style: TextStyle(
+                                  color: foreground,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                  height: 1,
+                                ),
                               ),
-                            const SizedBox(width: 9),
-                            Text(
-                              label,
-                              style: TextStyle(
-                                color: foreground,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w700,
-                                height: 1,
-                              ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),

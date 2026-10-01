@@ -75,6 +75,8 @@ abstract final class FrameTrace {
   static int _lastWallMs = 0;
   static ValueListenable<double>? _scrollDepth;
   static ScrollController? _scrollController;
+  static AppLifecycleListener? _lifecycle;
+  static int _resumeFrames = 0;
 
   /// 诊断是否已启用。生产路径上恒为 false。
   static bool get enabled => _file != null || _logcatEnabled;
@@ -191,6 +193,17 @@ abstract final class FrameTrace {
       ' glass_skip=${skips.isEmpty ? '-' : skips.join('+')}',
     );
     SchedulerBinding.instance.addTimingsCallback(_onTimings);
+    _lifecycle ??= AppLifecycleListener(
+      onStateChange: (state) {
+        final cache = PaintingBinding.instance.imageCache;
+        _write(
+          'LIFECYCLE state=${state.name} wall_ms=${_clock?.elapsedMilliseconds}'
+          ' images=${cache.currentSize} bytes=${cache.currentSizeBytes}'
+          ' live=${cache.liveImageCount} pending=${cache.pendingImageCount}',
+        );
+        if (state == AppLifecycleState.resumed) _resumeFrames = 6;
+      },
+    );
     // 进程存活期间一直按秒聚合；不需要保留句柄来取消（install 只会走一次）。
     Timer.periodic(const Duration(seconds: 1), (_) => _emitWindow());
     _startScrollDriver();
@@ -202,7 +215,20 @@ abstract final class FrameTrace {
     _write('STARTUP stage=$stage wall_ms=${_clock?.elapsedMilliseconds ?? 0}');
   }
 
-  static void _onTimings(List<FrameTiming> timings) => _window.addAll(timings);
+  static void _onTimings(List<FrameTiming> timings) {
+    _window.addAll(timings);
+    for (final frame in timings) {
+      if (_resumeFrames == 0) break;
+      _resumeFrames--;
+      _write(
+        'RESUME_FRAME remaining=$_resumeFrames'
+        ' build_us=${frame.buildDuration.inMicroseconds}'
+        ' raster_us=${frame.rasterDuration.inMicroseconds}'
+        ' span_us=${frame.totalSpan.inMicroseconds}'
+        ' wall_us=${frame.timestampInMicroseconds(FramePhase.rasterFinishWallTime)}',
+      );
+    }
+  }
 
   static void _emitWindow() {
     final clock = _clock;

@@ -26,6 +26,7 @@ class YingjiApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Mova',
+      builder: (context, child) => MovaLifecycleScope(child: child!),
       theme: ThemeData(
         brightness: isLight ? Brightness.light : Brightness.dark,
         useMaterial3: true,
