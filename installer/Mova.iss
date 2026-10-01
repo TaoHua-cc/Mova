@@ -3,7 +3,7 @@
 ;   ISCC.exe /DAppVersion=3.1.81 installer\Mova.iss
 ; 不传参数时用下面的默认值（本地手工打包用）。
 #ifndef AppVersion
-  #define AppVersion "3.1.117"
+  #define AppVersion "3.1.118"
 #endif
 #define AppPublisher "Mova"
 #define AppExeName "mova.exe"
