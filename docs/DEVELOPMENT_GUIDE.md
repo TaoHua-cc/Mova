@@ -5,7 +5,7 @@
 ## 1. 项目概览
 
 - 产品：Mova（映迹），私人媒体聚合与播放客户端。
-- 技术栈：Flutter / Dart，播放器基于 `media_kit` / libmpv。
+- 技术栈：Flutter / Dart；Windows 原生 libmpv，Android 默认 Media3 ExoPlayer，可在设置切换 `media_kit` / libmpv。
 - 当前平台：Windows 10/11 与 Android 7.0+。
 - 数据来源：TMDB、Emby、Jellyfin、WebDAV、Trakt，以及用户本机缓存。
 - Dart 包名仍为 `yingji`，这是兼容性遗留约定，不要仅为改名而批量修改 import。
@@ -116,6 +116,8 @@ Windows 使用单一的 `MovaNativePlayer.exe` / libmpv 播放器，源码位于
 - 网络客户端：避免真实外网依赖，使用可控响应或现有注入方式。
 - 设置项：验证只写目标偏好，不意外覆盖其他设置。
 - UI 人工验证至少记录设备/窗口尺寸、操作路径和预期结果；共享 UI 应覆盖一个宽屏和一个窄屏场景。
+
+Android 播放入口现统一遵守 `yingji.player.android-engine`，未设置默认 ExoPlayer 原生 SurfaceView；选择 mpv 时使用 Flutter 纹理。上文“普通 Android 视频继续走 Flutter 纹理”仅适用于 mpv。功能差异见 `DESIGN.md`。
 
 ## 5. 标准工作流
 

@@ -107,6 +107,48 @@ void main() {
     expect(rows, hasLength(2));
   });
 
+  test('same-day source copies merge when one source omits episode fields', () {
+    final rows = mergeCalendarEvents([
+      TraktEvent(
+        tmdbId: 7031,
+        title: '兰香如故',
+        episode: '第 1 季 · 第 6 集 · 旧梦',
+        airDate: DateTime(2026, 10, 4, 20),
+        timeKnown: false,
+      ),
+      TraktEvent(
+        tmdbId: 7031,
+        title: 'Lan Xiang Ru Gu',
+        episode: 'S01E06 · Old Dream',
+        seasonNumber: 1,
+        episodeNumber: 6,
+        airDate: DateTime(2026, 10, 4, 21),
+        timeKnown: true,
+        platform: 'Trakt',
+      ),
+    ]);
+
+    expect(rows, hasLength(1));
+    expect(rows.single.timeKnown, isTrue);
+    expect(rows.single.platform, 'Trakt');
+  });
+
+  test('same episode number in different seasons is not merged', () {
+    final rows = mergeCalendarEvents([
+      for (final season in [1, 2])
+        TraktEvent(
+          tmdbId: 7031,
+          title: '兰香如故',
+          episode: '第 $season 季 · 第 6 集',
+          seasonNumber: season,
+          episodeNumber: 6,
+          airDate: DateTime(2026, 10, 4),
+        ),
+    ]);
+
+    expect(rows, hasLength(2));
+  });
+
   test('Mova watchlist and Trakt personal calendar are additive sources', () {
     final rows = mergeCalendarEvents([
       TraktEvent(

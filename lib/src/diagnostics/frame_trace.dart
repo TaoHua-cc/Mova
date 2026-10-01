@@ -41,10 +41,18 @@ import 'package:flutter/widgets.dart';
 /// 「慢帧」定义：`build` 或 `raster` 超过一个面板刷新周期（`budget`）。在
 /// 170Hz 面板上 budget 约 5.88ms —— 这是弹幕 / 滚动掉帧的判据基准。
 abstract final class FrameTrace {
+  static const bool _logcatEnabled = bool.fromEnvironment(
+    'MOVA_TRACE_FRAME_LOGCAT',
+    defaultValue: false,
+  );
   static const String _framesVar = 'MOVA_TRACE_FRAMES';
   static const String _scrollVar = 'MOVA_TRACE_SCROLL';
   static const String _blurVar = 'MOVA_TRACE_BLUR';
+  static const String _blurOverride = String.fromEnvironment(_blurVar);
   static const String _glassSkipVar = 'MOVA_TRACE_GLASS_SKIP';
+  static const String _glassSkipOverride = String.fromEnvironment(
+    _glassSkipVar,
+  );
 
   static Set<String>? _glassSkips;
 
@@ -69,7 +77,7 @@ abstract final class FrameTrace {
   static ScrollController? _scrollController;
 
   /// 诊断是否已启用。生产路径上恒为 false。
-  static bool get enabled => _file != null;
+  static bool get enabled => _file != null || _logcatEnabled;
 
   /// 由 `YingjiSmoothWheel` 在挂载时登记它驱动的滚动控制器。
   ///
@@ -86,8 +94,8 @@ abstract final class FrameTrace {
 
   /// 诊断用的玻璃模糊半径覆盖值；未设置时为 null（调用方应回落到偏好值）。
   static double? get glassBlurOverride {
-    final raw = Platform.environment[_blurVar]?.trim();
-    if (raw == null || raw.isEmpty) return null;
+    final raw = (Platform.environment[_blurVar] ?? _blurOverride).trim();
+    if (raw.isEmpty) return null;
     final value = double.tryParse(raw);
     if (value == null) return null;
     return value.clamp(0, 40);
@@ -101,7 +109,7 @@ abstract final class FrameTrace {
   /// 回读**照样发生**，所以量出来的差值只是「高斯核」的钱，不是「这条路」的钱。
   static bool skipGlass(String part) {
     final skips = _glassSkips ??= parseGlassSkips(
-      Platform.environment[_glassSkipVar],
+      Platform.environment[_glassSkipVar] ?? _glassSkipOverride,
     );
     if (skips.isEmpty) return false;
     return skips.contains('all') || skips.contains(part);
@@ -147,15 +155,21 @@ abstract final class FrameTrace {
   /// `yingjiHomeScrollDepth`），用来把帧耗时与滚动位置对齐。
   static void install({ValueListenable<double>? scrollDepth}) {
     final path = Platform.environment[_framesVar]?.trim();
-    if (path == null || path.isEmpty || _file != null) return;
-    final file = File(path);
-    try {
-      file.parent.createSync(recursive: true);
-      // 先探一次写权限，免得跑到一半才发现写不出去。
-      file.writeAsStringSync('', mode: FileMode.append, flush: true);
-    } on FileSystemException {
-      // 诊断写不出去不该影响应用启动：静默放弃。
+    if (_clock != null || ((path == null || path.isEmpty) && !_logcatEnabled)) {
       return;
+    }
+    File? file;
+    if (path != null && path.isNotEmpty) {
+      file = File(path);
+      try {
+        file.parent.createSync(recursive: true);
+        // 先探一次写权限，免得跑到一半才发现写不出去。
+        file.writeAsStringSync('', mode: FileMode.append, flush: true);
+      } on FileSystemException {
+        // 诊断写不出去不该影响应用启动：静默放弃。
+        if (!_logcatEnabled) return;
+        file = null;
+      }
     }
     _file = file;
     _scrollDepth = scrollDepth;
@@ -167,7 +181,7 @@ abstract final class FrameTrace {
         ? null
         : view.physicalSize / view.devicePixelRatio;
     final skips = _glassSkips ??= parseGlassSkips(
-      Platform.environment[_glassSkipVar],
+      Platform.environment[_glassSkipVar] ?? _glassSkipOverride,
     );
     _write(
       'FRAMETRACE start view=${size == null ? '?' : '${size.width.toInt()}x${size.height.toInt()}'}'
@@ -184,7 +198,7 @@ abstract final class FrameTrace {
 
   /// Named startup milestone; only writes when frame tracing is enabled.
   static void mark(String stage) {
-    if (_file == null) return;
+    if (!enabled) return;
     _write('STARTUP stage=$stage wall_ms=${_clock?.elapsedMilliseconds ?? 0}');
   }
 
@@ -369,11 +383,13 @@ abstract final class FrameTrace {
   /// 只剩驱动行），却完全不报错到日记文件上。诊断每秒只写一行，同步写没有代价。
   static void _write(String line) {
     final file = _file;
-    if (file == null) return;
-    try {
-      file.writeAsStringSync('$line\n', mode: FileMode.append);
-    } on FileSystemException {
-      // 写不出去就静默放弃，绝不影响应用运行。
+    if (_logcatEnabled) debugPrint('MOVA_FRAME_TRACE $line', wrapWidth: 2048);
+    if (file != null) {
+      try {
+        file.writeAsStringSync('$line\n', mode: FileMode.append);
+      } on FileSystemException {
+        // 写不出去就静默放弃，绝不影响应用运行。
+      }
     }
   }
 }

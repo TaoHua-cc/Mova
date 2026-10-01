@@ -321,6 +321,7 @@ class MovaHud extends StatelessWidget {
       borderRadius: BorderRadius.circular(radius),
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: blur, sigmaY: blur),
+        enabled: blur > 0,
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: background,

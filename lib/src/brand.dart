@@ -1,5 +1,6 @@
 // ignore_for_file: constant_identifier_names
 
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:ui';
 
@@ -18,9 +19,23 @@ import 'motion.dart';
 ScrollPhysics? get yingjiWheelPhysics =>
     WindowHost.isDesktop ? const NeverScrollableScrollPhysics() : null;
 
-/// Windows/Impeller 在滚动中重复读取整屏背板的代价远高于静止合成。滚轮滑行时
-/// 暂停玻璃采样，材质底色与边缘仍保留；停稳后下一帧恢复真实模糊。
+/// 非稳定玻璃范围可在滚动时暂停背板采样；Android 页面滚动默认使用动态采样，
+/// 只在明确需要固定模糊的弹出层中保留稳定玻璃。
 final yingjiScrollInProgress = ValueNotifier<bool>(false);
+final Set<Object> _yingjiScrollOwners = <Object>{};
+
+void beginYingjiScrollActivity(Object owner) {
+  _yingjiScrollOwners.add(owner);
+  if (!yingjiScrollInProgress.value) yingjiScrollInProgress.value = true;
+}
+
+void endYingjiScrollActivity(Object owner) {
+  _yingjiScrollOwners.remove(owner);
+  final active = _yingjiScrollOwners.isNotEmpty;
+  if (yingjiScrollInProgress.value != active) {
+    yingjiScrollInProgress.value = active;
+  }
+}
 
 /// 把鼠标滚轮的离散刻度，换成一段连续、可被下一次滚动接续的平滑位移。
 ///
@@ -49,8 +64,7 @@ class YingjiSmoothWheel extends StatefulWidget {
   /// 每个 60fps 帧之后仍未走完的距离比例；越小越跟手、滑行尾巴越短。
   final double settlePerFrame;
 
-  /// 滚动列表里的玻璃保持轻量静态材质，不在起步/停稳时切换背板滤镜。
-  /// 全局滚动信号仍会用于暂停流动背景，避免背景动画与列表同时合成。
+  /// 空闲时保持玻璃模糊；桌面滚轮活动期间暂停背板采样，停稳后恢复。
   final bool stableGlass;
 
   @override
@@ -96,7 +110,7 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
     }
     _lastFrame = Duration.zero;
     _written = double.nan;
-    yingjiScrollInProgress.value = false;
+    endYingjiScrollActivity(this);
   }
 
   void _scheduleFrame() {
@@ -144,7 +158,7 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
       position.minScrollExtent,
       position.maxScrollExtent,
     );
-    yingjiScrollInProgress.value = true;
+    beginYingjiScrollActivity(this);
     if (_frame == null) {
       _lastFrame = Duration.zero;
       _scheduleFrame();
@@ -197,16 +211,24 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
 
   @override
   Widget build(BuildContext context) {
-    final child = widget.stableGlass
-        ? YingjiStableScrollGlass(child: widget.child)
+    // Tablet-sized Android screens cannot afford sampling every glass surface
+    // during scroll. Keep the requested stable treatment on desktop only;
+    // explicit stable dialog scopes remain unchanged.
+    final child = widget.stableGlass && WindowHost.isDesktop
+        ? ValueListenableBuilder<bool>(
+            valueListenable: yingjiScrollInProgress,
+            child: widget.child,
+            builder: (context, scrolling, child) =>
+                YingjiStableScrollGlass(stable: !scrolling, child: child!),
+          )
         : widget.child;
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (!WindowHost.isDesktop) {
           if (notification is ScrollStartNotification) {
-            yingjiScrollInProgress.value = true;
+            beginYingjiScrollActivity(this);
           } else if (notification is ScrollEndNotification) {
-            yingjiScrollInProgress.value = false;
+            endYingjiScrollActivity(this);
           }
         }
         return false;
@@ -221,15 +243,78 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
   }
 }
 
-class YingjiStableScrollGlass extends InheritedWidget {
-  const YingjiStableScrollGlass({super.key, required super.child});
+class YingjiStableScrollGlass extends StatefulWidget {
+  const YingjiStableScrollGlass({
+    super.key,
+    required this.child,
+    this.stable = true,
+  });
+
+  final Widget child;
+  final bool stable;
 
   static bool enabled(BuildContext context) =>
-      context.dependOnInheritedWidgetOfExactType<YingjiStableScrollGlass>() !=
-      null;
+      context
+          .dependOnInheritedWidgetOfExactType<_YingjiStableScrollGlassScope>()
+          ?.stable ??
+      false;
 
   @override
-  bool updateShouldNotify(YingjiStableScrollGlass oldWidget) => false;
+  State<YingjiStableScrollGlass> createState() =>
+      _YingjiStableScrollGlassState();
+}
+
+class _YingjiStableScrollGlassState extends State<YingjiStableScrollGlass> {
+  final HashMap<Object, Object> _owners = HashMap.identity();
+
+  bool _onScroll(ScrollNotification notification) {
+    // Scroll notifications may snapshot metrics into a fresh object on every
+    // frame; their Scrollable context is the stable per-position identity.
+    final position = notification.context ?? notification.metrics;
+    if (notification is ScrollStartNotification) {
+      _owners.putIfAbsent(position, () {
+        final owner = Object();
+        beginYingjiScrollActivity(owner);
+        return owner;
+      });
+    } else if (notification is ScrollEndNotification) {
+      final owner = _owners.remove(position);
+      if (owner != null) endYingjiScrollActivity(owner);
+    }
+    return false;
+  }
+
+  @override
+  void dispose() {
+    for (final owner in _owners.values) {
+      endYingjiScrollActivity(owner);
+    }
+    _owners.clear();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      NotificationListener<ScrollNotification>(
+        onNotification: _onScroll,
+        child: _YingjiStableScrollGlassScope(
+          stable: widget.stable,
+          child: widget.child,
+        ),
+      );
+}
+
+class _YingjiStableScrollGlassScope extends InheritedWidget {
+  const _YingjiStableScrollGlassScope({
+    required this.stable,
+    required super.child,
+  });
+
+  final bool stable;
+
+  @override
+  bool updateShouldNotify(_YingjiStableScrollGlassScope oldWidget) =>
+      stable != oldWidget.stable;
 }
 
 class YingjiAppearance extends ChangeNotifier {
@@ -341,7 +426,9 @@ class _YingjiBackdropState extends State<YingjiBackdrop>
   late final AnimationController _flow = AnimationController(
     vsync: this,
     duration: const Duration(seconds: 28),
-  )..repeat(reverse: true);
+  );
+
+  bool _animateBackdrop = false;
 
   late final Animation<Offset> _violetDrift = _flow.drive(
     Tween<Offset>(
@@ -362,8 +449,20 @@ class _YingjiBackdropState extends State<YingjiBackdrop>
     yingjiScrollInProgress.addListener(_syncFlowWithScroll);
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Android 的大面积渐变漂移会让所有真实玻璃背板逐帧失效。
+    // 保留材质和配色，空闲时不为装饰效果持续占用 GPU。
+    _animateBackdrop =
+        Theme.of(context).platform != TargetPlatform.android &&
+        !MediaQuery.disableAnimationsOf(context) &&
+        TickerMode.valuesOf(context).enabled;
+    _syncFlowWithScroll();
+  }
+
   void _syncFlowWithScroll() {
-    if (yingjiScrollInProgress.value) {
+    if (!_animateBackdrop || yingjiScrollInProgress.value) {
       // 两张超出视口的大渐变层持续平移时，滚动列表无法复用已经合成的背板。
       // 滚轮滑行期间冻结在当前相位；列表停稳后从同一位置继续，不会跳色。
       _flow.stop(canceled: false);
@@ -476,7 +575,7 @@ abstract final class YingjiPlayerTools {
   static const all = <YingjiPlayerTool>[
     YingjiPlayerTool('声音', YingjiIcons.speaker_2_fill),
     YingjiPlayerTool('字幕', YingjiIcons.captions_bubble),
-    YingjiPlayerTool('剧集', YingjiIcons.episodes),
+    YingjiPlayerTool('全集列表', YingjiIcons.rectangle_stack),
     YingjiPlayerTool('弹幕', YingjiIcons.danmaku),
     YingjiPlayerTool('画面', YingjiIcons.film),
     YingjiPlayerTool('倍速', YingjiIcons.gauge),
@@ -593,6 +692,7 @@ class YingjiGlassSurface extends StatelessWidget {
     this.sigma,
     this.depth = true,
     this.shadow = false,
+    this.sampleBackdrop = true,
   });
 
   final Widget? child;
@@ -615,6 +715,7 @@ class YingjiGlassSurface extends StatelessWidget {
 
   /// 玻璃下方的柔和投影：抬升「一片玻璃浮在内容上」的层次。
   final bool shadow;
+  final bool sampleBackdrop;
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -643,7 +744,11 @@ class YingjiGlassSurface extends StatelessWidget {
       decoration: BoxDecoration(
         borderRadius: circle ? null : rounded,
         shape: shape,
-        color: YingjiGlass.surface(strength: strength),
+        color: sampleBackdrop
+            ? YingjiGlass.surface(strength: strength)
+            : YingjiColors.elevated.withValues(
+                alpha: (.72 + YingjiGlass.blur / 200).clamp(.72, .94),
+              ),
       ),
       child: inner,
     );
@@ -651,6 +756,7 @@ class YingjiGlassSurface extends StatelessWidget {
     // 后者仍会插一层离屏 layer 并做一次全屏回读，量不出通道本身的代价。
     final stableFilter = YingjiStableScrollGlass.enabled(context);
     final skipFilter =
+        !sampleBackdrop ||
         FrameTrace.skipGlass('glass') ||
         FrameTrace.skipGlass(circle ? 'circle' : 'rect');
     // These surfaces overlap (dialog shell + episode rows), and the app does
@@ -850,6 +956,7 @@ class YingjiGlassCard extends StatelessWidget {
     this.radius = 18,
     this.strength = 1,
     this.shadow = true,
+    this.sampleBackdrop = true,
   });
 
   final Widget child;
@@ -861,11 +968,13 @@ class YingjiGlassCard extends StatelessWidget {
 
   /// 玻璃下方的柔和投影：抬升「一片玻璃浮在内容上」的层次。
   final bool shadow;
+  final bool sampleBackdrop;
 
   @override
   Widget build(BuildContext context) {
     final rounded = BorderRadius.circular(radius);
     final card = YingjiGlassSurface(
+      sampleBackdrop: sampleBackdrop,
       radius: radius,
       strength: strength,
       padding: padding ?? const EdgeInsets.all(20),
@@ -1186,21 +1295,23 @@ class YingjiGlassMenu extends StatelessWidget {
     menuChildren: [
       ListenableBuilder(
         listenable: yingjiAppearance,
-        builder: (context, _) => GlassPanel(
-          padding: const EdgeInsets.all(6),
-          radius: 16,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minWidth: 200,
-              maxWidth: 360,
-              maxHeight: MediaQuery.sizeOf(context).height * .65,
-            ),
-            child: SingleChildScrollView(
-              primary: false,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: entries,
+        builder: (context, _) => YingjiStableScrollGlass(
+          child: GlassPanel(
+            padding: const EdgeInsets.all(6),
+            radius: 16,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minWidth: 200,
+                maxWidth: 360,
+                maxHeight: MediaQuery.sizeOf(context).height * .65,
+              ),
+              child: SingleChildScrollView(
+                primary: false,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: entries,
+                ),
               ),
             ),
           ),
@@ -1738,15 +1849,21 @@ class GlassPanel extends StatelessWidget {
     required this.child,
     this.padding,
     this.radius = 18,
+    this.sampleBackdrop = true,
   });
 
   final Widget child;
   final EdgeInsetsGeometry? padding;
   final double radius;
+  final bool sampleBackdrop;
 
   @override
-  Widget build(BuildContext context) =>
-      YingjiGlassCard(padding: padding, radius: radius, child: child);
+  Widget build(BuildContext context) => YingjiGlassCard(
+    padding: padding,
+    radius: radius,
+    sampleBackdrop: sampleBackdrop,
+    child: child,
+  );
 }
 
 class YingjiContextAction {
@@ -1934,7 +2051,6 @@ class YingjiPinnedDialog extends StatelessWidget {
                     ? scrollView
                     : YingjiSmoothWheel(
                         controller: scrollController!,
-                        stableGlass: true,
                         child: scrollView,
                       ),
               ),
@@ -1950,11 +2066,8 @@ class YingjiPinnedDialog extends StatelessWidget {
         ),
       ),
     );
-    // 稳定材质需要覆盖弹窗玻璃外壳，而不是只包住里面的滚动内容；否则
-    // 全局滚动状态仍会在外层 GlassPanel 上关掉 BackdropFilter。
-    return scrollController == null
-        ? dialog
-        : YingjiStableScrollGlass(child: dialog);
+    // 菜单滚动时保留背板模糊，避免每次 ScrollStart/End 重建玻璃滤镜。
+    return YingjiStableScrollGlass(child: dialog);
   }
 }
 

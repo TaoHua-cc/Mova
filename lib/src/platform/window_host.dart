@@ -24,6 +24,8 @@ class WindowHost {
   static bool get isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
+  static bool get isAndroid => !kIsWeb && Platform.isAndroid;
+
   static Future<void> ensureInitialized() async {
     if (!isDesktop) return;
     await windowManager.ensureInitialized();
@@ -114,6 +116,36 @@ class WindowHost {
   static Future<bool> isFullScreen() async {
     if (!isDesktop) return _mobileFullScreen;
     return windowManager.isFullScreen();
+  }
+
+  /// Lock the Android player to a predictable portrait/landscape orientation.
+  /// Exiting the player still restores the app's normal portrait orientation.
+  static Future<void> setPlayerOrientation({required bool portrait}) async {
+    if (!isAndroid) return;
+    await SystemChrome.setPreferredOrientations(
+      portrait
+          ? const [DeviceOrientation.portraitUp]
+          : const [
+              DeviceOrientation.landscapeLeft,
+              DeviceOrientation.landscapeRight,
+            ],
+    );
+  }
+
+  /// Ask Android to place the current player Activity in picture-in-picture.
+  /// Older devices and OEM policies fail closed without disturbing playback.
+  static Future<bool> enterPictureInPicture() async {
+    if (!isAndroid) return false;
+    try {
+      return await _platformChannel.invokeMethod<bool>(
+            'enterPictureInPicture',
+          ) ??
+          false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
   }
 
   /// 桌面端返回可拖动窗口的区域；移动端没有窗口可拖，原样返回 [child]。

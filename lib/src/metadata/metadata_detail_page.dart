@@ -18,7 +18,7 @@ import '../cache/image_prefetch.dart';
 import '../cache/media_cache.dart';
 import '../network/proxy_routing.dart';
 import '../player/player_page.dart';
-import '../player/native_dolby_vision.dart';
+import '../player/android_player.dart';
 import '../player/windows_native_player.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
@@ -262,6 +262,7 @@ class MetadataDetailPage extends StatefulWidget {
 
 class _MetadataDetailPageState extends State<MetadataDetailPage> {
   final _pageScroll = ScrollController();
+  final _pageBackdropDepth = ValueNotifier<double>(0);
   final _playlistPickerScroll = ScrollController();
   final _resourcePickerScroll = ScrollController();
   final _compactTrackPickerScroll = ScrollController();
@@ -291,6 +292,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   @override
   void initState() {
     super.initState();
+    _pageScroll.addListener(_syncPageBackdropDepth);
+    yingjiScrollInProgress.addListener(_syncPageBackdropDepth);
     _details =
         widget.item.id > 0 &&
             (widget.item.kind == '剧集' || widget.item.kind == '电影')
@@ -320,6 +323,15 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     } else {
       _loadResources();
     }
+  }
+
+  void _syncPageBackdropDepth() {
+    if (!_pageScroll.hasClients ||
+        (WindowHost.isDesktop && yingjiScrollInProgress.value)) {
+      return;
+    }
+    final next = yingjiScrollDepth(_pageScroll.position);
+    if (_pageBackdropDepth.value != next) _pageBackdropDepth.value = next;
   }
 
   Future<void> _initializeSeriesCatalog() async {
@@ -1650,35 +1662,36 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     final selected = await showModalBottomSheet<YingjiPlaylist>(
       context: context,
       backgroundColor: YingjiGlass.surface(strength: 1.15),
-      builder: (context) => SafeArea(
-        child: YingjiSmoothWheel(
-          controller: _playlistPickerScroll,
-          stableGlass: true,
-          child: ListView(
+      builder: (context) => YingjiStableScrollGlass(
+        child: SafeArea(
+          child: YingjiSmoothWheel(
             controller: _playlistPickerScroll,
-            physics:
-                yingjiWheelPhysics ??
-                const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
+            child: ListView(
+              controller: _playlistPickerScroll,
+              physics:
+                  yingjiWheelPhysics ??
+                  const BouncingScrollPhysics(
+                    parent: AlwaysScrollableScrollPhysics(),
+                  ),
+              shrinkWrap: true,
+              children: [
+                const ListTile(
+                  title: Text(
+                    '加入片单',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  subtitle: Text('选择一个本地自定义片单'),
                 ),
-            shrinkWrap: true,
-            children: [
-              const ListTile(
-                title: Text(
-                  '加入片单',
-                  style: TextStyle(fontWeight: FontWeight.w800),
+                ...playlists.map(
+                  (playlist) => ListTile(
+                    leading: const Icon(YingjiIcons.rectangle_stack),
+                    title: Text(playlist.name),
+                    subtitle: Text('${playlist.items.length} 部内容'),
+                    onTap: () => Navigator.pop(context, playlist),
+                  ),
                 ),
-                subtitle: Text('选择一个本地自定义片单'),
-              ),
-              ...playlists.map(
-                (playlist) => ListTile(
-                  leading: const Icon(YingjiIcons.rectangle_stack),
-                  title: Text(playlist.name),
-                  subtitle: Text('${playlist.items.length} 部内容'),
-                  onTap: () => Navigator.pop(context, playlist),
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -2120,6 +2133,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
 
   @override
   void dispose() {
+    _pageScroll.removeListener(_syncPageBackdropDepth);
+    yingjiScrollInProgress.removeListener(_syncPageBackdropDepth);
+    _pageBackdropDepth.dispose();
     _pageScroll.dispose();
     _playlistPickerScroll.dispose();
     _resourcePickerScroll.dispose();
@@ -2149,14 +2165,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                       // 详情页背景与首页同一套逻辑：**顶部是清晰的海报，往下滚才
                       // 逐渐变糊**。以前这里是无条件 `blur(glassBlur * .5)`，一进
                       // 详情页背景就已经糊死，和首页的观感对不上；现在深度由
-                      // [yingjiScrollDepth] 给出，清晰层与模糊层叠加，模糊层的不
-                      // 透明度就是深度。
-                      AnimatedBuilder(
-                        animation: _pageScroll,
-                        builder: (context, _) {
-                          final depth = _pageScroll.hasClients
-                              ? yingjiScrollDepth(_pageScroll.position)
-                              : 0.0;
+                      // [yingjiScrollDepth] 给出，清晰层与模糊层叠加。桌面滚轮运动
+                      // 期间冻结深度，只在停稳时更新，避免每帧重合成整屏滤镜。
+                      ValueListenableBuilder<double>(
+                        valueListenable: _pageBackdropDepth,
+                        builder: (context, depth, _) {
                           return Stack(
                             fit: StackFit.expand,
                             children: [
@@ -2242,7 +2255,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                     Expanded(
                       child: YingjiSmoothWheel(
                         controller: _pageScroll,
-                        stableGlass: true,
+                        // 桌面详情页外层同时移动背景、海报货架和多个玻璃面；
+                        // 暂停这些玻璃面的背板采样，避免滚轮期间每帧重复合成。
+                        // Android 保留现有材质策略；“全部剧集”弹窗另有稳定玻璃范围。
+                        stableGlass: !WindowHost.isDesktop,
                         child: ListView(
                           controller: _pageScroll,
                           scrollCacheExtent: const ScrollCacheExtent.pixels(
@@ -2374,7 +2390,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }).firstOrNull;
     final remotePosition = resource!.playbackPosition ?? Duration.zero;
     final savedPosition = saved?.position ?? Duration.zero;
-    final resumePosition = remotePosition > savedPosition
+    var resumePosition = remotePosition > savedPosition
         ? remotePosition
         : savedPosition;
     if (!context.mounted) return;
@@ -2526,69 +2542,44 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       return playerEpisode(option, overrideResource: selected);
     }
 
-    if (NativeDolbyVisionPlayer.isAvailablePlatform &&
-        NativeDolbyVisionPlayer.isDolbyVision(resource.videoRange)) {
-      final capabilities = await NativeDolbyVisionPlayer.capabilities();
+    if (await useAndroidExoPlayer()) {
       if (!context.mounted) return;
-      if (capabilities.supported) {
-        try {
-          final result = await NativeDolbyVisionPlayer.play(
-            url: resource.playbackUrl.toString(),
-            title: item.title,
-            headers: resource.headers,
-            initialPosition: resumePosition,
-            container: resource.container,
-          );
-          final duration = result.duration > Duration.zero
-              ? result.duration
-              : resource.runtime ?? Duration.zero;
-          if (result.position > Duration.zero || result.completed) {
-            await watchStore.save(
-              WatchState(
-                mediaId: resource.playbackUrl.toString(),
-                title: item.title,
-                position: result.position,
-                duration: duration,
-                imageUrl: resource.imageUrl?.toString(),
-                sourceId: resource.source.id,
-                serverItemId: resource.id,
-                tmdbId: item.id,
-                episodeTitle: resource.title,
-                seasonNumber: resource.seasonNumber,
-                episodeNumber: resource.episodeNumber,
-                isPlayed: result.completed,
-              ),
-            );
-          }
-          if (!context.mounted) return;
-          final message = result.error != null
-              ? '原生 Dolby Vision 播放失败：${result.error}'
-              : result.nativeDolbyVision
-              ? '已使用 Android 原生 Dolby Vision 解码'
-              : '系统未选中 Dolby Vision 轨道，请检查片源封装与设备支持的 Profile';
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text(message)));
-          await _refreshProgressAfterPlayback();
-          return;
-        } on PlatformException catch (error) {
-          if (!context.mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                '无法启动原生 Dolby Vision，已切换兼容模式：${error.message ?? error.code}',
-              ),
+      try {
+        await Navigator.push<void>(
+          context,
+          MaterialPageRoute<void>(
+            builder: (_) => PlayerPage(
+              url: resource.playbackUrl.toString(),
+              title: item.title,
+              initialPosition: resumePosition,
+              imageUrl: resource.imageUrl?.toString(),
+              sourceId: resource.source.id,
+              serverItemId: resource.id,
+              episodeTitle: resource.title,
+              seasonNumber: resource.seasonNumber,
+              episodeNumber: resource.episodeNumber,
+              headers: resource.headers,
+              container: resource.container,
+              episodes: episodeOptions
+                  .map((option) => playerEpisode(option))
+                  .toList(growable: false),
+              onResolveEpisode: resolvePlayerEpisode,
+              androidExo: true,
             ),
-          );
+          ),
+        );
+        await _refreshProgressAfterPlayback();
+        return;
+      } catch (error) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('播放失败，可在设置中切换 mpv：$error')));
         }
-      } else {
-        final missing = [
-          if (!capabilities.decoder) 'Dolby Vision 解码器',
-          if (!capabilities.display) 'Dolby Vision 显示能力',
-        ].join('和');
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('当前设备缺少$missing，已使用兼容模式')));
+        await _refreshProgressAfterPlayback();
+        return;
       }
     }
+    if (!context.mounted) return;
     if (WindowHost.isDesktop) {
       // 原生窗口的「资源」面板可以切到当前剧集在任意已连接服务器上的版本。
       // 原生自己换不了 —— 播放列表、headers 与 hwdec 选择都绑在起播时那个
@@ -3790,285 +3781,298 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
     await showDialog<void>(
       context: context,
       barrierColor: Colors.black.withValues(alpha: .58),
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, updateDialog) => YingjiSmoothWheel(
-          controller: _allEpisodesController,
-          stableGlass: true,
-          child: Dialog(
-            backgroundColor: Colors.transparent,
-            insetPadding: const EdgeInsets.all(28),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 720, maxHeight: 760),
-              child: GlassPanel(
-                radius: 22,
-                padding: EdgeInsets.zero,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(22, 20, 14, 16),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              '第 ${widget.episodes.first.seasonNumber} 季 · 全部剧集',
-                              style: const TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w900,
+      builder: (dialogContext) => YingjiStableScrollGlass(
+        child: StatefulBuilder(
+          builder: (context, updateDialog) => YingjiSmoothWheel(
+            controller: _allEpisodesController,
+            child: Dialog(
+              backgroundColor: Colors.transparent,
+              insetPadding: const EdgeInsets.all(28),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(
+                  maxWidth: 720,
+                  maxHeight: 760,
+                ),
+                child: GlassPanel(
+                  radius: 22,
+                  padding: EdgeInsets.zero,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(22, 20, 14, 16),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '第 ${widget.episodes.first.seasonNumber} 季 · 全部剧集',
+                                style: const TextStyle(
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w900,
+                                ),
                               ),
                             ),
-                          ),
-                          YingjiMotionIconButton(
-                            icon: YingjiIcons.xmark,
-                            tooltip: '关闭',
-                            size: 38,
-                            onPressed: () => Navigator.pop(dialogContext),
-                          ),
-                        ],
+                            YingjiMotionIconButton(
+                              icon: YingjiIcons.xmark,
+                              tooltip: '关闭',
+                              size: 38,
+                              onPressed: () => Navigator.pop(dialogContext),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                    Divider(height: 1, color: YingjiGlass.line(strength: .85)),
-                    Flexible(
-                      child: ScrollConfiguration(
-                        behavior: ScrollConfiguration.of(context)
-                            .copyWith(scrollbars: false),
-                        child: ListView.builder(
-                          controller: _allEpisodesController,
-                          physics: yingjiWheelPhysics,
-                          padding: const EdgeInsets.fromLTRB(14, 12, 14, 16),
-                          itemCount: widget.episodes.length,
-                          itemBuilder: (context, index) {
-                            final episode = widget.episodes[index];
-                            final key = _episodeKey(
-                              episode.seasonNumber,
-                              episode.episodeNumber,
-                            );
-                            final progress = progressByEpisode[key] ?? 0;
-                            final selected =
-                                episode.episodeNumber == dialogSelectedEpisode;
-                            final played = progress >= .92;
-                            final hovered =
-                                hoveredEpisodeNumber == episode.episodeNumber;
-                            final overview = episode.overview?.trim();
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  _contextEpisode(
-                                    episode,
-                                    MouseRegion(
-                                      cursor: SystemMouseCursors.click,
-                                      onEnter: (_) => updateDialog(
-                                        () => hoveredEpisodeNumber =
-                                            episode.episodeNumber,
-                                      ),
-                                      onExit: (_) {
-                                        if (hoveredEpisodeNumber ==
-                                            episode.episodeNumber) {
-                                          updateDialog(
-                                            () => hoveredEpisodeNumber = null,
-                                          );
-                                        }
-                                      },
-                                      child: AnimatedContainer(
-                                        duration: MovaMotion.standard,
-                                        curve: MovaMotion.standardEase,
-                                        decoration: BoxDecoration(
-                                          color: selected
-                                              ? Colors.white.withValues(
-                                                  alpha: .12,
-                                                )
-                                              : hovered
-                                              ? Colors.white.withValues(
-                                                  alpha: .055,
-                                                )
-                                              : Colors.transparent,
-                                          borderRadius: BorderRadius.circular(
-                                            14,
-                                          ),
-                                          border: Border.all(
+                      Divider(
+                        height: 1,
+                        color: YingjiGlass.line(strength: .85),
+                      ),
+                      Flexible(
+                        child: ScrollConfiguration(
+                          behavior: ScrollConfiguration.of(context)
+                              .copyWith(scrollbars: false),
+                          child: ListView.builder(
+                            controller: _allEpisodesController,
+                            physics: yingjiWheelPhysics,
+                            padding: const EdgeInsets.fromLTRB(14, 12, 14, 16),
+                            itemCount: widget.episodes.length,
+                            itemBuilder: (context, index) {
+                              final episode = widget.episodes[index];
+                              final key = _episodeKey(
+                                episode.seasonNumber,
+                                episode.episodeNumber,
+                              );
+                              final progress = progressByEpisode[key] ?? 0;
+                              final selected =
+                                  episode.episodeNumber ==
+                                  dialogSelectedEpisode;
+                              final played = progress >= .92;
+                              final hovered =
+                                  hoveredEpisodeNumber == episode.episodeNumber;
+                              final overview = episode.overview?.trim();
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    _contextEpisode(
+                                      episode,
+                                      MouseRegion(
+                                        cursor: SystemMouseCursors.click,
+                                        onEnter: (_) => updateDialog(
+                                          () => hoveredEpisodeNumber =
+                                              episode.episodeNumber,
+                                        ),
+                                        onExit: (_) {
+                                          if (hoveredEpisodeNumber ==
+                                              episode.episodeNumber) {
+                                            updateDialog(
+                                              () => hoveredEpisodeNumber = null,
+                                            );
+                                          }
+                                        },
+                                        child: AnimatedContainer(
+                                          duration: MovaMotion.standard,
+                                          curve: MovaMotion.standardEase,
+                                          decoration: BoxDecoration(
                                             color: selected
                                                 ? Colors.white.withValues(
-                                                    alpha: .78,
+                                                    alpha: .12,
                                                   )
                                                 : hovered
                                                 ? Colors.white.withValues(
-                                                    alpha: .58,
+                                                    alpha: .055,
                                                   )
                                                 : Colors.transparent,
-                                            width: 1.4,
-                                          ),
-                                        ),
-                                        child: ListTile(
-                                          selected: false,
-                                          shape: RoundedRectangleBorder(
                                             borderRadius: BorderRadius.circular(
                                               14,
                                             ),
+                                            border: Border.all(
+                                              color: selected
+                                                  ? Colors.white.withValues(
+                                                      alpha: .78,
+                                                    )
+                                                  : hovered
+                                                  ? Colors.white.withValues(
+                                                      alpha: .58,
+                                                    )
+                                                  : Colors.transparent,
+                                              width: 1.4,
+                                            ),
                                           ),
-                                          contentPadding:
-                                              const EdgeInsets.symmetric(
-                                                horizontal: 8,
-                                                vertical: 5,
-                                              ),
-                                          leading: SizedBox(
-                                            width: 112,
-                                            height: 64,
-                                            child: ClipRRect(
+                                          child: ListTile(
+                                            selected: false,
+                                            shape: RoundedRectangleBorder(
                                               borderRadius:
-                                                  BorderRadius.circular(8),
-                                              child: episode.stillUrl == null
-                                                  ? const _EpisodeArtworkFallback()
-                                                  : CachedNetworkImage(
-                                                      imageUrl: episode.stillUrl
-                                                          .toString(),
-                                                      fit: BoxFit.cover,
-                                                      errorWidget: (_, _, _) =>
-                                                          const _EpisodeArtworkFallback(),
+                                                  BorderRadius.circular(14),
+                                            ),
+                                            contentPadding:
+                                                const EdgeInsets.symmetric(
+                                                  horizontal: 8,
+                                                  vertical: 5,
+                                                ),
+                                            leading: SizedBox(
+                                              width: 112,
+                                              height: 64,
+                                              child: ClipRRect(
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                                child: episode.stillUrl == null
+                                                    ? const _EpisodeArtworkFallback()
+                                                    : CachedNetworkImage(
+                                                        imageUrl: episode
+                                                            .stillUrl
+                                                            .toString(),
+                                                        fit: BoxFit.cover,
+                                                        errorWidget: (_, _, _) =>
+                                                            const _EpisodeArtworkFallback(),
+                                                      ),
+                                              ),
+                                            ),
+                                            title: Text(
+                                              '第 ${episode.episodeNumber} 集 · ${episode.name}',
+                                            ),
+                                            subtitle: Text(
+                                              [
+                                                    _dateLabel(episode.airDate),
+                                                    if (episode.runtime != null)
+                                                      '${episode.runtime} 分钟',
+                                                  ]
+                                                  .where(
+                                                    (part) => part.isNotEmpty,
+                                                  )
+                                                  .join(' · '),
+                                            ),
+                                            onTap: () {
+                                              if (selected) {
+                                                Navigator.pop(dialogContext);
+                                                widget.onPlay(episode);
+                                              } else {
+                                                dialogSelectedEpisode =
+                                                    episode.episodeNumber;
+                                                widget.onSelect(episode);
+                                                updateDialog(() {});
+                                              }
+                                            },
+                                            trailing: AnimatedSwitcher(
+                                              duration: MovaMotion.standard,
+                                              switchInCurve: MovaMotion.spring,
+                                              switchOutCurve: MovaMotion.exit,
+                                              transitionBuilder:
+                                                  (child, animation) =>
+                                                      ScaleTransition(
+                                                        scale: animation,
+                                                        child: FadeTransition(
+                                                          opacity: animation,
+                                                          child: child,
+                                                        ),
+                                                      ),
+                                              child: played
+                                                  ? Container(
+                                                      key: const ValueKey(
+                                                        'played',
+                                                      ),
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 10,
+                                                            vertical: 6,
+                                                          ),
+                                                      decoration: BoxDecoration(
+                                                        color:
+                                                            const Color(
+                                                              0xFF6AD7A1,
+                                                            ).withValues(
+                                                              alpha: .19,
+                                                            ),
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              999,
+                                                            ),
+                                                        border: Border.all(
+                                                          color:
+                                                              const Color(
+                                                                0xFF8CE9B5,
+                                                              ).withValues(
+                                                                alpha: .72,
+                                                              ),
+                                                        ),
+                                                      ),
+                                                      child: const Row(
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          Icon(
+                                                            YingjiIcons
+                                                                .checkmark_circle_fill,
+                                                            size: 16,
+                                                            color: Color(
+                                                              0xFF9BF1BF,
+                                                            ),
+                                                          ),
+                                                          SizedBox(width: 6),
+                                                          Text(
+                                                            '已播放',
+                                                            style: TextStyle(
+                                                              fontSize: 12,
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w800,
+                                                              color: Color(
+                                                                0xFFB9F6D0,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    )
+                                                  : Icon(
+                                                      YingjiIcons.play_circle,
+                                                      key: const ValueKey(
+                                                        'unplayed',
+                                                      ),
+                                                      color: selected
+                                                          ? Colors.white
+                                                          : Colors.white54,
                                                     ),
                                             ),
                                           ),
-                                          title: Text(
-                                            '第 ${episode.episodeNumber} 集 · ${episode.name}',
-                                          ),
-                                          subtitle: Text(
-                                            [
-                                                  _dateLabel(episode.airDate),
-                                                  if (episode.runtime != null)
-                                                    '${episode.runtime} 分钟',
-                                                ]
-                                                .where(
-                                                  (part) => part.isNotEmpty,
-                                                )
-                                                .join(' · '),
-                                          ),
-                                          onTap: () {
-                                            if (selected) {
-                                              Navigator.pop(dialogContext);
-                                              widget.onPlay(episode);
-                                            } else {
-                                              dialogSelectedEpisode =
-                                                  episode.episodeNumber;
-                                              widget.onSelect(episode);
-                                              updateDialog(() {});
-                                            }
-                                          },
-                                          trailing: AnimatedSwitcher(
-                                            duration: MovaMotion.standard,
-                                            switchInCurve: MovaMotion.spring,
-                                            switchOutCurve: MovaMotion.exit,
-                                            transitionBuilder:
-                                                (child, animation) =>
-                                                    ScaleTransition(
-                                                      scale: animation,
-                                                      child: FadeTransition(
-                                                        opacity: animation,
-                                                        child: child,
-                                                      ),
-                                                    ),
-                                            child: played
-                                                ? Container(
-                                                    key: const ValueKey(
-                                                      'played',
-                                                    ),
-                                                    padding:
-                                                        const EdgeInsets.symmetric(
-                                                          horizontal: 10,
-                                                          vertical: 6,
-                                                        ),
-                                                    decoration: BoxDecoration(
-                                                      color: const Color(
-                                                        0xFF6AD7A1,
-                                                      ).withValues(alpha: .19),
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            999,
-                                                          ),
-                                                      border: Border.all(
-                                                        color:
-                                                            const Color(
-                                                              0xFF8CE9B5,
-                                                            ).withValues(
-                                                              alpha: .72,
-                                                            ),
-                                                      ),
-                                                    ),
-                                                    child: const Row(
-                                                      mainAxisSize:
-                                                          MainAxisSize.min,
-                                                      children: [
-                                                        Icon(
-                                                          YingjiIcons
-                                                              .checkmark_circle_fill,
-                                                          size: 16,
-                                                          color: Color(
-                                                            0xFF9BF1BF,
-                                                          ),
-                                                        ),
-                                                        SizedBox(width: 6),
-                                                        Text(
-                                                          '已播放',
-                                                          style: TextStyle(
-                                                            fontSize: 12,
-                                                            fontWeight:
-                                                                FontWeight.w800,
-                                                            color: Color(
-                                                              0xFFB9F6D0,
-                                                            ),
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  )
-                                                : Icon(
-                                                    YingjiIcons.play_circle,
-                                                    key: const ValueKey(
-                                                      'unplayed',
-                                                    ),
-                                                    color: selected
-                                                        ? Colors.white
-                                                        : Colors.white54,
-                                                  ),
+                                        ),
+                                      ),
+                                      onChoice: (played) => updateDialog(
+                                        () => progressByEpisode[key] = played
+                                            ? 1
+                                            : 0,
+                                      ),
+                                    ),
+                                    if (overview != null && overview.isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.fromLTRB(
+                                          12,
+                                          5,
+                                          12,
+                                          1,
+                                        ),
+                                        child: YingjiGlassTooltip(
+                                          message: overview,
+                                          child: Text(
+                                            overview,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              color: YingjiColors.muted,
+                                              fontSize: 12,
+                                            ),
                                           ),
                                         ),
                                       ),
-                                    ),
-                                    onChoice: (played) => updateDialog(
-                                      () => progressByEpisode[key] = played
-                                          ? 1
-                                          : 0,
-                                    ),
-                                  ),
-                                  if (overview != null && overview.isNotEmpty)
-                                    Padding(
-                                      padding: const EdgeInsets.fromLTRB(
-                                        12,
-                                        5,
-                                        12,
-                                        1,
-                                      ),
-                                      child: YingjiGlassTooltip(
-                                        message: overview,
-                                        child: Text(
-                                          overview,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                            color: YingjiColors.muted,
-                                            fontSize: 12,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                ],
-                              ),
-                            );
-                          },
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),

@@ -44,6 +44,37 @@ void main() {
     }
   });
 
+  test('Android home hero supports horizontal swipe carousel navigation', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final home = classBody(source, '_CinematicHomeState');
+    expect(home, contains('onHorizontalDragStart: Platform.isAndroid'));
+    expect(home, contains('onHorizontalDragUpdate: Platform.isAndroid'));
+    expect(home, contains('onHorizontalDragEnd: Platform.isAndroid'));
+    expect(home, contains('distance.abs() >= threshold'));
+    expect(home, contains('direction < 0 ? 1 : -1'));
+  });
+
+  test('Android restores persisted discovery section poster snapshots', () {
+    final media = File('lib/src/media_center.dart').readAsStringSync();
+    final cache = File('lib/src/cache/discover_snapshot_cache.dart')
+        .readAsStringSync();
+    final discover = classBody(media, '_DiscoverPageState');
+    expect(discover, contains('DiscoverSnapshotCache.read('));
+    expect(discover, contains('DiscoverSnapshotCache.write('));
+    expect(discover, contains('refreshed[section] = rows'));
+    expect(discover, contains('Platform.isAndroid && refreshed.isNotEmpty'));
+    expect(
+      discover,
+      contains(
+        'if (!Platform.isWindows && !Platform.isAndroid) return const {}',
+      ),
+    );
+    expect(cache, contains('Platform.isAndroid'));
+    expect(cache, contains('await _readAndroid(key)'));
+    expect(cache, contains('await _writeAndroid(key, value)'));
+    expect(cache, contains('const _capacity = 96'));
+  });
+
   test('standalone detail and library pages use the same wheel', () {
     final files = {
       'PlaylistDetailPage': 'lib/src/playlists/playlist_detail_page.dart',
@@ -106,6 +137,29 @@ void main() {
     expect(wheel, contains('pointerSignalResolver.register(event, (_)'));
   });
 
+  test(
+    'Windows detail scroll pauses glass while episode dialog keeps blur',
+    () {
+      final source = File('lib/src/metadata/metadata_detail_page.dart')
+          .readAsStringSync();
+      final detail = classBody(source, '_MetadataDetailPageState');
+      expect(detail, contains('stableGlass: !WindowHost.isDesktop'));
+      expect(detail, contains('ValueListenableBuilder<double>'));
+      expect(
+        detail,
+        contains('(WindowHost.isDesktop && yingjiScrollInProgress.value)'),
+      );
+
+      final episodeRail = classBody(source, '_CatalogEpisodeRailState');
+      final dialogStart = episodeRail.indexOf('Future<void> _showAll()');
+      expect(dialogStart, isNonNegative);
+      expect(
+        episodeRail.substring(dialogStart),
+        contains('YingjiStableScrollGlass('),
+      );
+    },
+  );
+
   test('discover data updates only the changed shelf', () {
     final source = File('lib/src/media_center.dart').readAsStringSync();
     final body = classBody(source, '_DiscoverPageState');
@@ -115,6 +169,30 @@ void main() {
       body,
       isNot(contains('setState(() {\n        _visibleItems = next;')),
     );
+  });
+
+  test('server source card grows to keep primary-line latency visible', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final card = classBody(source, '_SourceCardState');
+    expect(card, contains('constraints: const BoxConstraints(minHeight: 144)'));
+    expect(card, isNot(contains('height: 128')));
+  });
+
+  test('settings scroll uses cached section offsets while scrolling', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    final settings = classBody(source, '_SettingsPageState');
+    final syncStart = settings.indexOf('void _syncActiveSetting()');
+    final jumpStart = settings.indexOf(
+      'Future<void> _jumpToSetting(',
+      syncStart,
+    );
+    expect(syncStart, isNonNegative);
+    expect(jumpStart, greaterThan(syncStart));
+    final sync = settings.substring(syncStart, jumpStart);
+    expect(settings, contains('_settingSectionOffsets = offsets;'));
+    expect(sync, contains('final offsets = _settingSectionOffsets;'));
+    expect(sync, contains('while (low < high)'));
+    expect(sync, isNot(contains('getOffsetToReveal')));
   });
 
   test('discover reorder dialog shares smooth wheel and mouse drag', () {

@@ -237,6 +237,8 @@ class PlayerPage extends StatefulWidget {
     this.chapters = const [],
     this.initialAudioTrack,
     this.initialSubtitleTrack,
+    this.androidExo = false,
+    this.container,
     this.episodes = const [],
     this.onResolveEpisode,
   });
@@ -256,6 +258,8 @@ class PlayerPage extends StatefulWidget {
   final List<MediaChapter> chapters;
   final int? initialAudioTrack;
   final int? initialSubtitleTrack;
+  final bool androidExo;
+  final String? container;
   final List<PlayerEpisode> episodes;
   final Future<PlayerEpisode?> Function(
     int season,
@@ -269,8 +273,20 @@ class PlayerPage extends StatefulWidget {
 }
 
 class _PlayerPageState extends State<PlayerPage> {
-  late final Player _player;
+  late final Player? _player;
   late final VideoController? _controller;
+  final _exoPositionController = StreamController<Duration>.broadcast();
+  final _exoBufferController = StreamController<Duration>.broadcast();
+  final _exoPlayingController = StreamController<bool>.broadcast();
+  final _exoCompletedController = StreamController<bool>.broadcast();
+  final _exoErrorController = StreamController<String>.broadcast();
+  final _exoTracksController = StreamController<Tracks>.broadcast();
+  final _exoTrackController = StreamController<Track>.broadcast();
+  PlayerState _exoState = const PlayerState();
+  MethodChannel? _exoCommands;
+  StreamSubscription<dynamic>? _exoEventSubscription;
+  String? _exoPlaybackUrl;
+  Map<String, String> _exoHeaders = const {};
   late final FocusNode _focusNode;
   late int _activeEpisodeIndex;
   bool _showControls = true;
@@ -305,7 +321,8 @@ class _PlayerPageState extends State<PlayerPage> {
   /// URL when the session starts. Not mandatory (the server falls back to the
   /// item's default source) but sent for parity with official clients.
   final Map<String, String> _sessionMediaSourceIds = {};
-  String _consoleTab = '声音';
+  String _consoleTab = '音轨与字幕';
+  double? _sliderSeekPreview;
   bool _hardware = true;
   bool _hdr = true;
   bool _downmix = false;
@@ -429,11 +446,9 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 是否已从宿主读到过真实亮度，读到之前不写回宿主。
   bool _brightnessKnown = false;
 
-  /// 移动端当前是否全屏。桌面端没有这个按钮（走窗口控制按钮），恒为 false。
-  bool _mobileFullScreen = false;
-
   /// 上一次单击的时间，用于自实现的双击判定。
   DateTime? _lastTapAt;
+  DateTime? _ignoreTapUntil;
 
   // ── 右下角工具按钮的顺序与显隐（设置页保存）────────────────────
   /// 用户排好的顺序；缺省是 [YingjiPlayerTools.all] 的声明顺序。
@@ -482,13 +497,148 @@ class _PlayerPageState extends State<PlayerPage> {
 
   PlayerEpisode get _activeEpisode => _resourceOverride ?? _baseEpisode;
 
+  bool get _usesAndroidExo => widget.androidExo && !WindowHost.isDesktop;
+  PlayerState get _state => _usesAndroidExo ? _exoState : _player!.state;
+  Stream<Duration> get _positionStream => _usesAndroidExo
+      ? _exoPositionController.stream
+      : _player!.stream.position;
+  Stream<Duration> get _bufferStream =>
+      _usesAndroidExo ? _exoBufferController.stream : _player!.stream.buffer;
+  Stream<bool> get _playingStream =>
+      _usesAndroidExo ? _exoPlayingController.stream : _player!.stream.playing;
+  Stream<bool> get _completedStream => _usesAndroidExo
+      ? _exoCompletedController.stream
+      : _player!.stream.completed;
+  Stream<String> get _errorStream =>
+      _usesAndroidExo ? _exoErrorController.stream : _player!.stream.error;
+  Stream<Tracks> get _tracksStream =>
+      _usesAndroidExo ? _exoTracksController.stream : _player!.stream.tracks;
+  Stream<Track> get _trackStream =>
+      _usesAndroidExo ? _exoTrackController.stream : _player!.stream.track;
+
+  Future<void> _play() async =>
+      _usesAndroidExo ? _exoCommand('play') : _player!.play();
+  Future<void> _pause() async =>
+      _usesAndroidExo ? _exoCommand('pause') : _player!.pause();
+  Future<void> _playOrPause() async =>
+      _usesAndroidExo ? _exoCommand('toggle') : _player!.playOrPause();
+  Future<void> _seek(Duration position) async => _usesAndroidExo
+      ? _exoCommand('seekTo', {'positionMs': position.inMilliseconds})
+      : _player!.seek(position);
+  Future<void> _backendSetVolume(double volume) async => _usesAndroidExo
+      ? _exoCommand('setVolume', {'volume': volume / 100})
+      : _player!.setVolume(volume);
+  Future<void> _setRate(double rate) async => _usesAndroidExo
+      ? _exoCommand('setRate', {'rate': rate})
+      : _player!.setRate(rate);
+  Future<void> _setAudioTrack(AudioTrack track) async => _usesAndroidExo
+      ? _exoCommand('setTrack', {
+          'type': 'audio',
+          'index': int.tryParse(track.id) ?? -1,
+        })
+      : _player!.setAudioTrack(track);
+  Future<void> _setSubtitleTrack(SubtitleTrack track) async => _usesAndroidExo
+      ? _exoCommand('setTrack', {
+          'type': 'text',
+          'index': int.tryParse(track.id) ?? -1,
+        })
+      : _player!.setSubtitleTrack(track);
+
+  Future<void> _exoCommand(
+    String method, [
+    Map<String, Object?>? arguments,
+  ]) async {
+    try {
+      await _exoCommands?.invokeMethod<void>(method, arguments);
+    } on PlatformException catch (error) {
+      if (mounted) setState(() => _error = error.message ?? error.code);
+    }
+  }
+
+  void _attachExoView(int viewId) {
+    _exoCommands = MethodChannel('mova/exo/$viewId');
+    unawaited(_exoCommand('setVolume', {'volume': _volume / 100}));
+    unawaited(_exoCommand('setRate', {'rate': _speed}));
+    _exoEventSubscription?.cancel();
+    _exoEventSubscription = EventChannel('mova/exo-events/$viewId')
+        .receiveBroadcastStream()
+        .listen(
+          _onExoEvent,
+          onError: (Object error) {
+            if (mounted) setState(() => _error = error.toString());
+          },
+        );
+  }
+
+  void _onExoEvent(dynamic event) {
+    if (event is! Map) return;
+    final error = event['error'] as String?;
+    if (error != null) {
+      _exoErrorController.add(error);
+      if (mounted) setState(() => _error = error);
+      return;
+    }
+    final audio = <AudioTrack>[];
+    final subtitle = <SubtitleTrack>[];
+    var selectedAudio = const AudioTrack('auto', null, null);
+    var selectedSubtitle = const SubtitleTrack('auto', null, null);
+    for (final raw in (event['tracks'] as List? ?? const [])) {
+      if (raw is! Map) continue;
+      final type = raw['type'] as String?;
+      final id = '${raw['index'] ?? -1}';
+      final title = raw['label'] as String?;
+      final language = raw['language'] as String?;
+      if (type == 'audio') {
+        final track = AudioTrack(id, title, language);
+        audio.add(track);
+        if (raw['selected'] == true) selectedAudio = track;
+      } else if (type == 'text') {
+        final track = SubtitleTrack(id, title, language);
+        subtitle.add(track);
+        if (raw['selected'] == true) selectedSubtitle = track;
+      }
+    }
+    final tracks = Tracks(audio: audio, subtitle: subtitle);
+    final selected = Track(audio: selectedAudio, subtitle: selectedSubtitle);
+    final position = Duration(
+      milliseconds: (event['positionMs'] as num?)?.toInt() ?? 0,
+    );
+    final duration = Duration(
+      milliseconds: (event['durationMs'] as num?)?.toInt() ?? 0,
+    );
+    final buffer = Duration(
+      milliseconds: (event['bufferedMs'] as num?)?.toInt() ?? 0,
+    );
+    final playing = event['playing'] == true;
+    final completed = event['completed'] == true;
+    final previous = _exoState;
+    _exoState = _exoState.copyWith(
+      position: position,
+      duration: duration,
+      buffer: buffer,
+      playing: playing,
+      buffering: event['buffering'] == true,
+      completed: completed,
+      tracks: tracks,
+      track: selected,
+    );
+    _exoPositionController.add(position);
+    _exoBufferController.add(buffer);
+    if (previous.playing != playing) _exoPlayingController.add(playing);
+    if (previous.completed != completed) {
+      _exoCompletedController.add(completed);
+    }
+    if (previous.tracks != tracks) _exoTracksController.add(tracks);
+    if (previous.track != selected) _exoTrackController.add(selected);
+    if (mounted) setState(() {});
+  }
+
   @override
   void initState() {
     super.initState();
     // 移动端：保持常亮 + 沉浸式 + 允许横屏（桌面端无操作）
     unawaited(WindowHost.enterMediaSession());
     // 移动端进播放器就是沉浸式全屏，右上角按钮初始画「退出全屏」。
-    _mobileFullScreen = !WindowHost.isDesktop;
     // 预读一次亮度，这样左半屏第一次上下滑动是从真实基准开始，不会跳变。
     unawaited(_loadScreenBrightness());
     unawaited(_loadToolbarPreferences());
@@ -496,26 +646,30 @@ class _PlayerPageState extends State<PlayerPage> {
       (episode) => episode.url == widget.url,
     );
     if (_activeEpisodeIndex < 0) _activeEpisodeIndex = 0;
-    _player = Player(
-      configuration: PlayerConfiguration(
-        vo: 'gpu-next',
-        osc: WindowHost.isDesktop,
-        title: 'Mova',
-        libass: true,
-      ),
-    );
+    _player = _usesAndroidExo
+        ? null
+        : Player(
+            configuration: PlayerConfiguration(
+              vo: 'gpu-next',
+              osc: WindowHost.isDesktop,
+              title: 'Mova',
+              libass: true,
+            ),
+          );
     _focusNode = FocusNode(debugLabel: 'Mova 播放器快捷键');
     // The Windows native child window keeps `vo=gpu-next`. Creating a
     // VideoController would change that same Player to Flutter's `vo=libmpv`.
-    _controller = WindowHost.isDesktop ? null : VideoController(_player);
-    _subtitleSubscription = _player.stream.tracks.listen((tracks) {
+    _controller = WindowHost.isDesktop || _usesAndroidExo
+        ? null
+        : VideoController(_player!);
+    _subtitleSubscription = _tracksStream.listen((tracks) {
       if (_preferAudioTrack &&
           !_audioChosen &&
           _activeEpisode.initialAudioTrack == null) {
         final audio = preferredAudioTrack(tracks.audio, _audioLanguage);
         if (audio != null) {
           _audioChosen = true;
-          unawaited(_player.setAudioTrack(audio));
+          unawaited(_setAudioTrack(audio));
         }
       }
       if (!_preferChineseSubtitle ||
@@ -525,7 +679,7 @@ class _PlayerPageState extends State<PlayerPage> {
       final track = preferredSubtitle(tracks.subtitle, _subtitleLanguage);
       if (track != null) {
         _subtitleChosen = true;
-        unawaited(_player.setSubtitleTrack(track));
+        unawaited(_setSubtitleTrack(track));
       }
     });
     _initializePlayer();
@@ -539,10 +693,10 @@ class _PlayerPageState extends State<PlayerPage> {
       unawaited(_preloadNextIfNeeded());
       unawaited(_advanceVideoCacheWindowIfNeeded());
     });
-    _player.stream.error.listen((value) {
+    _errorStream.listen((value) {
       if (mounted && value.isNotEmpty) setState(() => _error = value);
     });
-    _playingSubscription = _player.stream.playing.listen((playing) {
+    _playingSubscription = _playingStream.listen((playing) {
       if (!mounted || _switchingEpisode) return;
       if (playing) {
         // 至少真正播过一次，之后暂停才在画面中央显示「继续播放」；
@@ -557,10 +711,10 @@ class _PlayerPageState extends State<PlayerPage> {
         _revealControls();
       }
     });
-    _completedSubscription = _player.stream.completed.listen((completed) {
+    _completedSubscription = _completedStream.listen((completed) {
       if (completed) unawaited(_deleteCompletedVideoCache(_activeEpisode.url));
     });
-    _bufferSubscription = _player.stream.buffer.listen((buffer) async {
+    _bufferSubscription = _bufferStream.listen((buffer) async {
       final now = DateTime.now();
       final previousAt = _lastBufferSampleAt;
       if (previousAt != null) {
@@ -586,9 +740,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (!_settingsOpen) _scheduleControlsHide();
   }
 
-  void _scheduleControlsHide({
-    Duration delay = const Duration(milliseconds: 1100),
-  }) {
+  void _scheduleControlsHide({Duration delay = const Duration(seconds: 3)}) {
     _controlsTimer?.cancel();
     if (_settingsOpen || _quickMenuOpen) return;
     _controlsTimer = Timer(delay, () {
@@ -617,6 +769,12 @@ class _PlayerPageState extends State<PlayerPage> {
   // 发滞。改为自己维护 280ms 的双击窗口，单击零延迟响应。
   void _handleTap() {
     final now = DateTime.now();
+    final ignoreTapUntil = _ignoreTapUntil;
+    _ignoreTapUntil = null;
+    if (ignoreTapUntil != null && now.isBefore(ignoreTapUntil)) {
+      _lastTapAt = null;
+      return;
+    }
     final previous = _lastTapAt;
     final isDoubleTap =
         previous != null &&
@@ -650,7 +808,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _gestureKind = _GestureKind.seek;
     _gestureIcon = Icons.fast_forward;
     _seekDragPixels = 0;
-    _seekDragAnchor = _player.state.position;
+    _seekDragAnchor = _state.position;
     _seekPreview = _seekDragAnchor;
     _gestureLabel = _time(_seekDragAnchor);
     _gestureCaption = '';
@@ -666,7 +824,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (width <= 0) return;
     _seekDragPixels += details.delta.dx;
     // 横向划过整屏 ≈ 90 秒；超过片长会被 clamp 到结尾。
-    final span = _player.state.duration;
+    final span = _state.duration;
     final target = _clampPosition(
       _seekDragAnchor +
           Duration(milliseconds: (_seekDragPixels / width * 90000).round()),
@@ -686,7 +844,7 @@ class _PlayerPageState extends State<PlayerPage> {
   void _onSeekDragEnd(DragEndDetails details) {
     final target = _seekPreview;
     _endGesture();
-    if (target != null) unawaited(_player.seek(target));
+    if (target != null) unawaited(_seek(target));
     _revealControls();
   }
 
@@ -736,7 +894,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _volume = next;
       _muted = next <= 0;
       if (next > 0) _lastAudibleVolume = next;
-      unawaited(_player.setVolume(next));
+      unawaited(_setVolume(next));
       _gestureIcon = next <= 0 ? YingjiIcons.speaker_slash : Icons.volume_up;
     }
     _gestureLabel = '${next.round()}%';
@@ -776,10 +934,21 @@ class _PlayerPageState extends State<PlayerPage> {
     });
   }
 
-  /// 移动端右上角的全屏开关。桌面端不渲染这个按钮。
-  Future<void> _toggleFullScreen() async {
-    final active = await WindowHost.toggleFullScreen();
-    if (mounted) setState(() => _mobileFullScreen = active);
+  Future<void> _enterPictureInPicture() async {
+    final controlsWereVisible = _showControls;
+    if (mounted) {
+      setState(() {
+        _showControls = false;
+        _settingsOpen = false;
+        _quickMenuOpen = false;
+      });
+      await Future<void>.delayed(MovaMotion.hudOut);
+    }
+    final entered = await WindowHost.enterPictureInPicture();
+    if (entered || !mounted) return;
+    if (controlsWereVisible) setState(() => _showControls = true);
+    ScaffoldMessenger.maybeOf(context)
+        ?.showSnackBar(const SnackBar(content: Text('当前设备暂不支持画中画')));
   }
 
   /// 手势结束后把音量落盘，下次进入播放器沿用。
@@ -809,7 +978,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 位置在总时长里的占比；时长未知时返回中点。
   double _progressFor(Duration value, [Duration? span]) {
-    final total = (span ?? _player.state.duration).inMilliseconds;
+    final total = (span ?? _state.duration).inMilliseconds;
     if (total <= 0) return .5;
     return (value.inMilliseconds / total).clamp(0.0, 1.0);
   }
@@ -836,6 +1005,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   void _openConsoleTab(String tab) {
+    if (tab == '声音' || tab == '字幕') tab = '音轨与字幕';
     setState(() {
       if (_settingsOpen && _consoleTab == tab) {
         _settingsOpen = false;
@@ -854,7 +1024,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _updateNetworkSpeed() async {
     try {
-      final raw = await (_player.platform as dynamic).getProperty(
+      if (_usesAndroidExo) throw StateError('Exo does not expose cache speed');
+      final raw = await (_player!.platform as dynamic).getProperty(
         'cache-speed',
       );
       final bytes = double.tryParse('$raw') ?? 0;
@@ -934,7 +1105,7 @@ class _PlayerPageState extends State<PlayerPage> {
       unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
     }
     if (!await _attachNativeVideoHost()) return;
-    await _applyMpvPreferences();
+    if (!_usesAndroidExo) await _applyMpvPreferences();
     await _openCurrentMedia();
     unawaited(_loadSegmentData());
     if (mounted) setState(() {});
@@ -942,7 +1113,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _openCurrentMedia() async {
     final episode = _activeEpisode;
-    await _applyVideoPipeline(episode);
+    if (!_usesAndroidExo) await _applyVideoPipeline(episode);
     _subtitleChosen = false;
     _audioChosen = false;
     _skipDismissed.clear();
@@ -959,18 +1130,42 @@ class _PlayerPageState extends State<PlayerPage> {
     _playingCachedFile = cached != null;
     _persistentCacheFraction = cached == null ? 0 : 1;
     _videoCacheStatus = cached == null ? null : '已完整缓存';
-    if (cached != null) {
+    if (_usesAndroidExo) {
+      final playbackUrl = cached == null
+          ? await _videoCache?.playbackUrl(
+              episode.url,
+              headers: episode.headers,
+            )
+          : Uri.file(cached.path).toString();
+      _exoHeaders = cached == null && playbackUrl == null
+          ? episode.headers
+          : const {};
+      _exoState = _exoState.copyWith(
+        position: episode.initialPosition,
+        duration: Duration.zero,
+        buffer: Duration.zero,
+        playing: false,
+        buffering: true,
+        completed: false,
+        tracks: const Tracks(),
+        track: const Track(),
+      );
+      _exoPlaybackUrl = playbackUrl ?? episode.url;
+      _exoCommands = null;
+      _exoEventSubscription?.cancel();
+      if (mounted) setState(() {});
+    } else if (cached != null) {
       // 命中本机缓存：直接开本地文件。本地文件用不上鉴权头，带了反而可能
       // 让 mpv 走一次无谓的 HTTP 请求流程。这里传的是**原始绝对路径**而不是
       // `file://` URI —— 用户目录里可能有中文，`Uri.file` 会转成百分号编码，
       // mpv 在 Windows 上未必能解回正确的路径。
-      await _player.open(Media(cached.path));
+      await _player!.open(Media(cached.path));
     } else {
       final playbackUrl = await _videoCache?.playbackUrl(
         episode.url,
         headers: episode.headers,
       );
-      await _player.open(
+      await _player!.open(
         Media(
           playbackUrl ?? episode.url,
           httpHeaders: playbackUrl == null ? episode.headers : const {},
@@ -978,7 +1173,7 @@ class _PlayerPageState extends State<PlayerPage> {
       );
     }
     if (WindowHost.isDesktop) {
-      await (_player.platform as dynamic).command(<String>[
+      await (_player!.platform as dynamic).command(<String>[
         'script-message-to',
         'osc',
         'osc-visibility',
@@ -990,10 +1185,10 @@ class _PlayerPageState extends State<PlayerPage> {
         'osc-show',
       ]);
     }
-    if (episode.initialAudioTrack != null) {
+    if (!_usesAndroidExo && episode.initialAudioTrack != null) {
       await _setMpvProperty('aid', '${episode.initialAudioTrack! + 1}');
     }
-    if (episode.initialSubtitleTrack != null) {
+    if (!_usesAndroidExo && episode.initialSubtitleTrack != null) {
       await _setMpvProperty(
         'sid',
         episode.initialSubtitleTrack == -1
@@ -1002,18 +1197,23 @@ class _PlayerPageState extends State<PlayerPage> {
       );
     }
     final resume = episode.initialPosition;
-    if (resume > Duration.zero) {
+    if (!_usesAndroidExo && resume > Duration.zero) {
       // media_kit's open() resolves before mpv finishes demuxing. A seek
       // issued at that instant is silently dropped for network streams, so
       // playback would restart from 0 even though the position was persisted.
       // Wait until a real duration is reported, then restore the position.
       final target = await _awaitSeekableTarget(resume);
       if (target != null) {
-        await _player.seek(target);
+        await _seek(target);
       }
     }
     if (cached == null) unawaited(_cacheCurrentEpisode(episode));
-    await _player.setVolume(_volume);
+    if (_usesAndroidExo) {
+      await _exoCommand('setVolume', {'volume': _volume / 100});
+      await _exoCommand('setRate', {'rate': _speed});
+    } else {
+      await _backendSetVolume(_volume);
+    }
   }
 
   Future<bool> _attachNativeVideoHost() async {
@@ -1074,10 +1274,10 @@ class _PlayerPageState extends State<PlayerPage> {
     final job = store.download(
       url: episode.url,
       limitBytes: limit,
-      startPosition: _player.state.position > episode.initialPosition
-          ? _player.state.position
+      startPosition: _state.position > episode.initialPosition
+          ? _state.position
           : episode.initialPosition,
-      mediaDuration: _player.state.duration,
+      mediaDuration: _state.duration,
       headers: episode.headers,
       title: episode.title,
     );
@@ -1112,7 +1312,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _advanceVideoCacheWindowIfNeeded() async {
     final store = _videoCache;
     final current = _videoDownload;
-    final state = _player.state;
+    final state = _state;
     if (!mounted ||
         store == null ||
         current == null ||
@@ -1189,7 +1389,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<Duration?> _awaitSeekableTarget(Duration target) async {
     final deadline = DateTime.now().add(const Duration(seconds: 12));
     while (DateTime.now().isBefore(deadline)) {
-      final duration = _player.state.duration;
+      final duration = _state.duration;
       if (duration > Duration.zero) {
         final upper = duration - const Duration(seconds: 1);
         if (upper <= Duration.zero) return Duration.zero;
@@ -1228,7 +1428,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _muted = next <= 0;
       if (next > 0) _lastAudibleVolume = next;
     });
-    await _player.setVolume(next);
+    await _backendSetVolume(next);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('yingji.player.volume', next);
   }
@@ -1247,14 +1447,14 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _togglePlayback() async {
     _focusNode.requestFocus();
     _revealControls();
-    await _player.playOrPause();
+    await _playOrPause();
   }
 
   Future<void> _seekBy(Duration delta) async {
     _revealControls();
-    final target = _player.state.position + delta;
-    final duration = _player.state.duration;
-    await _player.seek(
+    final target = _state.position + delta;
+    final duration = _state.duration;
+    await _seek(
       target < Duration.zero
           ? Duration.zero
           : (duration > Duration.zero && target > duration ? duration : target),
@@ -1271,12 +1471,13 @@ class _PlayerPageState extends State<PlayerPage> {
         index == _activeEpisodeIndex) {
       return;
     }
-    _switchingEpisode = true;
+    final wasPlaying = _state.playing;
+    setState(() => _switchingEpisode = true);
     try {
-      await _player.pause();
+      await _pause();
       final previousEpisode = _activeEpisode;
-      final previousPosition = _player.state.position;
-      final previousDuration = _player.state.duration;
+      final previousPosition = _state.position;
+      final previousDuration = _state.duration;
       await _saveWatchState(isPlayed: markCurrentPlayed);
       if (markCurrentPlayed) {
         unawaited(_deleteCompletedVideoCache(previousEpisode.url));
@@ -1315,7 +1516,7 @@ class _PlayerPageState extends State<PlayerPage> {
               });
         if (resolved == null || resolved.url.isEmpty) {
           if (mounted && !_exitStarted) {
-            await _player.play();
+            if (wasPlaying) await _play();
             if (!mounted || _exitStarted) return;
             ScaffoldMessenger.of(
               context,
@@ -1344,8 +1545,12 @@ class _PlayerPageState extends State<PlayerPage> {
         unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
       }
       _revealControls();
+    } catch (error) {
+      if (mounted && !_exitStarted) {
+        setState(() => _error = '切换剧集失败：$error');
+      }
     } finally {
-      _switchingEpisode = false;
+      if (mounted) setState(() => _switchingEpisode = false);
     }
   }
 
@@ -1356,8 +1561,8 @@ class _PlayerPageState extends State<PlayerPage> {
         _activeEpisodeIndex >= widget.episodes.length - 1) {
       return;
     }
-    final duration = _player.state.duration;
-    final position = _player.state.position;
+    final duration = _state.duration;
+    final position = _state.position;
     if (duration <= Duration.zero ||
         duration - position > Duration(minutes: _preloadLeadMinutes.round())) {
       return;
@@ -1468,7 +1673,7 @@ class _PlayerPageState extends State<PlayerPage> {
         episodeNumber: episode.episodeNumber,
         sourceId: episode.sourceId,
         serverItemId: episode.serverItemId,
-        duration: _player.state.duration,
+        duration: _state.duration,
         chapters: episode.chapters,
         sources: SegmentSourceSettings(
           server: _segmentServerSource,
@@ -1497,7 +1702,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _setSegment({required bool intro}) async {
     // A manual mark intentionally overrides any provider data for this title.
-    final value = _player.state.position;
+    final value = _state.position;
     final prefs = await SharedPreferences.getInstance();
     final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
     if (prefix == null) return;
@@ -1540,7 +1745,7 @@ class _PlayerPageState extends State<PlayerPage> {
   final Set<String> _skipDismissed = {};
 
   String? get _currentSkipKind {
-    final position = _player.state.position;
+    final position = _state.position;
     if (_introEnd != null &&
         position > Duration.zero &&
         position < _introEnd!) {
@@ -1551,7 +1756,7 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     if (_outroStart != null &&
         position >= _outroStart! &&
-        _player.state.duration > position)
+        _state.duration > position)
       return 'outro';
     return null;
   }
@@ -1568,8 +1773,8 @@ class _PlayerPageState extends State<PlayerPage> {
     if (kind == null ||
         _skipDismissed.contains(kind) ||
         !_autoSkipSegments ||
-        !_player.state.playing ||
-        _player.state.buffering)
+        !_state.playing ||
+        _state.buffering)
       return;
     setState(() => _skipTicks++);
     if (_skipTicks >= (_autoSkipDelaySeconds * 2).round()) {
@@ -1584,12 +1789,12 @@ class _PlayerPageState extends State<PlayerPage> {
     _skipDismissed.add(kind);
     try {
       if (kind == 'intro') {
-        await _player.seek(_introEnd!);
+        await _seek(_introEnd!);
       } else if (widget.episodes.isNotEmpty &&
           _activeEpisodeIndex < widget.episodes.length - 1) {
         await _switchEpisode(_activeEpisodeIndex + 1, markCurrentPlayed: true);
       } else {
-        await _player.seek(_player.state.duration);
+        await _seek(_state.duration);
       }
     } finally {
       _segmentActionPending = false;
@@ -1665,7 +1870,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _switchResource(PlayerResourceOption resource) async {
     if (resource.url == _activeEpisode.url) return;
-    final position = _player.state.position;
+    final position = _state.position;
     await _saveWatchState();
     setState(() {
       _resourceOverride = _baseEpisode
@@ -1683,7 +1888,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _applyOnlineSubtitle(DownloadedSubtitle subtitle) async {
     if (!mounted) throw StateError('当前播放已结束，无法应用字幕');
     _downloadedSubtitlePaths.add(subtitle.path);
-    await _player.setSubtitleTrack(
+    await _setSubtitleTrack(
       SubtitleTrack.uri(
         Uri.file(subtitle.path).toString(),
         title: subtitle.fileName,
@@ -1850,7 +2055,7 @@ class _PlayerPageState extends State<PlayerPage> {
       '21:9' => '2.3333333',
       _ => '0',
     });
-    await _player.setRate(_speed);
+    await _setRate(_speed);
   }
 
   Future<void> _applyColorPipeline(bool enabled) async {
@@ -1873,15 +2078,16 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _setMpvProperty(String name, String value) async {
+    if (_usesAndroidExo) return;
     try {
-      await (_player.platform as dynamic).setProperty(name, value);
+      await (_player!.platform as dynamic).setProperty(name, value);
     } catch (_) {
       // Keep playback available on libmpv builds without an optional property.
     }
   }
 
   Future<void> _setRequiredMpvProperty(String name, String value) async {
-    await (_player.platform as dynamic).setProperty(name, value);
+    await (_player!.platform as dynamic).setProperty(name, value);
   }
 
   Future<void> _setAudioPreference({bool? downmix, bool? night}) async {
@@ -1919,7 +2125,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _setPlaybackSpeed(double value) async {
     final prefs = await SharedPreferences.getInstance();
-    await _player.setRate(value);
+    await _setRate(value);
     await prefs.setDouble('yingji.player.speed', value);
     if (mounted) setState(() => _speed = value);
   }
@@ -1986,8 +2192,12 @@ class _PlayerPageState extends State<PlayerPage> {
     final diagnostics = <String>[
       'Mova 播放诊断',
       '标题: ${_activeEpisode.title}',
-      '内核: libmpv / gpu-next',
-      '硬件解码: ${_hardware ? (WindowHost.isDesktop ? 'D3D11VA' : 'MediaCodec') : '关闭'}',
+      '内核: ${_usesAndroidExo ? 'Android ExoPlayer / Media3' : 'libmpv / gpu-next'}',
+      '硬件解码: ${_usesAndroidExo
+          ? 'MediaCodec（Exo 自动选择）'
+          : _hardware
+          ? (WindowHost.isDesktop ? 'D3D11VA' : 'MediaCodec')
+          : '关闭'}',
       'HDR: ${_hdr ? '自动' : '关闭'}',
       '播放速度: ${_speed.toStringAsFixed(2)}x',
       '状态: ${_error ?? '正常'}',
@@ -2004,6 +2214,14 @@ class _PlayerPageState extends State<PlayerPage> {
     // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
     unawaited(WindowHost.exitMediaSession());
     _subtitleSubscription?.cancel();
+    _exoEventSubscription?.cancel();
+    _exoPositionController.close();
+    _exoBufferController.close();
+    _exoPlayingController.close();
+    _exoCompletedController.close();
+    _exoErrorController.close();
+    _exoTracksController.close();
+    _exoTrackController.close();
     _videoDownload?.cancel();
     _videoDownload = null;
     _nextEpisodePreload?.cancel();
@@ -2026,7 +2244,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _disposePlayerAndSubtitles() async {
     try {
-      await _player.dispose();
+      await _player?.dispose();
     } catch (_) {
       // Subtitle cleanup still runs if the platform player fails to dispose.
     }
@@ -2047,7 +2265,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _saveWatchState({bool isPlayed = false}) async {
     final store = _watchStore;
     if (store == null) return;
-    final state = _player.state;
+    final state = _state;
     if (state.duration <= Duration.zero) return;
     await store.save(
       // 与原生播放器的保存循环同一套清洗：集名与剧名同名/通用集名时清空，
@@ -2110,8 +2328,8 @@ class _PlayerPageState extends State<PlayerPage> {
     Duration? durationOverride,
   }) async {
     final episode = episodeOverride ?? _activeEpisode;
-    final position = positionOverride ?? _player.state.position;
-    final duration = durationOverride ?? _player.state.duration;
+    final position = positionOverride ?? _state.position;
+    final duration = durationOverride ?? _state.duration;
     // 「观看记录只保存在本机」时不向媒体服务器与 Trakt 上报任何进度。
     // 本机记录由 _saveWatchState 照常写入，服务器资源也照常播放；读取
     // （服务器继续观看、Trakt 已看）同样不受影响 —— 这里只停回写。
@@ -2194,7 +2412,7 @@ class _PlayerPageState extends State<PlayerPage> {
                         itemId: itemId,
                         position: position,
                         duration: duration,
-                        isPaused: !_player.state.playing,
+                        isPaused: !_state.playing,
                         playSessionId: playSessionId,
                         mediaSourceId: mediaSourceId,
                       );
@@ -2212,7 +2430,7 @@ class _PlayerPageState extends State<PlayerPage> {
                       itemId: itemId,
                       position: position,
                       duration: duration,
-                      isPaused: !_player.state.playing,
+                      isPaused: !_state.playing,
                       playSessionId: _sessionPlayIds[itemId],
                       mediaSourceId: _mediaSourceIdOf(episode),
                     );
@@ -2340,7 +2558,20 @@ class _PlayerPageState extends State<PlayerPage> {
                         _skipKind == null &&
                         !_gestureVisible,
                   )
-                else
+                else if (_usesAndroidExo && _exoPlaybackUrl != null)
+                  AndroidView(
+                    key: ValueKey<String>('exo:$_exoPlaybackUrl'),
+                    viewType: 'mova/exo-video',
+                    onPlatformViewCreated: _attachExoView,
+                    creationParams: {
+                      'url': _exoPlaybackUrl,
+                      'headers': _exoHeaders,
+                      'container': widget.container,
+                      'positionMs': _state.position.inMilliseconds,
+                    },
+                    creationParamsCodec: const StandardMessageCodec(),
+                  )
+                else if (!_usesAndroidExo)
                   Video(
                     controller: _controller!,
                     fit: BoxFit.contain,
@@ -2349,7 +2580,7 @@ class _PlayerPageState extends State<PlayerPage> {
                 if (_danmakuComments.isNotEmpty)
                   Positioned.fill(
                     child: _DanmakuOverlay(
-                      positionStream: _player.stream.position,
+                      positionStream: _positionStream,
                       comments: _danmakuComments,
                       opacity: _danmakuOpacity,
                       area: _danmakuArea,
@@ -2401,6 +2632,22 @@ class _PlayerPageState extends State<PlayerPage> {
                       ),
                     ),
                   ),
+                if (!WindowHost.isDesktop &&
+                    !_showControls &&
+                    !_settingsOpen &&
+                    _error == null)
+                  Positioned.fill(
+                    child: Listener(
+                      behavior: HitTestBehavior.opaque,
+                      onPointerDown: (_) {
+                        _ignoreTapUntil = DateTime.now().add(
+                          const Duration(milliseconds: 400),
+                        );
+                        _lastTapAt = null;
+                        _revealControls();
+                      },
+                    ),
+                  ),
                 IgnorePointer(
                   ignoring: !_showControls && !_settingsOpen,
                   child: AnimatedOpacity(
@@ -2415,6 +2662,34 @@ class _PlayerPageState extends State<PlayerPage> {
                     !_settingsOpen)
                   _segmentPrompt(),
                 if (_settingsOpen) _consolePanel(context),
+                if (_switchingEpisode)
+                  Positioned(
+                    left: 24,
+                    right: 24,
+                    bottom: 180,
+                    child: Center(
+                      child: GlassPanel(
+                        sampleBackdrop: false,
+                        radius: 24,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 12,
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 12),
+                            Text('正在切换剧集…'),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 _gestureIndicator(),
                 _pauseResumePrompt(),
                 // Keep a dedicated caption strip above the custom overlay so
@@ -2506,10 +2781,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     ],
                   ),
                 ),
-                _StateChip(
-                  label: _networkSpeedLabel(),
-                  ok: !_player.state.buffering,
-                ),
+                _StateChip(label: _networkSpeedLabel(), ok: !_state.buffering),
                 if (_videoCacheStatus != null) ...[
                   const SizedBox(width: 8),
                   _StateChip(
@@ -2519,15 +2791,28 @@ class _PlayerPageState extends State<PlayerPage> {
                         !_videoCacheStatus!.contains('不可用'),
                   ),
                 ],
-                if (!WindowHost.isDesktop) ...[
+                if (WindowHost.isAndroid) ...[
                   const SizedBox(width: 10),
                   YingjiMotionIconButton(
-                    icon: _mobileFullScreen
-                        ? YingjiIcons.fullscreen_exit
-                        : YingjiIcons.fullscreen,
-                    tooltip: _mobileFullScreen ? '退出全屏' : '全屏',
+                    icon: Icons.screen_rotation_rounded,
+                    tooltip:
+                        MediaQuery.orientationOf(context) ==
+                            Orientation.portrait
+                        ? '切换为横屏'
+                        : '切换为竖屏',
                     size: 46,
-                    onPressed: _toggleFullScreen,
+                    onPressed: () => WindowHost.setPlayerOrientation(
+                      portrait:
+                          MediaQuery.orientationOf(context) ==
+                          Orientation.landscape,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  YingjiMotionIconButton(
+                    icon: Icons.picture_in_picture_alt_rounded,
+                    tooltip: '画中画',
+                    size: 46,
+                    onPressed: _enterPictureInPicture,
                   ),
                 ],
                 if (WindowHost.isDesktop) ...[
@@ -2552,10 +2837,10 @@ class _PlayerPageState extends State<PlayerPage> {
           ),
           const Spacer(),
           StreamBuilder<Duration>(
-            stream: _player.stream.position,
+            stream: _positionStream,
             builder: (_, snap) {
               final position = snap.data ?? Duration.zero;
-              final duration = _player.state.duration;
+              final duration = _state.duration;
               return Padding(
                 padding: const EdgeInsets.fromLTRB(28, 0, 28, 22),
                 child: Column(
@@ -2576,23 +2861,25 @@ class _PlayerPageState extends State<PlayerPage> {
                     ],
                     const SizedBox(height: 8),
                     StreamBuilder<Duration>(
-                      stream: _player.stream.buffer,
+                      stream: _bufferStream,
                       builder: (_, bufferSnap) {
                         final max = duration.inMilliseconds == 0
                             ? 1.0
                             : duration.inMilliseconds.toDouble();
                         final buffered = normalizedBufferedPosition(
                           position: position,
-                          buffer: bufferSnap.data ?? _player.state.buffer,
+                          buffer: bufferSnap.data ?? _state.buffer,
                           duration: duration,
                           fullyCached: _playingCachedFile,
                           persistentCacheFraction: _persistentCacheFraction,
                         ).inMilliseconds.toDouble();
-                        final current = duration.inMilliseconds == 0
-                            ? 0.0
-                            : position.inMilliseconds
-                                  .clamp(0, duration.inMilliseconds)
-                                  .toDouble();
+                        final current =
+                            _sliderSeekPreview ??
+                            (duration.inMilliseconds == 0
+                                ? 0.0
+                                : position.inMilliseconds
+                                      .clamp(0, duration.inMilliseconds)
+                                      .toDouble());
                         return SliderTheme(
                           data: SliderTheme.of(context).copyWith(
                             trackHeight: 4,
@@ -2603,13 +2890,21 @@ class _PlayerPageState extends State<PlayerPage> {
                           ),
                           child: Slider(
                             value: current,
-                            secondaryTrackValue: buffered,
+                            secondaryTrackValue: math.max(buffered, current),
                             max: max,
                             semanticFormatterCallback: (value) =>
                                 '${_time(Duration(milliseconds: value.round()))}，'
                                 '已缓存至 ${_time(Duration(milliseconds: buffered.round()))}',
+                            onChangeStart: (_) => _controlsTimer?.cancel(),
                             onChanged: (v) =>
-                                _player.seek(Duration(milliseconds: v.round())),
+                                setState(() => _sliderSeekPreview = v),
+                            onChangeEnd: (v) {
+                              setState(() => _sliderSeekPreview = null);
+                              unawaited(
+                                _seek(Duration(milliseconds: v.round())),
+                              );
+                              _revealControls();
+                            },
                           ),
                         );
                       },
@@ -2657,21 +2952,24 @@ class _PlayerPageState extends State<PlayerPage> {
                                   onPressed: () =>
                                       _switchEpisode(_activeEpisodeIndex - 1),
                                 ),
+                              if (widget.episodes.length > 1)
+                                const SizedBox(width: 4),
                               YingjiMotionIconButton(
                                 tooltip: '后退 10 秒',
-                                onPressed: () => _player.seek(
+                                onPressed: () => _seek(
                                   position - const Duration(seconds: 10),
                                 ),
                                 icon: YingjiIcons.gobackward_10,
                                 size: 40,
                               ),
+                              const SizedBox(width: 4),
                               StreamBuilder<bool>(
-                                stream: _player.stream.playing,
+                                stream: _playingStream,
                                 builder: (_, playing) => YingjiMotionIconButton(
                                   tooltip: playing.data == true ? '暂停' : '播放',
                                   onPressed: () {
                                     _revealControls();
-                                    _player.playOrPause();
+                                    _playOrPause();
                                   },
                                   selected: playing.data == true,
                                   size: 40,
@@ -2680,14 +2978,17 @@ class _PlayerPageState extends State<PlayerPage> {
                                       : YingjiIcons.play_fill,
                                 ),
                               ),
+                              const SizedBox(width: 4),
                               YingjiMotionIconButton(
                                 tooltip: '前进 10 秒',
-                                onPressed: () => _player.seek(
+                                onPressed: () => _seek(
                                   position + const Duration(seconds: 10),
                                 ),
                                 icon: YingjiIcons.goforward_10,
                                 size: 40,
                               ),
+                              if (widget.episodes.length > 1)
+                                const SizedBox(width: 4),
                               if (widget.episodes.length > 1)
                                 YingjiDirectionalArrow(
                                   previous: false,
@@ -2699,7 +3000,7 @@ class _PlayerPageState extends State<PlayerPage> {
                                   onPressed: () =>
                                       _switchEpisode(_activeEpisodeIndex + 1),
                                 ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: 4),
                               Text(
                                 '${_time(position)} / ${_time(duration)}',
                                 style: const TextStyle(
@@ -2748,7 +3049,9 @@ class _PlayerPageState extends State<PlayerPage> {
         -1.0,
         1.0,
       );
-      final background = YingjiGlass.hud();
+      final background = YingjiColors.elevated.withValues(
+        alpha: (.72 + YingjiGlass.blur / 200).clamp(.72, .94),
+      );
       // 液态玻璃无描边：HUD 的边界靠「背后模糊、浮层不模糊」的反差自己显现。
       final border = Colors.transparent;
       return IgnorePointer(
@@ -2768,7 +3071,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     width: 292,
                     background: background,
                     borderColor: border,
-                    blur: YingjiGlass.blur,
+                    blur: 0,
                   )
                 : MovaHud(
                     icon: _gestureIcon,
@@ -2777,7 +3080,7 @@ class _PlayerPageState extends State<PlayerPage> {
                     trackWidth: 104,
                     background: background,
                     borderColor: border,
-                    blur: YingjiGlass.blur,
+                    blur: 0,
                   ),
           ),
         ),
@@ -2791,7 +3094,7 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 这里单独浮一个圆钮，点它直接续播（它是叶子节点，会赢过外层的
   /// 单击手势，不会退化成“切换控件显示”）。
   Widget _pauseResumePrompt() => StreamBuilder<bool>(
-    stream: _player.stream.playing,
+    stream: _playingStream,
     builder: (context, snapshot) {
       if (!_hasPlayed ||
           snapshot.data != false ||
@@ -2806,7 +3109,7 @@ class _PlayerPageState extends State<PlayerPage> {
           child: MovaPress(
             onTap: () {
               _revealControls();
-              unawaited(_player.play());
+              unawaited(_play());
             },
             behavior: HitTestBehavior.opaque,
             scale: MovaMotion.pressScaleIcon,
@@ -2841,7 +3144,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   String _networkSpeedLabel() {
     final bytes = _networkBytesPerSecond;
-    if (bytes <= 0) return _player.state.buffering ? '读取中' : '—';
+    if (bytes <= 0) return _state.buffering ? '读取中' : '—';
     if (bytes >= 1048576) {
       return '${(bytes / 1048576).toStringAsFixed(1)} MB/s';
     }
@@ -2849,12 +3152,16 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Widget _consolePanel(BuildContext context) => Positioned(
-    right: 26,
+    right: 16,
     bottom: 102,
-    width: 440,
-    height: (MediaQuery.sizeOf(context).height - 188).clamp(320, 560),
+    width: math.min(440, MediaQuery.sizeOf(context).width - 32),
+    height: math.min(
+      560,
+      math.max(120, MediaQuery.sizeOf(context).height - 188),
+    ),
     child: GlassPanel(
       radius: 24,
+      sampleBackdrop: false,
       padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2863,8 +3170,8 @@ class _PlayerPageState extends State<PlayerPage> {
             children: [
               if (_consoleTab == '在线字幕')
                 YingjiMotionIconButton(
-                  tooltip: '返回字幕菜单',
-                  onPressed: () => _openConsoleTab('字幕'),
+                  tooltip: '返回音轨与字幕',
+                  onPressed: () => _openConsoleTab('音轨与字幕'),
                   icon: YingjiIcons.chevron_left,
                   size: 34,
                 ),
@@ -2884,38 +3191,37 @@ class _PlayerPageState extends State<PlayerPage> {
               ),
             ],
           ),
-          if (_consoleTab != '在线字幕') ...[
-            const Text(
-              '音轨、音量与音频处理会即时下发给 libmpv。',
-              style: TextStyle(color: Colors.white54, fontSize: 12),
-            ),
-            const SizedBox(height: 16),
-          ] else
-            const SizedBox(height: 10),
+          const SizedBox(height: 10),
           Expanded(
-            child: _consoleTab == '在线字幕'
-                ? SubtitleSearchPanel(
-                    query: SubtitleSearchQuery(
-                      title: _activeEpisode.title,
-                      season: _activeEpisode.seasonNumber,
-                      episode: _activeEpisode.episodeNumber,
-                      episodeTitle: _activeEpisode.episodeTitle,
-                      language: _subtitleLanguage,
-                    ),
-                    onApply: _applyOnlineSubtitle,
-                  )
-                : _consoleTab == '全集'
-                ? ListView.builder(
-                    itemCount: widget.episodes.length,
-                    padding: const EdgeInsets.only(bottom: 8),
-                    itemBuilder: (_, index) => Padding(
-                      padding: EdgeInsets.only(
-                        bottom: index == widget.episodes.length - 1 ? 0 : 8,
+            child: YingjiStableScrollGlass(
+              child: _consoleTab == '在线字幕'
+                  ? SubtitleSearchPanel(
+                      query: SubtitleSearchQuery(
+                        title: _activeEpisode.title,
+                        season: _activeEpisode.seasonNumber,
+                        episode: _activeEpisode.episodeNumber,
+                        episodeTitle: _activeEpisode.episodeTitle,
+                        language: _subtitleLanguage,
                       ),
-                      child: _episodeRow(index),
+                      onApply: _applyOnlineSubtitle,
+                    )
+                  : _consoleTab == '全集'
+                  ? ListView.builder(
+                      itemCount: widget.episodes.length,
+                      padding: const EdgeInsets.only(bottom: 8),
+                      itemBuilder: (_, index) => Padding(
+                        padding: EdgeInsets.only(
+                          bottom: index == widget.episodes.length - 1 ? 0 : 8,
+                        ),
+                        child: _episodeRow(index),
+                      ),
+                    )
+                  : ScrollConfiguration(
+                      behavior: ScrollConfiguration.of(context)
+                          .copyWith(scrollbars: false),
+                      child: ListView(children: _consoleContent()),
                     ),
-                  )
-                : ListView(children: _consoleContent()),
+            ),
           ),
         ],
       ),
@@ -2924,10 +3230,27 @@ class _PlayerPageState extends State<PlayerPage> {
 
   List<Widget> _consoleContent() {
     switch (_consoleTab) {
+      case '音轨与字幕':
+        return [
+          _trackSelector(audio: true),
+          _trackSelector(audio: false),
+          _consoleGroup('同步', [
+            '音频延迟  ${(_audioDelay * 1000).round()} ms',
+            '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
+          ]),
+          YingjiGlassPillButton(
+            icon: YingjiIcons.search,
+            label: '在线搜索字幕',
+            compactLabel: '搜索字幕',
+            tooltip: '搜索当前剧集字幕并下载应用',
+            onPressed: _searchOnlineSubtitle,
+            height: 44,
+          ),
+        ];
       case '声音':
         return [
           _consoleGroup('音轨', [
-            '音频轨道  ${_player.state.tracks.audio.length} 条',
+            '音频轨道  ${_state.tracks.audio.length} 条',
             '音量  ${_volume.round()}%',
           ]),
           _trackSelector(audio: true),
@@ -2936,7 +3259,7 @@ class _PlayerPageState extends State<PlayerPage> {
       case '字幕':
         return [
           _consoleGroup('字幕', [
-            '字幕轨道  ${_player.state.tracks.subtitle.length} 条',
+            '字幕轨道  ${_state.tracks.subtitle.length} 条',
             '首选语言  ${_preferChineseSubtitle ? (subtitleLanguages[_subtitleLanguage] ?? '中文') : '跟随媒体默认'}',
             '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
           ]),
@@ -3001,6 +3324,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Widget _danmakuControls() => GlassPanel(
+    sampleBackdrop: false,
     radius: 16,
     padding: const EdgeInsets.all(14),
     child: Column(
@@ -3133,6 +3457,7 @@ class _PlayerPageState extends State<PlayerPage> {
   );
 
   Widget _segmentPanel() => GlassPanel(
+    sampleBackdrop: false,
     radius: 18,
     padding: const EdgeInsets.all(14),
     child: Column(
@@ -3304,6 +3629,7 @@ class _PlayerPageState extends State<PlayerPage> {
       child: GlassPanel(
         radius: 16,
         padding: EdgeInsets.zero,
+        sampleBackdrop: false,
         child: ListTile(
           selected: index == _activeEpisodeIndex,
           leading: SizedBox(
@@ -3354,6 +3680,7 @@ class _PlayerPageState extends State<PlayerPage> {
         padding: const EdgeInsets.only(bottom: 8),
         child: GlassPanel(
           radius: 14,
+          sampleBackdrop: false,
           padding: EdgeInsets.zero,
           child: ListTile(
             dense: true,
@@ -3366,6 +3693,7 @@ class _PlayerPageState extends State<PlayerPage> {
       );
 
   Widget _chapterGroup() => GlassPanel(
+    sampleBackdrop: false,
     radius: 16,
     padding: EdgeInsets.zero,
     child: Column(
@@ -3387,7 +3715,7 @@ class _PlayerPageState extends State<PlayerPage> {
               _time(chapter.start),
               style: const TextStyle(color: Colors.white60, fontSize: 12),
             ),
-            onTap: () => _player.seek(chapter.start),
+            onTap: () => _seek(chapter.start),
           ),
         ),
       ],
@@ -3405,7 +3733,9 @@ class _PlayerPageState extends State<PlayerPage> {
       const double button = 40;
       final available = constraints.maxWidth;
       final hasEpisodes = widget.episodes.isNotEmpty;
-      final tools = _activeTools;
+      final tools = _activeTools
+          .where((tool) => tool.id != '全集列表' || hasEpisodes)
+          .toList(growable: false);
       // 窄屏收窄音量滑条，把空间让给工具按钮。
       final sliderWidth = available < 420
           ? 56.0
@@ -3415,8 +3745,7 @@ class _PlayerPageState extends State<PlayerPage> {
       final fixed =
           28 + // 面板左右 padding
           (button + gap) + // 静音
-          (sliderWidth + gap) + // 音量滑条
-          (hasEpisodes ? button + gap : 0); // 全集列表
+          (sliderWidth + gap); // 音量滑条
       // 不折叠时能平铺下的工具按钮个数：n 个按钮占 n*(button+gap) - gap。
       final fit = ((available - fixed + gap) / (button + gap)).floor();
       final overflowing = fit < tools.length;
@@ -3455,16 +3784,6 @@ class _PlayerPageState extends State<PlayerPage> {
               _playerToolControl(tool),
               const SizedBox(width: gap),
             ],
-            if (hasEpisodes) ...[
-              YingjiMotionIconButton(
-                icon: YingjiIcons.rectangle_stack,
-                tooltip: '全集列表',
-                selected: _settingsOpen && _consoleTab == '全集',
-                size: 40,
-                onPressed: _showEpisodeList,
-              ),
-              const SizedBox(width: gap),
-            ],
             if (hidden.isNotEmpty) _overflowToolsMenu(hidden),
           ],
         ),
@@ -3475,6 +3794,13 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 把工具描述渲染成控件。带取值的两个入口（播放速度、画面比例）平铺时是
   /// 下拉快选，其余是打开控制台对应标签的图标按钮。
   Widget _playerToolControl(_PlayerTool tool) => switch (tool.id) {
+    '全集列表' => YingjiMotionIconButton(
+      icon: tool.icon,
+      tooltip: tool.id,
+      selected: _settingsOpen && _consoleTab == '全集',
+      size: 40,
+      onPressed: _showEpisodeList,
+    ),
     // 倍速不画图标：直接把当前值写在按钮上，一眼能看见，也省一个槽位。
     '倍速' => _quickChoice<double>(
       icon: YingjiIcons.gauge,
@@ -3496,7 +3822,10 @@ class _PlayerPageState extends State<PlayerPage> {
     _ => YingjiMotionIconButton(
       icon: tool.icon,
       tooltip: tool.id,
-      selected: _settingsOpen && _consoleTab == tool.id,
+      selected:
+          _settingsOpen &&
+          (_consoleTab == tool.id ||
+              (_consoleTab == '音轨与字幕' && (tool.id == '声音' || tool.id == '字幕'))),
       size: 40,
       onPressed: () => _openConsoleTab(tool.id),
     ),
@@ -3550,7 +3879,8 @@ class _PlayerPageState extends State<PlayerPage> {
       for (final tool in hidden)
         MenuItemButton(
           leadingIcon: Icon(tool.icon, size: 16),
-          onPressed: () => _openConsoleTab(tool.id),
+          onPressed: () =>
+              tool.id == '全集列表' ? _showEpisodeList() : _openConsoleTab(tool.id),
           child: Text(tool.id),
         ),
     ],
@@ -3613,6 +3943,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Widget _consoleGroup(String title, List<String> rows) => Padding(
     padding: const EdgeInsets.only(bottom: 12),
     child: GlassPanel(
+      sampleBackdrop: false,
       radius: 16,
       padding: EdgeInsets.zero,
       child: Column(
@@ -3727,60 +4058,90 @@ class _PlayerPageState extends State<PlayerPage> {
     onChanged: onChanged,
   );
 
-  Widget _trackSelector({required bool audio}) => StreamBuilder<Tracks>(
-    stream: _player.stream.tracks,
-    initialData: _player.state.tracks,
-    builder: (_, snapshot) {
-      final tracks = audio
-          ? snapshot.data?.audio ?? const <AudioTrack>[]
-          : snapshot.data?.subtitle ?? const <SubtitleTrack>[];
-      if (tracks.isEmpty) return const SizedBox.shrink();
-      final current = audio
-          ? _player.state.track.audio
-          : _player.state.track.subtitle;
-      final choices = tracks
-          .map((track) => _TrackChoice.fromTrack(track, audio))
-          .toList(growable: false);
-      final currentChoice = _TrackChoice.fromTrack(current, audio);
-      final selected = choices.contains(currentChoice)
-          ? currentChoice
-          : choices.first;
-      return Padding(
-        padding: const EdgeInsets.only(bottom: 12),
-        child: GlassPanel(
-          radius: 16,
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
+  Widget _trackSelector({required bool audio}) => StreamBuilder<Track>(
+    stream: _trackStream,
+    initialData: _state.track,
+    builder: (_, selectedSnapshot) => StreamBuilder<Tracks>(
+      stream: _tracksStream,
+      initialData: _state.tracks,
+      builder: (_, snapshot) {
+        final tracks = audio
+            ? snapshot.data?.audio ?? const <AudioTrack>[]
+            : snapshot.data?.subtitle ?? const <SubtitleTrack>[];
+        final current = audio
+            ? selectedSnapshot.data?.audio ?? _state.track.audio
+            : selectedSnapshot.data?.subtitle ?? _state.track.subtitle;
+        final choices = <_TrackChoice>[
+          _TrackChoice.fromTrack(
+            audio ? AudioTrack.auto() : SubtitleTrack.auto(),
+            audio,
+          ),
+          if (!audio) _TrackChoice.fromTrack(SubtitleTrack.no(), false),
+          ...tracks
+              .where((track) => track.id != 'auto' && track.id != 'no')
+              .map((track) => _TrackChoice.fromTrack(track, audio)),
+        ];
+        final currentChoice = _TrackChoice.fromTrack(current, audio);
+        final selected = choices.contains(currentChoice)
+            ? currentChoice
+            : choices.first;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: GlassPanel(
+            radius: 16,
+            sampleBackdrop: false,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
                   audio ? '音频轨道' : '字幕轨道',
                   style: const TextStyle(fontWeight: FontWeight.w700),
                 ),
-              ),
-              YingjiGlassChoiceButton<_TrackChoice>(
-                value: selected,
-                items: choices,
-                labelBuilder: (choice) {
-                  final track = audio ? choice.audio : choice.subtitle;
-                  if (track == null) return '';
-                  if (!audio) return subtitleTrackLabel(track as SubtitleTrack);
-                  return '${track.title ?? track.id}${track.language == null ? '' : ' · ${track.language}'}';
-                },
-                onChanged: (choice) {
-                  if (audio && choice.audio != null) {
-                    _player.setAudioTrack(choice.audio!);
-                  }
-                  if (!audio && choice.subtitle != null) {
-                    _subtitleChosen = true;
-                    _player.setSubtitleTrack(choice.subtitle!);
-                  }
-                },
-              ),
-            ],
+                const SizedBox(height: 8),
+                for (final choice in choices)
+                  ListTile(
+                    selected: choice == selected,
+                    selectedTileColor: YingjiGlass.surface(strength: 1.8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    trailing: choice == selected
+                        ? const Icon(
+                            YingjiIcons.checkmark_circle_fill,
+                            size: 20,
+                          )
+                        : null,
+                    title: Text(
+                      () {
+                        final track = audio ? choice.audio : choice.subtitle;
+                        if (track == null) return '';
+                        if (track.id == 'auto') return '跟随媒体默认';
+                        if (track.id == 'no') return '关闭字幕';
+                        if (!audio) {
+                          return subtitleTrackLabel(track as SubtitleTrack);
+                        }
+                        return '${track.title ?? track.id}${track.language == null ? '' : ' · ${track.language}'}';
+                      }(),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    onTap: () {
+                      if (audio && choice.audio != null) {
+                        _audioChosen = true;
+                        _setAudioTrack(choice.audio!);
+                      }
+                      if (!audio && choice.subtitle != null) {
+                        _subtitleChosen = true;
+                        _setSubtitleTrack(choice.subtitle!);
+                      }
+                    },
+                  ),
+              ],
+            ),
           ),
-        ),
-      );
-    },
+        );
+      },
+    ),
   );
 }
 

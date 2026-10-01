@@ -2,11 +2,14 @@ package com.taohua.mova
 
 import android.content.Context
 import android.content.Intent
+import android.app.PictureInPictureParams
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.content.pm.PackageManager
+import android.util.Rational
 import android.view.WindowManager
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
@@ -42,6 +45,10 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        flutterEngine.platformViewsController.registry.registerViewFactory(
+            "mova/exo-video",
+            ExoPlayerPlatformViewFactory(flutterEngine.dartExecutor.binaryMessenger),
+        )
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -71,19 +78,21 @@ class MainActivity : FlutterActivity() {
                         installApk(call.argument<String>("path")),
                     )
                     "networkType" -> result.success(networkType())
+                    "enterPictureInPicture" -> result.success(enterPictureInPicture())
                     "dolbyVisionCapabilities" -> result.success(
                         DolbyVisionSupport.query(this).asMap(),
                     )
                     "playDolbyVision" -> playDolbyVision(call.arguments, result)
+                    "playExoPlayer" -> playDolbyVision(call.arguments, result, false)
                     else -> result.notImplemented()
                 }
             }
     }
 
     /** Starts the native SurfaceView player and keeps the channel reply pending. */
-    private fun playDolbyVision(arguments: Any?, result: MethodChannel.Result) {
+    private fun playDolbyVision(arguments: Any?, result: MethodChannel.Result, requireDolbyVision: Boolean = true) {
         if (pendingDolbyVisionResult != null) {
-            result.error("already_playing", "原生 Dolby Vision 播放器已打开", null)
+            result.error("already_playing", "原生播放器已打开", null)
             return
         }
         val args = arguments as? Map<*, *>
@@ -96,8 +105,8 @@ class MainActivity : FlutterActivity() {
             result.error("invalid_url", "播放地址为空", null)
             return
         }
-        val capabilities = DolbyVisionSupport.query(this)
-        if (!capabilities.supported) {
+        val capabilities = if (requireDolbyVision) DolbyVisionSupport.query(this) else null
+        if (capabilities != null && !capabilities.supported) {
             result.error("unsupported", "设备解码器或当前显示屏不支持 Dolby Vision", capabilities.asMap())
             return
         }
@@ -131,7 +140,23 @@ class MainActivity : FlutterActivity() {
             startActivityForResult(intent, DOLBY_VISION_REQUEST)
         } catch (error: Exception) {
             pendingDolbyVisionResult = null
-            result.error("launch_failed", "无法打开原生 Dolby Vision 播放器", error.message)
+            result.error("launch_failed", "无法打开原生播放器", error.message)
+        }
+    }
+
+    private fun enterPictureInPicture(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            !packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+        ) return false
+        return try {
+            val params = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(16, 9))
+                .build()
+            enterPictureInPictureMode(params)
+        } catch (_: IllegalArgumentException) {
+            false
+        } catch (_: IllegalStateException) {
+            false
         }
     }
 
@@ -142,7 +167,7 @@ class MainActivity : FlutterActivity() {
         val pending = pendingDolbyVisionResult ?: return
         pendingDolbyVisionResult = null
         if (resultCode != RESULT_OK) {
-            pending.error("player_closed", "原生 Dolby Vision 播放器未返回播放状态", null)
+            pending.error("player_closed", "原生播放器未返回播放状态", null)
             return
         }
         pending.success(

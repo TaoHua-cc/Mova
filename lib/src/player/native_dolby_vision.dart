@@ -106,9 +106,10 @@ class NativeDolbyVisionPlayer {
     required Map<String, String> headers,
     required Duration initialPosition,
     String? container,
+    bool useExoPlayer = false,
   }) async {
     final value = await _channel.invokeMapMethod<Object?, Object?>(
-      'playDolbyVision',
+      useExoPlayer ? 'playExoPlayer' : 'playDolbyVision',
       {
         'url': url,
         'title': title,

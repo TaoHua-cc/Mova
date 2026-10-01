@@ -1,0 +1,10 @@
+This application includes the AndroidX Media3 FFmpeg audio decoder module.
+
+Media3 version: 1.11.0
+Source: https://github.com/androidx/media/tree/91fd5df7ab6b5c2f1a589fbdee5ee8deeae97f02/libraries/decoder_ffmpeg
+License: Apache License 2.0 (see MEDIA3-APACHE-2.0.txt)
+
+The bundled FFmpeg libraries are built from FFmpeg 6.0 (commit
+b4a62c32549b8295691a8e0ff2c9b82188923159) with the E-AC-3 decoder enabled.
+They are licensed under LGPL 2.1 or later (see FFMPEG-LGPL-2.1.txt).
+Corresponding source: https://github.com/FFmpeg/FFmpeg/tree/b4a62c32549b8295691a8e0ff2c9b82188923159

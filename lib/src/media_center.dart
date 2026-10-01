@@ -36,6 +36,7 @@ import 'metadata/ratings.dart';
 import 'playlists/playlist_store.dart';
 import 'playlists/playlist_detail_page.dart';
 import 'player/danmaku_client.dart';
+import 'player/android_player.dart';
 import 'player/subtitle_preference.dart';
 import 'player/player_page.dart';
 import 'player/windows_native_player.dart';
@@ -228,6 +229,8 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   final PageController _pageController = PageController();
   Timer? _wheelResetTimer;
   Timer? _updateCheckTimer;
+  Timer? _pageGlassResumeTimer;
+  final Object _pageGlassOwner = Object();
   double _wheelDelta = 0;
   double _pageScrollHint = 0;
   DateTime _lastWheelNavigation = DateTime.fromMillisecondsSinceEpoch(0);
@@ -298,6 +301,17 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   void _selectSection(_CenterSection value) {
     final target = _pageSections.indexOf(value);
     if (target < 0) return;
+    if (WindowHost.isAndroid) {
+      // The section jump is synchronous, but compositing its first frame with
+      // every live BackdropFilter still stalls the tablet. Keep the material's
+      // tint/shape, skip backdrop sampling for this short handoff, then restore.
+      _pageGlassResumeTimer?.cancel();
+      beginYingjiScrollActivity(_pageGlassOwner);
+      _pageGlassResumeTimer = Timer(const Duration(milliseconds: 160), () {
+        _pageGlassResumeTimer = null;
+        endYingjiScrollActivity(_pageGlassOwner);
+      });
+    }
     final previous = _section;
     setState(() => _section = value);
     yingjiSectionFocus.value = _sectionKey(value);
@@ -306,10 +320,11 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     final current = _pageController.hasClients && _pageController.page != null
         ? _pageController.page!.round()
         : _pageSections.indexOf(previous);
-    if ((target - current).abs() > 1) {
+    if (WindowHost.isAndroid || (target - current).abs() > 1) {
       // 跨多页滑动会把中间那几页挨个构建 + 绘制一遍（日历要拉数据、片单要读
-      // 本地库，还各带一层玻璃模糊），全屏窗口下就是一段明显卡顿。相邻页
-      // 照旧滑动，跨页直接落位 —— 中间页本来也不会停留。
+      // 本地库，还各带一层玻璃模糊），全屏窗口下就是一段明显卡顿。Android
+      // 平板上的单次转场也会同时合成两页和全屏背板，直接落位避免慢帧；Windows
+      // 相邻页仍保留动画。
       _pageController.jumpToPage(target);
     } else {
       _pageController.animateToPage(
@@ -380,6 +395,9 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
     yingjiSectionRequest.removeListener(_handleSectionRequest);
     _wheelResetTimer?.cancel();
     _updateCheckTimer?.cancel();
+    _pageGlassResumeTimer?.cancel();
+    endYingjiScrollActivity(_pageGlassOwner);
+    endYingjiScrollActivity(this);
     _pageController.dispose();
     super.dispose();
   }
@@ -387,28 +405,47 @@ class _MediaCenterShellState extends State<MediaCenterShell> {
   @override
   Widget build(BuildContext context) {
     final shellBody = YingjiStableScrollGlass(
+      stable: WindowHost.isDesktop,
       child: BackdropGroup(
         child: Stack(
           fit: StackFit.expand,
           children: [
             const _ContinuousShellBackdrop(),
-            PageView.builder(
-              controller: _pageController,
-              scrollDirection: Axis.vertical,
-              allowImplicitScrolling: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: _pageSections.length,
-              onPageChanged: (index) {
-                final section = _pageSections[index];
-                setState(() => _section = section);
-                yingjiSectionFocus.value = _sectionKey(section);
+            NotificationListener<ScrollNotification>(
+              onNotification: (notification) {
+                if (notification.depth != 0) return false;
+                if (notification is ScrollStartNotification) {
+                  beginYingjiScrollActivity(this);
+                } else if (notification is ScrollEndNotification) {
+                  endYingjiScrollActivity(this);
+                }
+                return false;
               },
-              itemBuilder: (context, index) {
-                final section = _pageSections[index];
-                final page = _pageFor(section);
-                if (section == _CenterSection.home) return page;
-                return Padding(padding: YingjiLayout.pageInset, child: page);
-              },
+              child: PageView.builder(
+                controller: _pageController,
+                scrollDirection: Axis.vertical,
+                // Android switches sections by direct navigation taps, not
+                // page swipes. Prefetching adjacent pages eagerly constructs
+                // expensive glass-heavy screens (calendar/settings) that are
+                // not visible; keep the desktop semantics unchanged.
+                allowImplicitScrolling: !WindowHost.isAndroid,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _pageSections.length,
+                onPageChanged: (index) {
+                  final section = _pageSections[index];
+                  setState(() => _section = section);
+                  yingjiSectionFocus.value = _sectionKey(section);
+                },
+                itemBuilder: (context, index) {
+                  final section = _pageSections[index];
+                  final page = TickerMode(
+                    enabled: section == _section,
+                    child: _pageFor(section),
+                  );
+                  if (section == _CenterSection.home) return page;
+                  return Padding(padding: YingjiLayout.pageInset, child: page);
+                },
+              ),
             ),
             const _FloatingHomeDragRegion(),
             _FloatingHomeRail(selected: _section, onChanged: _selectSection),
@@ -661,6 +698,7 @@ class _HomeHeroBackdrop extends StatelessWidget {
           return Opacity(
             opacity: clarity,
             child: ImageFiltered(
+              enabled: clarity < 1,
               imageFilter: ImageFilter.blur(
                 sigmaX: (1 - clarity) * YingjiGlass.blur,
                 sigmaY: (1 - clarity) * YingjiGlass.blur,
@@ -979,6 +1017,7 @@ class _CinematicHomeState extends State<_CinematicHome>
   bool _historyLoadRunning = false;
   bool _historyReloadRequested = false;
   int _hero = 0;
+  double _heroDragDistance = 0;
   // 轮播进度由 ValueNotifier 驱动：每 100ms 只刷新圆点层，避免整页重建。
   final ValueNotifier<double> _heroProgress = ValueNotifier<double>(0);
   double _carouselSeconds = 6;
@@ -1000,21 +1039,43 @@ class _CinematicHomeState extends State<_CinematicHome>
     _loadHomePreferences();
     _loadHistory();
     yingjiHomeFocusTick.addListener(_handleHomeFocus);
+    yingjiSectionFocus.addListener(_syncHeroTimer);
+    yingjiHomeScrollDepth.addListener(_syncHeroTimer);
     // 后台把轮播那批元数据刷新回来后换上新内容（FutureBuilder 会保留旧数据，
     // 所以替换过程不会闪一下空白）。
     yingjiMetadataRevision.addListener(_handleMetadataRevision);
     yingjiScrollInProgress.addListener(_flushMetadataAfterScroll);
-    _heroTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      if (!mounted ||
-          yingjiScrollInProgress.value ||
-          yingjiHomeScrollDepth.value > 0) {
-        return;
-      }
+    yingjiScrollInProgress.addListener(_syncHeroTimer);
+  }
+
+  bool get _canAdvanceHero =>
+      mounted &&
+      _autoCarousel &&
+      _trendingValue.length > 1 &&
+      yingjiSectionFocus.value == 'home' &&
+      ModalRoute.of(context)?.isCurrent != false &&
+      !yingjiScrollInProgress.value &&
+      yingjiHomeScrollDepth.value <= 0;
+
+  void _syncHeroTimer() {
+    if (!_canAdvanceHero) {
+      _heroTimer?.cancel();
+      _heroTimer = null;
+      return;
+    }
+    if (_heroTimer != null) return;
+    final ticker = Stopwatch()..start();
+    final period = Platform.isAndroid
+        ? const Duration(milliseconds: 500)
+        : const Duration(milliseconds: 100);
+    _heroTimer = Timer.periodic(period, (_) {
       final items = _trendingValue;
-      if (items.length < 2 || !_autoCarousel) return;
-      final next = _heroProgress.value + .1 / _carouselSeconds;
+      final elapsed = ticker.elapsedMilliseconds;
+      ticker.reset();
+      final next = _heroProgress.value + elapsed / (_carouselSeconds * 1000);
       if (next < 1) {
-        // 仅推进进度：只触发圆点层的 ValueListenableBuilder，不重建整页。
+        // 进度只更新圆点层；Android 平板将节拍放宽到 500ms，避免在 6MP
+        // 画布上每秒触发 10 次整帧合成。轮播倒计时仍由单调时钟保持准确。
         _heroProgress.value = next;
         return;
       }
@@ -1031,19 +1092,33 @@ class _CinematicHomeState extends State<_CinematicHome>
     if (route != null) {
       yingjiRouteObserver.subscribe(this, route);
     }
+    _syncHeroTimer();
   }
+
+  @override
+  void didPush() => _syncHeroTimer();
+
+  @override
+  void didPushNext() => _syncHeroTimer();
+
+  @override
+  void didPop() => _syncHeroTimer();
 
   @override
   void didPopNext() {
     // A detail page or the player closed above the home route; both may have
     // persisted new watch progress that the continue-watching shelf must show.
     _loadHistory();
+    _syncHeroTimer();
   }
 
   /// The shell re-shows this tab (or an external request navigated back to it):
   /// pull the server resume rails again so the shelf reflects playback that
   /// happened on other devices while this page was off-screen.
-  void _handleHomeFocus() => _loadHistory();
+  void _handleHomeFocus() {
+    _loadHistory();
+    _syncHeroTimer();
+  }
 
   /// 后台刷新可能连着改写好几条缓存，攒到一起只重排一次轮播。
   void _handleMetadataRevision() {
@@ -1081,6 +1156,7 @@ class _CinematicHomeState extends State<_CinematicHome>
       _autoCarousel = prefs.getBool('yingji.home.auto-carousel') ?? true;
       _showCarouselDots = prefs.getBool('yingji.home.show-dots') ?? true;
     });
+    _syncHeroTimer();
   }
 
   Future<List<TmdbItem>> _loadCarouselItems() async {
@@ -1097,6 +1173,11 @@ class _CinematicHomeState extends State<_CinematicHome>
     // 之后每次打开都应该已经躺在本地。
     YingjiImageWarmup.items(items, backdrop: true, maxItems: 2);
     unawaited(_prefetchHeroDetails(items.take(2).toList(growable: false)));
+    if (mounted) {
+      _hero = 0;
+      _trendingValue = items;
+      _syncHeroTimer();
+    }
     return items;
   }
 
@@ -1189,8 +1270,11 @@ class _CinematicHomeState extends State<_CinematicHome>
   @override
   void dispose() {
     yingjiHomeFocusTick.removeListener(_handleHomeFocus);
+    yingjiSectionFocus.removeListener(_syncHeroTimer);
+    yingjiHomeScrollDepth.removeListener(_syncHeroTimer);
     yingjiMetadataRevision.removeListener(_handleMetadataRevision);
     yingjiScrollInProgress.removeListener(_flushMetadataAfterScroll);
+    yingjiScrollInProgress.removeListener(_syncHeroTimer);
     _revisionDebounce?.cancel();
     yingjiRouteObserver.unsubscribe(this);
     _heroTimer?.cancel();
@@ -1302,6 +1386,34 @@ class _CinematicHomeState extends State<_CinematicHome>
                         onTapDown: (details) => tap = details.globalPosition,
                         onTap: () =>
                             _openHeroDetails(sourceContext, selected, tap),
+                        onHorizontalDragStart: Platform.isAndroid
+                            ? (_) => _heroDragDistance = 0
+                            : null,
+                        onHorizontalDragUpdate: Platform.isAndroid
+                            ? (details) => _heroDragDistance += details.delta.dx
+                            : null,
+                        onHorizontalDragEnd: Platform.isAndroid
+                            ? (details) {
+                                final distance = _heroDragDistance;
+                                _heroDragDistance = 0;
+                                final threshold = math.max(
+                                  48.0,
+                                  constraints.maxWidth * .07,
+                                );
+                                final velocity = details.primaryVelocity ?? 0;
+                                if (distance.abs() < threshold &&
+                                    velocity.abs() < 650) {
+                                  return;
+                                }
+                                final direction = distance.abs() >= threshold
+                                    ? distance
+                                    : velocity;
+                                _moveHero(
+                                  direction < 0 ? 1 : -1,
+                                  carouselItemCount,
+                                );
+                              }
+                            : null,
                       );
                     },
                   ),
@@ -1442,13 +1554,16 @@ class _CinematicHomeState extends State<_CinematicHome>
                   Positioned(
                     right: 48,
                     bottom: _showContinue ? continueHeight + 136 : 44,
-                    child: ValueListenableBuilder<double>(
-                      valueListenable: _heroProgress,
-                      builder: (context, progress, _) => _HeroProgressDots(
-                        length: carouselItemCount.clamp(1, 8),
-                        active: _hero,
-                        progress: progress,
-                        onChanged: _selectHero,
+                    // 100ms 更新的圆点不能让周围卡片和玻璃一起重绘。
+                    child: RepaintBoundary(
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: _heroProgress,
+                        builder: (context, progress, _) => _HeroProgressDots(
+                          length: carouselItemCount.clamp(1, 8),
+                          active: _hero,
+                          progress: progress,
+                          onChanged: _selectHero,
+                        ),
                       ),
                     ),
                   ),
@@ -2312,7 +2427,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
       );
 
   Future<Map<String, List<TmdbItem>>> _loadSessionSnapshots() async {
-    if (!Platform.isWindows) return const {};
+    if (!Platform.isWindows && !Platform.isAndroid) return const {};
     final prefs = await SharedPreferences.getInstance();
     final entries = await Future.wait(
       _sections.where((section) => !_hiddenSections.contains(section)).map((
@@ -2334,7 +2449,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
   Future<void> _saveSessionSnapshots(
     Map<String, List<TmdbItem>> updates,
   ) async {
-    if (!Platform.isWindows || updates.isEmpty) return;
+    if ((!Platform.isWindows && !Platform.isAndroid) || updates.isEmpty) return;
     final prefs = await SharedPreferences.getInstance();
     await Future.wait(
       updates.entries.where((entry) => entry.value.isNotEmpty).map((
@@ -2394,6 +2509,7 @@ class _DiscoverPageState extends State<_DiscoverPage> {
     _refreshingVisibleSections = true;
     try {
       final updates = <String, List<TmdbItem>>{};
+      final refreshed = <String, List<TmdbItem>>{};
       final visible = _sections
           .where((section) => !_hiddenSections.contains(section))
           .take(widget.sectionLimit ?? _sections.length)
@@ -2407,11 +2523,15 @@ class _DiscoverPageState extends State<_DiscoverPage> {
         }
         if (!mounted) return;
         rows = retainBundledPosters(rows, _visibleItems[section] ?? const []);
+        refreshed[section] = rows;
         _seededSections.remove(section);
         if (!_sameItems(_visibleItems[section], rows)) {
           updates[section] = rows;
           YingjiImageWarmup.items(rows, maxItems: 6);
         }
+      }
+      if (Platform.isAndroid && refreshed.isNotEmpty) {
+        unawaited(_saveSessionSnapshots(refreshed));
       }
       if (!mounted || updates.isEmpty) return;
       if (yingjiScrollInProgress.value) {
@@ -3067,7 +3187,6 @@ class _DiscoverPageState extends State<_DiscoverPage> {
                     Flexible(
                       child: YingjiSmoothWheel(
                         controller: orderScrollController,
-                        stableGlass: true,
                         child: ReorderableListView.builder(
                           scrollController: orderScrollController,
                           physics: yingjiWheelPhysics,
@@ -9857,7 +9976,10 @@ class _SettingsPageState extends State<SettingsPage>
   final _maintenanceKey = GlobalKey();
   final _aboutKey = GlobalKey();
   final _activeSetting = ValueNotifier<int>(0);
+  List<double> _settingSectionOffsets = const <double>[];
+  bool _settingOffsetsMeasurementScheduled = false;
   bool _hardware = true, _hdr = true, _downmix = false, _night = false;
+  String _androidEngine = 'exo';
   bool _preferChineseSubtitle = true;
   String _subtitleLanguage = 'zh';
   bool _preferAudioTrack = false;
@@ -10030,6 +10152,7 @@ class _SettingsPageState extends State<SettingsPage>
     if (mounted) {
       setState(() {
         _hardware = prefs.getBool('yingji.player.hardware') ?? true;
+        _androidEngine = androidPlayerEngine(prefs);
         _hdr = prefs.getBool('yingji.player.hdr') ?? true;
         _downmix = prefs.getBool('yingji.player.downmix') ?? false;
         _night = prefs.getBool('yingji.player.night') ?? false;
@@ -10182,6 +10305,7 @@ class _SettingsPageState extends State<SettingsPage>
         .toList(growable: false);
     return <String, Object>{
       'yingji.player.hardware': _hardware,
+      if (Platform.isAndroid) androidPlayerEngineKey: _androidEngine,
       'yingji.player.hdr': _hdr,
       'yingji.player.downmix': _downmix,
       'yingji.player.night': _night,
@@ -10516,7 +10640,7 @@ class _SettingsPageState extends State<SettingsPage>
   /// 改上限后立即按新上限裁一次，否则「调小」只是账面数字，磁盘上还是老样子。
   Future<void> _setVideoCacheLimit(int bytes) async {
     setState(() => _videoCacheLimit = bytes);
-    if (WindowHost.isDesktop) {
+    if (WindowHost.isDesktop || YingjiStableScrollGlass.enabled(context)) {
       await VideoCachePolicy.saveDesktop(bytes);
     } else {
       await VideoCachePolicy.saveWifi(bytes);
@@ -10592,18 +10716,44 @@ class _SettingsPageState extends State<SettingsPage>
     _aboutKey,
   ];
 
+  void _scheduleSettingSectionOffsetsMeasurement() {
+    if (_settingOffsetsMeasurementScheduled) return;
+    _settingOffsetsMeasurementScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _settingOffsetsMeasurementScheduled = false;
+      if (!mounted || !_settingsScroll.hasClients) return;
+      final offsets = <double>[];
+      for (final key in _settingKeys) {
+        final target = key.currentContext?.findRenderObject();
+        if (target == null || !target.attached) return;
+        offsets.add(
+          RenderAbstractViewport.of(target).getOffsetToReveal(target, 0).offset,
+        );
+      }
+      _settingSectionOffsets = offsets;
+      _syncActiveSetting();
+    });
+  }
+
   void _syncActiveSetting() {
     if (_jumpingToSetting || !_settingsScroll.hasClients) return;
     final position = _settingsScroll.offset + 28;
-    var active = 0;
-    for (var index = 0; index < _settingKeys.length; index++) {
-      final target = _settingKeys[index].currentContext?.findRenderObject();
-      if (target == null || !target.attached) continue;
-      final offset = RenderAbstractViewport.of(target)
-          .getOffsetToReveal(target, 0)
-          .offset;
-      if (offset <= position) active = index;
+    final offsets = _settingSectionOffsets;
+    if (offsets.length != _settingKeys.length) {
+      _scheduleSettingSectionOffsetsMeasurement();
+      return;
     }
+    var low = 0;
+    var high = offsets.length;
+    while (low < high) {
+      final middle = (low + high) >> 1;
+      if (offsets[middle] <= position) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    var active = (low - 1).clamp(0, offsets.length - 1).toInt();
     // 滑到底时最后一节可能永远到不了顶部（它后面没有足够内容可滚），
     // 不补这一条的话末尾那一节永远高亮不上。
     final metrics = _settingsScroll.position;
@@ -10777,6 +10927,7 @@ class _SettingsPageState extends State<SettingsPage>
         _FrostSurface(
           key: _homeKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -10889,10 +11040,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _appearanceKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -10940,10 +11098,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _playerKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -10955,9 +11120,31 @@ class _SettingsPageState extends State<SettingsPage>
               Text(
                 WindowHost.isDesktop
                     ? '内置 libmpv；这些偏好会在播放时下发给内核。'
-                    : '内置 libmpv，视频解码走 Android 的 MediaCodec 硬解；这些偏好会在播放时下发给内核。',
+                    : 'ExoPlayer 使用系统解码与原生控制栏；mpv 提供弹幕、在线字幕和扩展缓存。下方内核偏好用于 mpv。',
                 style: const TextStyle(color: Color(0xFFABB1BE)),
               ),
+              if (Platform.isAndroid)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Wrap(
+                    spacing: 16,
+                    runSpacing: 8,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      const Text('播放引擎（下次播放生效）'),
+                      YingjiGlassChoiceButton<String>(
+                        value: _androidEngine,
+                        items: const ['exo', 'mpv'],
+                        labelBuilder: (value) =>
+                            value == 'exo' ? 'ExoPlayer（默认）' : 'mpv',
+                        onChanged: (value) {
+                          setState(() => _androidEngine = value);
+                          _save();
+                        },
+                      ),
+                    ],
+                  ),
+                ),
               _ToggleRow(
                 title: '硬件解码',
                 detail: WindowHost.isDesktop
@@ -11012,10 +11199,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _playerToolsKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11057,10 +11251,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _behaviorKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11091,7 +11292,7 @@ class _SettingsPageState extends State<SettingsPage>
                 const _GestureHintRow(
                   icon: YingjiIcons.play_circle,
                   title: '单击画面',
-                  detail: '呼出或收起播放控件；控件约 1 秒后自动隐藏',
+                  detail: '呼出或收起播放控件；控件约 3 秒后自动隐藏',
                 ),
                 const _GestureHintRow(
                   icon: YingjiIcons.pause_fill,
@@ -11248,10 +11449,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _networkKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11314,10 +11522,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _proxyKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11385,10 +11600,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _danmakuKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11687,9 +11909,11 @@ class _SettingsPageState extends State<SettingsPage>
               Text('显示区域  占画面高度 ${(_danmakuArea * 100).round()}%'),
               Slider(
                 value: _danmakuArea,
-                min: 0.25,
+                // 播放器自己的弹幕面板允许 20%；设置页需与同一偏好值
+                // 的范围一致，否则从播放器保存的 20–25% 会触发 Slider 断言。
+                min: 0.2,
                 max: 1,
-                divisions: 15,
+                divisions: 16,
                 label: '${(_danmakuArea * 100).round()}%',
                 onChanged: (value) => setState(() => _danmakuArea = value),
                 onChangeEnd: (_) => _save(),
@@ -11764,10 +11988,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _systemKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11840,10 +12071,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _maintenanceKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -11951,10 +12189,17 @@ class _SettingsPageState extends State<SettingsPage>
             ],
           ),
         ),
-        const SizedBox(height: 18),
+        const Divider(
+          height: 18,
+          thickness: 1,
+          indent: 18,
+          endIndent: 18,
+          color: Color(0x22FFFFFF),
+        ),
         _FrostSurface(
           key: _aboutKey,
           borderRadius: 22,
+          glass: false,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -12075,6 +12320,7 @@ class _SettingsPageState extends State<SettingsPage>
   ) {
     return LayoutBuilder(
       builder: (context, constraints) {
+        _scheduleSettingSectionOffsetsMeasurement();
         // 手机上（或桌面上把窗口拖窄）没有 220px 的余地给左栏：那套两栏面板
         // 会把正文挤到只剩几十像素。窄屏改成「横向分栏胶囊 + 单栏正文」，
         // 宽屏保留原来的左栏面板。
@@ -12093,6 +12339,8 @@ class _SettingsPageState extends State<SettingsPage>
         }
         return Padding(
           padding: const EdgeInsets.only(bottom: 30),
+          // One continuous material sits behind both columns. The right-hand
+          // section wrappers keep spacing only, so they don't look stacked.
           child: YingjiGlassSurface(
             radius: 16,
             strength: 1.08,
@@ -14545,6 +14793,37 @@ Future<void> _resumePlayback(BuildContext context, WatchState state) async {
     if (choice == 'restart') startPosition = Duration.zero;
   }
   if (!context.mounted) return;
+  if (await useAndroidExoPlayer()) {
+    if (!context.mounted) return;
+    try {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => PlayerPage(
+            url: state.mediaId,
+            title: state.title,
+            initialPosition: startPosition,
+            imageUrl: state.imageUrl,
+            sourceId: state.sourceId,
+            serverItemId: state.serverItemId,
+            headers: headers,
+            episodeTitle: state.episodeTitle,
+            seasonNumber: state.seasonNumber,
+            episodeNumber: state.episodeNumber,
+            androidExo: true,
+          ),
+        ),
+      );
+      return;
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('播放失败，可在设置中切换 mpv：$error')));
+      }
+      return;
+    }
+  }
+  if (!context.mounted) return;
   if (WindowHost.isDesktop) {
     try {
       await WindowsNativePlayer.play(
@@ -14882,10 +15161,12 @@ class _FrostSurface extends StatefulWidget {
     required this.child,
     this.padding = const EdgeInsets.all(18),
     required this.borderRadius,
+    this.glass = true,
   });
   final Widget child;
   final EdgeInsetsGeometry padding;
   final double borderRadius;
+  final bool glass;
 
   @override
   State<_FrostSurface> createState() => _FrostSurfaceState();
@@ -14896,65 +15177,85 @@ class _FrostSurfaceState extends State<_FrostSurface> {
 
   /// 归因开关命中时直接返回 [child]：**整条**跳过离屏背板模糊（含 layer 与全屏
   /// 回读），而不只是把 sigma 归零。见 `FrameTrace.skipGlass`。
-  Widget _frosted(Widget child) => FrameTrace.skipGlass('frost')
-      ? child
-      : BackdropFilter(filter: YingjiGlass.backdrop(), child: child);
+  Widget _frosted(BuildContext context, Widget child) {
+    if (FrameTrace.skipGlass('frost')) return child;
+    if (YingjiStableScrollGlass.enabled(context)) {
+      return BackdropFilter(filter: YingjiGlass.backdrop(), child: child);
+    }
+    return ValueListenableBuilder<bool>(
+      valueListenable: yingjiScrollInProgress,
+      child: child,
+      builder: (context, scrolling, child) => BackdropFilter(
+        filter: YingjiGlass.backdrop(),
+        enabled: !scrolling,
+        child: child,
+      ),
+    );
+  }
 
   @override
-  Widget build(BuildContext context) => MouseRegion(
-    onEnter: (_) => setState(() => _hovered = true),
-    onExit: (_) => setState(() => _hovered = false),
-    child: AnimatedScale(
-      scale: _hovered ? 1.008 : 1,
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        transform: Matrix4.translationValues(0, _hovered ? -3 : 0, 0),
+  Widget build(BuildContext context) {
+    final hovered = widget.glass && _hovered;
+    Widget surface = Material(
+      color: Colors.transparent,
+      child: Padding(padding: widget.padding, child: widget.child),
+    );
+    if (widget.glass) {
+      surface = DecoratedBox(
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(widget.borderRadius),
-          boxShadow: _hovered
-              ? const [
-                  BoxShadow(
-                    color: Color(0x82000000),
-                    blurRadius: 32,
-                    offset: Offset(0, 17),
-                  ),
-                ]
-              : const [
-                  BoxShadow(
-                    color: Color(0x52000000),
-                    blurRadius: 28,
-                    offset: Offset(0, 14),
-                  ),
-                ],
+          gradient: YingjiGlass.depth,
         ),
-        child: ClipRRect(
+        child: surface,
+      );
+      surface = DecoratedBox(
+        // 无描边、无高光：悬停反馈用底色略微加深来表现玻璃层次。
+        decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(widget.borderRadius),
-          child: _frosted(
-            DecoratedBox(
-              // 无描边、无高光：悬停反馈用底色略微加深来表现（玻璃「贴」近了
-              // 一点），任何白色边缘都会把它拉回塑料片。
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(widget.borderRadius),
-                color: YingjiGlass.surface(strength: _hovered ? 1.14 : 1),
-              ),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
+          color: YingjiGlass.surface(strength: hovered ? 1.14 : 1),
+        ),
+        child: surface,
+      );
+      surface = _frosted(context, surface);
+    }
+    return MouseRegion(
+      onEnter: widget.glass ? (_) => setState(() => _hovered = true) : null,
+      onExit: widget.glass ? (_) => setState(() => _hovered = false) : null,
+      child: AnimatedScale(
+        scale: hovered ? 1.008 : 1,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          transform: Matrix4.translationValues(0, hovered ? -3 : 0, 0),
+          decoration: !widget.glass
+              ? null
+              : BoxDecoration(
                   borderRadius: BorderRadius.circular(widget.borderRadius),
-                  gradient: YingjiGlass.depth,
+                  boxShadow: hovered
+                      ? const [
+                          BoxShadow(
+                            color: Color(0x82000000),
+                            blurRadius: 32,
+                            offset: Offset(0, 17),
+                          ),
+                        ]
+                      : const [
+                          BoxShadow(
+                            color: Color(0x52000000),
+                            blurRadius: 28,
+                            offset: Offset(0, 14),
+                          ),
+                        ],
                 ),
-                child: Material(
-                  color: Colors.transparent,
-                  child: Padding(padding: widget.padding, child: widget.child),
-                ),
-              ),
-            ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(widget.borderRadius),
+            child: surface,
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _CircleAction extends StatelessWidget {
@@ -15229,124 +15530,126 @@ class _SourceCardState extends State<_SourceCard> {
     borderRadius: BorderRadius.circular(18),
     child: SizedBox(
       width: 388,
-      height: 128,
       child: _FrostSurface(
         borderRadius: 18,
         padding: const EdgeInsets.fromLTRB(14, 13, 12, 12),
-        child: FutureBuilder<DateTime?>(
-          future: _lastWatched,
-          builder: (context, watchedSnapshot) {
-            final lastWatched = watchedSnapshot.data;
-            final days = lastWatched == null
-                ? null
-                : DateTime.now().difference(lastWatched).inDays;
-            final stats = widget.stats;
-            return Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                InkWell(
-                  onTap: widget.onPickIcon,
-                  borderRadius: BorderRadius.circular(16),
-                  child: ServerMark(
-                    source: widget.source,
-                    token: widget.iconToken,
-                    size: 54,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 144),
+          child: FutureBuilder<DateTime?>(
+            future: _lastWatched,
+            builder: (context, watchedSnapshot) {
+              final lastWatched = watchedSnapshot.data;
+              final days = lastWatched == null
+                  ? null
+                  : DateTime.now().difference(lastWatched).inDays;
+              final stats = widget.stats;
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  InkWell(
+                    onTap: widget.onPickIcon,
+                    borderRadius: BorderRadius.circular(16),
+                    child: ServerMark(
+                      source: widget.source,
+                      token: widget.iconToken,
+                      size: 54,
+                    ),
                   ),
-                ),
-                const SizedBox(width: 13),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              widget.source.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 17,
-                                fontWeight: FontWeight.w800,
+                  const SizedBox(width: 13),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                widget.source.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w800,
+                                ),
                               ),
                             ),
-                          ),
-                          IconButton(
-                            tooltip: '服务器设置',
-                            visualDensity: VisualDensity.compact,
-                            onPressed: widget.testing ? null : widget.onEdit,
-                            icon: const Icon(YingjiIcons.gear, size: 17),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        days == null
-                            ? '尚未有本地观看记录'
-                            : days == 0
-                            ? '上次观看：今天'
-                            : '上次观看：$days 天前',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: YingjiColors.muted,
+                            IconButton(
+                              tooltip: '服务器设置',
+                              visualDensity: VisualDensity.compact,
+                              onPressed: widget.testing ? null : widget.onEdit,
+                              icon: const Icon(YingjiIcons.gear, size: 17),
+                            ),
+                          ],
                         ),
-                      ),
-                      const SizedBox(height: 2),
-                      Container(
-                        height: 1,
-                        color: Colors.white.withValues(alpha: .16),
-                      ),
-                      const SizedBox(height: 7),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              stats == null
-                                  ? '电影  --'
-                                  : '电影  ${stats.movieCount}',
-                              style: const TextStyle(fontSize: 12),
-                            ),
+                        const SizedBox(height: 4),
+                        Text(
+                          days == null
+                              ? '尚未有本地观看记录'
+                              : days == 0
+                              ? '上次观看：今天'
+                              : '上次观看：$days 天前',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: YingjiColors.muted,
                           ),
-                          Expanded(
-                            child: Text(
-                              stats == null
-                                  ? '剧集  --'
-                                  : '剧集  ${stats.seriesCount}',
-                              style: const TextStyle(fontSize: 12),
+                        ),
+                        const SizedBox(height: 2),
+                        Container(
+                          height: 1,
+                          color: Colors.white.withValues(alpha: .16),
+                        ),
+                        const SizedBox(height: 7),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                stats == null
+                                    ? '电影  --'
+                                    : '电影  ${stats.movieCount}',
+                                style: const TextStyle(fontSize: 12),
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 5),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              widget.source.alternateEndpoints.isEmpty
-                                  ? '主线路'
-                                  : '主线路 · ${widget.source.alternateEndpoints.length + 1} 条',
-                              style: const TextStyle(fontSize: 12),
+                            Expanded(
+                              child: Text(
+                                stats == null
+                                    ? '剧集  --'
+                                    : '剧集  ${stats.seriesCount}',
+                                style: const TextStyle(fontSize: 12),
+                              ),
                             ),
-                          ),
-                          _statusChip(),
-                        ],
-                      ),
-                    ],
+                          ],
+                        ),
+                        const SizedBox(height: 5),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                widget.source.alternateEndpoints.isEmpty
+                                    ? '主线路'
+                                    : '主线路 · ${widget.source.alternateEndpoints.length + 1} 条',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ),
+                            _statusChip(),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                IconButton(
-                  tooltip: '移除来源',
-                  visualDensity: VisualDensity.compact,
-                  onPressed: widget.onRemove,
-                  icon: const Icon(
-                    YingjiIcons.trash,
-                    size: 16,
-                    color: YingjiColors.danger,
+                  IconButton(
+                    tooltip: '移除来源',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onRemove,
+                    icon: const Icon(
+                      YingjiIcons.trash,
+                      size: 16,
+                      color: YingjiColors.danger,
+                    ),
                   ),
-                ),
-              ],
-            );
-          },
+                ],
+              );
+            },
+          ),
         ),
       ),
     ),

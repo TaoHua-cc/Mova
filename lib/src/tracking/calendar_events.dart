@@ -44,19 +44,56 @@ int? calendarAbsoluteEpisode(TraktEvent event) {
   if ((event.absoluteEpisodeNumber ?? 0) > 0) {
     return event.absoluteEpisodeNumber;
   }
-  final name = event.episode.split('·').last.trim();
-  final match = RegExp(
-    r'^(?:Episode|EP)\s*#?\s*(\d+)$|^第\s*(\d+)\s*集$',
+  // Episode titles may follow the numbering (for example, "第 1 季 · 第 3 集 ·
+  // 标题"). Read the explicit absolute marker first, then the Chinese label.
+  final explicit = RegExp(
+    r'\b(?:Episode|EP)\s*#?\s*(\d+)\b',
     caseSensitive: false,
-  ).firstMatch(name);
-  final number = int.tryParse(match?.group(1) ?? match?.group(2) ?? '');
+  ).firstMatch(event.episode);
+  final local = RegExp(r'第\s*(\d+)\s*集').firstMatch(event.episode);
+  final number = int.tryParse(explicit?.group(1) ?? local?.group(1) ?? '');
   if (number == null || number <= 0) return null;
   // "Episode 17" for season 8 may only mean S08E17, not absolute #17.
-  if ((event.seasonNumber ?? 1) > 1 && number == event.episodeNumber) {
+  if ((_calendarSeason(event) ?? 1) > 1 &&
+      number == _calendarEpisodeNumber(event)) {
     return null;
   }
   return number;
 }
+
+int? _calendarSeason(TraktEvent event) {
+  if ((event.seasonNumber ?? 0) > 0) return event.seasonNumber;
+  final match = RegExp(
+    r'(?:第\s*(\d+)\s*季|\bS(?:eason\s*)?(\d+)\b)',
+    caseSensitive: false,
+  ).firstMatch(event.episode);
+  return int.tryParse(match?.group(1) ?? match?.group(2) ?? '');
+}
+
+int? _calendarEpisodeNumber(TraktEvent event) {
+  if ((event.episodeNumber ?? 0) > 0) return event.episodeNumber;
+  final match = RegExp(
+    r'\bS\d+\s*E(\d+)\b|第\s*\d+\s*季\s*[·:：-]*\s*第\s*(\d+)\s*集|第\s*(\d+)\s*集|\b(?:Episode|EP)\s*#?\s*(\d+)\b',
+    caseSensitive: false,
+  ).firstMatch(event.episode);
+  for (final group in [1, 2, 3, 4]) {
+    final number = int.tryParse(match?.group(group) ?? '');
+    if (number != null && number > 0) return number;
+  }
+  return null;
+}
+
+bool _sameLocalCalendarDay(DateTime left, DateTime right) {
+  final a = left.toLocal();
+  final b = right.toLocal();
+  return a.year == b.year && a.month == b.month && a.day == b.day;
+}
+
+String _normalizedEpisodeLabel(String value) => value
+    .toLowerCase()
+    .replaceAll(RegExp(r'\s+'), '')
+    .replaceAll('·', '')
+    .replaceAll('：', ':');
 
 List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
   final merged = <TraktEvent>[];
@@ -72,19 +109,23 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
       if (previousAbsolute != null && nextAbsolute != null) {
         return previousAbsolute == nextAbsolute;
       }
-      if (previous.seasonNumber != null &&
-          previous.episodeNumber != null &&
-          event.seasonNumber != null &&
-          event.episodeNumber != null) {
-        return previous.seasonNumber == event.seasonNumber &&
-            previous.episodeNumber == event.episodeNumber;
+      final previousSeason = _calendarSeason(previous);
+      final nextSeason = _calendarSeason(event);
+      final previousEpisode = _calendarEpisodeNumber(previous);
+      final nextEpisode = _calendarEpisodeNumber(event);
+      if (previousEpisode != null && nextEpisode != null) {
+        if (previousSeason != null && nextSeason != null) {
+          return previousSeason == nextSeason && previousEpisode == nextEpisode;
+        }
+        // If a provider omitted season metadata, only use its episode number
+        // within the same local broadcast date; otherwise S01E06 and S02E06
+        // could be collapsed into one event.
+        return previousEpisode == nextEpisode &&
+            _sameLocalCalendarDay(previous.airDate, event.airDate);
       }
-      final a = previous.airDate.toLocal();
-      final b = event.airDate.toLocal();
-      return previous.episode == event.episode &&
-          a.year == b.year &&
-          a.month == b.month &&
-          a.day == b.day;
+      return _normalizedEpisodeLabel(previous.episode) ==
+              _normalizedEpisodeLabel(event.episode) &&
+          _sameLocalCalendarDay(previous.airDate, event.airDate);
     });
     if (index < 0) {
       merged.add(event);

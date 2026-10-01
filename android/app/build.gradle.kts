@@ -10,6 +10,8 @@ plugins {
 // ---------- 签名配置（密钥不入库，从 key.properties 读取）----------
 val keystorePropertiesFile = rootProject.file("key.properties")
 val keystoreProperties = Properties()
+// Explicit opt-in for performance testing without replacing the signed app.
+val localTestBuild = providers.gradleProperty("movaLocalTest").orNull == "true"
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
@@ -34,6 +36,7 @@ android {
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["movaLabel"] = if (localTestBuild) "Mova · 测试" else "Mova"
 
         // 不要在这里设 ndk.abiFilters：与下面的 splits.abi 同时存在会直接报错
         // "Conflicting configuration ... in ndk abiFilters cannot be present
@@ -53,7 +56,8 @@ android {
 
     buildTypes {
         release {
-            signingConfig = if (keystorePropertiesFile.exists()) {
+            if (localTestBuild) applicationIdSuffix = ".debug"
+            signingConfig = if (!localTestBuild && keystorePropertiesFile.exists()) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
@@ -92,4 +96,5 @@ dependencies {
     // Texture。Media3 负责选择设备提供的 video/dolby-vision 解码器。
     implementation("androidx.media3:media3-exoplayer:1.11.0")
     implementation("androidx.media3:media3-ui:1.11.0")
+    implementation(files("libs/media3-decoder-ffmpeg-eac3.aar"))
 }

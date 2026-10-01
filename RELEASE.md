@@ -148,6 +148,8 @@ build-release.cmd
 
 ### 本机路径速查
 
+本地 Android 性能验证可在 `android/` 使用 `gradlew.bat app:assembleRelease "-PmovaLocalTest=true" "-Ptarget-platform=android-arm64"`。需配置真实 Android SDK 与 JAVA_HOME。显式属性使用 `.debug` 测试包名、测试标签与调试签名，但 Dart 为 Release AOT；安装前用 aapt 核实包名，不覆盖正式签名应用。默认构建和 CI 签名逻辑保持不变。Windows 部署脚本可能写入临时 Android SDK 路径，双端本地构建应依次运行并恢复真实 SDK 路径。
+
 | 用途 | 路径 |
 |---|---|
 | 源码 | `D:\codex\Mova` |
@@ -198,4 +200,3 @@ CI 里所有 PowerShell 步骤都写 `shell: pwsh`（PowerShell 7），能正确
 - `pubspec.yaml` 的 `name` 仍是 `yingji`（刻意未改，避免全量 import 变更）；安卓 `applicationId` 是 `com.taohua.mova`
 - 内置圆润中文字体约 18MB，尚未子集化
 - 旧包 `com.example.yingji` 的观看记录不会自动迁移到新包名
-

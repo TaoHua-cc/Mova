@@ -8,6 +8,28 @@ import 'package:yingji/src/media_center.dart';
 const _removedControls = <String>['颜色模式', '玻璃色调', '玻璃不透明度', '背景模糊', '背景卡片颜色'];
 
 void main() {
+  testWidgets('danmaku area accepts values persisted by the player panel', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'yingji.danmaku.area': 0.249951646639986,
+    });
+    tester.view.physicalSize = const Size(1440, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(body: SizedBox(height: 2200, child: SettingsPage())),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('appearance section keeps only the blur slider', (tester) async {
     SharedPreferences.setMockInitialValues({});
     tester.view.physicalSize = const Size(1440, 2400);

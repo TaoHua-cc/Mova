@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
@@ -18,12 +19,13 @@ import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 
 /**
- * Full-screen native Dolby Vision player.
+ * Full-screen ExoPlayer, including the native Dolby Vision output path.
  *
  * PlayerView uses a SurfaceView by default. Keeping this as a native Activity is
  * intentional: putting decoded frames in a Flutter Texture would route them
@@ -74,11 +76,13 @@ class DolbyVisionPlayerActivity : Activity(), Player.Listener {
 
         val headers = readHeaders()
         val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent("Mova-Android-DolbyVision")
+            .setUserAgent("Mova-Android-ExoPlayer")
             .setAllowCrossProtocolRedirects(true)
             .setDefaultRequestProperties(headers)
         val dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
-        val exoPlayer = ExoPlayer.Builder(this)
+        val renderersFactory = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+        val exoPlayer = ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
         player = exoPlayer
@@ -104,6 +108,20 @@ class DolbyVisionPlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onTracksChanged(tracks: Tracks) {
+        // Codec diagnostics only: never log media URLs, headers or track labels.
+        val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        Log.i("MovaAudio", "audioGroups=${audioGroups.size}")
+        audioGroups.forEach { group ->
+            (0 until group.length).forEach { index ->
+                val format = group.getTrackFormat(index)
+                Log.i("MovaAudio", "mime=${format.sampleMimeType} channels=${format.channelCount} " +
+                    "sampleRate=${format.sampleRate} support=${group.getTrackSupport(index)} " +
+                    "selected=${group.isTrackSelected(index)}")
+            }
+        }
+        if (audioGroups.isNotEmpty() && audioGroups.none { group ->
+                (0 until group.length).any { group.isTrackSupported(it) }
+            }) Toast.makeText(this, "ExoPlayer 不支持此音轨", Toast.LENGTH_LONG).show()
         nativeDolbyVisionSelected = tracks.groups.any { group ->
             group.isSelected && (0 until group.length).any { index ->
                 group.isTrackSelected(index) &&
@@ -114,12 +132,18 @@ class DolbyVisionPlayerActivity : Activity(), Player.Listener {
 
     override fun onPlayerError(error: PlaybackException) {
         playbackError = error.errorCodeName
-        Toast.makeText(this, "原生 Dolby Vision 播放失败：${error.errorCodeName}", Toast.LENGTH_LONG)
+        Toast.makeText(this, "ExoPlayer 播放失败：${error.errorCodeName}", Toast.LENGTH_LONG)
             .show()
     }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
+        if (playbackState == Player.STATE_READY) playbackError = null
         if (playbackState == Player.STATE_ENDED) finishWithResult(null)
+    }
+
+    override fun onStop() {
+        player?.pause()
+        super.onStop()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

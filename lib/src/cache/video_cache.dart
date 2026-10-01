@@ -234,6 +234,13 @@ class VideoCacheStore {
     return 'http://${server.address.address}:${server.port}/media/$key';
   }
 
+  /// Only close a proxy owned by the finished playback session.
+  Future<void> closePlaybackProxy() async {
+    await _proxy?.close(force: true);
+    _proxy = null;
+    _proxySources.clear();
+  }
+
   Future<void> _serveProxy(HttpServer server) async {
     await for (final request in server) {
       unawaited(_handleProxy(request));
