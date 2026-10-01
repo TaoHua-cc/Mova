@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../brand.dart';
 import '../cache/danmaku_cache.dart';
 import '../cache/video_cache.dart';
 import '../history/watch_state_store.dart';
@@ -398,7 +399,7 @@ class WindowsNativePlayer {
     }
     final toolOrder =
         preferences.getStringList('yingji.player.tool-order') ??
-        const ['声音', '字幕', '剧集', '弹幕', '画面', '倍速', '章节', '片头片尾', '资源'];
+        YingjiPlayerTools.all.map((tool) => tool.id).toList(growable: false);
     final toolHidden =
         preferences.getStringList('yingji.player.tool-hidden') ??
         const <String>[];
@@ -908,6 +909,36 @@ class WindowsNativePlayer {
     Duration? requestedEpisodePosition;
     final episodePositions = <int, Duration>{};
     final episodeDurations = <int, Duration>{};
+    var progressWrites = Future<void>.value();
+    var lastProgressSave = DateTime.fromMillisecondsSinceEpoch(0);
+    void saveSample(int index, Duration at, Duration total) {
+      if (total <= Duration.zero || index < 0 || index >= entries.length) {
+        return;
+      }
+      final entry = entries[index];
+      final state = normalizeWatchState(
+        WatchState(
+          mediaId: entry.url,
+          title: request.title,
+          position: at,
+          duration: total,
+          imageUrl: entry.imageUrl,
+          sourceId: entry.sourceId,
+          serverItemId: entry.serverItemId,
+          tmdbId: entry.tmdbId,
+          episodeTitle: entry.episodeTitle,
+          seasonNumber: entry.seasonNumber,
+          episodeNumber: entry.episodeNumber,
+        ),
+      );
+      progressWrites = progressWrites
+          .then((_) async {
+            await (await WatchStateStore.create()).save(state);
+          })
+          .catchError((Object error) {
+            /* Final exit save remains authoritative. */
+          });
+    }
 
     String subtitleKey(SubtitleSearchResult result) =>
         '${result.provider}:${result.providerId}';
@@ -1032,246 +1063,250 @@ class WindowsNativePlayer {
       }
     }
 
+    final outputDone = Completer<void>();
     final output = process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen((chunk) {
-          if (chunk.startsWith('MOVA_EPISODE_REQUEST=')) {
-            final fields = chunk.substring(21).split('|');
-            if (fields.length == 4) {
-              final index = int.tryParse(fields[0]);
-              final season = int.tryParse(fields[1]);
-              final episode = int.tryParse(fields[2]);
-              final resolve = request.onResolveEpisode;
-              if (index != null &&
-                  index >= 0 &&
-                  index < entries.length &&
-                  season != null &&
-                  episode != null &&
-                  resolve != null) {
-                final generation = ++episodeResolveGeneration;
-                unawaited(() async {
-                  try {
-                    var resourceRevision = 0;
-                    void onResourcesChanged(
-                      List<WindowsNativeResourceOption> resources,
-                      int currentIndex,
-                    ) {
+        .listen(
+          (chunk) {
+            if (chunk.startsWith('MOVA_EPISODE_REQUEST=')) {
+              final fields = chunk.substring(21).split('|');
+              if (fields.length == 4) {
+                final index = int.tryParse(fields[0]);
+                final season = int.tryParse(fields[1]);
+                final episode = int.tryParse(fields[2]);
+                final resolve = request.onResolveEpisode;
+                if (index != null &&
+                    index >= 0 &&
+                    index < entries.length &&
+                    season != null &&
+                    episode != null &&
+                    resolve != null) {
+                  final generation = ++episodeResolveGeneration;
+                  unawaited(() async {
+                    try {
+                      var resourceRevision = 0;
+                      void onResourcesChanged(
+                        List<WindowsNativeResourceOption> resources,
+                        int currentIndex,
+                      ) {
+                        if (generation != episodeResolveGeneration) return;
+                        sendLine(
+                          encodeEpisodeResourceSnapshotLine(
+                            playlistIndex: index,
+                            revision: ++resourceRevision,
+                            currentIndex: currentIndex,
+                            resources: resources,
+                          ),
+                        );
+                      }
+
+                      final entry = await resolve(
+                        season,
+                        episode,
+                        onResourcesChanged,
+                      );
+                      if (generation != episodeResolveGeneration) return;
+                      if (entry == null || entry.url.isEmpty) {
+                        sendLine(
+                          'MOVA_EPISODE_RESOLVE_FAILED=$index|${Uri.encodeComponent('未找到该集可播放资源')}',
+                        );
+                        return;
+                      }
+                      entries[index] = entry;
+                      final playbackUrl = cache == null
+                          ? entry.url
+                          : await cache.playbackUrl(
+                              entry.url,
+                              headers: entry.headers,
+                            );
+                      if (generation != episodeResolveGeneration) return;
+                      playbackUrls[index] = playbackUrl;
+                      final headers =
+                          (cache == null
+                                  ? entry.headers
+                                  : const <String, String>{})
+                              .entries
+                              .map((header) => '${header.key}: ${header.value}')
+                              .join('\n');
+                      sendLine(
+                        'MOVA_EPISODE_RESOLVED=$index|'
+                        '${Uri.encodeComponent(playbackUrl)}|'
+                        '${Uri.encodeComponent(headers)}|'
+                        '${entry.resumeSeconds ?? 0}',
+                      );
+                    } catch (_) {
                       if (generation != episodeResolveGeneration) return;
                       sendLine(
-                        encodeEpisodeResourceSnapshotLine(
-                          playlistIndex: index,
-                          revision: ++resourceRevision,
-                          currentIndex: currentIndex,
-                          resources: resources,
-                        ),
+                        'MOVA_EPISODE_RESOLVE_FAILED=$index|${Uri.encodeComponent('该集搜索失败，请重试')}',
                       );
                     }
-
-                    final entry = await resolve(
-                      season,
-                      episode,
-                      onResourcesChanged,
-                    );
-                    if (generation != episodeResolveGeneration) return;
-                    if (entry == null || entry.url.isEmpty) {
-                      sendLine(
-                        'MOVA_EPISODE_RESOLVE_FAILED=$index|${Uri.encodeComponent('未找到该集可播放资源')}',
-                      );
-                      return;
-                    }
-                    entries[index] = entry;
-                    final playbackUrl = cache == null
-                        ? entry.url
-                        : await cache.playbackUrl(
-                            entry.url,
-                            headers: entry.headers,
-                          );
-                    if (generation != episodeResolveGeneration) return;
-                    playbackUrls[index] = playbackUrl;
-                    final headers =
-                        (cache == null
-                                ? entry.headers
-                                : const <String, String>{})
-                            .entries
-                            .map((header) => '${header.key}: ${header.value}')
-                            .join('\n');
-                    sendLine(
-                      'MOVA_EPISODE_RESOLVED=$index|'
-                      '${Uri.encodeComponent(playbackUrl)}|'
-                      '${Uri.encodeComponent(headers)}|'
-                      '${entry.resumeSeconds ?? 0}',
-                    );
-                  } catch (_) {
-                    if (generation != episodeResolveGeneration) return;
-                    sendLine(
-                      'MOVA_EPISODE_RESOLVE_FAILED=$index|${Uri.encodeComponent('该集搜索失败，请重试')}',
-                    );
-                  }
+                  }());
+                }
+              }
+            }
+            if (chunk == 'MOVA_DANMAKU_RELOAD') {
+              unawaited(pushEpisodeDanmaku(extrasEpisode, forceRefresh: true));
+            }
+            if (chunk == 'MOVA_SUBTITLE_SEARCH') {
+              unawaited(requestSubtitleSearch());
+            }
+            if (chunk.startsWith('MOVA_SUBTITLE_DOWNLOAD=')) {
+              final index = int.tryParse(chunk.substring(23));
+              if (index != null) unawaited(downloadSubtitle(index));
+            }
+            // 用户在原生「资源」面板里换了版本：记下选择与当时的位置，等进程退出
+            // 之后交给调用方用新资源重新起播。
+            for (final match in RegExp(
+              r'MOVA_RESOURCE=([0-9]+)\|([0-9.]+)',
+            ).allMatches(chunk)) {
+              final index = int.tryParse(match.group(1) ?? '');
+              if (index != null) {
+                requestedResource = index;
+                requestedResourcePosition = _seconds(match.group(2));
+              }
+            }
+            for (final match in RegExp(
+              r'MOVA_EPISODE=([0-9]+)\|([0-9]+)\|([0-9.]+)',
+            ).allMatches(chunk)) {
+              requestedEpisodeSeason = int.tryParse(match.group(1) ?? '');
+              requestedEpisodeNumber = int.tryParse(match.group(2) ?? '');
+              requestedEpisodePosition = _seconds(match.group(3));
+            }
+            for (final match in RegExp(
+              r'MOVA_POSITION=([0-9.]+)\|([0-9.]+)(?:\|([0-9]+))?',
+            ).allMatches(chunk)) {
+              position = _seconds(match.group(1));
+              duration = _seconds(match.group(2));
+              playlistPosition =
+                  int.tryParse(match.group(3) ?? '') ?? playlistPosition;
+              episodePositions[playlistPosition] = position;
+              if (duration > Duration.zero) {
+                episodeDurations[playlistPosition] = duration;
+              }
+              if (DateTime.now().difference(lastProgressSave) >=
+                  const Duration(seconds: 5)) {
+                lastProgressSave = DateTime.now();
+                saveSample(playlistPosition, position, duration);
+              }
+              if (preloadNext &&
+                  cache != null &&
+                  limit > 0 &&
+                  duration > Duration.zero &&
+                  duration - position <= preloadLead &&
+                  playlistPosition >= 0 &&
+                  playlistPosition < entries.length - 1) {
+                final nextEntry = entries[playlistPosition + 1];
+                if (nextEntry.url.isNotEmpty &&
+                    preloadedUrls.add(nextEntry.url)) {
+                  nextEpisodePreload = cache.download(
+                    url: nextEntry.url,
+                    limitBytes: limit,
+                    targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
+                    headers: nextEntry.headers,
+                    title: nextEntry.title,
+                  );
+                }
+              }
+              final nextCacheIndex = playlistPosition.clamp(
+                0,
+                entries.length - 1,
+              );
+              if (cache != null &&
+                  limit > 0 &&
+                  nextCacheIndex != activeCacheIndex) {
+                activeCacheIndex = nextCacheIndex;
+                cacheSwitchTask = switchCacheEpisode(
+                  nextCacheIndex,
+                  position,
+                  duration,
+                );
+                unawaited(cacheSwitchTask!);
+              }
+              if (!cacheRefreshPending && !cacheIndexSwitchPending) {
+                cacheRefreshTask = advanceCacheWindow(
+                  nextCacheIndex,
+                  position,
+                  duration,
+                );
+                unawaited(cacheRefreshTask!);
+              }
+              // 换集了：弹幕与片头片尾都得按新的一集重来，否则面板里显示的还是
+              // 上一集的数据、自动跳过也会对着上一集的片头时间点跳。
+              if (playlistPosition != extrasEpisode) {
+                unawaited(loadEpisodeExtras(playlistPosition));
+              }
+            }
+            for (final match in RegExp(
+              r'MOVA_COMPLETED=([0-9]+)',
+            ).allMatches(chunk)) {
+              final index = int.tryParse(match.group(1) ?? '');
+              if (index != null && index >= 0 && index < entries.length) {
+                completedEpisodes.add(index);
+                final completedUrl = entries[index].url;
+                completedCacheUrls.add(completedUrl);
+                final completedDownload = index == activeCacheIndex
+                    ? download
+                    : null;
+                completedDownload?.cancel();
+                unawaited(() async {
+                  await completedDownload?.done;
+                  await cache?.deleteEpisode(completedUrl);
                 }());
               }
             }
-          }
-          if (chunk == 'MOVA_DANMAKU_RELOAD') {
-            unawaited(pushEpisodeDanmaku(extrasEpisode, forceRefresh: true));
-          }
-          if (chunk == 'MOVA_SUBTITLE_SEARCH') {
-            unawaited(requestSubtitleSearch());
-          }
-          if (chunk.startsWith('MOVA_SUBTITLE_DOWNLOAD=')) {
-            final index = int.tryParse(chunk.substring(23));
-            if (index != null) unawaited(downloadSubtitle(index));
-          }
-          // 用户在原生「资源」面板里换了版本：记下选择与当时的位置，等进程退出
-          // 之后交给调用方用新资源重新起播。
-          for (final match in RegExp(
-            r'MOVA_RESOURCE=([0-9]+)\|([0-9.]+)',
-          ).allMatches(chunk)) {
-            final index = int.tryParse(match.group(1) ?? '');
-            if (index != null) {
-              requestedResource = index;
-              requestedResourcePosition = _seconds(match.group(2));
-            }
-          }
-          for (final match in RegExp(
-            r'MOVA_EPISODE=([0-9]+)\|([0-9]+)\|([0-9.]+)',
-          ).allMatches(chunk)) {
-            requestedEpisodeSeason = int.tryParse(match.group(1) ?? '');
-            requestedEpisodeNumber = int.tryParse(match.group(2) ?? '');
-            requestedEpisodePosition = _seconds(match.group(3));
-          }
-          for (final match in RegExp(
-            r'MOVA_POSITION=([0-9.]+)\|([0-9.]+)(?:\|([0-9]+))?',
-          ).allMatches(chunk)) {
-            position = _seconds(match.group(1));
-            duration = _seconds(match.group(2));
-            playlistPosition =
-                int.tryParse(match.group(3) ?? '') ?? playlistPosition;
-            episodePositions[playlistPosition] = position;
-            if (duration > Duration.zero) {
-              episodeDurations[playlistPosition] = duration;
-            }
-            if (preloadNext &&
-                cache != null &&
-                limit > 0 &&
-                duration > Duration.zero &&
-                duration - position <= preloadLead &&
-                playlistPosition >= 0 &&
-                playlistPosition < entries.length - 1) {
-              final nextEntry = entries[playlistPosition + 1];
-              if (nextEntry.url.isNotEmpty &&
-                  preloadedUrls.add(nextEntry.url)) {
-                nextEpisodePreload = cache.download(
-                  url: nextEntry.url,
-                  limitBytes: limit,
-                  targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
-                  headers: nextEntry.headers,
-                  title: nextEntry.title,
-                );
+            for (final match in RegExp(
+              r'MOVA_EPISODE_MARK=([0-9]+)\|([01])',
+            ).allMatches(chunk)) {
+              final index = int.tryParse(match.group(1) ?? '');
+              if (index == null || index >= entries.length) continue;
+              final completed = match.group(2) == '1';
+              if (completed) {
+                completedEpisodes.add(index);
+              } else {
+                completedEpisodes.remove(index);
               }
+              manualEpisodeMarks[index] = completed;
             }
-            final nextCacheIndex = playlistPosition.clamp(
-              0,
-              entries.length - 1,
-            );
-            if (cache != null &&
-                limit > 0 &&
-                nextCacheIndex != activeCacheIndex) {
-              activeCacheIndex = nextCacheIndex;
-              cacheSwitchTask = switchCacheEpisode(
-                nextCacheIndex,
-                position,
-                duration,
+            // 用户在原生弹幕面板里改了显示设置：回写到应用偏好，下次起播沿用。
+            for (final match in RegExp(
+              r'MOVA_SETTING=([A-Za-z0-9._-]+)\|(\S+)',
+            ).allMatches(chunk)) {
+              unawaited(_saveNativeSetting(match.group(1)!, match.group(2)!));
+            }
+            for (final match in RegExp(
+              r'MOVA_SEGMENT_MARK=(intro|outro)\|([0-9]+)\|(-?[0-9.]+)',
+            ).allMatches(chunk)) {
+              unawaited(
+                saveManualSegment(
+                  int.parse(match.group(2)!),
+                  match.group(1)!,
+                  double.parse(match.group(3)!),
+                ),
               );
-              unawaited(cacheSwitchTask!);
             }
-            if (!cacheRefreshPending && !cacheIndexSwitchPending) {
-              cacheRefreshTask = advanceCacheWindow(
-                nextCacheIndex,
-                position,
-                duration,
-              );
-              unawaited(cacheRefreshTask!);
-            }
-            // 换集了：弹幕与片头片尾都得按新的一集重来，否则面板里显示的还是
-            // 上一集的数据、自动跳过也会对着上一集的片头时间点跳。
-            if (playlistPosition != extrasEpisode) {
-              unawaited(loadEpisodeExtras(playlistPosition));
-            }
-          }
-          for (final match in RegExp(
-            r'MOVA_COMPLETED=([0-9]+)',
-          ).allMatches(chunk)) {
-            final index = int.tryParse(match.group(1) ?? '');
-            if (index != null && index >= 0 && index < entries.length) {
-              completedEpisodes.add(index);
-              final completedUrl = entries[index].url;
-              completedCacheUrls.add(completedUrl);
-              final completedDownload = index == activeCacheIndex
-                  ? download
-                  : null;
-              completedDownload?.cancel();
-              unawaited(() async {
-                await completedDownload?.done;
-                await cache?.deleteEpisode(completedUrl);
-              }());
-            }
-          }
-          for (final match in RegExp(
-            r'MOVA_EPISODE_MARK=([0-9]+)\|([01])',
-          ).allMatches(chunk)) {
-            final index = int.tryParse(match.group(1) ?? '');
-            if (index == null || index >= entries.length) continue;
-            final completed = match.group(2) == '1';
-            if (completed) {
-              completedEpisodes.add(index);
-            } else {
-              completedEpisodes.remove(index);
-            }
-            manualEpisodeMarks[index] = completed;
-          }
-          // 用户在原生弹幕面板里改了显示设置：回写到应用偏好，下次起播沿用。
-          for (final match in RegExp(
-            r'MOVA_SETTING=([A-Za-z0-9._-]+)\|(\S+)',
-          ).allMatches(chunk)) {
-            unawaited(_saveNativeSetting(match.group(1)!, match.group(2)!));
-          }
-          for (final match in RegExp(
-            r'MOVA_SEGMENT_MARK=(intro|outro)\|([0-9]+)\|(-?[0-9.]+)',
-          ).allMatches(chunk)) {
-            unawaited(
-              saveManualSegment(
-                int.parse(match.group(2)!),
-                match.group(1)!,
-                double.parse(match.group(3)!),
-              ),
-            );
-          }
-        });
+          },
+          onDone: () => outputDone.complete(),
+          onError: (Object error) {
+            if (!outputDone.isCompleted) outputDone.complete();
+          },
+        );
     await process.stderr.drain<void>();
     final exitCode = await process.exitCode;
+    await outputDone.future;
+    await progressWrites;
     cacheSessionStopping = true;
-    await cacheSwitchTask;
-    await cacheRefreshTask;
-    await cacheProgress?.cancel();
-    await process.stdin.close();
-    await output.cancel();
     subtitleSearchGeneration++;
     subtitleSearchService?.dispose();
     // 播放结束：设置的热更新入口随之失效，再推也没人接了。
     _live = null;
     download?.cancel();
-    await download?.done;
     // 收尾：删掉最后一次下发的弹幕临时文件（换集时上一份已经在换集流程里删过）。
     final lastDanmakuFile = activeDanmakuFile;
     if (lastDanmakuFile != null) {
       await _deleteFileQuietly(lastDanmakuFile);
     }
     nextEpisodePreload?.cancel();
-    await nextEpisodePreload?.done;
-    for (final url in completedCacheUrls) {
-      await cache?.deleteEpisode(url);
-    }
     final savedStates = <WatchState>[];
     if (episodeDurations.isNotEmpty) {
       final store = await WatchStateStore.create();
@@ -1308,7 +1343,22 @@ class WindowsNativePlayer {
     }
     // Flutter 播放器会持续上报进度；Windows 原生播放器是独立进程，过去只
     // 写了本机缓存。退出时补一份最终状态，保证服务器与其他设备能继续播放。
-    await _syncServerWatchStates(savedStates);
+    unawaited(_syncServerWatchStates(savedStates));
+    for (final url in completedCacheUrls) {
+      await cache?.deleteEpisode(url);
+    }
+    // Persist and report before potentially slow cache/process cleanup.
+    await cacheSwitchTask;
+    await cacheRefreshTask;
+    await cacheProgress?.cancel();
+    try {
+      await process.stdin.close();
+    } catch (_) {
+      // The native process has already exited; its input pipe may be closed.
+    }
+    await output.cancel();
+    await download?.done;
+    await nextEpisodePreload?.done;
     // Manual marks win over the last mpv progress sample, which may otherwise
     // re-save a partially watched position after the user chose "unplayed".
     for (final mark in manualEpisodeMarks.entries) {
@@ -1357,8 +1407,56 @@ class WindowsNativePlayer {
     );
   }
 
-  static Future<void> _syncServerWatchStates(List<WatchState> states) async {
-    if (states.isEmpty || await WatchStateStore.localOnly()) return;
+  static const _pendingWatchSyncKey = 'yingji.watch-sync.pending-items';
+  static Future<void> _watchSyncWrites = Future<void>.value();
+  static String _watchSyncId(WatchState state) =>
+      '${state.sourceId}\t${state.serverItemId}';
+
+  static Future<void> retryPendingWatchSync() =>
+      _syncServerWatchStates(const []);
+
+  static Future<void> _syncServerWatchStates(List<WatchState> states) {
+    _watchSyncWrites = _watchSyncWrites
+        .then((_) async {
+          if (await WatchStateStore.localOnly()) return;
+          final prefs = await SharedPreferences.getInstance();
+          final pending =
+              (prefs.getStringList(_pendingWatchSyncKey) ?? const <String>[])
+                  .toSet();
+          pending.addAll(
+            states
+                .where((s) => s.sourceId != null && s.serverItemId != null)
+                .map(_watchSyncId),
+          );
+          await prefs.setStringList(_pendingWatchSyncKey, pending.toList());
+          for (var attempt = 0; attempt < 3 && pending.isNotEmpty; attempt++) {
+            final history = (await WatchStateStore.create()).load();
+            final latest = <String, WatchState>{};
+            for (final row in history) {
+              final id = _watchSyncId(row);
+              if (pending.contains(id)) latest.putIfAbsent(id, () => row);
+            }
+            final failed = await _sendServerWatchStates(latest.values.toList());
+            pending.removeAll(latest.keys.where((id) => !failed.contains(id)));
+            await prefs.setStringList(_pendingWatchSyncKey, pending.toList());
+            if (pending.isNotEmpty && attempt < 2) {
+              await Future<void>.delayed(const Duration(seconds: 2));
+            }
+          }
+        })
+        .catchError((Object error) {
+          /* Persisted pending items survive a failed run. */
+        });
+    return _watchSyncWrites;
+  }
+
+  static Future<Set<String>> _sendServerWatchStates(
+    List<WatchState> states,
+  ) async {
+    final failed = <String>{};
+    if (states.isEmpty || await WatchStateStore.localOnly()) {
+      return states.map(_watchSyncId).toSet();
+    }
     final store = await SourceStore.create();
     final sources = {for (final source in store.load()) source.id: source};
     for (var index = 0; index < states.length; index++) {
@@ -1372,7 +1470,10 @@ class WindowsNativePlayer {
         continue;
       }
       final token = store.tokenFor(source);
-      if (token == null || token.isEmpty) continue;
+      if (token == null || token.isEmpty) {
+        failed.add(_watchSyncId(state));
+        continue;
+      }
       final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
       try {
         final session = await client.resolveSession(
@@ -1403,11 +1504,13 @@ class WindowsNativePlayer {
           await client.setPlayed(session, itemId, played: true);
         }
       } catch (_) {
+        failed.add(_watchSyncId(state));
         // 单个服务器离线不能影响播放器正常退出，也不能阻止其他服务器同步。
       } finally {
         client.dispose();
       }
     }
+    return failed;
   }
 
   static String _shortcutLabel(String saved) =>

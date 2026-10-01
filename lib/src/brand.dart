@@ -681,6 +681,14 @@ abstract final class YingjiGlass {
 /// 界面是玻璃，别处还是黑塑料」——这正是之前反复出现的问题。
 ///
 /// 轮廓仅保留低对比内边和短促顶部反射，不使用刺眼的整圈白边。
+/// Player chrome uses the existing fixed material, never a video backdrop.
+class YingjiFixedGlass extends InheritedWidget {
+  const YingjiFixedGlass({super.key, required super.child});
+
+  @override
+  bool updateShouldNotify(YingjiFixedGlass oldWidget) => false;
+}
+
 class _YingjiGlassBackdropScope extends InheritedWidget {
   const _YingjiGlassBackdropScope({required super.child});
 
@@ -732,6 +740,9 @@ class YingjiGlassSurface extends StatelessWidget {
   );
 
   Widget _buildSurface(BuildContext context, Widget? content) {
+    final sampleBackdrop =
+        this.sampleBackdrop &&
+        context.dependOnInheritedWidgetOfExactType<YingjiFixedGlass>() == null;
     final stableFilter = YingjiStableScrollGlass.enabled(context);
     final sharesBackdrop =
         stableFilter &&

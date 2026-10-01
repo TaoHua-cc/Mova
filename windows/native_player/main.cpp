@@ -140,6 +140,7 @@ constexpr UINT kAddExternalSubtitle = WM_APP + 8;
 constexpr UINT kSubtitleSearchUpdated = WM_APP + 9;
 constexpr UINT kEpisodeResolved = WM_APP + 10;
 constexpr UINT kEpisodeResourcesUpdated = WM_APP + 11;
+constexpr UINT kDanmakuStateChanged = WM_APP + 12;
 // 判断「是不是真播完了」的容差：正常播完时 time-pos 和 duration 会差一点点，
 // 给几秒余量；差得更多的 EOF 就是中途断流被误报成播完。
 constexpr double kEofGraceSeconds = 3.0;
@@ -289,6 +290,7 @@ std::vector<int> g_resource_marks;
 std::vector<int> g_resource_ranks;
 int g_resource_current = -1;
 int g_resource_revision = 0;
+std::wstring g_native_resource_info;
 std::unique_ptr<EpisodeResourcesUpdate> g_pending_episode_resources;
 // 剧集面板的缩略图与观看进度。缩略图同样是本地文件路径；进度是 0..1 的分数，
 // 时长以秒计，用来在缩略图上画进度条与「13:00 / 44:00」。
@@ -677,6 +679,8 @@ enum class PanelRow {
   Option,
   /// 紧凑媒体轨道行：仍沿用同一行绘制，只缩短高度以便字幕与音轨同屏浏览。
   Track,
+  Slider,
+  Toggle,
   /// 分组标题：图标 + 名称 + 右侧计数胶囊。
   Header,
   /// 说明文字：不可点，一个图标加一行灰字。
@@ -695,12 +699,15 @@ struct PanelItem {
   std::string toast;
   bool selected = false;
   bool enabled = true;
+  bool expanded = false;
   PanelRow row = PanelRow::Option;
   /// 应用下发到本地的图片路径：剧集缩略图，或服务器图标。空则由调用方画兜底。
   std::wstring image;
   /// 剧集卡的观看进度（0..1，负数表示没有观看记录）与时长（秒）。
   double progress = -1.0;
   double duration = 0.0;
+  double minimum = 0.0;
+  double maximum = 1.0;
   /// 已播完的集：画对勾、不画进度条。与 progress 解耦 —— 服务器上标记了
   /// 「已播放」但没有任何播放位置的集 progress 是 0，单看进度会漏。
   bool watched = false;
@@ -754,7 +761,8 @@ PanelItem PanelNote(wchar_t icon, std::wstring label) {
   PanelItem item;
   item.label = std::move(label);
   item.icon = icon;
-  item.enabled = false;
+  item.enabled = item.label.size() > 32;
+  item.property = "mova-expand-note";
   item.row = PanelRow::Note;
   return item;
 }
@@ -786,7 +794,7 @@ PanelItem PanelEpisode(wchar_t icon, std::wstring label, std::wstring detail,
 constexpr float kUiDesignWidth = 1280.0f;
 constexpr float kUiDesignHeight = 760.0f;
 constexpr float kUiMinScale = 0.55f;
-constexpr float kUiMaxScale = 1.6f;
+constexpr float kUiMaxScale = 1.1f;
 std::atomic<float> g_ui_scale{1.0f};
 
 float UiScale() { return g_ui_scale.load(); }
@@ -808,13 +816,15 @@ void UpdateUiScale(const RECT& client) {
 }
 
 // 弹出菜单的度量与 Flutter 弹窗对齐：卡片式行、12px 圆角、图标容器 34px。
-constexpr int kPanelPadding = 10;constexpr float kPanelRowGap = 6.0f;
-constexpr float kPanelOptionHeight = 68.0f;
-constexpr float kPanelTrackHeight = 48.0f;
+constexpr int kPanelPadding = 20;
+constexpr float kPanelRowGap = 8.0f;
+constexpr float kPanelTitleHeight = 46.0f;
+constexpr float kPanelOptionHeight = 56.0f;
+constexpr float kPanelTrackHeight = 56.0f;
 constexpr float kPanelHeaderHeight = 32.0f;
-constexpr float kPanelNoteHeight = 34.0f;
-constexpr int kPanelContentWidth = 344;
-constexpr int kPanelMaxContentHeight = 470;
+constexpr float kPanelNoteHeight = 28.0f;
+constexpr int kPanelContentWidth = 440;
+constexpr int kPanelMaxContentHeight = 560;
 // 逐像素透明才能得到真正的圆角抗锯齿与投影，所以窗口比内容四周各多一圈。
 constexpr int kPanelShadowMargin = 26;
 // 玻璃表面那圈内描边的不透明度。面板与控件条共用同一个值 —— 此前控件条用的是
@@ -831,7 +841,7 @@ constexpr float kEpisodeRowHeight =
 constexpr int kPanelEpisodeWidth = 480;
 // 资源面板的信息行是「分辨率 · 色彩范围 · 码率 · 大小」，344 的默认宽度
 // 装不下，会被省略号截掉末尾的大小。
-constexpr int kPanelResourceWidth = 430;
+constexpr int kPanelResourceWidth = 440;
 
 // ---------------------------------------------------------------- 液态玻璃
 //
@@ -907,51 +917,32 @@ bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
 /// `blur(背后) × (1−α) + frost × α` —— 与应用侧 `backdrop()` ＋ `surface()` 完全
 /// 同构。它不是「假透明」：真实的分层窗口透明度仍在（背板拿不到时就走原来的路），
 /// 只是换成了「背后画面先糊再混」这种更接近毛玻璃的合成方式。
+void FillStaticPlayerMenuSurface(Gdiplus::Graphics& graphics,
+                                 const Gdiplus::GraphicsPath& path,
+                                 const Gdiplus::RectF& rect);
+
 void FillGlassSurface(Gdiplus::Graphics& graphics,
                       const Gdiplus::GraphicsPath& path,
                       const Gdiplus::RectF& rect, int top_alpha,
                       int bottom_alpha, bool use_backdrop = false) {
-  const bool has_backdrop = use_backdrop && DrawGlassBackdrop(graphics, path, rect);
-  if (has_backdrop) {
-    // A restrained neutral tint keeps white text legible without washing out
-    // the video colours. Apply once per glass surface.
-    Gdiplus::SolidBrush tint(Gdiplus::Color(22, 69, 49, 30));
-    graphics.FillPath(&tint, &path);
-  }
-  Gdiplus::LinearGradientBrush surface(
-      Gdiplus::PointF(rect.X, rect.Y), Gdiplus::PointF(rect.X, rect.GetBottom()),
-      Gdiplus::Color(static_cast<BYTE>(top_alpha), kGlassFrostRed,
-                     kGlassFrostGreen, kGlassFrostBlue),
-      Gdiplus::Color(static_cast<BYTE>(bottom_alpha), kGlassFrostRed,
-                     kGlassFrostGreen, kGlassFrostBlue));
-  graphics.FillPath(&surface, &path);
-  // 一条覆盖完整高度的连续光学曲线。上一版把顶部反射和底部厚度分别限制在
-  // 局部区间，GDI+ 会把区间外颜色钳住，于是圆钮里出现两条硬横纹。
-  Gdiplus::LinearGradientBrush optics(
-      Gdiplus::PointF(rect.X, rect.Y),
-      Gdiplus::PointF(rect.X, rect.GetBottom()), Gdiplus::Color(0, 0, 0, 0),
-      Gdiplus::Color(0, 0, 0, 0));
-  Gdiplus::Color optical_colors[5] = {
-      Gdiplus::Color(13, 255, 255, 255),
-      Gdiplus::Color(5, 255, 246, 239), Gdiplus::Color(0, 255, 255, 255),
-      Gdiplus::Color(3, 247, 235, 220), Gdiplus::Color(4, 0, 0, 0)};
-  Gdiplus::REAL optical_positions[5] = {0.0f, 0.14f, 0.46f, 0.78f, 1.0f};
-  optics.SetInterpolationColors(optical_colors, optical_positions, 5);
-  graphics.FillPath(&optics, &path);
+  (void)use_backdrop;
+  (void)top_alpha;
+  (void)bottom_alpha;
+  FillStaticPlayerMenuSurface(graphics, path, rect);
 }
 
 /// 播放器二级菜单采用固定雾面材质，外观设置只微调透明度，不读取视频帧。
 void FillStaticPlayerMenuSurface(Gdiplus::Graphics& graphics,
                                  const Gdiplus::GraphicsPath& path,
                                  const Gdiplus::RectF& rect) {
-  const BYTE top_alpha = static_cast<BYTE>(
-      std::lround(234.0f - 54.0f * GlassLevel()));
-  const BYTE bottom_alpha = static_cast<BYTE>(top_alpha + 12);
+  // Same fixed material as YingjiGlassSurface(sampleBackdrop: false).
+  const BYTE top_alpha = static_cast<BYTE>(std::lround(255.0 *
+      std::clamp(.66 + g_glass_blur.load() / 240.0, .66, .90)));
   Gdiplus::LinearGradientBrush surface(
       Gdiplus::PointF(rect.X, rect.Y),
       Gdiplus::PointF(rect.X, rect.GetBottom()),
-      Gdiplus::Color(top_alpha, 49, 53, 58),
-      Gdiplus::Color(bottom_alpha, 27, 30, 34));
+      Gdiplus::Color(top_alpha, 27, 29, 34),
+      Gdiplus::Color(top_alpha, 27, 29, 34));
   graphics.FillPath(&surface, &path);
   Gdiplus::LinearGradientBrush reflection(
       Gdiplus::PointF(rect.X, rect.Y),
@@ -1103,7 +1094,12 @@ int g_panel_content_height = 0;
 std::vector<PanelItem> g_panel_items;
 std::vector<PanelBox> g_panel_boxes;
 int g_panel_scroll = 0;
+int g_panel_scroll_target = -1;
 int g_panel_viewport_height = 0;
+float PanelTitleHeight() {
+  return !g_panel_items.empty() && g_panel_items.front().row == PanelRow::Header
+      ? kPanelTitleHeight : 0.0f;
+}
 bool g_subtitle_search_menu_open = false;
 bool g_subtitle_search_loading = false;
 std::vector<std::wstring> g_subtitle_search_statuses;
@@ -1114,11 +1110,14 @@ float PanelRowHeight(const PanelItem& item) {
     case PanelRow::Header:
       return kPanelHeaderHeight;
     case PanelRow::Note:
-      return kPanelNoteHeight;
+      return item.expanded ? std::max(kPanelNoteHeight, 20.0f *
+          static_cast<float>((item.label.size() + 21) / 22)) : kPanelNoteHeight;
     case PanelRow::Episode:
       return kEpisodeRowHeight;
     case PanelRow::Track:
       return kPanelTrackHeight;
+    case PanelRow::Slider:
+      return 44.0f;
     default:
       return kPanelOptionHeight;
   }
@@ -1137,30 +1136,58 @@ void LayoutPanelRows() {
                      kPanelPadding * 2.0f;
   float y = static_cast<float>(kPanelPadding);
   for (size_t index = 0; index < g_panel_items.size(); ++index) {
+    if (index == 0 && PanelTitleHeight() > 0) continue;
+    if (g_panel_items[index].row == PanelRow::Toggle) {
+      size_t end = index;
+      while (end < g_panel_items.size() && g_panel_items[end].row == PanelRow::Toggle) ++end;
+      const float cell = (full - kPanelRowGap * (end - index - 1)) / (end - index);
+      for (size_t option = index; option < end; ++option)
+        g_panel_boxes[option] = {left + (cell + kPanelRowGap) * (option - index), y, cell, 36.0f};
+      y += 36.0f + kPanelRowGap;
+      index = end - 1;
+      continue;
+    }
+    if (index > 1 && g_panel_items[index].row == PanelRow::Header) y += 8.0f;
     const float height = PanelRowHeight(g_panel_items[index]);
     g_panel_boxes[index] = {left, y, full, height};
     y += height + kPanelRowGap;
   }
   g_panel_content_height =
-      static_cast<int>(std::max(0.0f, y - kPanelRowGap)) + kPanelPadding;
+      static_cast<int>(std::max(0.0f, y - kPanelRowGap) + PanelTitleHeight()) + kPanelPadding;
 }
 
 int PanelContentHeight() { return g_panel_content_height; }
 
 int PanelMaxScroll() {
-  return std::max(0, PanelContentHeight() - g_panel_viewport_height);
+  return std::max(0, PanelContentHeight() - static_cast<int>(PanelTitleHeight()) -
+      kPanelPadding * 2 - g_panel_viewport_height);
 }
 
 void ScrollPanel(int delta) {
-  const int next = std::clamp(g_panel_scroll + delta, 0, PanelMaxScroll());
-  if (next == g_panel_scroll) return;
-  g_panel_scroll = next;
-  if (g_panel) InvalidateRect(g_panel, nullptr, FALSE);
+  const int origin = g_panel_scroll_target < 0 ? g_panel_scroll : g_panel_scroll_target;
+  g_panel_scroll_target = std::clamp(origin + delta, 0, PanelMaxScroll());
+}
+
+void AnimatePanelScroll() {
+  if (g_panel_scroll_target < 0) return;
+  const int distance = g_panel_scroll_target - g_panel_scroll;
+  if (distance == 0) { g_panel_scroll_target = -1; return; }
+  const int step = std::max(1, static_cast<int>(std::ceil(std::abs(distance) * .22)));
+  g_panel_scroll += distance > 0 ? step : -step;
+  if (g_panel && IsWindowVisible(g_panel)) InvalidateRect(g_panel, nullptr, FALSE);
 }
 
 int PanelIndexAt(int x, int y) {
   const float local_x = static_cast<float>(x - kPanelShadowMargin);
-  const float local_y = static_cast<float>(y - kPanelShadowMargin + g_panel_scroll);
+  if (local_x < kPanelPadding || local_x >= g_panel_metrics.width - kPanelPadding ||
+      y < kPanelShadowMargin + 18) return -1;
+  if (PanelTitleHeight() > 0 && y < kPanelShadowMargin + kPanelPadding + PanelTitleHeight()) {
+    return x >= kPanelShadowMargin + g_panel_metrics.width - kPanelPadding - 36 &&
+        y < kPanelShadowMargin + 54 ? -1 : 0;
+  }
+  if (y >= kPanelShadowMargin + kPanelPadding + PanelTitleHeight() +
+      g_panel_viewport_height) return -1;
+  const float local_y = static_cast<float>(y - kPanelShadowMargin + g_panel_scroll) - PanelTitleHeight();
   for (size_t index = 0; index < g_panel_boxes.size(); ++index) {
     const PanelBox& box = g_panel_boxes[index];
     if (local_y >= box.y && local_y < box.y + box.h && local_x >= box.x &&
@@ -1179,17 +1206,18 @@ bool PanelItemFocusable(int index) {
 }
 
 void EnsurePanelItemVisible(int index) {
+  g_panel_scroll_target = -1;
   if (index < 0 || index >= static_cast<int>(g_panel_boxes.size())) return;
   const PanelBox& box = g_panel_boxes[static_cast<size_t>(index)];
   const int visible_top = g_panel_scroll + kPanelPadding;
   const int visible_bottom =
-      g_panel_scroll + g_panel_viewport_height - kPanelPadding;
+      g_panel_scroll + g_panel_viewport_height + kPanelPadding;
   if (box.y < visible_top) {
     g_panel_scroll = std::max(0, static_cast<int>(box.y) - kPanelPadding);
   } else if (box.y + box.h > visible_bottom) {
     g_panel_scroll = std::min(
         PanelMaxScroll(), static_cast<int>(box.y + box.h) -
-                              g_panel_viewport_height + kPanelPadding);
+                              g_panel_viewport_height - kPanelPadding);
   }
 }
 
@@ -1215,7 +1243,7 @@ void ActivatePanelFocus(HWND window) {
   EnsurePanelItemVisible(g_panel_focus);
   const PanelBox& box = g_panel_boxes[static_cast<size_t>(g_panel_focus)];
   const int x = Scaled(static_cast<int>(kPanelShadowMargin + box.x + box.w / 2));
-  const int y = Scaled(static_cast<int>(kPanelShadowMargin + box.y + box.h / 2 -
+  const int y = Scaled(static_cast<int>(kPanelShadowMargin + PanelTitleHeight() + box.y + box.h / 2 -
                                          g_panel_scroll));
   SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
 }
@@ -1336,6 +1364,24 @@ std::wstring Wide(const std::string& value) {
   MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
                       output.data(), length);
   return output;
+}
+
+void RefreshNativeResourceInfo() {
+  if (g_resource_current >= 0 &&
+      g_resource_current < static_cast<int>(g_resource_details.size()) &&
+      !g_resource_details[static_cast<size_t>(g_resource_current)].empty()) {
+    g_native_resource_info = g_resource_details[static_cast<size_t>(g_resource_current)];
+    return;
+  }
+  const std::string media_width = MpvString("width");
+  const std::string media_height = MpvString("height");
+  const std::string video_codec = MpvString("video-codec");
+  const std::string media_format = MpvString("file-format");
+  g_native_resource_info.clear();
+  if (!media_width.empty() && !media_height.empty())
+    g_native_resource_info = Wide(media_width + "×" + media_height);
+  if (!video_codec.empty()) g_native_resource_info += (g_native_resource_info.empty() ? L"" : L" · ") + Wide(video_codec);
+  if (!media_format.empty()) g_native_resource_info += (g_native_resource_info.empty() ? L"" : L" · ") + Wide(media_format);
 }
 
 std::string PercentDecode(const std::string& value) {
@@ -1945,16 +1991,24 @@ std::vector<MediaTrack> ReadTracks(const char* wanted_type) {
   return tracks;
 }
 
+PanelItem PanelSlider(std::wstring label, std::string property, double value,
+                      double minimum, double maximum) {
+  PanelItem item;
+  item.row = PanelRow::Slider;
+  item.label = std::move(label);
+  item.property = std::move(property);
+  item.progress = std::clamp(value, minimum, maximum);
+  item.minimum = minimum;
+  item.maximum = maximum;
+  return item;
+}
+
 void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
   (void)owner;
-  (void)audio;
   g_subtitle_search_menu_open = false;
   const auto subtitles = ReadTracks("sub");
   const auto audio_tracks = ReadTracks("audio");
   std::vector<PanelItem> items;
-  items.push_back(PanelHeader(
-      kGlyphSubtitle, L"字幕与音轨",
-      std::to_wstring(subtitles.size() + audio_tracks.size()) + L" 条"));
   const auto add_track = [&items](wchar_t icon, std::wstring label,
                                   std::wstring detail, std::string property,
                                   std::string value, std::string toast,
@@ -1964,11 +2018,44 @@ void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
                                  std::move(toast), selected,
                                  std::move(badge));
     item.row = PanelRow::Track;
-    items.push_back(std::move(item));
+    if (selected && item.value != "auto" && item.value != "no" &&
+        item.property != "mova-subtitle-search") {
+      const auto first_track = std::find_if(items.begin(), items.end(),
+          [](const PanelItem& row) {
+            return row.row == PanelRow::Track && row.value != "auto" &&
+                   row.value != "no";
+          });
+      items.insert(first_track, std::move(item));
+    } else {
+      items.push_back(std::move(item));
+    }
   };
+  if (audio) {
+    const std::string audio_id = MpvString("aid");
+    items.push_back(PanelHeader(kGlyphSpeaker, L"声音",
+                                std::to_wstring(audio_tracks.size()) + L" 条"));
+    items.push_back(PanelNote(kGlyphInfo, L"音频轨道  " + std::to_wstring(audio_tracks.size()) + L" 条 · 音量  " +
+        std::to_wstring(static_cast<int>(g_volume.load())) + L"%"));
+    items.push_back(PanelNote(kGlyphInfo, L"音频延迟  " + std::to_wstring(static_cast<int>(
+        std::strtod(MpvString("audio-delay").c_str(), nullptr) * 1000)) + L" ms"));
+    add_track(kGlyphSparkles, L"自动选择", L"使用播放器的默认音轨", "aid",
+              "auto", "音轨：自动选择", audio_id == "auto");
+    for (const auto& track : audio_tracks) {
+      add_track(kGlyphSpeaker, track.title, track.detail, "aid", track.id,
+                "音轨：" + Utf8(track.title), track.selected,
+                track.is_default ? L"默认" : std::wstring());
+    }
+    if (audio_tracks.empty()) {
+      items.push_back(PanelNote(kGlyphInfo, L"当前片源没有其他音轨"));
+    }
+    OpenPanel(std::move(items), anchor, PanelMetrics{});
+    return;
+  }
   const std::string subtitle_id = MpvString("sid");
   items.push_back(PanelHeader(kGlyphSubtitle, L"字幕",
                               std::to_wstring(subtitles.size()) + L" 条"));
+  items.push_back(PanelNote(kGlyphInfo, L"字幕轨道  " + std::to_wstring(subtitles.size()) + L" 条 · 字幕延迟  " +
+      std::to_wstring(static_cast<int>(std::strtod(MpvString("sub-delay").c_str(), nullptr) * 1000)) + L" ms"));
   add_track(kGlyphSparkles, L"自动选择", L"按字幕语言偏好智能选择",
             "sid", "auto", "字幕：自动选择", subtitle_id == "auto");
   add_track(kGlyphSubtitle, L"关闭字幕", L"播放时不加载字幕轨道", "sid",
@@ -1984,19 +2071,6 @@ void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
   add_track(kGlyphSubtitle, L"在线搜索字幕", L"结果在此菜单内显示和应用",
             "mova-subtitle-search", "", "正在搜索字幕", false);
 
-  const std::string audio_id = MpvString("aid");
-  items.push_back(PanelHeader(kGlyphSpeaker, L"音轨",
-                              std::to_wstring(audio_tracks.size()) + L" 条"));
-  add_track(kGlyphSparkles, L"自动选择", L"使用播放器的默认音轨", "aid",
-            "auto", "音轨：自动选择", audio_id == "auto");
-  for (const auto& track : audio_tracks) {
-    add_track(kGlyphSpeaker, track.title, track.detail, "aid", track.id,
-              "音轨：" + Utf8(track.title), track.selected,
-              track.is_default ? L"默认" : std::wstring());
-  }
-  if (audio_tracks.empty()) {
-    items.push_back(PanelNote(kGlyphInfo, L"当前片源没有其他音轨"));
-  }
   PanelMetrics metrics;
   metrics.max_height = 560;
   OpenPanel(std::move(items), anchor, metrics);
@@ -2105,7 +2179,7 @@ void ShowPictureMenu(PanelAnchor anchor) {
   for (int index = 0; index < 4; ++index) {
     if (aspect_selected(aspect_values[index])) aspect_badge = aspect_labels[index];
   }
-  items.push_back(PanelHeader(kGlyphCrop, L"画面比例", aspect_badge));
+  items.push_back(PanelHeader(kGlyphCrop, L"画面", aspect_badge));
   for (int index = 0; index < 4; ++index) {
     items.push_back(PanelOption(kGlyphCrop, aspect_labels[index],
                                 aspect_details[index], "video-aspect-override",
@@ -2242,7 +2316,8 @@ std::wstring DanmakuDensityLabel(double value) {
   return L"密集";
 }
 
-void ApplyDanmakuSetting(const std::string& name, const std::string& value) {
+void ApplyDanmakuSetting(const std::string& name, const std::string& value,
+                         bool persist = true) {
   const double number = std::strtod(value.c_str(), nullptr);
   std::string emitted = value;
   if (name == "area") {
@@ -2309,7 +2384,7 @@ void ApplyDanmakuSetting(const std::string& name, const std::string& value) {
       slot = std::max(slot, item.free_at);
     }
   }
-  EmitSetting("yingji.danmaku." + name, emitted);
+  if (persist) EmitSetting("yingji.danmaku." + name, emitted);
   g_danmaku_dirty = true;
   if (g_danmaku) InvalidateRect(g_danmaku, nullptr, FALSE);
 }
@@ -2443,13 +2518,16 @@ void ShowDanmakuMenu(PanelAnchor anchor) {
   } else if (g_danmaku_loading) {
     items.push_back(PanelNote(kGlyphInfo, L"正在从弹幕服务获取…"));
     items.push_back(PanelNote(kGlyphInfo, L"获取完成后会自动叠加到画面上"));
-  } else if (!g_danmaku_error.empty()) {
+  } else if (!g_danmaku_error.empty() && g_danmaku_count <= 0) {
     items.push_back(PanelNote(kGlyphInfo, L"获取失败：" + g_danmaku_error));
     items.push_back(PanelNote(kGlyphInfo, L"可检查弹幕 API 地址与网络代理"));
     items.push_back(PanelOption(kGlyphGauge, L"重新获取弹幕",
                                 L"重新匹配当前集并跳过缓存",
                                 "mova-danmaku-reload", "", "", true));
   } else if (g_danmaku_count > 0) {
+    if (!g_danmaku_error.empty()) {
+      items.push_back(PanelNote(kGlyphInfo, L"刷新失败，保留已加载弹幕：" + g_danmaku_error));
+    }
     items.push_back(PanelNote(
         kGlyphInfo, L"已加载 " + std::to_wstring(g_danmaku_count) + L" 条弹幕"));
     if (!g_danmaku_matched.empty()) {
@@ -2477,33 +2555,6 @@ void ShowDanmakuMenu(PanelAnchor anchor) {
   // （改完立刻生效，并回写应用偏好让下次起播沿用）。每项一行、点按前进一档，
   // 面板不会因为档位多而滚不到底。
   items.push_back(PanelHeader(kGlyphCrop, L"显示设置", DanmakuAreaLabel(g_danmaku_area)));
-  const double area = g_danmaku_area;
-  items.push_back(PanelOption(
-      kGlyphCrop, L"显示区域",
-      // 四档比其它项多一档，写全「25% / 50% / 75% / 100%」会被行宽截断成
-      // 「10…」，所以省掉每个百分号后的空格。
-      L"当前 " + DanmakuAreaLabel(area) + L" · 可选 25/50/75/100",
-      "mova-danmaku-area", NextStep({0.25, 0.5, 0.75, 1.0}, area), "", false));
-  const double opacity = g_danmaku_opacity;
-  items.push_back(PanelOption(
-      kGlyphSparkles, L"不透明度",
-      L"当前 " + DanmakuOpacityLabel(opacity) + L" · 可选 淡 / 标准 / 清晰",
-      "mova-danmaku-opacity", NextStep({0.55, 0.82, 1.0}, opacity), "", false));
-  const double font = g_danmaku_font_size;
-  items.push_back(PanelOption(
-      kGlyphSubtitle, L"字号",
-      L"当前 " + DanmakuFontLabel(font) + L" · 可选 小 / 标准 / 大",
-      "mova-danmaku-font-size", NextStep({15.0, 18.0, 22.0}, font), "", false));
-  const double speed = g_danmaku_speed;
-  items.push_back(PanelOption(
-      kGlyphGauge, L"滚动速度",
-      L"当前 " + DanmakuSpeedLabel(speed) + L" · 可选 慢 / 标准 / 快",
-      "mova-danmaku-speed", NextStep({0.7, 1.0, 1.5}, speed), "", false));
-  const double density = g_danmaku_density;
-  items.push_back(PanelOption(
-      kGlyphEpisodes, L"同屏密度",
-      L"当前 " + DanmakuDensityLabel(density) + L" · 可选 稀疏 / 标准 / 密集",
-      "mova-danmaku-density", NextStep({0.35, 0.55, 0.8}, density), "", false));
   items.push_back(PanelOption(
       kGlyphCheckCircle, L"滚动弹幕",
       g_danmaku_scroll ? L"已开启 · 点按关闭" : L"已关闭 · 点按开启",
@@ -2519,8 +2570,32 @@ void ShowDanmakuMenu(PanelAnchor anchor) {
       g_danmaku_bottom ? L"已开启 · 点按关闭" : L"已关闭 · 点按开启",
       "mova-danmaku-bottom", g_danmaku_bottom ? "false" : "true", "",
       g_danmaku_bottom));
+  // Replace legacy cycling rows with the same continuous controls as Android.
+  for (auto& item : items) {
+    if (item.property == "mova-danmaku-reload") {
+      item.selected = false;
+      item.enabled = g_danmaku_enabled && !g_danmaku_loading;
+      if (g_danmaku_loading) item.label = L"正在重新获取";
+    }
+    if (item.row == PanelRow::Header && item.label == L"显示设置")
+      item.label = L"显示方式";
+    if (item.property == "mova-danmaku-scroll" || item.property == "mova-danmaku-top" ||
+        item.property == "mova-danmaku-bottom") {
+      item.row = PanelRow::Toggle;
+      item.detail.clear();
+      item.label = item.property == "mova-danmaku-scroll" ? L"滚动" :
+          item.property == "mova-danmaku-top" ? L"顶部固定" : L"底部固定";
+    }
+  }
+  items.push_back(PanelSlider(L"透明度", "mova-danmaku-opacity", g_danmaku_opacity, .15, 1));
+  items.push_back(PanelSlider(L"显示区域", "mova-danmaku-area", g_danmaku_area, .2, 1));
+  items.push_back(PanelSlider(L"密度", "mova-danmaku-density", g_danmaku_density, .2, 1));
+  items.push_back(PanelSlider(L"字体大小", "mova-danmaku-font-size", g_danmaku_font_size, 12, 30));
+  items.push_back(PanelSlider(L"滚动速度", "mova-danmaku-speed", g_danmaku_speed, .5, 2));
   OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
+
+void AppendChapterRows(std::vector<PanelItem>& items);
 
 void ShowSegmentMenu(PanelAnchor anchor) {
   std::vector<PanelItem> items;
@@ -2533,7 +2608,7 @@ void ShowSegmentMenu(PanelAnchor anchor) {
   } else {
     badge = L"无数据";
   }
-  items.push_back(PanelHeader(kGlyphScissors, L"片头片尾", badge));
+  items.push_back(PanelHeader(kGlyphScissors, L"章节与片头片尾", badge));
   // 自动跳过做成开关行（而不是只读说明）：这个开关在应用设置页里也有，
   // 两边都能改、改完互相回写，就不会出现「设置页关了但播放器还在跳」。
   items.push_back(PanelOption(
@@ -2613,11 +2688,11 @@ void ShowSegmentMenu(PanelAnchor anchor) {
             L" 秒后跳过",
         "mova-skip-cancel", "", "本次不再跳过", false));
   }
+  AppendChapterRows(items);
   OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
 
-void ShowChapterMenu(PanelAnchor anchor) {
-  std::vector<PanelItem> items;
+void AppendChapterRows(std::vector<PanelItem>& items) {
   const int count = std::atoi(MpvString("chapter-list/count").c_str());
   const int current = std::atoi(MpvString("chapter").c_str());
   std::wstring header = L"章节";
@@ -2638,8 +2713,9 @@ void ShowChapterMenu(PanelAnchor anchor) {
   if (count == 0) {
     items.push_back(PanelNote(kGlyphInfo, L"当前片源没有章节信息"));
   }
-  OpenPanel(std::move(items), anchor, PanelMetrics{});
 }
+
+void ShowChapterMenu(PanelAnchor anchor) { ShowSegmentMenu(anchor); }
 
 // 播放列表里出现过的不同季数个数。用来决定剧集面板要不要插分组标题 ——
 // 单季作品再插一行「第 1 季」只是噪音。
@@ -2853,6 +2929,7 @@ void ApplyEpisodeResources(EpisodeResourcesUpdate update) {
                            ? update.current
                            : -1;
   g_resource_revision = update.revision;
+  RefreshNativeResourceInfo();
 
   const bool resource_menu_open =
       g_panel && IsWindowVisible(g_panel) &&
@@ -3069,6 +3146,8 @@ void ShowControlsAt(int line) {
 
 void HideDwmWindowBorder(HWND window) {
   if (!window) return;
+  const DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
+  DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
   const COLORREF border_color = DWMWA_COLOR_NONE;
   DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &border_color,
                         sizeof(border_color));
@@ -3273,17 +3352,11 @@ void DrawIconsaxGlyph(Gdiplus::Graphics& graphics, wchar_t codepoint, float x,
   DrawGlyph(graphics, codepoint, x, y, size, color, mirror_x, shadow);
 }
 
-void DrawPlayIcon(Gdiplus::Graphics& graphics, float x, float y,
-                  float play_amount, float emphasis) {
-  const wchar_t glyph = play_amount > 0.5f ? L'\xEE64' : L'\xEE44';
-  DrawIconsaxGlyph(graphics, glyph, x, y, 25.0f + emphasis,
-                   IconInk(emphasis), false, true);
-}
-
 void DrawSpeaker(Gdiplus::Graphics& graphics, float x, float y, bool muted,
                  float emphasis) {
   DrawIconsaxGlyph(graphics, muted ? L'\xF097' : L'\xF08F', x, y,
-                   19.0f + emphasis, IconInk(emphasis), false, true);
+                   17.2f, muted ? Gdiplus::Color(255, 17, 24, 36)
+                                : IconInk(emphasis), false, !muted);
 }
 
 // 上一集 / 下一集：字体里没有 Iconsax 的 next / previous（图标集在构建时被
@@ -3291,10 +3364,10 @@ void DrawSpeaker(Gdiplus::Graphics& graphics, float x, float y, bool muted,
 // 下一步用镜像，而不是硬塞一个语意不相干的图标。
 void DrawSkipIcon(Gdiplus::Graphics& graphics, float x, float y, bool next,
                   float emphasis, bool enabled = true) {
-  DrawIconsaxGlyph(graphics, L'\xE964', x, y, 22.0f + emphasis,
+  DrawIconsaxGlyph(graphics, kGlyphChevronRight, x, y, 17.2f,
                    enabled ? IconInk(emphasis)
                            : Gdiplus::Color(128, 204, 206, 212),
-                   next, true);
+                   !next, true);
 }
 
 void DrawSeekIcon(Gdiplus::Graphics& graphics, float x, float y, bool forward,
@@ -3359,13 +3432,13 @@ wchar_t ToolGlyph(ControlId control) {
     case kDanmaku:
       return kGlyphDanmaku;
     case kPicture:
-      return L'\xF06E';
+      return kGlyphCrop;
     case kSpeed:
       return L'\xEFAE';
     case kChapters:
       return L'\xE9EC';
     case kEpisodes:
-      return kGlyphEpisodes;
+      return L'\xE9F6';
     case kSegments:
       return L'\xEE3E';
     case kPlaylist:
@@ -3414,8 +3487,8 @@ ControlId ToolControl(const std::string& tool) {
   if (tool == "弹幕") return kDanmaku;
   if (tool == "画面") return kPicture;
   if (tool == "倍速") return kSpeed;
-  if (tool == "章节") return kChapters;
-  if (tool == "剧集") return kEpisodes;
+  if (tool == "章节") return kSegments;
+  if (tool == "剧集" || tool == "全集列表") return kEpisodes;
   if (tool == "片头片尾") return kSegments;
   if (tool == "资源") return kPlaylist;
   return kNone;
@@ -3440,8 +3513,23 @@ std::vector<ControlId> ConfiguredTools() {
 }
 
 float ToolAreaStart(int width) {
-  const float transport_right = width / 2.0f + (width < 780 ? 104.0f : 166.0f);
-  return transport_right + 24.0f;
+  const bool episodes = width >= 780 && g_playlist_titles.size() > 1;
+  const float dock_width = (episodes ? 216.0f : 128.0f) +
+                           (width >= 480 ? 120.0f : 0.0f) + 28.0f;
+  return 24.0f + dock_width + 14.0f;
+}
+
+std::vector<std::pair<ControlId, float>> TransportLayout(int width) {
+  std::vector<ControlId> controls;
+  if (width >= 780 && g_playlist_titles.size() > 1)
+    controls.push_back(kPreviousEpisode);
+  controls.insert(controls.end(), {kBackTen, kPlayPause, kForwardTen});
+  if (width >= 780 && g_playlist_titles.size() > 1)
+    controls.push_back(kNextEpisode);
+  std::vector<std::pair<ControlId, float>> result;
+  for (size_t i = 0; i < controls.size(); ++i)
+    result.push_back({controls[i], 58.0f + static_cast<float>(i) * 44.0f});
+  return result;
 }
 
 bool CanSelectPlaylistStep(int direction) {
@@ -3454,10 +3542,10 @@ bool CanSelectPlaylistStep(int direction) {
 // 该按钮已移除（全屏仍可用画面双击与快捷键触发）。
 int ToolSlotCapacity(int width) {
   const bool compact = width < 780;
-  const float reserved_for_volume = compact ? 0.0f : 120.0f;
+  const float reserved_for_volume = compact ? 28.0f : 134.0f;
   const float available = width - 24.0f - ToolAreaStart(width) -
                           reserved_for_volume;
-  return std::max(0, static_cast<int>(std::floor(available / 40.0f)));
+  return std::max(0, static_cast<int>(std::floor((available + 4.0f) / 44.0f)));
 }
 
 std::vector<ControlId> OverflowTools(int width) {
@@ -3488,13 +3576,14 @@ std::vector<std::pair<ControlId, float>> ToolLayout(int width) {
   const bool overflow = static_cast<int>(tools.size()) > slots;
   const int shown = overflow ? std::max(0, slots - 1)
                              : std::min(static_cast<int>(tools.size()), slots);
-  const float start = ToolAreaStart(width) + (width < 780 ? 0.0f : 120.0f);
+  const int count = shown + (overflow ? 1 : 0);
+  const float start = width - 38.0f - (count * 44.0f - 4.0f);
   for (int index = 0; index < shown; ++index) {
     result.push_back({tools[static_cast<size_t>(index)],
-                      start + 20.0f + index * 40.0f});
+                      start + 20.0f + index * 44.0f});
   }
   if (overflow) {
-    result.push_back({kMore, start + 20.0f + shown * 40.0f});
+    result.push_back({kMore, start + 20.0f + shown * 44.0f});
   }
   return result;
 }
@@ -3502,15 +3591,30 @@ std::vector<std::pair<ControlId, float>> ToolLayout(int width) {
 float HoverAmount(ControlId id);
 
 float VolumeStart(int width) {
-  return ToolAreaStart(width) + 46.0f;
+  const auto tools = ToolLayout(width);
+  const float tools_left = tools.empty() ? width - 38.0f
+                                         : tools.front().second - 20.0f;
+  return tools_left - 62.0f;
 }
 
 void DrawToolIcon(Gdiplus::Graphics& graphics, ControlId control, float x,
                   float y) {
+  if (control == kSpeed) {
+    auto font = MakeInterfaceFont(11.5f, Gdiplus::FontStyleRegular);
+    Gdiplus::StringFormat format;
+    format.SetAlignment(Gdiplus::StringAlignmentCenter);
+    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    std::wstring label = SpeedLabel(g_speed.load());
+    label.back() = L'x';
+    Gdiplus::SolidBrush ink(IconInk(HoverAmount(control)));
+    graphics.DrawString(label.c_str(), -1, &font,
+                        Gdiplus::RectF(x - 20, y - 20, 40, 40), &format, &ink);
+    return;
+  }
   const wchar_t glyph = ToolGlyph(control);
   if (glyph == 0) return;
   const float emphasis = HoverAmount(control);
-  DrawIconsaxGlyph(graphics, glyph, x, y, 19.0f + emphasis,
+  DrawIconsaxGlyph(graphics, glyph, x, y, 17.2f,
                    IconInk(emphasis), false, true);
 }
 
@@ -3632,26 +3736,23 @@ ControlId HitControl(int x, int y, int width) {
   if (y < 34) return kNone;
   // 播放失败后的「重新播放」：占住左下时间码那一行。命中区比胶囊本身略宽，
   // 手抖也点得中。放在 y<34 之后，所以进度条（含拖动）那一带完全不受影响。
-  if (g_playback_error.load() && x >= 20 && x <= 152) return kReplay;
+  if (g_playback_error.load() && y < 52 && x >= 20 && x <= 152) return kReplay;
+  if (y < 52 || y > 92) return kNone;
   const bool compact = width < 780;
-  const int center = width / 2;
-  if (!compact && x >= center - 166 && x < center - 116 &&
-      CanSelectPlaylistStep(-1))
-    return kPreviousEpisode;
-  if (x >= center - 104 && x < center - 48) return kBackTen;
-  if (x >= center - 28 && x <= center + 28) return kPlayPause;
-  if (x > center + 48 && x <= center + 104) return kForwardTen;
-  if (!compact && x > center + 116 && x <= center + 166 &&
-      CanSelectPlaylistStep(1))
-    return kNextEpisode;
+  for (const auto& item : TransportLayout(width)) {
+    if (std::abs(x - item.second) > 20.0f) continue;
+    if (item.first == kPreviousEpisode && !CanSelectPlaylistStep(-1)) return kNone;
+    if (item.first == kNextEpisode && !CanSelectPlaylistStep(1)) return kNone;
+    return item.first;
+  }
   for (const auto& item : ToolLayout(width)) {
-    if (x >= item.second - 19 && x < item.second + 19) return item.first;
+    if (x >= item.second - 20 && x < item.second + 20) return item.first;
   }
   if (compact) return kNone;
   const float volume_start = VolumeStart(width);
   const float volume_end = volume_start + 58;
   if (x >= volume_start - 5 && x <= volume_end + 5) return kVolume;
-  if (x >= volume_start - 45 && x < volume_start - 7) return kMute;
+  if (x >= volume_start - 44 && x < volume_start - 4) return kMute;
   return kNone;
 }
 
@@ -3672,9 +3773,27 @@ void DrawHover(Gdiplus::Graphics& graphics, ControlId id, float x, float y,
                     0.5f);
   Gdiplus::GraphicsPath disc_path;
   AddRoundedRectPath(disc_path, disc, disc.Width / 2.0f);
-  FillGlassSurface(graphics, disc_path, disc, GlassDiscAlpha(false),
-                   GlassDiscAlpha(true), true);
-  StrokeGlassEdge(graphics, disc_path);
+  // The dock already provides contrast: keep its circular controls light.
+  Gdiplus::LinearGradientBrush button_surface(
+      Gdiplus::PointF(disc.X, disc.Y), Gdiplus::PointF(disc.X, disc.GetBottom()),
+      Gdiplus::Color(24, 255, 255, 255), Gdiplus::Color(8, 255, 255, 255));
+  graphics.FillPath(&button_surface, &disc_path);
+  Gdiplus::Pen button_edge(Gdiplus::Color(
+      static_cast<BYTE>(enabled ? 24.0f + amount * 48.0f : 12.0f),
+      255, 255, 255), 0.8f);
+  graphics.DrawPath(&button_edge, &disc_path);
+  if (selected && enabled) {
+    Gdiplus::LinearGradientBrush selection(
+        Gdiplus::PointF(disc.X, disc.Y),
+        Gdiplus::PointF(disc.GetRight(), disc.GetBottom()),
+        Gdiplus::Color(245, 255, 255, 255), Gdiplus::Color(242, 250, 252, 255));
+    const Gdiplus::Color colors[] = {Gdiplus::Color(245, 255, 255, 255),
+        Gdiplus::Color(234, 243, 245, 248), Gdiplus::Color(219, 213, 221, 230),
+        Gdiplus::Color(242, 250, 252, 255)};
+    const float stops[] = {0, .34f, .76f, 1};
+    selection.SetInterpolationColors(colors, stops, 4);
+    graphics.FillPath(&selection, &disc_path);
+  }
   const float pressed = enabled ? PressAmount(id) : 0.0f;
   const BYTE lit_alpha = static_cast<BYTE>(std::max(
       selected && enabled ? 32.0f : 0.0f,
@@ -3729,6 +3848,19 @@ Gdiplus::Bitmap* CachedImage(const std::wstring& path) {
       image->GetHeight() == 0) {
     g_image_missing.insert(path);
     return nullptr;
+  }
+  // Menu thumbnails never need full-resolution poster pixels on each frame.
+  const float shrink = std::min(1.0f, 320.0f /
+      static_cast<float>(std::max(image->GetWidth(), image->GetHeight())));
+  if (shrink < 1.0f) {
+    auto thumbnail = std::make_unique<Gdiplus::Bitmap>(
+        std::max(1, static_cast<int>(image->GetWidth() * shrink)),
+        std::max(1, static_cast<int>(image->GetHeight() * shrink)), PixelFormat32bppPARGB);
+    Gdiplus::Graphics painter(thumbnail.get());
+    painter.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    painter.DrawImage(image.get(), 0, 0, static_cast<int>(thumbnail->GetWidth()),
+                      static_cast<int>(thumbnail->GetHeight()));
+    if (thumbnail->GetLastStatus() == Gdiplus::Ok) image = std::move(thumbnail);
   }
   Gdiplus::Bitmap* raw = image.get();
   g_image_cache.emplace(path, std::move(image));
@@ -3830,9 +3962,10 @@ void DrawServerMark(Gdiplus::Graphics& graphics, const Gdiplus::RectF& box,
 // GDI+ 无法像 Skia 那样取可变字体的粗体实例，请求 FontStyleBold 只会拿回同一
 // 个字面。所以层级靠字号 + 颜色拉，而不是靠字重。
 struct PanelSkin {
-  Gdiplus::Font header = MakeInterfaceFont(15, Gdiplus::FontStyleRegular);
-  Gdiplus::Font title = MakeInterfaceFont(13, Gdiplus::FontStyleRegular);
-  Gdiplus::Font detail = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
+  Gdiplus::Font header = MakeInterfaceFont(18, Gdiplus::FontStyleRegular);
+  Gdiplus::Font group = MakeInterfaceFont(14, Gdiplus::FontStyleRegular);
+  Gdiplus::Font title = MakeInterfaceFont(14, Gdiplus::FontStyleRegular);
+  Gdiplus::Font detail = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
   Gdiplus::Font chip = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
   Gdiplus::Font note = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
   Gdiplus::SolidBrush ink{Gdiplus::Color(248, 245, 247, 249)};
@@ -3862,6 +3995,58 @@ float MeasurePanelText(Gdiplus::Graphics& graphics, const wchar_t* text,
 }
 
 
+float PanelSliderStart(const PanelBox& box) { return box.x + 84.0f; }
+float PanelSliderEnd(const PanelBox& box) { return box.x + box.w - 52.0f; }
+
+void DrawPanelSlider(Gdiplus::Graphics& graphics, const PanelSkin& skin,
+                     const PanelItem& item, const PanelBox& box, float top) {
+  const float left = kPanelShadowMargin + PanelSliderStart(box);
+  const float right = kPanelShadowMargin + PanelSliderEnd(box);
+  const float y = top + box.h / 2.0f;
+  const float fraction = static_cast<float>((item.progress - item.minimum) /
+      (item.maximum - item.minimum));
+  Gdiplus::StringFormat format;
+  format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+  graphics.DrawString(item.label.c_str(), -1, &skin.detail,
+      Gdiplus::RectF(kPanelShadowMargin + box.x, top, 80, box.h), &format, &skin.ink);
+  Gdiplus::Pen track(Gdiplus::Color(50, 255, 255, 255), 3.0f);
+  Gdiplus::Pen fill(Gdiplus::Color(225, 235, 238, 243), 3.0f);
+  const float thumb = left + (right - left) * fraction;
+  graphics.DrawLine(&track, left, y, right, y);
+  graphics.DrawLine(&fill, left, y, thumb, y);
+  graphics.FillEllipse(&skin.icon_bright, Gdiplus::RectF(thumb - 5.0f, y - 5.0f, 10.0f, 10.0f));
+  std::wstring value;
+  if (item.property == "mova-danmaku-font-size") value = std::to_wstring(static_cast<int>(std::lround(item.progress)));
+  else if (item.property == "mova-danmaku-speed") {
+    wchar_t text[24]{};
+    swprintf_s(text, L"%.1f×", item.progress);
+    value = text;
+  } else value = std::to_wstring(static_cast<int>(std::lround(item.progress * 100))) + L"%";
+  format.SetAlignment(Gdiplus::StringAlignmentFar);
+  graphics.DrawString(value.c_str(), -1, &skin.detail,
+      Gdiplus::RectF(right + 8, top, 44, box.h), &format, &skin.muted);
+}
+
+int g_panel_drag_slider = -1;
+
+void SetPanelSlider(int index, double value, bool persist) {
+  if (index < 0 || index >= static_cast<int>(g_panel_items.size())) return;
+  auto& item = g_panel_items[index];
+  if (item.row != PanelRow::Slider) return;
+  item.progress = std::clamp(value, item.minimum, item.maximum);
+  ApplyDanmakuSetting(item.property.substr(13), NumberText(item.progress), persist);
+  InvalidateRect(g_panel, nullptr, FALSE);
+}
+
+void DragPanelSlider(int x, bool persist) {
+  if (g_panel_drag_slider < 0 || g_panel_drag_slider >= static_cast<int>(g_panel_boxes.size())) return;
+  const auto& box = g_panel_boxes[g_panel_drag_slider];
+  const auto& item = g_panel_items[g_panel_drag_slider];
+  const double fraction = std::clamp((x - kPanelShadowMargin - PanelSliderStart(box)) /
+      std::max(1.0f, PanelSliderEnd(box) - PanelSliderStart(box)), 0.0f, 1.0f);
+  SetPanelSlider(g_panel_drag_slider, item.minimum + fraction * (item.maximum - item.minimum), persist);
+}
+
 void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                         const PanelItem& item, const Gdiplus::RectF& row,
                         bool hovered) {
@@ -3875,12 +4060,23 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   const Gdiplus::Color card_fill_color(fill_alpha, 255, 255, 255);
   Gdiplus::SolidBrush card_fill(card_fill_color);
   graphics.FillPath(&card_fill, &card);
-  const BYTE edge_alpha = item.selected ? BYTE{112}
-                                        : (hovered ? BYTE{65} : BYTE{0});
+  const BYTE edge_alpha = item.row == PanelRow::Toggle
+      ? (item.selected ? BYTE{70} : (hovered ? BYTE{40} : BYTE{0})) : BYTE{0};
   const Gdiplus::Color edge_color(edge_alpha, 255, 255, 255);
   Gdiplus::Pen card_edge(edge_color, item.selected ? 1.25f : 1.0f);
   graphics.DrawPath(&card_edge, &card);
-  if (item.selected) {
+  if (item.row == PanelRow::Toggle) {
+    Gdiplus::StringFormat format;
+    format.SetAlignment(Gdiplus::StringAlignmentCenter);
+    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    const float leading = item.selected ? 14.0f : 0.0f;
+    graphics.DrawString(item.label.c_str(), -1, &skin.detail,
+        Gdiplus::RectF(row.X + leading, row.Y, row.Width - leading, row.Height), &format, &skin.ink);
+    if (item.selected) DrawGlyph(graphics, kGlyphCheckCircle, row.X + 14, row.Y + row.Height / 2, 14,
+        Gdiplus::Color(245, 240, 243, 247));
+    return;
+  }
+  if (item.selected && item.row == PanelRow::Toggle) {
     Gdiplus::GraphicsPath sheen;
     AddRoundedRectPath(
         sheen,
@@ -3893,6 +4089,7 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
 
   // 前置图标容器与应用弹窗 _TrackPickerOption 逐项对齐：36px 圆角方块、圆角 12、
   // 内部 Icon(size: 17)，左边距 12、与文字间距 11。
+  const bool track_row = item.row == PanelRow::Track;
   const float tile = 36.0f;
   const Gdiplus::RectF tile_rect(row.X + 12.0f,
                                  row.Y + (row.Height - tile) / 2.0f, tile, tile);
@@ -3910,11 +4107,7 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     graphics.Restore(state);
   } else if (item.mark != 0) {
     DrawServerMark(graphics, tile_rect, item.mark);
-  } else {
-    const BYTE tile_alpha = item.selected ? BYTE{36} : BYTE{14};
-    const Gdiplus::Color tile_color(tile_alpha, 255, 255, 255);
-    Gdiplus::SolidBrush tile_fill(tile_color);
-    graphics.FillPath(&tile_fill, &tile_path);
+  } else if (!track_row) {
     if (item.icon != 0) {
       DrawGlyph(graphics, item.icon, tile_rect.X + tile / 2.0f,
                 tile_rect.Y + tile / 2.0f, 17.0f,
@@ -3939,7 +4132,7 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     graphics.DrawPath(&ring_pen, &ring_path);
   }
 
-  const float text_left = tile_rect.GetRight() + 11.0f;
+  const float text_left = track_row ? row.X + 16.0f : tile_rect.GetRight() + 11.0f;
   const float trailing_x = row.GetRight() - 21.0f;
   const float text_right = trailing_x - 17.0f;
   Gdiplus::StringFormat format;
@@ -3961,7 +4154,7 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   }
   const bool single_line = item.detail.empty();
   const Gdiplus::RectF label_box(
-      text_left, single_line ? row.Y + 19.0f : row.Y + 10.0f,
+      text_left, single_line ? row.Y + (row.Height - 18.0f) / 2.0f : row.Y + 10.0f,
       std::max(0.0f, title_right - text_left), 18.0f);
   // 主标题走带暗影的那支：面板透出画面之后，白字全靠这层影子压住对比度。
   DrawGlassText(graphics, item.label.c_str(), skin.title, label_box, format,
@@ -3977,9 +4170,8 @@ void DrawPanelOptionRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
 
   // 末尾状态：选中的勾、可展开的箭头、其余的圆形单选圈。
   const bool opens_panel = item.property == "mova-open-tool";
-  const wchar_t state = item.selected ? kGlyphCheckCircle
-                                      : (opens_panel ? kGlyphChevronRight
-                                                     : kGlyphRadio);
+  if (!item.selected && !opens_panel) return;
+  const wchar_t state = item.selected ? kGlyphCheckCircle : kGlyphChevronRight;
   const BYTE state_alpha = opens_panel ? BYTE{210} : BYTE{150};
   const Gdiplus::Color state_ink = item.selected
                                        ? Gdiplus::Color(255, 244, 247, 248)
@@ -4000,7 +4192,7 @@ void DrawPanelHeaderRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
   format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
   format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-  DrawGlassText(graphics, item.label.c_str(), skin.header,
+  DrawGlassText(graphics, item.label.c_str(), skin.group,
                 Gdiplus::RectF(row.X + 30.0f, row.Y,
                                std::max(0.0f, row.Width - 90.0f), row.Height),
                 format, skin.ink);
@@ -4032,12 +4224,18 @@ void DrawPanelNoteRow(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   }
   Gdiplus::StringFormat format;
   format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-  format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-  format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+  if (!item.expanded) format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+  format.SetTrimming(item.expanded ? Gdiplus::StringTrimmingNone
+                                  : Gdiplus::StringTrimmingEllipsisCharacter);
   DrawGlassText(graphics, item.label.c_str(), skin.note,
                 Gdiplus::RectF(row.X + 30.0f, row.Y,
-                               std::max(0.0f, row.Width - 40.0f), row.Height),
+                               std::max(0.0f, row.Width - 58.0f), row.Height),
                 format, skin.muted);
+  if (item.enabled) {
+    DrawGlassText(graphics, item.expanded ? L"−" : L"+", skin.note,
+                  Gdiplus::RectF(row.GetRight() - 24.0f, row.Y, 20.0f, row.Height),
+                  format, skin.muted);
+  }
 }
 
 // 剧集行：一行一集。缩略图在左（16:9），缩略图底部叠观看进度与时间；右侧
@@ -4096,7 +4294,7 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
 
   // 缩略图底部的进度条与时间。已播完的集整块不画（对勾已经说明状态）；
   // 没看过的集只画时长，避免出现一条空进度槽和没有意义的 00:00:00。
-  const bool has_progress = !item.watched && item.progress > 0.0;
+  const bool has_progress = item.watched || item.progress > 0.0;
   if (has_progress || (!item.watched && item.duration > 0.0)) {
     const Gdiplus::GraphicsState state = graphics.Save();
     // 同上：进度段与视口裁切取交集，防止滚出视口的内容画出面板。
@@ -4114,7 +4312,7 @@ void DrawPanelEpisodeCard(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     ConfigureControlPen(track);
     graphics.DrawLine(&track, bar_left, bar_y, bar_left + bar_width, bar_y);
     const float fraction =
-        static_cast<float>(std::clamp(item.progress, 0.0, 1.0));
+        item.watched ? 1.0f : static_cast<float>(std::clamp(item.progress, 0.0, 1.0));
     if (has_progress && fraction > 0.0f) {
       Gdiplus::Pen value(Gdiplus::Color(255, 250, 250, 252), 2.6f);
       ConfigureControlPen(value);
@@ -4595,31 +4793,82 @@ void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                                       body_rect.Y - spread + 3.0f,
                                       body_width + spread * 2.0f,
                                       body_height + spread * 2.0f),
-                       16.0f + spread);
+                       24.0f + spread);
     const BYTE shadow_alpha = step == kShadowSteps ? BYTE{3} : BYTE{9};
     Gdiplus::SolidBrush shadow(Gdiplus::Color(shadow_alpha, 0, 0, 0));
     graphics.FillPath(&shadow, &ring);
   }
 
   Gdiplus::GraphicsPath body;
-  AddRoundedRectPath(body, body_rect, 16.0f);
+  AddRoundedRectPath(body, body_rect, 24.0f);
   // 所有原生二级菜单共用固定雾面材质，不实时读取视频背板。
   FillStaticPlayerMenuSurface(graphics, body, body_rect);
   StrokeStaticPlayerMenuEdge(graphics, body);
+
+  const float title_height = PanelTitleHeight();
+  if (title_height > 0) {
+    Gdiplus::StringFormat title_format;
+    title_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    title_format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    title_format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    DrawGlassText(graphics, g_panel_items.front().label.c_str(), skin.header,
+        Gdiplus::RectF(body_rect.X + kPanelPadding, body_rect.Y + 18.0f,
+            body_width - kPanelPadding * 2.0f - 48.0f, 36.0f), title_format, skin.ink);
+    const Gdiplus::RectF close_rect(body_rect.GetRight() - kPanelPadding - 36.0f,
+        body_rect.Y + 18.0f, 36.0f, 36.0f);
+    Gdiplus::SolidBrush close_fill(Gdiplus::Color(24, 255, 255, 255));
+    Gdiplus::Pen close_edge(Gdiplus::Color(76, 255, 255, 255), .8f);
+    graphics.FillEllipse(&close_fill, close_rect);
+    graphics.DrawEllipse(&close_edge, close_rect);
+    Gdiplus::Pen cross(Gdiplus::Color(240, 255, 255, 255), 1.6f);
+    const float cx = close_rect.X + 18.0f;
+    const float cy = close_rect.Y + 18.0f;
+    graphics.DrawLine(&cross, cx - 4.0f, cy - 4.0f, cx + 4.0f, cy + 4.0f);
+    graphics.DrawLine(&cross, cx + 4.0f, cy - 4.0f, cx - 4.0f, cy + 4.0f);
+  }
 
   // 行内容裁到「内容视口」而不是整个面板体：body 的上下 padding 区留给面板
   // 底色。以前裁到 body_rect，滚动定位后上方行的下半截（缩略图、时间戳）会悬
   // 在面板顶部 padding 区，卡片圆角和面板圆角错位、再往上是透明阴影区，看起来
   // 就像内容画出了面板。收紧后在视口边界干净切断，和任何滚动列表一致。
   const Gdiplus::RectF content_rect(
-      body_rect.X + kPanelPadding, body_rect.Y + kPanelPadding,
-      body_width - kPanelPadding * 2.0f, body_height - kPanelPadding * 2.0f);
+      body_rect.X + kPanelPadding, body_rect.Y + kPanelPadding + title_height,
+      body_width - kPanelPadding * 2.0f,
+      std::max(0.0f, body_height - kPanelPadding * 2.0f - title_height));
   graphics.SetClip(content_rect);
+  // Consecutive choices share one grouped surface, not nested row cards.
+  for (size_t first = 0; first < g_panel_items.size(); ++first) {
+    const auto grouped = [](const PanelItem& item) {
+      return item.row == PanelRow::Option || item.row == PanelRow::Track;
+    };
+    if (!grouped(g_panel_items[first])) continue;
+    size_t last = first;
+    while (last + 1 < g_panel_items.size() && grouped(g_panel_items[last + 1])) ++last;
+    const auto& start = g_panel_boxes[first];
+    const auto& end = g_panel_boxes[last];
+    const float top = kPanelShadowMargin + title_height + start.y - g_panel_scroll;
+    Gdiplus::GraphicsPath group;
+    AddRoundedRectPath(group, Gdiplus::RectF(kPanelShadowMargin + start.x, top,
+        start.w, end.y + end.h - start.y), 12.0f);
+    Gdiplus::SolidBrush group_fill(Gdiplus::Color(10, 255, 255, 255));
+    graphics.FillPath(&group_fill, &group);
+    Gdiplus::Pen divider(Gdiplus::Color(20, 255, 255, 255), 0.7f);
+    for (size_t line = first; line < last; ++line) {
+      const auto& box = g_panel_boxes[line];
+      const float y = kPanelShadowMargin + title_height + box.y + box.h +
+                      kPanelRowGap / 2.0f - g_panel_scroll;
+      const float inset = g_panel_items[line].row == PanelRow::Track ? 16.0f : 59.0f;
+      graphics.DrawLine(&divider, kPanelShadowMargin + box.x + inset, y,
+          kPanelShadowMargin + box.x + box.w - 16.0f, y);
+    }
+    first = last;
+  }
   for (size_t index = 0; index < g_panel_items.size(); ++index) {
     if (index >= g_panel_boxes.size()) break;
+    if (index == 0 && title_height > 0) continue;
     const PanelItem& item = g_panel_items[index];
     const PanelBox& box = g_panel_boxes[index];
-    const float top = static_cast<float>(kPanelShadowMargin) + box.y -
+    const float top = static_cast<float>(kPanelShadowMargin) + title_height + box.y -
                       static_cast<float>(g_panel_scroll);
     if (top + box.h < 0.0f || top > height) continue;
     const Gdiplus::RectF row(static_cast<float>(kPanelShadowMargin) + box.x, top,
@@ -4627,7 +4876,9 @@ void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
     const bool hovered = item.enabled &&
         (g_panel_hover == static_cast<int>(index) ||
          (g_panel_keyboard_mode && g_panel_focus == static_cast<int>(index)));
-    if (item.row == PanelRow::Header) {
+    if (item.row == PanelRow::Slider) {
+      DrawPanelSlider(graphics, skin, item, box, top);
+    } else if (item.row == PanelRow::Header) {
       DrawPanelHeaderRow(graphics, skin, item, row);
     } else if (item.row == PanelRow::Note) {
       DrawPanelNoteRow(graphics, skin, item, row);
@@ -4745,6 +4996,10 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
     }
     case WM_MOUSEMOVE: {
       const float scale = UiScale();
+      if (g_panel_drag_slider >= 0) {
+        DragPanelSlider(static_cast<int>(GET_X_LPARAM(lparam) / scale), false);
+        return 0;
+      }
       const int next = PanelIndexAt(
           static_cast<int>(GET_X_LPARAM(lparam) / scale),
           static_cast<int>(GET_Y_LPARAM(lparam) / scale));
@@ -4790,7 +5045,18 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
       }
       if (index < static_cast<int>(g_panel_items.size())) {
         const auto item = g_panel_items[index];
-        if (item.enabled && item.property == "mova-open-tool") {
+        if (item.enabled && item.property == "mova-expand-note") {
+          g_panel_items[index].expanded = !item.expanded;
+          LayoutPanelRows();
+          g_panel_scroll = std::clamp(g_panel_scroll, 0, PanelMaxScroll());
+          g_panel_scroll_target = -1;
+          InvalidateRect(window, nullptr, FALSE);
+        } else if (item.enabled && item.row == PanelRow::Slider) {
+          g_panel_drag_slider = index;
+          g_panel_focus = index;
+          SetCapture(window);
+          DragPanelSlider(static_cast<int>(GET_X_LPARAM(lparam) / scale), false);
+        } else if (item.enabled && item.property == "mova-open-tool") {
           const auto control =
               static_cast<ControlId>(std::atoi(item.value.c_str()));
           // 沿用当前面板的锚点在原位换一个面板。以前是从面板角落再算一次锚点，
@@ -4967,7 +5233,29 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
     case WM_MOUSEWHEEL:
       ScrollPanel(GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? -80 : 80);
       return 0;
+    case WM_LBUTTONUP:
+      if (g_panel_drag_slider >= 0) {
+        DragPanelSlider(static_cast<int>(GET_X_LPARAM(lparam) / UiScale()), true);
+        g_panel_drag_slider = -1;
+        ReleaseCapture();
+      }
+      return 0;
+    case WM_CAPTURECHANGED:
+      if (g_panel_drag_slider >= 0) {
+        const int index = g_panel_drag_slider;
+        g_panel_drag_slider = -1;
+        SetPanelSlider(index, g_panel_items[index].progress, true);
+      }
+      return 0;
     case WM_KEYDOWN:
+      if ((wparam == VK_LEFT || wparam == VK_RIGHT) && g_panel_focus >= 0 &&
+          g_panel_focus < static_cast<int>(g_panel_items.size()) &&
+          g_panel_items[g_panel_focus].row == PanelRow::Slider) {
+        const auto& item = g_panel_items[g_panel_focus];
+        SetPanelSlider(g_panel_focus, item.progress + (wparam == VK_RIGHT ? 1 : -1) *
+            (item.maximum - item.minimum) / 100.0, true);
+        return 0;
+      }
       if (wparam == VK_ESCAPE) {
         g_subtitle_search_menu_open = false;
         g_panel_keyboard_mode = false;
@@ -5025,6 +5313,7 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
   g_panel_hover = -1;
   g_panel_focus = -1;
   g_panel_keyboard_mode = false;
+  g_panel_scroll_target = -1;
   if (!preserve_scroll) g_panel_scroll = 0;
   // 度量与布局全部是设计稿坐标；窗口开成缩放后的物理大小，绘制端用
   // ScaleTransform 一次放大，滚动、命中继续留在设计坐标系，两套坐标不混算。
@@ -5078,7 +5367,8 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
       std::min(PanelContentHeight(),
                static_cast<int>(max_content / std::max(0.1f, UiScale()))));
   const int content = Scaled(content_design);
-  g_panel_viewport_height = content_design - kPanelPadding * 2;
+  g_panel_viewport_height = std::max(1, content_design - kPanelPadding * 2 -
+      static_cast<int>(PanelTitleHeight()));
   // 打开时把指定的行滚进视野：剧集面板要定位到正在播的那一集，而不是永远从
   // 第一集开始。把当前集顶到内容区第一行，一打开视线就落在它上面；越靠近
   // 列表末尾时由 clamp 兜底，不会滚过头。
@@ -5159,18 +5449,8 @@ Gdiplus::Color HintToneColor(HintTone tone, BYTE alpha = 255) {
 void FillHintGlassSurface(Gdiplus::Graphics& graphics,
                           const Gdiplus::GraphicsPath& path,
                           const Gdiplus::RectF& rect) {
-  // 提示只使用一种固定的轻透明胶囊。它不采样视频背板，也不随状态或模糊设置
-  // 换材质，避免后台背板就绪后同一条提示突然变色、连续操作复用旧画面。
-  constexpr int kHintGlassTopAlpha = 14;
-  constexpr int kHintGlassBottomAlpha = 24;
-  FillGlassSurface(graphics, path, rect, kHintGlassTopAlpha,
-                   kHintGlassBottomAlpha);
-  // 高光渐变覆盖完整胶囊，避免渐变在中途结束时出现水平断层。
-  Gdiplus::LinearGradientBrush sheen(
-      Gdiplus::PointF(rect.X, rect.Y),
-      Gdiplus::PointF(rect.X, rect.GetBottom()),
-      Gdiplus::Color(18, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255));
-  graphics.FillPath(&sheen, &path);
+  // Shared fixed material: state colours affect symbols, never the background.
+  FillStaticPlayerMenuSurface(graphics, path, rect);
 }
 
 HintMode g_hint_mode = HintMode::Hidden;
@@ -5319,7 +5599,8 @@ void MeasureHint(const std::wstring& text, const std::wstring& detail,
   const int body_width = content_left + text_width + value_width + kHintPadding;
   // 常规操作统一基准尺寸。连续从快进切到音量、再拖进度时不再反复缩放窗口，
   // 避免 layered window 重建过程中短暂沿用上一条提示的裁剪区域。
-  const int minimum_width = layout == HintLayout::Episode ? 250 : 270;
+  const int minimum_width = layout == HintLayout::Episode ? 250
+      : (HintDetailIsValue(text) ? 160 : 240);
   const int base_height = layout == HintLayout::Episode
                               ? (second_row ? 60 : 50)
                               : (second_row ? 66 : 52);
@@ -5410,7 +5691,7 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
     graphics.FillPath(&shadow, &ring);
   }
   FillHintGlassSurface(graphics, path, body);
-  StrokeGlassEdge(graphics, path);
+  StrokeStaticPlayerMenuEdge(graphics, path);
 
   const auto title_font = MakeHintFont();
   const auto detail_font = MakeHintDetailFont();
@@ -5572,6 +5853,13 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   // MeasureHint 给的是设计稿尺寸，窗口与位置都按缩放后的物理大小摆放。
   width = Scaled(width);
   height = Scaled(height);
+  // Repeated adjustments reuse the current footprint; shorter values never
+  // pull the capsule sideways while the user is still interacting.
+  RECT previous{};
+  if (was_visible && g_hint_icon == icon && g_hint_layout == layout &&
+      GetWindowRect(g_hint, &previous)) {
+    width = std::max(width, static_cast<int>(previous.right - previous.left));
+  }
   RECT work_area{};
   // 提示挂在**播放器窗口**的水平中心，而不是整个屏幕的中心：窗口模式下播放器
   // 只占桌面一块，按屏幕居中会让提示飘到窗口外面去。再与屏幕工作区求一次交，
@@ -5600,11 +5888,13 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
       std::min(static_cast<int>(work_area.bottom), static_cast<int>(frame.bottom)) -
       8;
   height = std::min(height, std::max(1, bottom_limit - top_limit));
-  const int dock_top = DockTopScreen();
   int x = limit_left + (limit_right - limit_left - width) / 2;
   x = std::clamp(x, limit_left, std::max(limit_left, usable_right - width));
   // 所有提示共享视觉中心：进度条/第二行出现时只向两侧扩展，连续操作不跳位。
-  int y = dock_top - Scaled(58) - height / 2;
+  // Android HUD: below the title, around 13% of the video height.
+  const int anchor_top = frame.top + std::clamp(
+      static_cast<int>((frame.bottom - frame.top) * .13), Scaled(76), Scaled(200));
+  int y = anchor_top;
   y = std::clamp(y, top_limit, std::max(top_limit, bottom_limit - height));
   g_hint_mode = mode;
   g_hint_layout = layout;
@@ -5947,6 +6237,7 @@ void AdoptDanmakuItems(std::vector<DanmakuItem> items) {
   g_danmaku_dropped = 0;
   ResetDanmakuLaneFree();
   g_danmaku_loaded = !g_danmaku_items.empty();
+  g_danmaku_count = static_cast<int>(g_danmaku_items.size());
 }
 
 void LoadDanmaku() {
@@ -6685,6 +6976,11 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
 void ShowAdjustHint(const std::wstring& title, const std::wstring& detail,
                     wchar_t icon, float fraction, HintTone tone,
                     HintLayout layout) {
+  if ((title == L"音量" || title == L"亮度" || title == L"倍速") &&
+      !detail.empty()) {
+    ShowHint(detail, std::wstring(), icon, HintMode::Toast, fraction, 0, tone, layout);
+    return;
+  }
   ShowHint(title, detail, icon, HintMode::Toast, fraction, 0, tone, layout);
 }
 
@@ -7044,6 +7340,17 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const float width = static_cast<float>(rect.right);
       const double duration = g_duration.load();
       const double position = g_position.load();
+      if (!g_native_resource_info.empty() && g_seek_hover.load() < 0 &&
+          !g_seek_dragging) {
+        auto resource_font = MakeInterfaceFont(9, Gdiplus::FontStyleRegular);
+        Gdiplus::StringFormat resource_format;
+        resource_format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        resource_format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        Gdiplus::SolidBrush resource_ink(Gdiplus::Color(205, 235, 237, 242));
+        graphics.DrawString(g_native_resource_info.c_str(), -1, &resource_font,
+            Gdiplus::RectF(16.0f, 0.0f, std::max(0.0f, width - 32.0f), 14.0f),
+            &resource_format, &resource_ink);
+      }
       const float fraction = duration > 0
                                  ? static_cast<float>(std::min(1.0, position / duration))
                                  : 0.0f;
@@ -7054,44 +7361,45 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       // 以前已播放是 (110,168,255) 的蓝，还和悬停高亮同色 —— 全屏唯一的强调色
       // 不该是蓝，用户说的「进度条是蓝的、分不清缓存」就是它。未缓存那一档压到
       // 亮画面上几乎看不见，所以底下垫一层 96 的黑，深浅画面都读得出来。
+      const double thumb_fraction =
+          g_seek_dragging && g_seek_drag_target >= 0.0
+              ? std::clamp(g_seek_drag_target, 0.0, 1.0)
+              : fraction;
+      const double hover_fraction = g_seek_hover.load();
+      const bool hovering_seek = hover_fraction >= 0 || g_seek_dragging;
+      const float track_size = hovering_seek ? 4.0f : 2.5f;
       const float cached = static_cast<float>(
           std::clamp(g_cache_fraction.load(), 0.0, 1.0));
-      const float played = std::clamp(fraction, 0.0f, 1.0f);
-      Gdiplus::Pen base(Gdiplus::Color(BYTE{96}, 0, 0, 0), 5.0f);
+      const float played = std::clamp(static_cast<float>(thumb_fraction), 0.0f, 1.0f);
+      Gdiplus::Pen base(Gdiplus::Color(BYTE{96}, 0, 0, 0), track_size + 1.0f);
       ConfigureControlPen(base);
       graphics.DrawLine(&base, 0.0f, kSeekLineY, width, kSeekLineY);
       // 未缓存一档给 52：34 压在深色画面上几乎看不见（黑底加黑托底＝还是黑），
       // 52 仍然明显暗于已缓存的 96，三档的区别不会糊在一起。
-      Gdiplus::Pen track(Gdiplus::Color(BYTE{52}, 255, 255, 255), 4.0f);
+      Gdiplus::Pen track(Gdiplus::Color(BYTE{52}, 255, 255, 255), track_size);
       ConfigureControlPen(track);
       graphics.DrawLine(&track, 0.0f, kSeekLineY, width, kSeekLineY);
       if (cached > 0.01f) {
         Gdiplus::Pen cache_progress(Gdiplus::Color(BYTE{96}, 255, 255, 255),
-                                    4.0f);
+                                    track_size);
         ConfigureControlPen(cache_progress);
         graphics.DrawLine(&cache_progress, 0.0f, kSeekLineY, width * cached,
                           kSeekLineY);
       }
       if (played > 0.01f) {
-        Gdiplus::Pen progress(Gdiplus::Color(BYTE{250}, 255, 255, 255), 4.0f);
+        Gdiplus::Pen progress(Gdiplus::Color(BYTE{250}, 255, 255, 255), track_size);
         ConfigureControlPen(progress);
         graphics.DrawLine(&progress, 0.0f, kSeekLineY, width * played,
                           kSeekLineY);
       }
-      const double thumb_fraction =
-          g_seek_dragging && g_seek_drag_target >= 0.0
-              ? std::clamp(g_seek_drag_target, 0.0, 1.0)
-              : fraction;
       const float played_x = width * static_cast<float>(thumb_fraction);
-      const double hover_fraction = g_seek_hover.load();
-      const bool hovering_seek = hover_fraction >= 0;
       Gdiplus::SolidBrush thumb(Gdiplus::Color(255, 245, 248, 255));
       const float thumb_size = hovering_seek ? 12.0f : 8.0f;
       graphics.FillEllipse(
           &thumb, Gdiplus::RectF(played_x - thumb_size / 2,
                                  kSeekLineY - thumb_size / 2, thumb_size,
                                  thumb_size));
-      if (hovering_seek && duration > 0) {
+      if (hover_fraction >= 0 && duration > 0) {
         const float hover_x = width * static_cast<float>(hover_fraction);
         Gdiplus::Pen marker(Gdiplus::Color(190, 255, 255, 255), 1.0f);
         graphics.DrawLine(&marker, hover_x, kSeekLineY - 4.0f, hover_x,
@@ -7101,70 +7409,68 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         wchar_t preview[24]{};
         swprintf_s(preview, L"%02d:%02d", preview_seconds / 60,
                    preview_seconds % 60);
-        const float bubble_x = std::clamp(hover_x - 25.0f, 2.0f, width - 52.0f);
+        const float bubble_x = std::clamp(hover_x - 31.0f, 2.0f, width - 64.0f);
         // 悬浮预览也是玻璃：和面板/提示同一套材质，不再是固定 245 的深灰块。
         // 同样铺背板（只是从缓存里搬一小块，不触发采集）—— 少铺这一层的话，同一根
         // 进度条上「气泡」和「面板」会是两种玻璃，正是用户说的「割裂」。
         Gdiplus::GraphicsPath bubble_path;
-        const Gdiplus::RectF bubble_rect(bubble_x, 0.0f, 50.0f, 17.0f);
+        const Gdiplus::RectF bubble_rect(bubble_x, 0.0f, 62.0f, 17.0f);
         AddRoundedRectPath(bubble_path, bubble_rect, 8.5f);
         FillGlassSurface(graphics, bubble_path, bubble_rect,
                          GlassPanelAlpha(false), GlassPanelAlpha(true), true);
         StrokeGlassEdge(graphics, bubble_path);
-        auto preview_font = MakeInterfaceFont(9, Gdiplus::FontStyleRegular);
+        auto preview_font = MakeInterfaceFont(10, Gdiplus::FontStyleRegular);
         Gdiplus::StringFormat preview_format;
         preview_format.SetAlignment(Gdiplus::StringAlignmentCenter);
         preview_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        Gdiplus::SolidBrush preview_ink(Gdiplus::Color(255, 29, 29, 31));
+        Gdiplus::SolidBrush preview_ink(Gdiplus::Color(255, 245, 247, 250));
         graphics.DrawString(preview, -1, &preview_font,
-                            Gdiplus::RectF(bubble_x, 0, 50, 17),
+                            Gdiplus::RectF(bubble_x, 0, 62, 17),
                             &preview_format, &preview_ink);
       }
 
-      const float center = width / 2;
       Gdiplus::SolidBrush quiet(Gdiplus::Color(255, 174, 176, 184));
       const float controls_y = 72.0f;
       const bool compact = width < 780;
-      DrawHover(graphics, kBackTen, center - 76, controls_y, 42);
-      DrawHover(graphics, kForwardTen, center + 76, controls_y, 42);
-      if (!compact) {
-        DrawHover(graphics, kPreviousEpisode, center - 140, controls_y, 42,
-                  false, CanSelectPlaylistStep(-1));
-        DrawHover(graphics, kNextEpisode, center + 140, controls_y, 42,
-                  false, CanSelectPlaylistStep(1));
+      const auto transport = TransportLayout(static_cast<int>(width));
+      const auto tool_layout = ToolLayout(static_cast<int>(width));
+      const auto draw_dock = [&graphics](const Gdiplus::RectF& box) {
+        Gdiplus::GraphicsPath path;
+        AddRoundedRectPath(path, box, 28.0f);
+        FillGlassSurface(graphics, path, box, 26, 30, true);
+        StrokeGlassEdge(graphics, path);
+      };
+      draw_dock(Gdiplus::RectF(24.0f, 44.0f,
+                             ToolAreaStart(static_cast<int>(width)) - 38.0f,
+                             56.0f));
+      if (!compact || !tool_layout.empty()) {
+        const float left = compact ? tool_layout.front().second - 34.0f
+                                    : VolumeStart(static_cast<int>(width)) - 58.0f;
+        draw_dock(Gdiplus::RectF(left, 44.0f, width - 24.0f - left, 56.0f));
       }
-      const float play_hover = HoverAmount(kPlayPause);
-      const Gdiplus::RectF play_rect = PixelSnapRect(
-          Gdiplus::RectF(center - 24, controls_y - 24, 48, 48),
-          0.5f);
-      Gdiplus::GraphicsPath play_path;
-      AddRoundedRectPath(play_path, play_rect, play_rect.Width / 2.0f);
-      FillGlassSurface(graphics, play_path, play_rect,
-                       GlassChromeAlpha(false), GlassChromeAlpha(true), true);
-      StrokeGlassEdge(graphics, play_path);
-      if (play_hover > 0.001f || PressAmount(kPlayPause) > 0.001f) {
-        Gdiplus::SolidBrush lit(Gdiplus::Color(
-            static_cast<BYTE>(std::max(play_hover * 22.0f,
-                                       PressAmount(kPlayPause) * 66.0f)),
-            255, 255, 255));
-        graphics.FillPath(&lit, &play_path);
+      for (const auto& item : transport) {
+        const auto id = item.first;
+        const float x = item.second;
+        const bool enabled = id == kPreviousEpisode ? CanSelectPlaylistStep(-1)
+                             : id == kNextEpisode ? CanSelectPlaylistStep(1)
+                                                  : true;
+        DrawHover(graphics, id, x, controls_y, id == kPlayPause ? 44.0f : 40.0f,
+                  id == kPlayPause && !g_paused.load() && !g_playback_error.load(),
+                  enabled);
+        if (id == kPlayPause) {
+          DrawIconsaxGlyph(graphics, g_play_state_mix > .5f ? L'\xEE64' : L'\xEE44',
+                           x, controls_y, 17.2f,
+                           !g_paused.load() && !g_playback_error.load()
+                               ? Gdiplus::Color(255, 17, 24, 36)
+                               : IconInk(HoverAmount(id)));
+        } else if (id == kBackTen || id == kForwardTen) {
+          DrawSeekIcon(graphics, x, controls_y, id == kForwardTen, HoverAmount(id));
+        } else {
+          DrawSkipIcon(graphics, x, controls_y, id == kNextEpisode,
+                       HoverAmount(id), enabled);
+        }
       }
-      DrawPlayIcon(graphics, center, controls_y, g_play_state_mix, play_hover);
-      auto font = MakeInterfaceFont(13, Gdiplus::FontStyleRegular);
-      Gdiplus::StringFormat centered;
-      centered.SetAlignment(Gdiplus::StringAlignmentCenter);
-      centered.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-      DrawSeekIcon(graphics, center - 76, controls_y, false,
-                   HoverAmount(kBackTen));
-      DrawSeekIcon(graphics, center + 76, controls_y, true,
-                   HoverAmount(kForwardTen));
-      if (!compact) {
-        DrawSkipIcon(graphics, center - 140, controls_y, false,
-                     HoverAmount(kPreviousEpisode),
-                     CanSelectPlaylistStep(-1));
-        DrawSkipIcon(graphics, center + 140, controls_y, true,
-                     HoverAmount(kNextEpisode), CanSelectPlaylistStep(1));
-      }
+      auto font = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
       wchar_t time[64]{};
       const auto seconds = static_cast<int>(position);
       const auto total = static_cast<int>(duration);
@@ -7174,14 +7480,14 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         Gdiplus::SolidBrush error(Gdiplus::Color(255, 255, 132, 124));
         auto status_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
         DrawDockLabel(graphics, L"播放失败", status_font,
-                      Gdiplus::PointF(24, 63), error);
+                      Gdiplus::PointF(24, 32), error);
         // 「重新播放」：失败之后 mpv 停在 idle，播放键发 cycle pause 毫无作用，
         // 这颗胶囊是界面上唯一说得清的恢复入口（命中区见 HitControl 的 kReplay，
         // 两者宽度是一份：78 + 74）。材质与控件条其它按钮完全一致 —— frost 渐变
         // 加悬停叠一层极淡的白，不另起一套观感。
         const float replay_hover = HoverAmount(kReplay);
         Gdiplus::GraphicsPath replay_path;
-        const Gdiplus::RectF replay_rect(78.0f, 54.0f, 74.0f, 26.0f);
+        const Gdiplus::RectF replay_rect(78.0f, 30.0f, 74.0f, 20.0f);
         AddRoundedRectPath(replay_path, replay_rect, 13.0f);
         FillGlassSurface(graphics, replay_path, replay_rect,
                          GlassDiscAlpha(false), GlassDiscAlpha(true), true);
@@ -7205,21 +7511,22 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         Gdiplus::SolidBrush accent(Gdiplus::Color(255, 236, 238, 245));
         Gdiplus::Pen spinner(Gdiplus::Color(255, 236, 238, 245), 1.8f);
         ConfigureControlPen(spinner);
-        graphics.DrawArc(&spinner, Gdiplus::RectF(23, 66, 10, 10),
+        graphics.DrawArc(&spinner, Gdiplus::RectF(23, 34, 10, 10),
                          g_buffer_phase, 245);
         auto status_font = MakeInterfaceFont(11, Gdiplus::FontStyleRegular);
         DrawDockLabel(graphics, L"缓冲中", status_font,
-                      Gdiplus::PointF(37, 63), accent);
-      } else {
-        DrawDockLabel(graphics, time, font, Gdiplus::PointF(24, 64), quiet);
+                      Gdiplus::PointF(37, 31), accent);
       }
-      const auto tool_layout = ToolLayout(static_cast<int>(width));
+      if (width >= 480) {
+        DrawDockLabel(graphics, time, font,
+                      Gdiplus::PointF(transport.back().second + 24, 64), quiet);
+      }
       if (!compact) {
         const float volume_start = VolumeStart(static_cast<int>(width));
         const float volume_end = volume_start + 58.0f;
-        DrawHover(graphics, kMute, volume_start - 28, controls_y, 36,
+        DrawHover(graphics, kMute, volume_start - 24, controls_y, 40,
                   g_muted.load());
-        DrawSpeaker(graphics, volume_start - 28, controls_y, g_muted.load(),
+        DrawSpeaker(graphics, volume_start - 24, controls_y, g_muted.load(),
                     HoverAmount(kMute));
         Gdiplus::Pen volume_track(Gdiplus::Color(120, 174, 176, 184), 3);
         volume_track.SetStartCap(Gdiplus::LineCapRound);
@@ -7242,7 +7549,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
                            controls_y - 3, 6, 6));
       }
       for (const auto& tool : tool_layout) {
-        DrawHover(graphics, tool.first, tool.second, controls_y, 34);
+        DrawHover(graphics, tool.first, tool.second, controls_y, 40);
         DrawToolIcon(graphics, tool.first, tool.second, controls_y);
       }
       graphics.Flush(Gdiplus::FlushIntentionSync);
@@ -7259,8 +7566,6 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       const int x = static_cast<int>(GET_X_LPARAM(lparam) / scale);
       const int y = static_cast<int>(GET_Y_LPARAM(lparam) / scale);
       rect.right = static_cast<LONG>(std::lround(rect.right / scale));
-      const int center = rect.right / 2;
-      const bool compact = rect.right < 780;
       const ControlId hit = HitControl(x, y, rect.right);
       if (hit != kNone) {
         g_pressed_control = hit;
@@ -7294,28 +7599,26 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         OpenToolPanel(hit, DockAnchor(x));
       } else if (hit == kMore) {
         ShowOverflowMenu(rect.right, DockAnchor(x));
-      } else if (x >= center - 28 && x <= center + 28) {
+      } else if (hit == kPlayPause) {
         // 失败态下这一键是「重新播放」：mpv 已经在 idle，cycle pause 没有任何
         // 效果 —— 用户报的「播放失败之后无法恢复」正是停在这一步。
         TogglePlaybackWithHint();
-      } else if (!compact && x >= center - 166 && x < center - 116 &&
-                 CanSelectPlaylistStep(-1)) {
+      } else if (hit == kPreviousEpisode) {
         SelectPlaylistEntry(g_playlist_position.load() - 1, L"上一集");
-      } else if (x >= center - 104 && x < center - 48) {
+      } else if (hit == kBackTen) {
         SeekBySeconds(-g_seek_seconds);
         ShowAdjustHint(
             L"后退 " + std::to_wstring(static_cast<int>(g_seek_seconds)) + L" 秒",
             ClockLabel(std::max(0.0, g_position.load() - g_seek_seconds)),
             kGlyphGauge, -1.0f);
-      } else if (x > center + 48 && x <= center + 104) {
+      } else if (hit == kForwardTen) {
         SeekBySeconds(g_seek_seconds);
         ShowAdjustHint(
             L"前进 " + std::to_wstring(static_cast<int>(g_seek_seconds)) + L" 秒",
             ClockLabel(std::min(g_duration.load(),
                                 g_position.load() + g_seek_seconds)),
             kGlyphGauge, -1.0f);
-      } else if (!compact && x > center + 116 && x <= center + 166 &&
-                 CanSelectPlaylistStep(1)) {
+      } else if (hit == kNextEpisode) {
         SelectPlaylistEntry(g_playlist_position.load() + 1, L"下一集");
       } else {
         switch (hit) {
@@ -7340,6 +7643,10 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       }
       return 0;
     }
+    case WM_LBUTTONDBLCLK:
+      ShowControls();
+      TogglePlaybackWithHint();
+      return 0;
     case WM_MOUSEWHEEL:
       ShowControls();
       // 滚轮改音量同样给实时反馈：音量条本身在下面，眼睛盯着画面时看不见。
@@ -7565,6 +7872,7 @@ bool RunShortcut(int key) {
 // 系统时钟节拍卡在 15.6ms 的整数倍上，请求 16ms 实际拿到 31.25ms ——
 // 弹幕层只有约 32fps，「一顿一顿」就是这么来的。
 void TickFrame() {
+  AnimatePanelScroll();
   const double frame_now = NowMs();
   // 第一帧没有「上一帧」可比，用一个等于当前节拍的 dt：对齐刷新时是刷新周期 ×
   // 分频，退回定时器时才是 kFrameIntervalMs。只影响第一帧，但拿错了转圈/淡出会
@@ -7772,8 +8080,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       return 1;
     }
     case WM_NCCALCSIZE:
-      if (wparam) return 0;
-      return DefWindowProcW(window, message, wparam, lparam);
+      return 0;
+    case WM_NCACTIVATE:
+      HideDwmWindowBorder(window);
+      return TRUE;
     case WM_NCPAINT:
       // The player draws no native non-client frame (resize hit tests are
       // handled separately in WM_NCHITTEST). Letting DefWindowProc paint it
@@ -7863,6 +8173,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       return 0;
     }
     case WM_CLOSE: {
+      EmitProgress(g_position.load(), g_duration.load());
       FadeOutPlayerWindow(window);
       if (g_handle) {
         // A live episode search temporarily pauses mpv while Flutter resolves
@@ -7935,6 +8246,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         }
         LoadDanmaku();
         PositionDanmaku();
+      }
+      PostMessageW(g_window, kDanmakuStateChanged, 0, 0);
+      return 0;
+    case kDanmakuStateChanged:
+      if (g_panel && IsWindowVisible(g_panel) && !g_panel_items.empty() &&
+          g_panel_items.front().label == L"弹幕") {
+        const int scroll = g_panel_scroll;
+        ShowDanmakuMenu(g_panel_anchor);
+        g_panel_scroll = std::clamp(scroll, 0, PanelMaxScroll());
+        InvalidateRect(g_panel, nullptr, FALSE);
       }
       return 0;
     case kApplyLiveSettings: {
@@ -8151,7 +8472,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       // 负责刷新，合成消息进不来。
       return 0;
     case WM_LBUTTONDBLCLK:
-      ToggleFullscreen();
+      ShowControls();
+      TogglePlaybackWithHint();
       return 0;
     case WM_TIMER:
       // 拿不到高精度可等待定时器时的回退节拍（见 wWinMain 里建定时器的地方）。
@@ -8210,6 +8532,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   controls_class.lpszClassName = kControlsClass;
   controls_class.lpfnWndProc = ControlsProc;
   controls_class.hCursor = LoadCursor(nullptr, IDC_HAND);
+  controls_class.style = CS_DBLCLKS;
   RegisterClassW(&controls_class);
   WNDCLASSW panel_class{};
   panel_class.hInstance = instance;
@@ -8831,6 +9154,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
             g_danmaku_loading = false;
           }
           PostMessageW(g_window, kPlayerStateChanged, 0, 0);
+          PostMessageW(g_window, kDanmakuStateChanged, 0, 0);
         } else if (line.rfind("MOVA_DANMAKU_INFO=", 0) == 0) {
           // 条数 \t 命中的 API 名 \t 匹配到的作品 / 集
           const std::string value = line.substr(18);
@@ -9035,6 +9359,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
       }
       if (event->event_id == MPV_EVENT_FILE_LOADED) {
         g_playback_error = false;
+        RefreshNativeResourceInfo();
         // 中断重试：文件加载完了才把位置补回去（加载中发 seek 会落空）。
         const double resume = g_resume_seconds.exchange(0);
         if (resume > 0 && g_handle) {
@@ -9113,7 +9438,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
         // 20–28ms per full-frame capture. Take one backdrop when the static
         // controls appear, then keep that blurred sample while they remain visible;
         // continuous 15Hz capture was making the whole player miss frames.
-        UpdateGlassBackdrop();
+        // All chrome uses fixed material; synchronous video capture is obsolete.
       } else if (panel_visible && !panel_was_visible) {
         // 二级菜单使用固定材质，不采样视频画面。
       }
@@ -9121,7 +9446,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
       panel_was_visible = panel_visible;
       // UpdateGlassBackdrop 自己按 66ms 节流。这里只让出一个时间片，
       // 避免原先的 8ms 睡眠把可达刷新率直接压到 30–40Hz。
-      Sleep(1);
+      Sleep(50);
     }
     glass_backdrop_done = true;
   });

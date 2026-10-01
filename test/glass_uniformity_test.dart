@@ -187,8 +187,8 @@ void main() {
     );
     expect(native, contains('(g_controls && IsWindowVisible(g_controls))'));
     expect(native, contains('(g_top_bar && IsWindowVisible(g_top_bar))'));
-    // 中央播放键和失败后的重播入口也必须取实时背板，不能各自画实心圆或静态渐变。
-    expect(native, contains('FillGlassSurface(graphics, play_path'));
+    // 播放键使用轻量圆片，重播入口复用固定玻璃；均不采样视频。
+    expect(native, contains('graphics.FillPath(&button_surface, &disc_path)'));
     expect(native, contains('FillGlassSurface(graphics, replay_path'));
     expect(
       native,
@@ -208,14 +208,14 @@ void main() {
     // 弹幕和 mpv 字幕都要避开播放器自己的顶部、底部控制区域。
     expect(native, contains('origin.y + safe_top'));
     expect(native, contains('SetOption(g_handle, "sub-pos", "84")'));
-    // 截图和模糊在后台按显隐变化更新，UI 帧循环只消费完成帧，不能同步采集。
+    // 保留旧采样实现但不调用，固定玻璃不得启动实时视频采样。
     expect(native, contains('std::thread glass_backdrop'));
     expect(
       native,
       contains('constexpr ULONGLONG kGlassBackdropRefreshMs = 66;'),
     );
     expect(native, contains('constexpr int kGlassDownscale = 6;'));
-    expect(native, contains('Sleep(1);'));
+    expect(native, contains('Sleep(50);'));
     expect(native, contains('bool CaptureGlassLayer('));
     expect(native, isNot(contains('HDC screen = GetDC(nullptr);')));
     expect(native, contains('const std::array<HWND, 2> windows'));
@@ -226,11 +226,16 @@ void main() {
       native.indexOf('void FillHintGlassSurface('),
       native.indexOf('HintMode g_hint_mode'),
     );
-    expect(hintSurface, contains('kHintGlassTopAlpha'));
-    expect(hintSurface, contains('kHintGlassBottomAlpha'));
+    expect(
+      hintSurface,
+      contains('FillStaticPlayerMenuSurface(graphics, path, rect)'),
+    );
     expect(hintSurface, isNot(contains('DrawGlassBackdrop')));
     expect(hintSurface, isNot(contains('HintTone')));
-    expect(native, contains('layout == HintLayout::Episode ? 250 : 270'));
+    expect(
+      native,
+      contains('minimum_width = layout == HintLayout::Episode ? 250'),
+    );
     expect(native, contains('每次鼠标移动都可直接同步重绘'));
     expect(native, contains('g_hint_target_fraction'));
     expect(native, contains('-18.0 * frame_dt'));
@@ -239,7 +244,7 @@ void main() {
         r'^\s+UpdateGlassBackdrop\(\);$',
         multiLine: true,
       ).allMatches(native).length,
-      1,
+      0,
     );
   });
 }

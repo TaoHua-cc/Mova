@@ -7,6 +7,39 @@ import 'package:yingji/src/history/watch_state_store.dart';
 import 'package:yingji/src/player/android_player.dart';
 
 void main() {
+  test('Exo surface waits for route transition and uses a black shutter', () {
+    final page = File('lib/src/player/player_page.dart').readAsStringSync();
+    final native = File(
+      'android/app/src/main/kotlin/com/taohua/mova/ExoPlayerPlatformView.kt',
+    ).readAsStringSync();
+    expect(page, contains('AnimationStatus.completed'));
+    expect(page, contains('弹幕加载失败 · 可在弹幕菜单重新获取'));
+    expect(
+      native,
+      contains('setShutterBackgroundColor(android.graphics.Color.BLACK)'),
+    );
+    expect(native, contains('setKeepContentOnPlayerReset(false)'));
+  });
+  test(
+    'Exo buffering preserves playback intent and toggle uses that intent',
+    () {
+      final source = File(
+        'android/app/src/main/kotlin/com/taohua/mova/ExoPlayerPlatformView.kt',
+      ).readAsStringSync();
+      expect(
+        source,
+        contains('exoPlayer.playWhenReady = !exoPlayer.playWhenReady'),
+      );
+      expect(
+        source,
+        isNot(contains('exoPlayer.playWhenReady = !exoPlayer.isPlaying')),
+      );
+      expect(source, contains('"playing" to (exoPlayer.playWhenReady &&'));
+      expect(source, contains('Player.PLAYBACK_SUPPRESSION_REASON_NONE'));
+      expect(source, contains('onPlayWhenReadyChanged'));
+    },
+  );
+
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('mova/platform');
   tearDown(() {

@@ -526,9 +526,48 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _seek(Duration position) async => _usesAndroidExo
       ? _exoCommand('seekTo', {'positionMs': position.inMilliseconds})
       : _player!.seek(position);
-  Future<void> _backendSetVolume(double volume) async => _usesAndroidExo
-      ? _exoCommand('setVolume', {'volume': volume / 100})
-      : _player!.setVolume(volume);
+  static const _systemVolumeChannel = MethodChannel('mova/platform');
+
+  Future<void> _readSystemVolume() async {
+    if (!Platform.isAndroid || !mounted) return;
+    try {
+      final value = await _systemVolumeChannel.invokeMethod<double>(
+        'getMediaVolume',
+      );
+      if (value == null || !mounted) return;
+      final next = (value * 100).clamp(0.0, 100.0);
+      if ((_volume - next).abs() < .1) return;
+      setState(() {
+        _volume = next;
+        _muted = next <= 0;
+      });
+    } on PlatformException catch (_) {
+      // Leave the current UI value intact when the host is unavailable.
+    } on MissingPluginException catch (_) {}
+  }
+
+  Future<void> _backendSetVolume(double volume) async {
+    if (Platform.isAndroid) {
+      final actual = await _systemVolumeChannel.invokeMethod<double>(
+        'setMediaVolume',
+        {'value': volume / 100},
+      );
+      if (mounted && actual != null) {
+        setState(() {
+          _volume = actual * 100;
+          _muted = _volume <= 0;
+        });
+      }
+      if (_usesAndroidExo) {
+        await _exoCommand('setVolume', {'volume': 1.0});
+      } else {
+        await _player!.setVolume(100);
+      }
+      return;
+    }
+    await _player!.setVolume(volume);
+  }
+
   Future<void> _setRate(double rate) async => _usesAndroidExo
       ? _exoCommand('setRate', {'rate': rate})
       : _player!.setRate(rate);
@@ -558,7 +597,11 @@ class _PlayerPageState extends State<PlayerPage> {
 
   void _attachExoView(int viewId) {
     _exoCommands = MethodChannel('mova/exo/$viewId');
-    unawaited(_exoCommand('setVolume', {'volume': _volume / 100}));
+    unawaited(
+      _exoCommand('setVolume', {
+        'volume': Platform.isAndroid ? 1.0 : _volume / 100,
+      }),
+    );
     unawaited(_exoCommand('setRate', {'rate': _speed}));
     _exoEventSubscription?.cancel();
     _exoEventSubscription = EventChannel('mova/exo-events/$viewId')
@@ -703,6 +746,7 @@ class _PlayerPageState extends State<PlayerPage> {
       unawaited(_saveWatchState());
     });
     _segmentTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      unawaited(_readSystemVolume());
       unawaited(_applySegmentSkip());
       unawaited(_preloadNextIfNeeded());
       unawaited(_advanceVideoCacheWindowIfNeeded());
@@ -1092,6 +1136,7 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     _aspect = prefs.getString('yingji.player.aspect') ?? '自动';
     _volume = (prefs.getDouble('yingji.player.volume') ?? 100).clamp(0, 100);
+    await _readSystemVolume();
     _muted = _volume <= 0;
     if (!_muted) _lastAudibleVolume = _volume;
     _danmakuEnabled = prefs.getBool('yingji.danmaku.enabled') ?? false;
@@ -1217,7 +1262,7 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     if (cached == null) unawaited(_cacheCurrentEpisode(episode));
     if (_usesAndroidExo) {
-      await _exoCommand('setVolume', {'volume': _volume / 100});
+      await _backendSetVolume(_volume);
       await _exoCommand('setRate', {'rate': _speed});
     } else {
       await _backendSetVolume(_volume);
@@ -1916,7 +1961,7 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 弹幕接口每次播放都要跑一次匹配（有的还要先 match 再取评论），同一集看
   /// 第二遍时这一步纯属浪费。缓存命中就立刻显示，只有超过
   /// [DanmakuCache.refreshAfter] 才走网络；网络失败而手里有缓存时继续用缓存
-  /// 且不报错 —— 用户看到的是「弹幕稍旧」，不是「弹幕加载失败」。
+  /// 并提示刷新失败，缓存仍可继续显示。
   Future<void> _loadDanmaku(String token, {bool forceRefresh = false}) async {
     final request = ++_danmakuRequest;
     _activeDanmakuApi = '';
@@ -1991,11 +2036,17 @@ class _PlayerPageState extends State<PlayerPage> {
         matchedEpisode: source?.matchedEpisode,
       );
     } catch (error) {
-      if (cached != null && cached.comments.isNotEmpty && !forceRefresh) return;
       if (mounted && request == _danmakuRequest) {
         setState(
           () =>
               _danmakuError = error.toString().replaceFirst('Exception: ', ''),
+        );
+        MovaToast.show(
+          context,
+          message: cached != null && cached.comments.isNotEmpty
+              ? '弹幕刷新失败，继续使用缓存 · 可在弹幕菜单重试'
+              : '弹幕加载失败 · 可在弹幕菜单重新获取',
+          icon: YingjiIcons.exclamationmark_triangle,
         );
       }
     } finally {
@@ -2518,188 +2569,203 @@ class _PlayerPageState extends State<PlayerPage> {
         await WindowHost.toggleFullScreen();
       },
     },
-    child: Focus(
-      focusNode: _focusNode,
-      autofocus: true,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: MouseRegion(
-          onEnter: (_) => _revealControls(),
-          onHover: (_) => _revealControls(),
-          onExit: (_) =>
-              _scheduleControlsHide(delay: const Duration(milliseconds: 250)),
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            // 单击呼出控件、双击播放 / 暂停，见 _handleTap。
-            onTap: _handleTap,
-            // 拖动调参只在移动端注册：桌面端用鼠标拖拽会误触亮度和音量，
-            // 而桌面本来就有方向键、滚轮和控件按钮可用。
-            onHorizontalDragStart: WindowHost.isDesktop
-                ? null
-                : _onSeekDragStart,
-            onHorizontalDragUpdate: WindowHost.isDesktop
-                ? null
-                : _onSeekDragUpdate,
-            onHorizontalDragEnd: WindowHost.isDesktop ? null : _onSeekDragEnd,
-            onVerticalDragStart: WindowHost.isDesktop
-                ? null
-                : _onValueDragStart,
-            onVerticalDragUpdate: WindowHost.isDesktop
-                ? null
-                : _onValueDragUpdate,
-            onVerticalDragEnd: WindowHost.isDesktop ? null : _onValueDragEnd,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                // 视频层不再自带手势：整屏手势（单击、双击、左右滑动快进
-                // 快退、左半屏调亮度、右半屏调音量）统一由外层
-                // GestureDetector 处理。内层再挂一个 TapGestureRecognizer
-                // 会先赢得手势竞技场，把外层的手势全部吃掉。
-                //
-                // media_kit 自带的原生控制条也必须关掉，否则折叠模式下
-                // 会多出一条原生控制栏。
-                if (WindowHost.isDesktop)
-                  NativeVideoSurface(
-                    visible:
-                        !_settingsOpen &&
-                        _error == null &&
-                        _skipKind == null &&
-                        !_gestureVisible,
-                  )
-                else if (_usesAndroidExo && _exoPlaybackUrl != null)
-                  IgnorePointer(
-                    child: AndroidView(
-                      key: ValueKey<String>('exo:$_exoPlaybackUrl'),
-                      viewType: 'mova/exo-video',
-                      onPlatformViewCreated: _attachExoView,
-                      creationParams: {
-                        'url': _exoPlaybackUrl,
-                        'headers': _exoHeaders,
-                        'container': widget.container,
-                        'positionMs': _state.position.inMilliseconds,
+    child: YingjiFixedGlass(
+      child: Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: MouseRegion(
+            onEnter: (_) => _revealControls(),
+            onHover: (_) => _revealControls(),
+            onExit: (_) =>
+                _scheduleControlsHide(delay: const Duration(milliseconds: 250)),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              // 单击呼出控件、双击播放 / 暂停，见 _handleTap。
+              onTap: _handleTap,
+              // 拖动调参只在移动端注册：桌面端用鼠标拖拽会误触亮度和音量，
+              // 而桌面本来就有方向键、滚轮和控件按钮可用。
+              onHorizontalDragStart: WindowHost.isDesktop
+                  ? null
+                  : _onSeekDragStart,
+              onHorizontalDragUpdate: WindowHost.isDesktop
+                  ? null
+                  : _onSeekDragUpdate,
+              onHorizontalDragEnd: WindowHost.isDesktop ? null : _onSeekDragEnd,
+              onVerticalDragStart: WindowHost.isDesktop
+                  ? null
+                  : _onValueDragStart,
+              onVerticalDragUpdate: WindowHost.isDesktop
+                  ? null
+                  : _onValueDragUpdate,
+              onVerticalDragEnd: WindowHost.isDesktop ? null : _onValueDragEnd,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  // 视频层不再自带手势：整屏手势（单击、双击、左右滑动快进
+                  // 快退、左半屏调亮度、右半屏调音量）统一由外层
+                  // GestureDetector 处理。内层再挂一个 TapGestureRecognizer
+                  // 会先赢得手势竞技场，把外层的手势全部吃掉。
+                  //
+                  // media_kit 自带的原生控制条也必须关掉，否则折叠模式下
+                  // 会多出一条原生控制栏。
+                  if (WindowHost.isDesktop)
+                    NativeVideoSurface(
+                      visible:
+                          !_settingsOpen &&
+                          _error == null &&
+                          _skipKind == null &&
+                          !_gestureVisible,
+                    )
+                  else if (_usesAndroidExo && _exoPlaybackUrl != null)
+                    AnimatedBuilder(
+                      animation: ModalRoute.of(context)!.animation!,
+                      builder: (context, child) {
+                        // SurfaceView must not participate in the route's zoom.
+                        if (ModalRoute.of(context)!.animation!.status !=
+                            AnimationStatus.completed) {
+                          return const ColoredBox(color: Colors.black);
+                        }
+                        return child!;
                       },
-                      creationParamsCodec: const StandardMessageCodec(),
+                      child: IgnorePointer(
+                        child: AndroidView(
+                          key: ValueKey<String>('exo:$_exoPlaybackUrl'),
+                          viewType: 'mova/exo-video',
+                          onPlatformViewCreated: _attachExoView,
+                          creationParams: {
+                            'url': _exoPlaybackUrl,
+                            'headers': _exoHeaders,
+                            'container': widget.container,
+                            'positionMs': _state.position.inMilliseconds,
+                          },
+                          creationParamsCodec: const StandardMessageCodec(),
+                        ),
+                      ),
+                    )
+                  else if (!_usesAndroidExo)
+                    Video(
+                      controller: _controller!,
+                      fit: BoxFit.contain,
+                      controls: NoVideoControls,
                     ),
-                  )
-                else if (!_usesAndroidExo)
-                  Video(
-                    controller: _controller!,
-                    fit: BoxFit.contain,
-                    controls: NoVideoControls,
-                  ),
-                if (_danmakuComments.isNotEmpty)
-                  Positioned.fill(
-                    child: _DanmakuOverlay(
-                      positionStream: _positionStream,
-                      playing: _state.playing && !_state.buffering,
-                      playbackRate: _speed,
-                      comments: _danmakuComments,
-                      opacity: _danmakuOpacity,
-                      area: _danmakuArea,
-                      density: _danmakuDensity,
-                      fontSize: _danmakuFontSize,
-                      speed: _danmakuSpeed,
-                      showScroll: _danmakuScroll,
-                      showTop: _danmakuTop,
-                      showBottom: _danmakuBottom,
-                      topInset: MediaQuery.paddingOf(context).top + 84,
-                    ),
-                  ),
-                if (_error != null)
-                  Center(
-                    child: GlassPanel(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(
-                            YingjiIcons.exclamationmark_triangle,
-                            color: Color(0xffff9b9b),
-                            size: 30,
-                          ),
-                          const SizedBox(height: 10),
-                          const Text(
-                            '播放失败',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 480),
-                            child: Text(
-                              _error!,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(color: Colors.white70),
-                            ),
-                          ),
-                          const SizedBox(height: 14),
-                          FilledButton(
-                            onPressed: () {
-                              setState(() => _error = null);
-                              _openCurrentMedia();
-                            },
-                            child: const Text('重试'),
-                          ),
-                        ],
+                  if (_danmakuComments.isNotEmpty)
+                    Positioned.fill(
+                      child: _DanmakuOverlay(
+                        positionStream: _positionStream,
+                        playing: _state.playing && !_state.buffering,
+                        playbackRate: _speed,
+                        comments: _danmakuComments,
+                        opacity: _danmakuOpacity,
+                        area: _danmakuArea,
+                        density: _danmakuDensity,
+                        fontSize: _danmakuFontSize,
+                        speed: _danmakuSpeed,
+                        showScroll: _danmakuScroll,
+                        showTop: _danmakuTop,
+                        showBottom: _danmakuBottom,
+                        topInset: MediaQuery.paddingOf(context).top + 84,
                       ),
                     ),
-                  ),
-                IgnorePointer(
-                  ignoring: !_showControls && !_settingsOpen,
-                  child: AnimatedOpacity(
-                    opacity: _showControls || _settingsOpen ? 1 : 0,
-                    duration: const Duration(milliseconds: 180),
-                    curve: Curves.easeOutCubic,
-                    child: _overlay(context),
-                  ),
-                ),
-                if (_skipKind != null &&
-                    !_skipDismissed.contains(_skipKind) &&
-                    !_settingsOpen)
-                  _segmentPrompt(),
-                if (_settingsOpen) _consolePanel(context),
-                if (_switchingEpisode)
-                  Positioned(
-                    left: 24,
-                    right: 24,
-                    bottom: 180,
-                    child: Center(
+                  if (_error != null)
+                    Center(
                       child: GlassPanel(
-                        sampleBackdrop: false,
-                        radius: 24,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 18,
-                          vertical: 12,
-                        ),
-                        child: const Row(
+                        child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
+                            const Icon(
+                              YingjiIcons.exclamationmark_triangle,
+                              color: Color(0xffff9b9b),
+                              size: 30,
                             ),
-                            SizedBox(width: 12),
-                            Text('正在切换剧集…'),
+                            const SizedBox(height: 10),
+                            const Text(
+                              '播放失败',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 480),
+                              child: Text(
+                                _error!,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: Colors.white70),
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            FilledButton(
+                              onPressed: () {
+                                setState(() => _error = null);
+                                _openCurrentMedia();
+                              },
+                              child: const Text('重试'),
+                            ),
                           ],
                         ),
                       ),
                     ),
+                  IgnorePointer(
+                    ignoring: !_showControls && !_settingsOpen,
+                    child: AnimatedOpacity(
+                      opacity: _showControls || _settingsOpen ? 1 : 0,
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeOutCubic,
+                      child: _overlay(context),
+                    ),
                   ),
-                _gestureIndicator(),
-                _pauseResumePrompt(),
-                // Keep a dedicated caption strip above the custom overlay so
-                // controls cannot swallow window-drag gestures. It avoids
-                // the left title/back button and right window buttons.
-                Positioned(
-                  left: 210,
-                  right: 210,
-                  top: 0,
-                  height: 64,
-                  child: WindowHost.dragArea(child: SizedBox.expand()),
-                ),
-              ],
+                  if (_skipKind != null &&
+                      !_skipDismissed.contains(_skipKind) &&
+                      !_settingsOpen)
+                    _segmentPrompt(),
+                  if (_settingsOpen) _consolePanel(context),
+                  if (_switchingEpisode)
+                    Positioned(
+                      left: 24,
+                      right: 24,
+                      bottom: 180,
+                      child: Center(
+                        child: GlassPanel(
+                          sampleBackdrop: false,
+                          radius: 24,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 12,
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                              SizedBox(width: 12),
+                              Text('正在切换剧集…'),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  _gestureIndicator(),
+                  _pauseResumePrompt(),
+                  // Keep a dedicated caption strip above the custom overlay so
+                  // controls cannot swallow window-drag gestures. It avoids
+                  // the left title/back button and right window buttons.
+                  Positioned(
+                    left: 210,
+                    right: 210,
+                    top: 0,
+                    height: 64,
+                    child: WindowHost.dragArea(child: SizedBox.expand()),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -3095,6 +3161,7 @@ class _PlayerPageState extends State<PlayerPage> {
     builder: (context, snapshot) {
       if (!_hasPlayed ||
           snapshot.data != false ||
+          _state.buffering ||
           _error != null ||
           _settingsOpen) {
         return const SizedBox.shrink();

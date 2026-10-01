@@ -305,6 +305,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   void initState() {
     super.initState();
     _pageScroll.addListener(_syncPageBackdropDepth);
+    WatchStateStore.revision.addListener(_refreshLocalProgress);
     yingjiScrollInProgress.addListener(_syncPageBackdropDepth);
     _details =
         widget.item.id > 0 &&
@@ -1065,13 +1066,18 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         )
         .map((resource) => resource.id)
         .toSet();
-    final progress = <String, double>{
-      for (final state in history)
-        if (state.tmdbId == widget.item.id &&
-            state.seasonNumber != null &&
-            state.episodeNumber != null)
-          _episodeKey(state.seasonNumber, state.episodeNumber): state.progress,
-    };
+    final progress = <String, double>{};
+    for (final state in history) {
+      if (state.tmdbId == widget.item.id &&
+          state.seasonNumber != null &&
+          state.episodeNumber != null) {
+        progress.putIfAbsent(
+          _episodeKey(state.seasonNumber, state.episodeNumber),
+          () => state.progress,
+        );
+      }
+    }
+    final localKeys = progress.keys.toSet();
     for (final resource in resources) {
       final local = history
           .where(
@@ -1091,7 +1097,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                     serverDuration.inMilliseconds)
                 .clamp(0.0, 1.0);
       final key = _episodeKey(resource.seasonNumber, resource.episodeNumber);
-      final next = serverProgress > localProgress
+      if (localKeys.contains(key)) continue;
+      final next = local != null
+          ? localProgress
+          : serverProgress > localProgress
           ? serverProgress
           : localProgress;
       if (next > (progress[key] ?? 0)) progress[key] = next;
@@ -1102,8 +1111,19 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   /// Re-derives episode progress after the player closes. The initial
   /// [_loadResources] snapshot predates playback, so without this the episode
   /// rails keep showing the position captured before the session started.
+  Future<void> _refreshLocalProgress() async {
+    final history = (await WatchStateStore.create()).load();
+    if (!mounted) return;
+    final derived = _deriveProgress(_resources, history, const {});
+    setState(() {
+      _episodeProgress = derived.progress;
+      _completedResourceIds = derived.completed;
+    });
+  }
+
   Future<void> _refreshProgressAfterPlayback() async {
     if (!mounted || _loadingResources) return;
+    await _refreshLocalProgress();
     final history = (await WatchStateStore.create()).load();
     final traktCompleted = await _traktCompletedEpisodes();
     final derived = _deriveProgress(_resources, history, traktCompleted);
@@ -2150,6 +2170,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   @override
   void dispose() {
     _pageScroll.removeListener(_syncPageBackdropDepth);
+    WatchStateStore.revision.removeListener(_refreshLocalProgress);
     yingjiScrollInProgress.removeListener(_syncPageBackdropDepth);
     _pageBackdropDepth.dispose();
     _pageScroll.dispose();
@@ -2932,7 +2953,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       context,
       PageRouteBuilder<void>(
         opaque: true,
-        allowSnapshotting: true,
+        allowSnapshotting: false,
         transitionDuration: const Duration(milliseconds: 280),
         reverseTransitionDuration: const Duration(milliseconds: 220),
         pageBuilder: (_, _, _) => PlayerPage(
@@ -5052,14 +5073,31 @@ class _AllEpisodeRow extends StatelessWidget {
                             height: 70,
                             child: ClipRRect(
                               borderRadius: BorderRadius.circular(9),
-                              child: image == null
-                                  ? const _EpisodeArtworkFallback()
-                                  : CachedNetworkImage(
-                                      imageUrl: image.toString(),
-                                      fit: BoxFit.cover,
-                                      errorWidget: (_, _, _) =>
-                                          const _EpisodeArtworkFallback(),
+                              child: Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  image == null
+                                      ? const _EpisodeArtworkFallback()
+                                      : CachedNetworkImage(
+                                          imageUrl: image.toString(),
+                                          fit: BoxFit.cover,
+                                          errorWidget: (_, _, _) =>
+                                              const _EpisodeArtworkFallback(),
+                                        ),
+                                  if (progress > 0 || completed)
+                                    Align(
+                                      alignment: Alignment.bottomCenter,
+                                      child: LinearProgressIndicator(
+                                        value: completed
+                                            ? 1
+                                            : progress.clamp(0, 1),
+                                        minHeight: 3,
+                                        backgroundColor: Colors.white24,
+                                        color: Colors.white,
+                                      ),
                                     ),
+                                ],
+                              ),
                             ),
                           ),
                           const SizedBox(width: 14),
@@ -5091,13 +5129,6 @@ class _AllEpisodeRow extends StatelessWidget {
                                     fontSize: 12,
                                   ),
                                 ),
-                                if (progress > 0) ...[
-                                  const SizedBox(height: 8),
-                                  LinearProgressIndicator(
-                                    value: progress.clamp(0, 1),
-                                    minHeight: 3,
-                                  ),
-                                ],
                               ],
                             ),
                           ),

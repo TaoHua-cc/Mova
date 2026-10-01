@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.View
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -41,6 +42,8 @@ class ExoPlayerPlatformView(
         controllerAutoShow = false
         resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
         setBackgroundColor(android.graphics.Color.BLACK)
+        setShutterBackgroundColor(android.graphics.Color.BLACK)
+        setKeepContentOnPlayerReset(false)
         keepScreenOn = true
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
@@ -108,7 +111,7 @@ class ExoPlayerPlatformView(
         when (call.method) {
             "play" -> { exoPlayer.play(); result.success(null) }
             "pause" -> { exoPlayer.pause(); result.success(null) }
-            "toggle" -> { exoPlayer.playWhenReady = !exoPlayer.isPlaying; result.success(null) }
+            "toggle" -> { exoPlayer.playWhenReady = !exoPlayer.playWhenReady; result.success(null) }
             "seekTo" -> {
                 exoPlayer.seekTo((call.argument<Number>("positionMs")?.toLong() ?: 0L).coerceAtLeast(0L))
                 result.success(null)
@@ -163,7 +166,26 @@ class ExoPlayerPlatformView(
     override fun onCancel(arguments: Any?) { eventSink = null }
 
     override fun onIsPlayingChanged(isPlaying: Boolean) = emitState()
-    override fun onPlaybackStateChanged(playbackState: Int) = emitState()
+    override fun onPlaybackStateChanged(playbackState: Int) {
+        tracePlayback("state=$playbackState")
+        emitState()
+    }
+    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+        tracePlayback("requestReason=$reason")
+        emitState()
+    }
+    override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+        tracePlayback("suppression=$playbackSuppressionReason")
+        emitState()
+    }
+
+    private fun tracePlayback(change: String) {
+        // State only: never include URLs, headers, tokens or media titles.
+        Log.i("MovaExo", "$change requested=${exoPlayer.playWhenReady} " +
+            "rendering=${exoPlayer.isPlaying} state=${exoPlayer.playbackState} " +
+            "positionMs=${exoPlayer.currentPosition} " +
+            "bufferAheadMs=${(exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L)}")
+    }
     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
         eventSink?.success(mapOf("error" to error.errorCodeName))
     }
@@ -177,7 +199,11 @@ class ExoPlayerPlatformView(
             "positionMs" to exoPlayer.currentPosition.coerceAtLeast(0L),
             "durationMs" to duration,
             "bufferedMs" to exoPlayer.bufferedPosition.coerceAtLeast(0L),
-            "playing" to exoPlayer.isPlaying,
+            // isPlaying is false while buffering even when no pause was requested.
+            "playing" to (exoPlayer.playWhenReady &&
+                exoPlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
+                exoPlayer.playbackState != Player.STATE_ENDED),
+            "rendering" to exoPlayer.isPlaying,
             "buffering" to (exoPlayer.playbackState == Player.STATE_BUFFERING),
             "completed" to (exoPlayer.playbackState == Player.STATE_ENDED),
             "tracks" to flattenTracks(exoPlayer.currentTracks),

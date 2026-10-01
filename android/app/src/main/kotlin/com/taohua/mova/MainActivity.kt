@@ -1,6 +1,7 @@
 package com.taohua.mova
 
 import android.content.Context
+import android.media.AudioManager
 import android.content.Intent
 import android.app.PictureInPictureParams
 import android.net.ConnectivityManager
@@ -45,6 +46,7 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        volumeControlStream = AudioManager.STREAM_MUSIC
         flutterEngine.platformViewsController.registry.registerViewFactory(
             "mova/exo-video",
             ExoPlayerPlatformViewFactory(flutterEngine.dartExecutor.binaryMessenger),
@@ -52,6 +54,16 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "getMediaVolume", "setMediaVolume" -> {
+                        val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        val maximum = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                        if (call.method == "setMediaVolume") {
+                            val fraction = (call.argument<Number>("value")?.toDouble() ?: 0.0).coerceIn(0.0, 1.0)
+                            audio.setStreamVolume(AudioManager.STREAM_MUSIC,
+                                kotlin.math.round(fraction * maximum).toInt(), 0)
+                        }
+                        result.success(audio.getStreamVolume(AudioManager.STREAM_MUSIC).toDouble() / maximum)
+                    }
                     "getBrightness" -> result.success(currentBrightness())
                     "setBrightness" -> {
                         val value = (call.argument<Double>("value") ?: 0.5)

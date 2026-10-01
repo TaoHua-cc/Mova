@@ -9,15 +9,16 @@ void main() {
     tester,
   ) async {
     await tester.pumpWidget(
-      const Directionality(
-        textDirection: TextDirection.ltr,
-        child: SizedBox(width: 800, height: 600, child: YingjiBackdrop()),
+      MaterialApp(
+        theme: ThemeData(platform: TargetPlatform.windows),
+        home: const SizedBox(width: 800, height: 600, child: YingjiBackdrop()),
       ),
     );
 
     final layers = find.byType(SlideTransition);
     expect(layers, findsNWidgets(2));
     final before = tester.widget<SlideTransition>(layers.first).position.value;
+    await tester.pump();
     await tester.pump(const Duration(seconds: 7));
     final after = tester.widget<SlideTransition>(layers.first).position.value;
     expect(after, isNot(before));
@@ -28,5 +29,6 @@ void main() {
     );
     expect(backdrop, isNot(contains('RadialGradient')));
     expect(backdrop, contains('width: size.maxWidth * 1.8'));
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 }

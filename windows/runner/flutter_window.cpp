@@ -30,9 +30,8 @@ bool FlutterWindow::OnCreate() {
       flutter_controller_->view()->GetNativeWindow());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
-  });
+  // WindowHost shows the first frame after applying size, chrome and centering.
+  // Showing here races that setup and exposes the initial (10, 10) position.
 
   // Flutter can complete the first frame before the "show window" callback is
   // registered. The following call ensures a frame is pending to ensure the

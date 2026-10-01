@@ -21,8 +21,8 @@ void main() {
         detail.indexOf('class _EpisodeStat'),
       );
       final allEpisodeCard = detail.substring(
-        detail.indexOf('class _AllEpisodeCard'),
-        detail.indexOf('class _EpisodeContextAction'),
+        detail.indexOf('class _AllEpisodeRow'),
+        detail.indexOf('class _EpisodeArtworkFallback'),
       );
 
       expect(previewRail, contains('onLongPressStart'));

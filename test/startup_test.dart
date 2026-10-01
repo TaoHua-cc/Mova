@@ -20,8 +20,11 @@ void main() {
       ),
     );
 
-    expect(find.text('Mova'), findsOneWidget);
+    expect(find.byKey(const ValueKey('startup-icon')), findsOneWidget);
+    expect(find.byType(Text), findsNothing);
     expect(find.byKey(const ValueKey('home')), findsNothing);
+    await tester.pumpAndSettle();
+    expect(tester.binding.hasScheduledFrame, isFalse);
 
     startup.complete();
     await tester.pump(const Duration(milliseconds: 1));
@@ -30,7 +33,7 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const ValueKey('home')), findsOneWidget);
-    expect(find.text('Mova'), findsNothing);
+    expect(find.byKey(const ValueKey('startup-icon')), findsNothing);
   });
 
   testWidgets('startup failure falls back to the app instead of blocking', (

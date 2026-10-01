@@ -1039,6 +1039,8 @@ class _CinematicHomeState extends State<_CinematicHome>
     _loadHomePreferences();
     _loadHistory();
     yingjiHomeFocusTick.addListener(_handleHomeFocus);
+    WatchStateStore.revision.addListener(_refreshLocalWatchHistory);
+    unawaited(WindowsNativePlayer.retryPendingWatchSync());
     yingjiSectionFocus.addListener(_syncHeroTimer);
     yingjiHomeScrollDepth.addListener(_syncHeroTimer);
     // 后台把轮播那批元数据刷新回来后换上新内容（FutureBuilder 会保留旧数据，
@@ -1242,7 +1244,7 @@ class _CinematicHomeState extends State<_CinematicHome>
       unawaited(
         _resolveArtworkForRows(current, store).then((resolved) {
           if (mounted) {
-            setState(() => _history = store.visibleContinueRows(resolved));
+            unawaited(_refreshLocalWatchHistory());
           }
         }),
       );
@@ -1253,6 +1255,13 @@ class _CinematicHomeState extends State<_CinematicHome>
         unawaited(_loadHistory());
       }
     }
+  }
+
+  Future<void> _refreshLocalWatchHistory() async {
+    final store = await WatchStateStore.create();
+    if (!mounted) return;
+    final rows = store.visibleContinueRows(store.load());
+    if (!_sameWatchStates(_history, rows)) setState(() => _history = rows);
   }
 
   Future<void> _removeFromContinue(WatchState state) async {
@@ -1270,6 +1279,7 @@ class _CinematicHomeState extends State<_CinematicHome>
   @override
   void dispose() {
     yingjiHomeFocusTick.removeListener(_handleHomeFocus);
+    WatchStateStore.revision.removeListener(_refreshLocalWatchHistory);
     yingjiSectionFocus.removeListener(_syncHeroTimer);
     yingjiHomeScrollDepth.removeListener(_syncHeroTimer);
     yingjiMetadataRevision.removeListener(_handleMetadataRevision);
@@ -1838,7 +1848,7 @@ Future<List<WatchState>> _mergeServerWatchHistory(
   // the local store — e.g. the home shelf right after the full continue list
   // page pops back — flashed that wrong order until a merge had re-run.
   await store.replaceAll(ordered);
-  return store.visibleContinueRows(ordered);
+  return store.visibleContinueRows(store.load());
 }
 
 /// Orders the reconciled rows for the continue-watching shelf. Rows carrying

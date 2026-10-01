@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// How many watch-state rows the local store retains. Emby resume rails can
@@ -174,6 +176,7 @@ class WatchState {
 }
 
 class WatchStateStore {
+  static final revision = ValueNotifier<int>(0);
   WatchStateStore(this._prefs);
   final SharedPreferences _prefs;
   static const key = 'yingji.watch-states';
@@ -240,6 +243,7 @@ class WatchStateStore {
         (_prefs.getStringList(_hiddenContinueKey) ?? const <String>[]).toSet();
     hidden.addAll(_continueWatchingAliases(state));
     await _prefs.setStringList(_hiddenContinueKey, hidden.toList());
+    revision.value++;
   }
 
   /// Saves [state] so it becomes the most recently watched record. When
@@ -267,15 +271,19 @@ class WatchStateStore {
         await _prefs.setStringList(_hiddenContinueKey, hidden.toList());
       }
     }
+    revision.value++;
   }
 
-  Future<void> remove(String mediaId) async => _prefs.setStringList(
-    key,
-    load()
-        .where((item) => item.mediaId != mediaId)
-        .map((item) => jsonEncode(item.toJson()))
-        .toList(),
-  );
+  Future<void> remove(String mediaId) async {
+    await _prefs.setStringList(
+      key,
+      load()
+          .where((item) => item.mediaId != mediaId)
+          .map((item) => jsonEncode(item.toJson()))
+          .toList(),
+    );
+    revision.value++;
+  }
 
   /// Upserts [state] exactly as given without fabricating a timestamp: rows
   /// folded in from a media server keep their real last-played time, or stay
@@ -284,6 +292,14 @@ class WatchStateStore {
   /// as freshly watched on this device and never leaps over genuinely recent
   /// local records.
   Future<void> import(WatchState state) async {
+    final existing = load()
+        .where((row) => row.mediaId == state.mediaId)
+        .firstOrNull;
+    if (existing?.updatedAt != null &&
+        (state.updatedAt == null ||
+            existing!.updatedAt!.isAfter(state.updatedAt!))) {
+      return;
+    }
     final rows = load().where((item) => item.mediaId != state.mediaId).toList()
       ..insert(0, state);
     await _prefs.setStringList(
@@ -304,18 +320,37 @@ class WatchStateStore {
   /// (home shelf, full list page) flashed that wrong order until the next
   /// network merge finished.
   Future<void> replaceAll(Iterable<WatchState> states) async {
+    final merged = states.toList();
+    for (final local in load()) {
+      if (local.progressOrigin != 'local' || local.updatedAt == null) continue;
+      bool same(WatchState row) =>
+          row.mediaId == local.mediaId ||
+          (local.sourceId != null &&
+              local.serverItemId != null &&
+              row.sourceId == local.sourceId &&
+              row.serverItemId == local.serverItemId);
+      final remote = merged.where(same).firstOrNull;
+      if (remote == null ||
+          remote.updatedAt == null ||
+          local.updatedAt!.isAfter(remote.updatedAt!)) {
+        merged.removeWhere(same);
+        merged.add(local);
+      }
+    }
     await _prefs.setStringList(
       key,
-      sortWatchStatesByRecency(states)
+      sortWatchStatesByRecency(merged)
           .take(watchStateStoreCap)
           .map((item) => jsonEncode(item.toJson()))
           .toList(),
     );
+    revision.value++;
   }
 
   Future<void> clear() async {
     await _prefs.remove(key);
     await _prefs.remove(_hiddenContinueKey);
+    revision.value++;
   }
 
   /// Writes resolved cover URLs back onto their records without touching the

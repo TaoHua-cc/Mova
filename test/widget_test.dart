@@ -192,7 +192,7 @@ void main() {
     await tester.pumpAndSettle();
 
     final firstTool = find.byKey(const ValueKey('声音'));
-    final thirdTool = find.byKey(const ValueKey('剧集'));
+    final thirdTool = find.byKey(const ValueKey('全集列表'));
     final dragHandle = find.descendant(
       of: firstTool,
       matching: find.byType(ReorderableDragStartListener),
