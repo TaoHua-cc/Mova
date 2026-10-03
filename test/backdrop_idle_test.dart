@@ -22,8 +22,7 @@ void main() {
       expect(source, contains('bool get _canAdvanceHero'));
       expect(source, contains('if (!_canAdvanceHero)'));
       expect(source, contains('_heroTimer?.cancel();'));
-      expect(source, contains('final period = Platform.isAndroid'));
-      expect(source, contains('Duration(milliseconds: 500)'));
+      expect(source, contains('const period = Duration(milliseconds: 100)'));
       expect(
         source,
         contains('yingjiHomeScrollDepth.addListener(_syncHeroTimer)'),
@@ -51,7 +50,7 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(tester.binding.hasScheduledFrame, false);
-    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(find.byType(BackdropFilter), findsNothing);
     yingjiScrollInProgress.value = true;
     await tester.pump();
     yingjiScrollInProgress.value = false;

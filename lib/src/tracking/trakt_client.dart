@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../metadata/tmdb_client.dart';
+import 'broadcast_platforms.dart';
 
 class TraktEvent {
   const TraktEvent({
@@ -20,6 +21,7 @@ class TraktEvent {
     this.absoluteEpisodeNumber,
     this.totalEpisodes,
     this.platformLogoUrl,
+    this.platforms = const {},
   });
   final String title;
   final String episode;
@@ -37,6 +39,11 @@ class TraktEvent {
   final int? absoluteEpisodeNumber;
   final int? totalEpisodes;
   final Uri? platformLogoUrl;
+  final Map<String, Uri?> platforms;
+  Map<String, Uri?> get broadcastPlatforms => mergeBroadcastPlatforms([
+    platforms,
+    if (platform?.isNotEmpty == true) {platform!: platformLogoUrl},
+  ]);
 
   Map<String, dynamic> toJson() => {
     'title': title,
@@ -54,6 +61,10 @@ class TraktEvent {
       'absoluteEpisodeNumber': absoluteEpisodeNumber,
     if (totalEpisodes != null) 'totalEpisodes': totalEpisodes,
     if (platformLogoUrl != null) 'platformLogoUrl': platformLogoUrl.toString(),
+    if (platforms.isNotEmpty)
+      'platforms': platforms.map(
+        (name, url) => MapEntry(name, url?.toString()),
+      ),
   };
 
   factory TraktEvent.fromJson(Map<String, dynamic> value) => TraktEvent(
@@ -67,6 +78,12 @@ class TraktEvent {
         ? null
         : Uri.tryParse('${value['backdropUrl']}'),
     platform: value['platform'] as String?,
+    platforms: value['platforms'] is Map
+        ? (value['platforms'] as Map).map(
+            (name, url) =>
+                MapEntry('$name', url == null ? null : Uri.tryParse('$url')),
+          )
+        : const {},
     timeKnown: value['timeKnown'] != false,
     tmdbId: (value['tmdbId'] as num?)?.toInt(),
     traktId: (value['traktId'] as num?)?.toInt(),

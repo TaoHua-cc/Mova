@@ -2,9 +2,9 @@
 
 import 'dart:collection';
 import 'dart:math' as math;
-import 'dart:ui';
 
 import 'package:flutter/gestures.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
 
@@ -19,8 +19,7 @@ import 'motion.dart';
 ScrollPhysics? get yingjiWheelPhysics =>
     WindowHost.isDesktop ? const NeverScrollableScrollPhysics() : null;
 
-/// 非稳定玻璃范围可在滚动时暂停背板采样；Android 页面滚动默认使用动态采样，
-/// 只在明确需要固定模糊的弹出层中保留稳定玻璃。
+/// Shared scroll activity; glass no longer captures any background.
 final yingjiScrollInProgress = ValueNotifier<bool>(false);
 final Set<Object> _yingjiScrollOwners = <Object>{};
 
@@ -64,7 +63,7 @@ class YingjiSmoothWheel extends StatefulWidget {
   /// 每个 60fps 帧之后仍未走完的距离比例；越小越跟手、滑行尾巴越短。
   final double settlePerFrame;
 
-  /// 空闲时保持玻璃模糊；桌面滚轮活动期间暂停背板采样，停稳后恢复。
+  /// 双端滚动时保持同一玻璃材质，避免起停切换模糊造成闪变。
   final bool stableGlass;
 
   @override
@@ -192,6 +191,7 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
         : (elapsed - _lastFrame).inMicroseconds / 1e6;
     _lastFrame = elapsed;
     // 掉帧时钳住步长，避免一帧跨过太远。
+    _goal = _goal.clamp(position.minScrollExtent, position.maxScrollExtent);
     final step = seconds.clamp(1 / 240, 1 / 24);
     // 与帧率无关的指数收敛：60fps 下每帧保留 settlePerFrame。
     final keep = math.pow(widget.settlePerFrame, step * 60).toDouble();
@@ -208,22 +208,17 @@ class _YingjiSmoothWheelState extends State<YingjiSmoothWheel> {
   }
 
   void _commit(ScrollPosition position, double value) {
-    _written = value;
-    position.jumpTo(value);
+    position.jumpTo(
+      value.clamp(position.minScrollExtent, position.maxScrollExtent),
+    );
+    _written = position.pixels;
   }
 
   @override
   Widget build(BuildContext context) {
-    // Tablet-sized Android screens cannot afford sampling every glass surface
-    // during scroll. Keep the requested stable treatment on desktop only;
-    // explicit stable dialog scopes remain unchanged.
-    final child = widget.stableGlass && WindowHost.isDesktop
-        ? ValueListenableBuilder<bool>(
-            valueListenable: yingjiScrollInProgress,
-            child: widget.child,
-            builder: (context, scrolling, child) =>
-                YingjiStableScrollGlass(stable: !scrolling, child: child!),
-          )
+    // Keep the same glass material throughout scrolling on both platforms.
+    final child = widget.stableGlass
+        ? YingjiStableScrollGlass(child: widget.child)
         : widget.child;
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
@@ -323,22 +318,19 @@ class _YingjiStableScrollGlassScope extends InheritedWidget {
 class YingjiAppearance extends ChangeNotifier {
   ThemeMode themeMode = ThemeMode.dark;
   String iconStyle = 'play';
-
-  /// 全局磨砂玻璃的模糊半径（设备像素）。外观里唯一留给用户的调整项 —— 底色、
-  /// 不透明度与色调都固定为中性磨砂，见 [YingjiGlass]。
-  /// 液态玻璃默认就要「厚」一点：24 更接近磨砂，30 才看得出玻璃的透光层次。
-  /// ⚠️ 这个默认值在 `main.dart` 与设置页各有一份拷贝，改动要三处同步。
-  double glassBlur = 30;
-
-  void apply({ThemeMode? themeMode, String? iconStyle, double? glassBlur}) {
+  void apply({ThemeMode? themeMode, String? iconStyle}) {
     if (themeMode != null) this.themeMode = themeMode;
     if (iconStyle != null) this.iconStyle = iconStyle;
-    if (glassBlur != null) this.glassBlur = glassBlur.clamp(0, 40);
     notifyListeners();
   }
 }
 
 final yingjiAppearance = YingjiAppearance();
+const double _fixedGlassBlur = 30;
+
+/// Shared fixed frost strength retained for the optical fill calculation.
+const double yingjiFixedGlassBlur = _fixedGlassBlur;
+
 final yingjiBackdropUrl = ValueNotifier<String?>(null);
 final yingjiBackdropEffect = ValueNotifier<String>('blur-dissolve');
 final yingjiSectionRequest = ValueNotifier<String?>(null);
@@ -624,16 +616,14 @@ abstract final class YingjiPlayerTools {
 
 /// 液态玻璃（Liquid Glass）材质的唯一来源。
 ///
-/// 玻璃直接采样并模糊它后面的内容；白色只是极低浓度的折射色，不承担遮罩职责。
+/// 全局固定磨砂材质：用中性固定遮蔽和轻微厚度渐变表现玻璃，不采样背后画面。
 abstract final class YingjiGlass {
+  static const double fixedBlur = yingjiFixedGlassBlur;
   static const Color frost = Color(0xFFF7FAFF);
 
   static const Color frostDeep = Color(0xFFE8EEF8);
 
-  /// 面板底色的不透明度。这一项不再开放给用户（设置里只剩「模糊程度」）。
-  ///
-  /// Apple 式玻璃的底色必须保持很薄；清晰度来自实时模糊、边缘折射与文字阴影，
-  /// 不是来自一层黑板。
+  /// 固定玻璃表面的基础浓度。
   static const double alpha = .10;
 
   /// 选中态 / 高亮态使用珍珠白，在深色玻璃上保持清晰、克制。
@@ -652,25 +642,36 @@ abstract final class YingjiGlass {
     stops: [0, .34, .76, 1],
   );
 
-  static Color surface({double strength = 1}) =>
-      frost.withValues(alpha: (alpha * strength).clamp(.07, .18));
+  static Color surface({double strength = 1}) => fixedFrost(strength: strength);
 
   /// 小面积控件需要更稳定的轮廓，因此浓度下限高于大面板。
-  static Color chrome({double strength = .82}) => Color.lerp(
-    frost,
-    frostDeep,
-    .38,
-  )!.withValues(alpha: (alpha * strength).clamp(.11, .24));
+  static Color chrome({double strength = .82}) =>
+      fixedFrost(strength: strength);
+
+  /// Fixed neutral frost, shared by Windows and Android.
+  static Color fixedFrost({double strength = 1}) {
+    return const Color(0xFF586062).withValues(alpha: .30);
+  }
+
+  /// Fixed depth sheen, not a filter of the scene or extra white fog.
+  static LinearGradient fixedDepth() {
+    const softness = fixedBlur / 40;
+    return LinearGradient(
+      begin: Alignment.topCenter,
+      end: Alignment.bottomCenter,
+      colors: depth.colors,
+      stops: [0, .08 + softness * .22, .46, .78, 1],
+    );
+  }
 
   /// 分隔线 / 未选中描边：与底色浓度无关，固定按白透明度给。
   static Color line({double strength = 1}) =>
       Colors.white.withValues(alpha: (.30 * strength).clamp(.12, .52));
 
   /// 播放器里的浮层（HUD、暂停圆钮）直接压在视频上，需要最高的对比度基线。
-  static Color hud({double strength = 1.5}) =>
-      frost.withValues(alpha: (alpha * strength).clamp(.14, .30));
+  static Color hud({double strength = 1.5}) => fixedFrost(strength: strength);
 
-  static double get blur => yingjiAppearance.glassBlur;
+  static double get blur => fixedBlur;
 
   /// 玻璃厚度的竖向渐变：只有底部微微沉暗，用来暗示「这是一片有厚度的玻璃」。
   ///
@@ -686,22 +687,12 @@ abstract final class YingjiGlass {
     ],
     stops: <double>[0, .14, .46, .78, 1],
   );
-
-  /// 液态玻璃的背板滤镜。直接使用高斯模糊，确保 Windows / Android 都应用同一
-  /// 个外观设置值；避免复合颜色滤镜让部分平台只显示半透明底色。
-  static ImageFilter backdrop({double? sigma}) {
-    final value = sigma ?? blur;
-    return ImageFilter.blur(sigmaX: value, sigmaY: value);
-  }
 }
 
-/// 一块液态玻璃表面：可调高斯模糊背板 + 半透明底 + 厚度沉底，可裁圆角矩形或正圆。
+/// Fixed frost material, with no background sampling.
 ///
 /// **所有浮在内容之上的东西都必须走这里** —— 卡片、圆形按钮、药丸选择器、
-/// 下拉菜单、悬浮提示、播放页控件。原因只有一个：「设置 → 外观 → 模糊程度」
-/// 是**一根**滑杆，它要同时驱动全部控件。任何手写 `DecoratedBox(color: 深色)`
-/// 的控件都没有 `BackdropFilter`，拖滑杆时它一动不动，看着就是「只有一部分
-/// 界面是玻璃，别处还是黑塑料」——这正是之前反复出现的问题。
+/// 下拉菜单、悬浮提示、播放页控件。所有部件复用相同固定材质；禁止读取背景像素。
 ///
 /// 轮廓仅保留低对比内边和短促顶部反射，不使用刺眼的整圈白边。
 /// Player chrome uses the existing fixed material, never a video backdrop.
@@ -715,13 +706,6 @@ class YingjiFixedGlass extends InheritedWidget {
       light != oldWidget.light;
 }
 
-class _YingjiGlassBackdropScope extends InheritedWidget {
-  const _YingjiGlassBackdropScope({required super.child});
-
-  @override
-  bool updateShouldNotify(_YingjiGlassBackdropScope oldWidget) => false;
-}
-
 class YingjiGlassSurface extends StatelessWidget {
   const YingjiGlassSurface({
     super.key,
@@ -730,10 +714,9 @@ class YingjiGlassSurface extends StatelessWidget {
     this.radius = 18,
     this.circle = false,
     this.strength = 1,
-    this.sigma,
     this.depth = true,
     this.shadow = false,
-    this.sampleBackdrop = true,
+    this.sampleBackdrop = false,
   });
 
   final Widget? child;
@@ -748,9 +731,6 @@ class YingjiGlassSurface extends StatelessWidget {
   /// 底色浓度倍率：需要压住文字的地方给 1.2 左右。
   final double strength;
 
-  /// 省略时跟随 [YingjiGlass.blur]；整屏背景那类只糊一半的层显式传值。
-  final double? sigma;
-
   /// 是否叠一层「玻璃厚度」的竖向沉底渐变。
   final bool depth;
 
@@ -759,38 +739,22 @@ class YingjiGlassSurface extends StatelessWidget {
   final bool sampleBackdrop;
 
   @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    animation: yingjiAppearance,
-    child: child,
-    builder: (context, child) => _buildSurface(context, child),
-  );
+  Widget build(BuildContext context) => _buildSurface(context, child);
 
   Widget _buildSurface(BuildContext context, Widget? content) {
     final fixedGlass = context
         .dependOnInheritedWidgetOfExactType<YingjiFixedGlass>();
-    final sampleBackdrop = this.sampleBackdrop && fixedGlass == null;
-    final stableFilter = YingjiStableScrollGlass.enabled(context);
-    final sharesBackdrop =
-        stableFilter &&
-        context
-                .dependOnInheritedWidgetOfExactType<
-                  _YingjiGlassBackdropScope
-                >() !=
-            null;
     final rounded = BorderRadius.circular(radius);
     final shape = circle ? BoxShape.circle : BoxShape.rectangle;
     final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
     Widget inner = content ?? const SizedBox.shrink();
-    if (stableFilter && sampleBackdrop) {
-      inner = _YingjiGlassBackdropScope(child: inner);
-    }
     if (padding != null) inner = Padding(padding: padding!, child: inner);
     if (depth) {
       inner = DecoratedBox(
         decoration: BoxDecoration(
           borderRadius: circle ? null : rounded,
           shape: shape,
-          gradient: YingjiGlass.depth,
+          gradient: YingjiGlass.fixedDepth(),
         ),
         child: inner,
       );
@@ -799,58 +763,19 @@ class YingjiGlassSurface extends StatelessWidget {
       decoration: BoxDecoration(
         borderRadius: circle ? null : rounded,
         shape: shape,
-        color: sampleBackdrop
-            ? YingjiGlass.surface(strength: strength)
-            : fixedGlass?.light == true
+        color: fixedGlass?.light == true
             ? YingjiGlass.chrome(strength: strength)
-            : YingjiColors.elevated.withValues(
-                alpha: (.72 + YingjiGlass.blur / 200).clamp(.72, .94),
-              ),
+            : YingjiGlass.fixedFrost(strength: strength),
       ),
       child: inner,
     );
-    // 归因开关命中时整条跳过离屏背板模糊，而不只是把 sigma 归零 ——
-    // 后者仍会插一层离屏 layer 并做一次全屏回读，量不出通道本身的代价。
-    final skipFilter =
-        !sampleBackdrop ||
-        sharesBackdrop ||
-        FrameTrace.skipGlass('glass') ||
-        FrameTrace.skipGlass(circle ? 'circle' : 'rect');
-    // These surfaces overlap (dialog shell + episode rows), and the app does
-    // not provide a BackdropGroup above dialog routes. Use independent
-    // backdrops so every surface samples the actual scene behind it.
-    final surface = skipFilter
-        ? body
-        : stableFilter
-        ? Stack(
-            children: [
-              Positioned.fill(
-                child: RepaintBoundary(
-                  child: BackdropFilter(
-                    filter: YingjiGlass.backdrop(sigma: sigma),
-                    child: const SizedBox.expand(),
-                  ),
-                ),
-              ),
-              RepaintBoundary(child: body),
-            ],
-          )
-        : ValueListenableBuilder<bool>(
-            valueListenable: yingjiScrollInProgress,
-            child: body,
-            builder: (context, scrolling, child) => BackdropFilter(
-              filter: YingjiGlass.backdrop(sigma: sigma),
-              enabled: !scrolling,
-              child: child,
-            ),
-          );
     final edged = CustomPaint(
       foregroundPainter: _YingjiGlassEdgePainter(
         radius: radius,
         circle: circle,
         devicePixelRatio: devicePixelRatio,
       ),
-      child: surface,
+      child: body,
     );
     // 圆形改用**圆角矩形**裁切，而不是椭圆裁切。
     //
@@ -1009,7 +934,7 @@ class _YingjiGlassEdgePainter extends CustomPainter {
       oldDelegate.devicePixelRatio != devicePixelRatio;
 }
 
-/// 一张液态玻璃卡片：模糊背板 + 半透明底 + 极轻微的厚度沉底。
+/// 一张固定磨砂玻璃卡片：中性半透明底 + 极轻微的厚度沉底。
 ///
 /// 所有「浮在内容之上的面板」都应走这里，不要再手写一层灰底。
 ///
@@ -1022,7 +947,7 @@ class YingjiGlassCard extends StatelessWidget {
     this.radius = 18,
     this.strength = 1,
     this.shadow = true,
-    this.sampleBackdrop = true,
+    this.sampleBackdrop = false,
   });
 
   final Widget child;
@@ -1194,17 +1119,15 @@ class YingjiMotionIconButton extends StatefulWidget {
   State<YingjiMotionIconButton> createState() => _YingjiMotionIconButtonState();
 }
 
-/// 全站唯一的悬浮提示：一模液态玻璃面板，背后真的模糊。
+/// 全站唯一的悬浮提示：复用共享固定磨砂玻璃面板。
 ///
 /// 之前只有「简介」那一处用了玻璃色底，别处（剧集行、评分、人物卡、片单、
 /// 控件条按钮）还是 Material 默认的深灰圆角方块 —— 同一个页面里两种悬浮提示
 /// 并存，用户看到的就是「鼠标悬浮的简介文字没有统一」。现在所有悬浮提示一律
 /// 走这里，尺寸、圆角、字号、内边距、材质完全同源。
 ///
-/// 实现用 [RawTooltip] 而不是 [Tooltip]：`Tooltip` 只允许换一个
-/// [Decoration]（画不出 `BackdropFilter`），而 `RawTooltip` 把整个浮层交给
-/// `tooltipBuilder` —— 于是玻璃面板能真正过滤它下面压着的画面，也就自然跟着
-/// 「设置 → 外观 → 模糊程度」一起变。悬停延迟、长按触发、定位、无障碍提示
+/// 实现用 [RawTooltip] 而不是 [Tooltip]：`RawTooltip` 把整个浮层交给
+/// `tooltipBuilder`，因此能复用固定玻璃和统一排版。悬停延迟、长按触发、定位、无障碍提示
 /// 仍是 Flutter 自己那套，没有重写。
 class YingjiGlassTooltip extends StatelessWidget {
   const YingjiGlassTooltip({
@@ -1632,15 +1555,9 @@ class _YingjiMotionIconButtonState extends State<YingjiMotionIconButton> {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    // 液态玻璃圆片：静止时也在。这里以前是 `YingjiGlass.chrome()`
-                    // 的一层半透明色 —— 没有 BackdropFilter，拖「模糊程度」时它
-                    // 一动不动，看着就是一块黑塑料圆片。
+                    // 固定磨砂圆片：浓度跟随外观，保留高光和描边，不采样背板。
                     YingjiGlassSurface(
                       circle: true,
-                      // 小圆片若沿用 30px 的面板模糊，背后颜色会被抹成一块
-                      // 均匀色，看起来像实心按钮。仍跟随同一滑杆，但保留更多
-                      // 实时画面细节，让移动背景能从图标下方流过。
-                      sigma: YingjiGlass.blur * .55,
                       strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
                       shadow: active,
                       child: widget.selected
@@ -1806,7 +1723,6 @@ class _YingjiGlassPillButtonState extends State<YingjiGlassPillButton> {
                   radius: widget.height / 2,
                   // 小面积玻璃沿用圆形按钮那一档：面板的 30px 模糊会把胶囊背后
                   // 抹成一块均匀色，看起来就是个实心按钮。
-                  sigma: YingjiGlass.blur * .55,
                   strength: widget.selected ? 1.3 : (active ? 1.05 : .78),
                   shadow: active,
                   child: SizedBox(
@@ -1918,7 +1834,7 @@ class GlassPanel extends StatelessWidget {
     required this.child,
     this.padding,
     this.radius = 18,
-    this.sampleBackdrop = true,
+    this.sampleBackdrop = false,
   });
 
   final Widget child;
@@ -1955,74 +1871,80 @@ Future<String?> showYingjiContextMenu({
   required Offset position,
   required List<YingjiContextAction> actions,
   double width = 248,
-}) => showGeneralDialog<String>(
-  context: context,
-  barrierDismissible: true,
-  barrierLabel: '关闭快捷菜单',
-  barrierColor: Colors.transparent,
-  transitionDuration: MovaMotion.quick,
-  pageBuilder: (dialogContext, _, _) {
-    final size = MediaQuery.sizeOf(dialogContext);
-    final left = position.dx.clamp(
-      12.0,
-      math.max(12.0, size.width - width - 12).toDouble(),
-    );
-    final top = position.dy.clamp(
-      12.0,
-      math.max(12.0, size.height - 180).toDouble(),
-    );
-    return Stack(
-      children: [
-        Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => Navigator.pop(dialogContext),
+}) async {
+  return await showGeneralDialog<String>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: '关闭快捷菜单',
+    barrierColor: Colors.transparent,
+    transitionDuration: MovaMotion.quick,
+    pageBuilder: (dialogContext, _, _) {
+      final size = MediaQuery.sizeOf(dialogContext);
+      final left = position.dx.clamp(
+        12.0,
+        math.max(12.0, size.width - width - 12).toDouble(),
+      );
+      final top = position.dy.clamp(
+        12.0,
+        math.max(12.0, size.height - 180).toDouble(),
+      );
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => Navigator.pop(dialogContext),
+            ),
           ),
-        ),
-        Positioned(
-          left: left,
-          top: top,
-          width: width,
-          child: Material(
-            type: MaterialType.transparency,
-            child: DefaultTextStyle.merge(
-              style: const TextStyle(
-                color: YingjiColors.ink,
-                fontSize: 14,
-                height: 1.2,
-                decoration: TextDecoration.none,
-              ),
-              child: GlassPanel(
-                radius: 17,
-                padding: const EdgeInsets.all(7),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (final action in actions)
-                      _YingjiContextActionTile(
-                        action: action,
-                        onTap: () => Navigator.pop(dialogContext, action.value),
-                      ),
-                  ],
+          Positioned(
+            left: left,
+            top: top,
+            width: width,
+            child: Material(
+              type: MaterialType.transparency,
+              child: DefaultTextStyle.merge(
+                style: const TextStyle(
+                  color: YingjiColors.ink,
+                  fontSize: 14,
+                  height: 1.2,
+                  decoration: TextDecoration.none,
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(17),
+                  child: GlassPanel(
+                    radius: 17,
+                    padding: const EdgeInsets.all(7),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final action in actions)
+                          _YingjiContextActionTile(
+                            action: action,
+                            onTap: () =>
+                                Navigator.pop(dialogContext, action.value),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-      ],
-    );
-  },
-  transitionBuilder: (context, animation, secondaryAnimation, child) =>
-      FadeTransition(
-        opacity: animation,
-        child: ScaleTransition(
-          scale: Tween<double>(begin: .96, end: 1).animate(
-            CurvedAnimation(parent: animation, curve: MovaMotion.enter),
+        ],
+      );
+    },
+    transitionBuilder: (context, animation, secondaryAnimation, child) =>
+        FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: .96, end: 1).animate(
+              CurvedAnimation(parent: animation, curve: MovaMotion.enter),
+            ),
+            child: child,
           ),
-          child: child,
         ),
-      ),
-);
+  );
+}
 
 class _YingjiContextActionTile extends StatelessWidget {
   const _YingjiContextActionTile({required this.action, required this.onTap});
@@ -2077,6 +1999,7 @@ class YingjiPinnedDialog extends StatelessWidget {
     this.maxHeight = 760,
     this.insetPadding = const EdgeInsets.all(28),
     this.scrollController,
+    this.transparentHeader = false,
   });
 
   final Widget header;
@@ -2086,6 +2009,7 @@ class YingjiPinnedDialog extends StatelessWidget {
   final double maxHeight;
   final EdgeInsets insetPadding;
   final ScrollController? scrollController;
+  final bool transparentHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -2104,34 +2028,54 @@ class YingjiPinnedDialog extends StatelessWidget {
       insetPadding: insetPadding,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth, maxHeight: maxHeight),
-        child: GlassPanel(
-          radius: 22,
-          padding: EdgeInsets.zero,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (transparentHeader)
               Padding(
                 padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
                 child: header,
               ),
-              Divider(height: 1, color: YingjiGlass.line(strength: .85)),
-              Flexible(
-                child: scrollController == null
-                    ? scrollView
-                    : YingjiSmoothWheel(
-                        controller: scrollController!,
-                        child: scrollView,
+            Flexible(
+              child: GlassPanel(
+                radius: 22,
+                padding: EdgeInsets.zero,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (!transparentHeader)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
+                        child: header,
                       ),
-              ),
-              if (actions != null) ...[
-                Divider(height: 1, color: YingjiGlass.line(strength: .85)),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(22, 14, 22, 18),
-                  child: actions!,
+                    if (!transparentHeader)
+                      Divider(
+                        height: 1,
+                        color: YingjiGlass.line(strength: .85),
+                      ),
+                    Flexible(
+                      child: scrollController == null
+                          ? scrollView
+                          : YingjiSmoothWheel(
+                              controller: scrollController!,
+                              child: scrollView,
+                            ),
+                    ),
+                    if (actions != null) ...[
+                      Divider(
+                        height: 1,
+                        color: YingjiGlass.line(strength: .85),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(22, 14, 22, 18),
+                        child: actions!,
+                      ),
+                    ],
+                  ],
                 ),
-              ],
-            ],
-          ),
+              ),
+            ),
+          ],
         ),
       ),
     );

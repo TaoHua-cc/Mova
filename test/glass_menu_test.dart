@@ -63,27 +63,21 @@ void main() {
     );
     await tester.tap(find.text('one'));
     await tester.pumpAndSettle();
-    // 两片玻璃：按钮自己（常驻）+ 展开的菜单面板。控件不再是「一层半透明色」，
-    // 整个应用的可点表面都走 YingjiGlassSurface，才会一起跟「模糊程度」变。
-    expect(find.byType(BackdropFilter), findsNWidgets(2));
+    // Both button and menu retain fixed frost without backdrop sampling.
+    expect(find.byType(BackdropFilter), findsNothing);
     final menuGlass = find.descendant(
       of: find.byType(GlassPanel),
       matching: find.byType(BackdropFilter),
     );
-    expect(menuGlass, findsOneWidget);
-    yingjiAppearance.apply(glassBlur: 0);
-    await tester.pump();
-    final filter = tester.widget<BackdropFilter>(menuGlass);
-    // 直接使用平台原生高斯模糊，避免只剩透明色底。
-    expect(yingjiAppearance.glassBlur, 0);
-    expect(filter.filter.toString(), contains('ImageFilter.blur'));
+    expect(menuGlass, findsNothing);
+    // The shared frost remains fixed while a menu is open.
+    expect(YingjiGlass.fixedFrost().a, closeTo(.30, .005));
     await tester.tap(find.text('two'));
     await tester.pumpAndSettle();
     expect(selection, 'two');
-    // 菜单关掉后只剩按钮那一片玻璃。
-    expect(find.byType(BackdropFilter), findsOneWidget);
+    // Closing the menu keeps the button's fixed material.
+    expect(find.byType(BackdropFilter), findsNothing);
     expect(tester.takeException(), isNull);
-    yingjiAppearance.apply(glassBlur: 24);
   });
 
   testWidgets('secondary-only context menu also opens on long press', (
@@ -175,7 +169,7 @@ void main() {
     );
     expect(
       find.ancestor(of: action, matching: find.byType(BackdropFilter)),
-      findsOneWidget,
+      findsNothing,
     );
     final style = DefaultTextStyle.of(tester.element(action)).style;
     expect(style.fontSize, 14);

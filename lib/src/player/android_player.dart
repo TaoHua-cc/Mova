@@ -27,7 +27,11 @@ Future<void> playAndroidExoPlayer({
     if (cache == null && Uri.parse(state.mediaId).scheme == 'http') {
       throw StateError('本机播放代理不可用，请检查应用存储空间后重试');
     }
-    final url = await cache?.playbackUrl(state.mediaId, headers: headers);
+    final url = await cache?.playbackUrl(
+      state.mediaId,
+      headers: headers,
+      sourceId: state.sourceId,
+    );
     result = await NativeDolbyVisionPlayer.play(
       url: url ?? state.mediaId,
       title: state.title,

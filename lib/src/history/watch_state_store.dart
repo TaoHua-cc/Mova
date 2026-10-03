@@ -292,6 +292,45 @@ class WatchStateStore {
     revision.value++;
   }
 
+  /// A reset is a saved zero, not deletion: deletion resurrects stale remote
+  /// progress. Update every known alias in one write and publish only once.
+  Future<void> setPlayed(WatchState state, bool played) async {
+    final now = DateTime.now();
+    bool matches(WatchState row) => sameWatchEpisode(row, state);
+    WatchState marked(WatchState row) => WatchState(
+      mediaId: row.mediaId,
+      title: row.title,
+      sourceId: row.sourceId,
+      serverItemId: row.serverItemId,
+      tmdbId: row.tmdbId,
+      episodeTitle: row.episodeTitle,
+      seasonNumber: row.seasonNumber,
+      episodeNumber: row.episodeNumber,
+      imageUrl: row.imageUrl,
+      duration: row.duration,
+      position: played ? row.duration : Duration.zero,
+      isPlayed: played,
+      updatedAt: now,
+    );
+    final rows = load();
+    final next = [
+      marked(state),
+      for (final row in rows)
+        if (row.mediaId != state.mediaId) matches(row) ? marked(row) : row,
+    ];
+    if (played && state.seasonNumber != null) {
+      await TrackingStatusStore.resume(_prefs, state.title, state.tmdbId);
+    }
+    await _prefs.setStringList(
+      key,
+      sortWatchStatesByRecency(next)
+          .take(watchStateStoreCap)
+          .map((row) => jsonEncode(row.toJson()))
+          .toList(),
+    );
+    revision.value++;
+  }
+
   /// Upserts [state] exactly as given without fabricating a timestamp: rows
   /// folded in from a media server keep their real last-played time, or stay
   /// undated (null) when the server reports none. Undated rows sort after all
@@ -330,12 +369,7 @@ class WatchStateStore {
     final merged = states.toList();
     for (final local in load()) {
       if (local.progressOrigin != 'local' || local.updatedAt == null) continue;
-      bool same(WatchState row) =>
-          row.mediaId == local.mediaId ||
-          (local.sourceId != null &&
-              local.serverItemId != null &&
-              row.sourceId == local.sourceId &&
-              row.serverItemId == local.serverItemId);
+      bool same(WatchState row) => sameWatchEpisode(row, local);
       final remote = merged.where(same).firstOrNull;
       if (remote == null ||
           remote.updatedAt == null ||
@@ -372,6 +406,20 @@ class WatchStateStore {
     await replaceAll(rows);
   }
 }
+
+bool sameWatchEpisode(WatchState a, WatchState b) =>
+    a.mediaId == b.mediaId ||
+    (a.sourceId != null &&
+        a.serverItemId != null &&
+        a.sourceId == b.sourceId &&
+        a.serverItemId == b.serverItemId) ||
+    (a.tmdbId != null &&
+        a.tmdbId! > 0 &&
+        a.tmdbId == b.tmdbId &&
+        a.seasonNumber != null &&
+        a.episodeNumber != null &&
+        a.seasonNumber == b.seasonNumber &&
+        a.episodeNumber == b.episodeNumber);
 
 /// Sorts continue-watching states by their real playback time. Dated entries
 /// always come first and are newest-first. When a provider cannot supply a

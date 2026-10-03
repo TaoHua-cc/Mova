@@ -27,10 +27,10 @@ void main() {
     final mediaCenter = File('lib/src/media_center.dart').readAsStringSync();
     final brand = File('lib/src/brand.dart').readAsStringSync();
 
-    expect(brand, contains('child: BackdropFilter('));
-    expect(brand, contains('enabled: !scrolling'));
-    expect(brand, contains('YingjiStableScrollGlass.enabled(context)'));
-    expect(brand, contains(RegExp(r'stableFilter\s*\? Stack\(')));
+    expect(brand, isNot(contains('child: BackdropFilter(')));
+    expect(brand, isNot(contains('enabled: !scrolling')));
+    expect(brand, contains('YingjiGlass.fixedDepth()'));
+    expect(brand, isNot(contains(RegExp(r'stableFilter\s*\? Stack\('))));
     expect(mediaCenter, contains('final shellBody = YingjiStableScrollGlass('));
     final embeddedHome = mediaCenter.substring(
       mediaCenter.indexOf('class _HomeFeedPageState'),

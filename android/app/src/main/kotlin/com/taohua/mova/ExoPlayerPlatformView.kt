@@ -15,6 +15,11 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
+import android.os.SystemClock
+import java.util.concurrent.atomic.AtomicLong
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -53,11 +58,27 @@ class ExoPlayerPlatformView(
     private var eventSink: EventChannel.EventSink? = null
     private var released = false
     private val exoPlayer: ExoPlayer
+    private val transferTrace = creationParams["transferTrace"] == true
+    private var lastBufferTraceMs = 0L
+    private val readBytes = AtomicLong(0L)
+    private var speedSampleMs = SystemClock.elapsedRealtime()
+    private var readBytesPerSecond = 0.0
+    private var tracksPending = true
 
     private val ticker = object : Runnable {
         override fun run() {
             if (released) return
+            val now = SystemClock.elapsedRealtime()
+            val elapsed = now - speedSampleMs
+            if (elapsed >= 1000L) {
+                readBytesPerSecond = readBytes.getAndSet(0L) * 1000.0 / elapsed
+                speedSampleMs = now
+            }
             emitState()
+            if (transferTrace && SystemClock.elapsedRealtime() - lastBufferTraceMs >= 5000L) {
+                lastBufferTraceMs = SystemClock.elapsedRealtime()
+                tracePlayback("directProbe")
+            }
             mainHandler.postDelayed(this, 250L)
         }
     }
@@ -76,6 +97,30 @@ class ExoPlayerPlatformView(
             .setUserAgent("Mova-Android-ExoPlayer")
             .setAllowCrossProtocolRedirects(true)
             .setDefaultRequestProperties(headers)
+            httpFactory.setTransferListener(object : TransferListener {
+                private var startedMs = 0L
+                private var reportedMs = 0L
+                private var bytes = 0L
+                override fun onTransferInitializing(source: DataSource, spec: DataSpec, network: Boolean) {}
+                override fun onTransferStart(source: DataSource, spec: DataSpec, network: Boolean) {
+                    startedMs = SystemClock.elapsedRealtime()
+                    reportedMs = startedMs
+                    bytes = 0
+                    if (transferTrace) Log.i("MovaExoTransfer", "event=start")
+                }
+                override fun onBytesTransferred(source: DataSource, spec: DataSpec, network: Boolean, count: Int) {
+                    bytes += count
+                    if (network) readBytes.addAndGet(count.toLong())
+                    val now = SystemClock.elapsedRealtime()
+                    if (transferTrace && now - reportedMs >= 5000L) {
+                        reportedMs = now
+                        Log.i("MovaExoTransfer", "elapsedMs=${now - startedMs} bytes=$bytes")
+                    }
+                }
+                override fun onTransferEnd(source: DataSource, spec: DataSpec, network: Boolean) {
+                    if (transferTrace) Log.i("MovaExoTransfer", "event=end elapsedMs=${SystemClock.elapsedRealtime() - startedMs} bytes=$bytes")
+                }
+            })
         val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
         val renderersFactory = DefaultRenderersFactory(context)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
@@ -160,6 +205,7 @@ class ExoPlayerPlatformView(
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
+        tracksPending = true
         emitState()
     }
 
@@ -189,16 +235,21 @@ class ExoPlayerPlatformView(
     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
         eventSink?.success(mapOf("error" to error.errorCodeName))
     }
-    override fun onTracksChanged(tracks: Tracks) = emitState()
+    override fun onTracksChanged(tracks: Tracks) {
+        tracksPending = true
+        emitState()
+    }
 
     private fun emitState() {
         if (released) return
         val rawDuration = exoPlayer.duration
         val duration = if (rawDuration == C.TIME_UNSET) 0L else rawDuration.coerceAtLeast(0L)
-        eventSink?.success(mapOf(
+        val sink = eventSink ?: return
+        val state = mutableMapOf<String, Any?>(
             "positionMs" to exoPlayer.currentPosition.coerceAtLeast(0L),
             "durationMs" to duration,
             "bufferedMs" to exoPlayer.bufferedPosition.coerceAtLeast(0L),
+            "readBytesPerSecond" to readBytesPerSecond,
             // isPlaying is false while buffering even when no pause was requested.
             "playing" to (exoPlayer.playWhenReady &&
                 exoPlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE &&
@@ -206,8 +257,14 @@ class ExoPlayerPlatformView(
             "rendering" to exoPlayer.isPlaying,
             "buffering" to (exoPlayer.playbackState == Player.STATE_BUFFERING),
             "completed" to (exoPlayer.playbackState == Player.STATE_ENDED),
-            "tracks" to flattenTracks(exoPlayer.currentTracks),
-        ))
+        )
+        // Track lists change independently of the 250 ms position ticker.
+        // Resend on subscription so a newly attached Flutter listener is complete.
+        if (tracksPending) {
+            state["tracks"] = flattenTracks(exoPlayer.currentTracks)
+            tracksPending = false
+        }
+        sink.success(state)
     }
 
     private fun flattenTracks(tracks: Tracks): List<Map<String, Any?>> {

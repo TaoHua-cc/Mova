@@ -1,5 +1,32 @@
 import 'dart:math' as math;
 
+/// Current media read throughput, not device-wide bandwidth or bitrate.
+String playbackNetworkLabel({
+  required double bytesPerSecond,
+  required Duration position,
+  required Duration buffer,
+  bool buffering = false,
+  bool playing = true,
+  bool local = false,
+}) {
+  if (local) return '本地播放';
+  final bytes = bytesPerSecond.isFinite ? math.max(0, bytesPerSecond) : 0;
+  final speed = bytes >= 1048576
+      ? '${(bytes / 1048576).toStringAsFixed(1)} MB/s'
+      : '${(bytes / 1024).toStringAsFixed(0)} KB/s';
+  final seconds = math.max(0, (buffer - position).inSeconds);
+  final status = buffering
+      ? '缓冲中'
+      : !playing
+      ? '已暂停'
+      : bytes > 0
+      ? '可播 ${seconds}s'
+      : seconds > 0
+      ? '已缓冲 ${seconds}s'
+      : '等待数据';
+  return '$speed · $status';
+}
+
 /// Returns the absolute timeline position that should be painted as buffered.
 ///
 /// mpv can briefly report a stale/zero cache endpoint while opening or seeking.

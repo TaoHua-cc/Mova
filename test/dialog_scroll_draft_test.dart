@@ -47,7 +47,7 @@ void main() {
       ),
     );
     final filter = find.byType(BackdropFilter);
-    expect(filter, findsOneWidget);
+    expect(filter, findsNothing);
     expect(
       find.descendant(of: filter, matching: find.byType(ListView)),
       findsNothing,
@@ -74,7 +74,7 @@ void main() {
         ),
       ),
     );
-    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(find.byType(BackdropFilter), findsNothing);
     expect(find.text('nested'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

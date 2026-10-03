@@ -4,13 +4,65 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart';
 
 import '../network/network_http_client.dart';
+import '../network/proxy_routing.dart';
 import '../platform/window_host.dart';
 
 const int _kb = 1024;
 const int _mb = 1024 * _kb;
 const int _gb = 1024 * _mb;
+
+// Temporary opt-in diagnostics: numeric counters only, never URLs or headers.
+const _transferTraceEnabled = bool.fromEnvironment('MOVA_TRANSFER_TRACE');
+int _transferTraceSequence = 0;
+
+class _TransferTrace {
+  _TransferTrace(this.phase, {this.file, this.initialBytes = 0}) {
+    if (_transferTraceEnabled) {
+      _clock.start();
+      _timer = Timer.periodic(const Duration(seconds: 5), (_) => _report());
+      debugPrint('MovaTransfer id=$id phase=$phase event=start');
+    }
+  }
+
+  final String phase;
+  final File? file;
+  final int initialBytes;
+  final int id = ++_transferTraceSequence;
+  final Stopwatch _clock = Stopwatch();
+  Timer? _timer;
+  bool _reporting = false;
+  int bytes = 0;
+  int readUs = 0;
+  int deliveryUs = 0;
+  int waitMs = 0;
+  int reads = 0;
+
+  Future<void> _report() async {
+    if (!_transferTraceEnabled || _reporting) return;
+    _reporting = true;
+    try {
+      final disk = file == null ? -1 : await file!.length();
+      debugPrint(
+        'MovaTransfer id=$id phase=$phase '
+        'elapsedMs=${_clock.elapsedMilliseconds} bytes=$bytes '
+        'readUs=$readUs deliveryUs=$deliveryUs waitMs=$waitMs '
+        'diskBytes=$disk enqueuedBytes=${initialBytes + bytes} reads=$reads',
+      );
+    } on FileSystemException {
+      debugPrint('MovaTransfer id=$id phase=$phase event=fileChanged');
+    } finally {
+      _reporting = false;
+    }
+  }
+
+  void close() {
+    _timer?.cancel();
+    unawaited(_report());
+  }
+}
 
 int cacheDownloadTargetBytes({
   required int retainLimitBytes,
@@ -135,6 +187,15 @@ class VideoCacheDownload {
   VideoCacheProgress _state = const VideoCacheProgress();
   bool _cancelled = false;
   HttpClientRequest? _request;
+  int? _redirectStartBytes;
+
+  void _prioritize(int offset) {
+    if (_cancelled || _completer.isCompleted || _redirectStartBytes != null) {
+      return;
+    }
+    _redirectStartBytes = offset;
+    _request?.abort();
+  }
 
   Future<void> get done => _completer.future;
   Stream<VideoCacheProgress> get progress => _progressController.stream;
@@ -193,11 +254,25 @@ class VideoCacheProgress {
 class VideoCacheStore {
   VideoCacheStore._(this._root);
 
+  @visibleForTesting
+  factory VideoCacheStore.forDirectory(Directory root) =>
+      VideoCacheStore._(root);
+
   static const String _folder = 'mova-video-cache';
 
   final Directory _root;
   HttpServer? _proxy;
   final Map<String, _ProxySource> _proxySources = <String, _ProxySource>{};
+  final Map<String, VideoCacheDownload> _downloads = {};
+  final Map<String, int> _playbackBytes = {};
+  int playbackBytesRead(String url) => _playbackBytes[_keyFor(url)] ?? 0;
+  final Map<String, String> _contentTypes = {};
+
+  HttpClient _mediaClient(String? sourceId) =>
+      HttpClient()
+        ..findProxy = sourceId != null && ProxyRouting.serverUsesProxy(sourceId)
+            ? findNetworkProxy
+            : (_) => 'DIRECT';
 
   /// 建好目录并返回实例；拿不到目录时返回 null（调用方按「没有缓存」处理）。
   static Future<VideoCacheStore?> tryCreate() async {
@@ -223,6 +298,7 @@ class VideoCacheStore {
   Future<String> playbackUrl(
     String url, {
     Map<String, String> headers = const {},
+    String? sourceId,
   }) async {
     final server = _proxy ??= await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -230,7 +306,7 @@ class VideoCacheStore {
     );
     if (_proxySources.isEmpty) unawaited(_serveProxy(server));
     final key = _keyFor(url);
-    _proxySources[key] = _ProxySource(url, headers);
+    _proxySources[key] = _ProxySource(url, headers, sourceId);
     return 'http://${server.address.address}:${server.port}/media/$key';
   }
 
@@ -308,6 +384,10 @@ class VideoCacheStore {
           (legacyMeta?['totalBytes'] as num?)?.toInt() ??
           0;
       final start = range?.$1 ?? 0;
+      if (request.method == 'GET' &&
+          await _serveSharedCache(request, key, source, range, cachedRanges)) {
+        return;
+      }
       // A growing prefix is not a complete HTTP response. Returning `0-N` for
       // an open-ended `bytes=0-` request makes mpv treat the current end of the
       // .part file as end-of-media while the downloader is still appending.
@@ -325,7 +405,12 @@ class VideoCacheStore {
         request.response.contentLength = length;
         final localStart = start - localRange.startBytes;
         await request.response.addStream(
-          localRange.file.openRead(localStart, localStart + length),
+          localRange.file.openRead(localStart, localStart + length).map((
+            block,
+          ) {
+            _playbackBytes[key] = (_playbackBytes[key] ?? 0) + block.length;
+            return block;
+          }),
         );
         await request.response.close();
         return;
@@ -348,7 +433,7 @@ class VideoCacheStore {
         attempt < attemptLimit && origin == null;
         attempt++
       ) {
-        final probe = HttpClient()..findProxy = findNetworkProxy;
+        final probe = _mediaClient(source.sourceId);
         try {
           final opened = await probe.openUrl(
             request.method,
@@ -400,7 +485,20 @@ class VideoCacheStore {
       if (origin.contentLength >= 0) {
         request.response.contentLength = origin.contentLength;
       }
-      if (request.method != 'HEAD') await request.response.addStream(origin);
+      if (request.method != 'HEAD') {
+        final trace = _TransferTrace('originProxy');
+        try {
+          await request.response.addStream(
+            origin.map((chunk) {
+              trace.bytes += chunk.length;
+              _playbackBytes[key] = (_playbackBytes[key] ?? 0) + chunk.length;
+              return chunk;
+            }),
+          );
+        } finally {
+          trace.close();
+        }
+      }
       await request.response.close();
     } catch (_) {
       try {
@@ -409,6 +507,242 @@ class VideoCacheStore {
       } catch (_) {}
     } finally {
       client?.close(force: true);
+    }
+  }
+
+  /// Read the downloader's growing file rather than opening a second origin
+  /// response. The HTTP response still describes the whole requested range.
+  /// Once the retained window ends, the origin supplies only the missing tail.
+  Future<bool> _serveSharedCache(
+    HttpRequest request,
+    String key,
+    _ProxySource source,
+    (int, int?)? range,
+    List<_CachedRange> cached,
+  ) async {
+    final start = range?.$1 ?? 0;
+    var job = _downloads[key];
+    final metadataDeadline = DateTime.now().add(const Duration(seconds: 30));
+    while (job != null &&
+        !job.isCancelled &&
+        !job._completer.isCompleted &&
+        (job.state.mediaTotalBytes <= 0 || job.state.totalBytes <= 0) &&
+        DateTime.now().isBefore(metadataDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      job = _downloads[key];
+    }
+    final total = (job?.state.mediaTotalBytes ?? 0) > 0
+        ? job!.state.mediaTotalBytes
+        : (cached.isEmpty ? 0 : cached.first.totalBytes);
+    if (range != null &&
+        range.$2 == null &&
+        start > 0 &&
+        start < total - _mb &&
+        job != null &&
+        (start < job.state.startBytes ||
+            start > job.state.startBytes + job.state.receivedBytes + _mb)) {
+      job._prioritize(start);
+    }
+    final cachedStart = cached.any(
+      (row) => start >= row.startBytes && start < row.startBytes + row.bytes,
+    );
+    final downloadingStart =
+        job != null &&
+        !job.isCancelled &&
+        job.state.totalBytes > 0 &&
+        (job._redirectStartBytes == start ||
+            (start >= job.state.startBytes &&
+                start < job.state.startBytes + job.state.totalBytes));
+    if (total <= start || (!cachedStart && !downloadingStart)) return false;
+    final end = (range?.$2 ?? total - 1).clamp(start, total - 1);
+    request.response.statusCode = range == null
+        ? HttpStatus.ok
+        : HttpStatus.partialContent;
+    request.response.contentLength = end - start + 1;
+    request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+    request.response.headers.set(
+      HttpHeaders.contentTypeHeader,
+      _contentTypes[key] ?? 'application/octet-stream',
+    );
+    if (range != null) {
+      request.response.headers.set(
+        HttpHeaders.contentRangeHeader,
+        'bytes $start-$end/$total',
+      );
+    }
+    var offset = start;
+    var stalledSince = DateTime.now();
+    final trace = _TransferTrace('cacheProxy');
+    RandomAccessFile? cachedInput;
+    String? inputPath;
+    int? inputStart;
+    VideoCacheDownload? inputJob;
+    try {
+      while (offset <= end) {
+        job = _downloads[key];
+        final candidates = <_CachedRange>[
+          if (job != null)
+            _CachedRange(
+              File(_windowPath(key)),
+              0,
+              job.state.startBytes,
+              total,
+            ),
+          ...cached.where(
+            (row) => job == null || row.file.path != _windowPath(key),
+          ),
+          _CachedRange(File(_path(key)), 0, 0, total),
+        ];
+        Uint8List? block;
+        for (final candidate in candidates) {
+          if (offset < candidate.startBytes) continue;
+          final readClock = Stopwatch()..start();
+          try {
+            // Keep the descriptor while this response reads the same window.
+            // Android async open/close per tiny growing block is expensive.
+            if (cachedInput == null ||
+                inputPath != candidate.file.path ||
+                inputStart != candidate.startBytes ||
+                (candidate.file.path == _windowPath(key) && inputJob != job)) {
+              await cachedInput?.close();
+              cachedInput = null;
+              cachedInput = await candidate.file.open();
+              inputPath = candidate.file.path;
+              inputStart = candidate.startBytes;
+              inputJob = job;
+            }
+            final input = cachedInput;
+            final localOffset = offset - candidate.startBytes;
+            final available = await input.length() - localOffset;
+            // Coalesce small writer chunks on Android, but bound the added
+            // latency for slow sources and short metadata requests.
+            if (Platform.isAndroid &&
+                available < 256 * _kb &&
+                end - offset + 1 > 256 * _kb &&
+                candidate.file.path == _windowPath(key) &&
+                job != null &&
+                !job._completer.isCompleted &&
+                !job.isCancelled &&
+                DateTime.now().difference(stalledSince).inMilliseconds < 200) {
+              break;
+            }
+            if (available <= 0 &&
+                candidate.file.path == _windowPath(key) &&
+                job != null &&
+                !job._completer.isCompleted &&
+                !job.isCancelled) {
+              // No other candidate can cover this still-growing window yet.
+              break;
+            }
+            if (available <= 0) continue;
+            await input.setPosition(localOffset);
+            block = await input.read(
+              (end - offset + 1).clamp(0, available).clamp(0, 512 * _kb),
+            );
+            trace.reads++;
+            if (candidate.file.path == _windowPath(key) &&
+                (_downloads[key] != job ||
+                    (job != null &&
+                        job.state.startBytes != candidate.startBytes))) {
+              block = null;
+              continue;
+            }
+            if (block.isNotEmpty) break;
+          } on FileSystemException {
+            // A window may have been replaced between selecting and opening it.
+            try {
+              await cachedInput?.close();
+            } catch (_) {}
+            cachedInput = null;
+          } finally {
+            // Windows prevents the downloader renaming an open cache file.
+            if (Platform.isWindows) {
+              await cachedInput?.close();
+              cachedInput = null;
+            }
+            trace.readUs += readClock.elapsedMicroseconds;
+          }
+        }
+        if (block != null && block.isNotEmpty) {
+          request.response.add(block);
+          _playbackBytes[key] = (_playbackBytes[key] ?? 0) + block.length;
+          final deliveryClock = Stopwatch()..start();
+          await request.response.flush();
+          trace.deliveryUs += deliveryClock.elapsedMicroseconds;
+          trace.bytes += block.length;
+          offset += block.length;
+          stalledSince = DateTime.now();
+          continue;
+        }
+        if (_downloads[key] != job) continue;
+        final stillDownloading =
+            job != null &&
+            !job.isCancelled &&
+            !job._completer.isCompleted &&
+            (job._redirectStartBytes != null ||
+                job.state.totalBytes <= 0 ||
+                (offset >= job.state.startBytes &&
+                    offset < job.state.startBytes + job.state.totalBytes));
+        if (stillDownloading &&
+            DateTime.now().difference(stalledSince) <
+                const Duration(seconds: 30)) {
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+          trace.waitMs += 25;
+          continue;
+        }
+        final client = _mediaClient(source.sourceId);
+        final tailTrace = _TransferTrace('originTail');
+        try {
+          final tail = await client
+              .getUrl(Uri.parse(source.url))
+              .timeout(const Duration(seconds: 20));
+          source.headers.forEach(tail.headers.set);
+          tail.headers.set(HttpHeaders.rangeHeader, 'bytes=$offset-$end');
+          final response = await tail.close().timeout(
+            const Duration(seconds: 30),
+          );
+          final partial = response.statusCode == HttpStatus.partialContent;
+          if ((!partial && response.statusCode != HttpStatus.ok) ||
+              (partial &&
+                  _contentRangeStart(
+                        response.headers.value(HttpHeaders.contentRangeHeader),
+                      ) !=
+                      offset)) {
+            throw const HttpException('Playback cache tail unavailable');
+          }
+          var skip = partial ? 0 : offset;
+          var remaining = end - offset + 1;
+          await for (final chunk in response) {
+            if (skip >= chunk.length) {
+              skip -= chunk.length;
+              continue;
+            }
+            final count = (chunk.length - skip).clamp(0, remaining);
+            request.response.add(chunk.sublist(skip, skip + count));
+            _playbackBytes[key] = (_playbackBytes[key] ?? 0) + count;
+            final deliveryClock = Stopwatch()..start();
+            await request.response.flush();
+            tailTrace.deliveryUs += deliveryClock.elapsedMicroseconds;
+            tailTrace.bytes += count;
+            trace.bytes += count;
+            skip = 0;
+            remaining -= count;
+            if (remaining == 0) break;
+          }
+          if (remaining != 0) {
+            throw const HttpException('Playback cache tail ended early');
+          }
+          offset = end + 1;
+        } finally {
+          tailTrace.close();
+          client.close(force: true);
+        }
+      }
+      await request.response.close();
+      return true;
+    } finally {
+      trace.close();
+      await cachedInput?.close();
     }
   }
 
@@ -525,6 +859,7 @@ class VideoCacheStore {
     Duration startPosition = Duration.zero,
     Duration mediaDuration = Duration.zero,
     Map<String, String> headers = const {},
+    String? sourceId,
     String title = '',
   }) {
     final job = VideoCacheDownload._();
@@ -532,6 +867,7 @@ class VideoCacheStore {
       job._completer.complete();
       return job;
     }
+    _downloads[_keyFor(url)] = job;
     unawaited(
       _run(
         job,
@@ -542,6 +878,7 @@ class VideoCacheStore {
         startPosition: startPosition,
         mediaDuration: mediaDuration,
         headers: headers,
+        sourceId: sourceId,
         title: title,
       ),
     );
@@ -557,6 +894,43 @@ class VideoCacheStore {
     required Duration startPosition,
     required Duration mediaDuration,
     required Map<String, String> headers,
+    required String? sourceId,
+    required String title,
+  }) async {
+    var nextStart = startBytes;
+    try {
+      do {
+        job._redirectStartBytes = null;
+        await _runWindow(
+          job,
+          url: url,
+          limitBytes: limitBytes,
+          targetBytes: targetBytes,
+          startBytes: nextStart,
+          startPosition: startPosition,
+          mediaDuration: mediaDuration,
+          headers: headers,
+          sourceId: sourceId,
+          title: title,
+        );
+        nextStart = job._redirectStartBytes;
+      } while (nextStart != null && !job._cancelled);
+    } finally {
+      if (!job._completer.isCompleted) job._completer.complete();
+      await job._progressController.close();
+    }
+  }
+
+  Future<void> _runWindow(
+    VideoCacheDownload job, {
+    required String url,
+    required int limitBytes,
+    required int? targetBytes,
+    required int? startBytes,
+    required Duration startPosition,
+    required Duration mediaDuration,
+    required Map<String, String> headers,
+    required String? sourceId,
     required String title,
   }) async {
     HttpClient? client;
@@ -587,7 +961,7 @@ class VideoCacheStore {
       if (startBytes == null &&
           startPosition > Duration.zero &&
           mediaDuration > Duration.zero) {
-        mediaTotalBytes = await _probeMediaTotal(uri, headers);
+        mediaTotalBytes = await _probeMediaTotal(uri, headers, sourceId);
         if (job._cancelled) return;
         windowStart = videoCacheByteOffsetForPosition(
           position: startPosition,
@@ -610,12 +984,13 @@ class VideoCacheStore {
           status: VideoCacheStatus.downloading,
         ),
       );
-      client = HttpClient()..findProxy = findNetworkProxy;
+      client = _mediaClient(sourceId);
       final request = await client
           .getUrl(uri)
           .timeout(const Duration(seconds: 20));
-      if (job._cancelled) return;
+      if (job._cancelled || job._redirectStartBytes != null) return;
       job._request = request;
+      if (job._redirectStartBytes != null) return;
       for (final entry in headers.entries) {
         request.headers.set(entry.key, entry.value);
       }
@@ -650,6 +1025,8 @@ class VideoCacheStore {
         return;
       }
       final remaining = response.contentLength;
+      final contentType = response.headers.value(HttpHeaders.contentTypeHeader);
+      if (contentType != null) _contentTypes[key] = contentType;
       final total =
           _contentRangeTotal(
             response.headers.value(HttpHeaders.contentRangeHeader),
@@ -690,14 +1067,29 @@ class VideoCacheStore {
         return;
       }
       var completed = false;
+      job._update(
+        VideoCacheProgress(
+          receivedBytes: offset,
+          totalBytes: downloadTargetBytes,
+          mediaTotalBytes: total,
+          startBytes: windowStart,
+          supportsRange: supportsRange,
+          status: VideoCacheStatus.downloading,
+        ),
+      );
       final sink = part.openWrite(
         mode: offset > 0 ? FileMode.append : FileMode.write,
+      );
+      final trace = _TransferTrace(
+        'originCache',
+        file: part,
+        initialBytes: offset,
       );
       try {
         var written = offset;
         var lastReported = offset;
         await for (final chunk in response) {
-          if (job._cancelled) break;
+          if (job._cancelled || job._redirectStartBytes != null) break;
           final bytesToWrite = cacheChunkBytesToWrite(
             writtenBytes: written,
             targetBytes: downloadTargetBytes,
@@ -710,6 +1102,7 @@ class VideoCacheStore {
                 : chunk.sublist(0, bytesToWrite),
           );
           written += bytesToWrite;
+          trace.bytes += bytesToWrite;
           if (written - lastReported >= _mb) {
             lastReported = written;
             job._update(
@@ -740,6 +1133,7 @@ class VideoCacheStore {
         try {
           await sink.close();
         } catch (_) {}
+        trace.close();
       }
       final size = await _lengthOf(part);
       if (size <= 0) {
@@ -782,25 +1176,30 @@ class VideoCacheStore {
       await prune(limitBytes);
     } catch (_) {
       // 缓存失败不影响播放，但向播放器暴露真实状态。
-      job._update(
-        VideoCacheProgress(
-          receivedBytes: job.state.receivedBytes,
-          totalBytes: job.state.totalBytes,
-          mediaTotalBytes: job.state.mediaTotalBytes,
-          startBytes: job.state.startBytes,
-          supportsRange: job.state.supportsRange,
-          status: VideoCacheStatus.unavailable,
-        ),
-      );
+      if (job._redirectStartBytes == null) {
+        job._update(
+          VideoCacheProgress(
+            receivedBytes: job.state.receivedBytes,
+            totalBytes: job.state.totalBytes,
+            mediaTotalBytes: job.state.mediaTotalBytes,
+            startBytes: job.state.startBytes,
+            supportsRange: job.state.supportsRange,
+            status: VideoCacheStatus.unavailable,
+          ),
+        );
+      }
     } finally {
       client?.close(force: true);
-      if (!job._completer.isCompleted) job._completer.complete();
-      await job._progressController.close();
+      job._request = null;
     }
   }
 
-  Future<int> _probeMediaTotal(Uri uri, Map<String, String> headers) async {
-    final client = HttpClient()..findProxy = findNetworkProxy;
+  Future<int> _probeMediaTotal(
+    Uri uri,
+    Map<String, String> headers,
+    String? sourceId,
+  ) async {
+    final client = _mediaClient(sourceId);
     try {
       final head = await client
           .openUrl('HEAD', uri)
@@ -822,7 +1221,7 @@ class VideoCacheStore {
       client.close(force: true);
     }
 
-    final probe = HttpClient()..findProxy = findNetworkProxy;
+    final probe = _mediaClient(sourceId);
     try {
       final request = await probe
           .getUrl(uri)
@@ -1046,9 +1445,10 @@ int? _contentRangeTotal(String? value) {
 }
 
 class _ProxySource {
-  const _ProxySource(this.url, this.headers);
+  const _ProxySource(this.url, this.headers, this.sourceId);
   final String url;
   final Map<String, String> headers;
+  final String? sourceId;
 }
 
 class _CacheFile {

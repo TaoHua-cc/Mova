@@ -158,6 +158,7 @@ struct EpisodeResolutionUpdate {
   size_t index = 0;
   std::string url;
   std::string headers;
+  bool native_network = false;
   double resume_seconds = 0.0;
   std::string error;
 };
@@ -217,6 +218,8 @@ constexpr int kSeekInterruptRetries = 2;
 constexpr uint64_t kRetryHealthWindowMs = 15000;
 std::atomic<double> g_cache_fraction{0};
 std::atomic<double> g_network_bytes_per_second{0};
+std::atomic<double> g_buffered_seconds{0};
+std::atomic<bool> g_network_speed_available{true};
 std::atomic<int64_t> g_playlist_position{0};
 // 整季的播放地址。注意：只有当前这一集会交给 mpv —— 把整季都 loadfile 进去
 // 的话，mpv 在任何 end-file（包括读取出错）之后都会自动前进到下一项，表现
@@ -311,6 +314,8 @@ std::vector<double> g_playlist_resumes;
 // 每集单独保存 HTTP headers，切换服务器或鉴权资源时在 loadfile 前更新。
 std::vector<std::string> g_playlist_headers;
 std::vector<bool> g_playlist_header_overrides;
+std::vector<bool> g_playlist_native_network;
+std::atomic<bool> g_native_network_input{false};
 std::string g_default_http_headers;
 bool g_default_http_headers_set = false;
 // 应用侧给「本次起播这一集」的精确续播点（秒）。它可能来自服务器端进度，比
@@ -850,14 +855,12 @@ constexpr int kPanelResourceWidth = 440;
 //   * 基色 —— 取 `YingjiGlass.frost`（#14141A），而不是此前那块海军蓝
 //     (43,47,57)/(22,24,30)。偏蓝的近黑叠在白字幕上会发青，也是用户说
 //     「菜单是一块黑色背景」的来源之一。
-//   * 浓度 —— 与应用侧常规玻璃和 HUD 的两级透明度保持同一范围；
-//     整条曲线由「设置 → 外观 → 模糊程度」驱动（stdin 的
-//     `MOVA_APPLY=mova-glass-blur|<0-40>`）：模糊越大 → 玻璃越薄、越透。
+//   * 浓度 —— 固定 30/40，与共享 Flutter 玻璃使用同一固定基线。
 //   * 厚度 —— `YingjiGlass.depth` 那条「只沉底边」的渐变，**里面没有白色**：
 //     白 = 高光，把材质带向塑料片的就是它。
 //   * 描边 —— 白 .16 的 1px 内描边（与 Dart 侧 `YingjiGlass.line()` 同值）。
 //
-// 默认 30 与 Dart 侧 `YingjiAppearance.glassBlur` 一致。
+// 固定值不再由外观滑块或用户偏好控制。
 std::atomic<double> g_glass_blur{30.0};
 
 /// 玻璃基色：与应用侧 `YingjiGlass.frost` 完全一致。
@@ -936,18 +939,23 @@ void FillStaticPlayerMenuSurface(Gdiplus::Graphics& graphics,
                                  const Gdiplus::GraphicsPath& path,
                                  const Gdiplus::RectF& rect) {
   // Same fixed material as YingjiGlassSurface(sampleBackdrop: false).
-  const BYTE top_alpha = static_cast<BYTE>(std::lround(255.0 *
-      std::clamp(.66 + g_glass_blur.load() / 240.0, .66, .90)));
-  Gdiplus::LinearGradientBrush surface(
-      Gdiplus::PointF(rect.X, rect.Y),
-      Gdiplus::PointF(rect.X, rect.GetBottom()),
-      Gdiplus::Color(top_alpha, 27, 29, 34),
-      Gdiplus::Color(top_alpha, 27, 29, 34));
+  // Video is not sampled: keep the reflection tint fixed, never turn the
+  // appearance blur slider into an increasing white/dark fog overlay.
+  Gdiplus::SolidBrush surface(Gdiplus::Color(77, 88, 96, 98));
   graphics.FillPath(&surface, &path);
+  constexpr float softness = .65f;
   Gdiplus::LinearGradientBrush reflection(
       Gdiplus::PointF(rect.X, rect.Y),
       Gdiplus::PointF(rect.X, rect.GetBottom()),
-      Gdiplus::Color(14, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255));
+      Gdiplus::Color(static_cast<BYTE>(9 + 11 * softness), 255, 255, 255),
+      Gdiplus::Color(0, 255, 255, 255));
+  const Gdiplus::Color lights[] = {
+      Gdiplus::Color(static_cast<BYTE>(9 + 11 * softness), 255, 255, 255),
+      Gdiplus::Color(1, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255),
+      Gdiplus::Color(1, 255, 255, 255),
+      Gdiplus::Color(10, 255, 255, 255)};
+  const float stops[] = {0, .08f, .55f, .94f, 1};
+  reflection.SetInterpolationColors(lights, stops, 5);
   graphics.FillPath(&reflection, &path);
 }
 
@@ -955,26 +963,44 @@ void StrokeStaticPlayerMenuEdge(Gdiplus::Graphics& graphics,
                                 const Gdiplus::GraphicsPath& path) {
   Gdiplus::RectF bounds;
   path.GetBounds(&bounds);
+  constexpr double t = .65;
   Gdiplus::LinearGradientBrush edge(
       Gdiplus::PointF(bounds.X, bounds.Y),
       Gdiplus::PointF(bounds.GetRight(), bounds.GetBottom()),
-      Gdiplus::Color(92, 255, 255, 255), Gdiplus::Color(35, 255, 255, 255));
-  Gdiplus::Pen hairline(&edge, 0.9f);
+      Gdiplus::Color(static_cast<BYTE>(71 + 87 * t), 255, 255, 255),
+      Gdiplus::Color(static_cast<BYTE>(31 + 56 * t), 255, 255, 255));
+  Gdiplus::Pen hairline(&edge, static_cast<float>(0.75 + .35 * t));
   graphics.DrawPath(&hairline, &path);
+  // A recessed inner rim gives thickness without tinting the clear centre.
+  const float inset = static_cast<float>(1.0 + 1.5 * t);
+  if (bounds.Width > inset * 4 && bounds.Height > inset * 4) {
+    std::unique_ptr<Gdiplus::GraphicsPath> inner(path.Clone());
+    const float sx = (bounds.Width - inset * 2) / bounds.Width;
+    const float sy = (bounds.Height - inset * 2) / bounds.Height;
+    Gdiplus::Matrix transform(sx, 0, 0, sy,
+        bounds.X * (1 - sx) + inset, bounds.Y * (1 - sy) + inset);
+    inner->Transform(&transform);
+    Gdiplus::LinearGradientBrush rim(
+        Gdiplus::PointF(bounds.X, bounds.Y),
+        Gdiplus::PointF(bounds.GetRight(), bounds.GetBottom()),
+        Gdiplus::Color(static_cast<BYTE>(26 + 30 * t), 255, 255, 255),
+        Gdiplus::Color(static_cast<BYTE>(20 + 26 * t), 255, 255, 255));
+    const Gdiplus::Color colors[] = {
+        Gdiplus::Color(static_cast<BYTE>(26 + 30 * t), 255, 255, 255),
+        Gdiplus::Color(0, 255, 255, 255),
+        Gdiplus::Color(static_cast<BYTE>(20 + 26 * t), 255, 255, 255)};
+    const float stops[] = {0, .55f, 1};
+    rim.SetInterpolationColors(colors, stops, 3);
+    Gdiplus::Pen inner_edge(&rim, .8f);
+    graphics.DrawPath(&inner_edge, inner.get());
+  }
 }
 
 /// 玻璃的一圈内描边（白 .16）。面板、提示、气泡共用同一个值：以前面板 46、
 /// 控件条 76，同一屏里两圈线亮度不同，看着就不是一套皮肤。
 void StrokeGlassEdge(Gdiplus::Graphics& graphics,
                      const Gdiplus::GraphicsPath& path) {
-  Gdiplus::RectF bounds;
-  path.GetBounds(&bounds);
-  Gdiplus::LinearGradientBrush light(
-      Gdiplus::PointF(bounds.X, bounds.Y),
-      Gdiplus::PointF(bounds.GetRight(), bounds.GetBottom()),
-      Gdiplus::Color(105, 255, 246, 222), Gdiplus::Color(28, 255, 255, 255));
-  Gdiplus::Pen edge(&light, 0.8f);
-  graphics.DrawPath(&edge, &path);
+  StrokeStaticPlayerMenuEdge(graphics, path);
 }
 
 /// 玻璃文字的统一绘制路径；具体墨色由调用方按珍珠色菜单或烟熏色 OSD 选择。
@@ -1264,13 +1290,14 @@ void OpenPanel(std::vector<PanelItem> items, PanelAnchor anchor,
 // 「确认悬停目标」更干扰；按钮身份用高亮动效表达已经足够。
 enum class HintMode { Hidden, Toast };
 enum class HintTone { Neutral, Success, Warning, Loading, Error };
-enum class HintLayout { Standard, Episode };
+enum class HintLayout { Standard, Episode, AutoSkip, SkipStatus };
 
 void ShowHint(const std::wstring& text, const std::wstring& detail,
               wchar_t icon, HintMode mode, float fraction, int anchor_x,
               HintTone tone = HintTone::Neutral,
               HintLayout layout = HintLayout::Standard);
 void HideHint();
+void HideAutoSkipHint();
 void ShowAdjustHint(const std::wstring& title, const std::wstring& detail,
                     wchar_t icon, float fraction,
                     HintTone tone = HintTone::Neutral,
@@ -1447,12 +1474,7 @@ void ApplyPlaylistStart(int64_t index) {
 // 切到播放列表的第 index 项。mpv 里始终只装着这一项，所以换集必须用
 // loadfile 而不是 playlist-next / playlist-pos —— 后者在单项列表上无效。
 // 索引由我们自己维护，Dart 侧据此跟踪集数、切换缓存与预加载下一集。
-bool LoadPlaylistEntry(int64_t index) {
-  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
-    return false;
-  }
-  if (!g_handle) return false;
-  const int64_t previous_index = g_playlist_position.load();
+void ApplyPlaylistHeaders(int64_t index) {
   const bool has_header_override =
       index < static_cast<int64_t>(g_playlist_header_overrides.size()) &&
       g_playlist_header_overrides[static_cast<size_t>(index)];
@@ -1464,6 +1486,15 @@ bool LoadPlaylistEntry(int64_t index) {
     const std::string headers = MpvHeaderFields(source_headers);
     MpvCommand("set", "http-header-fields", headers.c_str());
   }
+}
+
+bool LoadPlaylistEntry(int64_t index) {
+  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
+    return false;
+  }
+  if (!g_handle) return false;
+  const int64_t previous_index = g_playlist_position.load();
+  ApplyPlaylistHeaders(index);
   // 先切索引：loadfile(replace) 发出的旧文件结束事件可能很快到达，事件回调
   // 必须已经知道新项；命令失败时再回滚索引。
   g_playlist_position = index;
@@ -1480,6 +1511,10 @@ bool LoadPlaylistEntry(int64_t index) {
   g_episode_search_pending = false;
   g_episode_search_index = -1;
   g_cache_fraction = 0;
+  g_native_network_input = g_playlist_native_network[static_cast<size_t>(index)];
+  g_network_bytes_per_second = 0;
+  g_buffered_seconds = 0;
+  g_network_speed_available = true;
   g_playback_error = false;
   g_last_valid_position = 0;
   // 换了一集：中断重试的预算重新给（见 kMaxInterruptRetries 的注释）。
@@ -1744,25 +1779,32 @@ void SkipSegment(size_t index, bool automatic) {
   if (g_position.load() >= end - 0.5) return;
   SeekToSeconds(end);
   ShowControls();
-  ShowToast(Utf8(automatic ? label + L"已自动跳过" : label + L"已跳过"),
-            HintTone::Success);
+  if (automatic) {
+    ShowHint(L"已跳过" + label, L"", 0, HintMode::Toast, -1.0f, 0,
+             HintTone::Success, HintLayout::SkipStatus);
+  } else {
+    ShowToast(Utf8(label + L"已跳过"), HintTone::Success);
+  }
 }
 
 // 自动跳过：位置落进某个片段后先提示、按设置里的秒数倒计时，到点才跳。
 // 倒计时期间用户可以在「片头片尾」面板里点「本次不跳过」取消。
 void UpdateAutoSkip(uint64_t now) {
   if (!g_auto_skip_segments || g_paused.load()) {
+    HideAutoSkipHint();
     g_skip_index = -1;
     return;
   }
   const auto segments = SegmentsSnapshot();
   if (segments.empty()) {
+    HideAutoSkipHint();
     g_skip_index = -1;
     return;
   }
   const int candidate =
       ActiveSegmentIndex(segments, g_position.load(), g_duration.load());
   if (candidate < 0) {
+    HideAutoSkipHint();
     g_skip_index = -1;
     return;
   }
@@ -1775,19 +1817,16 @@ void UpdateAutoSkip(uint64_t now) {
   const double remaining = g_skip_deadline > now
                                ? static_cast<double>(g_skip_deadline - now) / 1000.0
                                : 0.0;
-  // 每半秒刷一次提示：文案里的剩余秒数要跟着走，进度条也才有推进感。
-  if (g_skip_hint_shown == 0 || now - g_skip_hint_shown >= 500) {
-    g_skip_hint_shown = now;
-    const double total = std::max(0.1, g_skip_delay_seconds);
+  const uint64_t seconds = static_cast<uint64_t>(std::ceil(remaining));
+  if (seconds > 0 && g_skip_hint_shown != seconds) {
+    g_skip_hint_shown = seconds;
     const std::wstring label = SegmentGlyphLabel(segments[candidate].kind);
     // 跳过是「要发生的事」，用应用侧的成功绿做强调（进度线与图标同色），
     // 与提示里其它白色信息分开 —— 参考图里那条 +6s 就是这么用的。
     ShowHint(
-        label + L"即将跳过 · " +
-            std::to_wstring(static_cast<int>(remaining + 0.999)) + L" 秒",
-        L"打开菜单可取消", kGlyphScissors, HintMode::Toast,
-        static_cast<float>(std::clamp(1.0 - remaining / total, 0.0, 1.0)), 0,
-        HintTone::Success);
+        std::to_wstring(seconds) + L" 秒后跳过" + label,
+        L"", 0, HintMode::Toast, -1.0f, 0,
+        HintTone::Neutral, HintLayout::AutoSkip);
   }
   if (now >= g_skip_deadline) {
     SkipSegment(static_cast<size_t>(candidate), true);
@@ -3776,12 +3815,10 @@ void DrawHover(Gdiplus::Graphics& graphics, ControlId id, float x, float y,
   // The dock already provides contrast: keep its circular controls light.
   Gdiplus::LinearGradientBrush button_surface(
       Gdiplus::PointF(disc.X, disc.Y), Gdiplus::PointF(disc.X, disc.GetBottom()),
-      Gdiplus::Color(24, 255, 255, 255), Gdiplus::Color(8, 255, 255, 255));
+      Gdiplus::Color(0, 255, 255, 255), Gdiplus::Color(0, 255, 255, 255));
+  // Dock already owns the substrate: only a clear rim inside it, no second grey fill.
   graphics.FillPath(&button_surface, &disc_path);
-  Gdiplus::Pen button_edge(Gdiplus::Color(
-      static_cast<BYTE>(enabled ? 24.0f + amount * 48.0f : 12.0f),
-      255, 255, 255), 0.8f);
-  graphics.DrawPath(&button_edge, &disc_path);
+  StrokeStaticPlayerMenuEdge(graphics, disc_path);
   if (selected && enabled) {
     Gdiplus::LinearGradientBrush selection(
         Gdiplus::PointF(disc.X, disc.Y),
@@ -4783,21 +4820,6 @@ void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
   const Gdiplus::RectF body_rect = PixelSnapRect(Gdiplus::RectF(
       static_cast<float>(kPanelShadowMargin),
       static_cast<float>(kPanelShadowMargin), body_width, body_height));
-  // 阴影：由外向内叠一圈圈圆角矩形，越靠近面板越深，得到柔和的下投影。
-  constexpr int kShadowSteps = 14;
-  for (int step = kShadowSteps; step >= 1; --step) {
-    const float spread = static_cast<float>(step) * 1.7f;
-    Gdiplus::GraphicsPath ring;
-    AddRoundedRectPath(ring,
-                       Gdiplus::RectF(body_rect.X - spread,
-                                      body_rect.Y - spread + 3.0f,
-                                      body_width + spread * 2.0f,
-                                      body_height + spread * 2.0f),
-                       24.0f + spread);
-    const BYTE shadow_alpha = step == kShadowSteps ? BYTE{3} : BYTE{9};
-    Gdiplus::SolidBrush shadow(Gdiplus::Color(shadow_alpha, 0, 0, 0));
-    graphics.FillPath(&shadow, &ring);
-  }
 
   Gdiplus::GraphicsPath body;
   AddRoundedRectPath(body, body_rect, 24.0f);
@@ -5530,6 +5552,21 @@ float MeasureHintText(Gdiplus::Graphics& graphics, const wchar_t* text,
 void MeasureHint(const std::wstring& text, const std::wstring& detail,
                  wchar_t icon, bool progress, HintLayout layout, int* width,
                  int* height) {
+  if (layout == HintLayout::AutoSkip || layout == HintLayout::SkipStatus) {
+    HDC dc = CreateCompatibleDC(nullptr);
+    {
+      Gdiplus::Graphics graphics(dc);
+      auto font = MakeInterfaceFont(13.0f, Gdiplus::FontStyleRegular);
+      const int title_width = static_cast<int>(
+          std::ceil(MeasureHintText(graphics, text.c_str(), font)));
+      // 12px side padding, 8px gap, 40px cancel target; no empty value column.
+      *width = title_width + 8 +
+          (layout == HintLayout::AutoSkip ? 64 : 24) + kHintMargin * 2;
+    }
+    DeleteDC(dc);
+    *height = 34 + kHintMargin * 2;
+    return;
+  }
   HDC dc = CreateCompatibleDC(nullptr);
   int text_width = 0;
   int value_width = 0;
@@ -5679,24 +5716,36 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
   const float body_radius = body.Height / 2.0f;
   Gdiplus::GraphicsPath path;
   AddRoundedRectPath(path, body, body_radius);
-  for (int step = 5; step >= 1; --step) {
-    const float spread = static_cast<float>(step) * 1.6f;
-    Gdiplus::GraphicsPath ring;
-    AddRoundedRectPath(ring,
-                       Gdiplus::RectF(body.X - spread, body.Y - spread + 2.0f,
-                                      body.Width + spread * 2.0f,
-                                      body.Height + spread * 2.0f),
-                       body_radius + spread);
-    Gdiplus::SolidBrush shadow(Gdiplus::Color(BYTE{10}, 0, 0, 0));
-    graphics.FillPath(&shadow, &ring);
+  if (layout == HintLayout::AutoSkip || layout == HintLayout::SkipStatus) {
+    // Reuse the menu's neutral material; no separate tinted gloss band.
+    FillStaticPlayerMenuSurface(graphics, path, body);
+    StrokeStaticPlayerMenuEdge(graphics, path);
+    auto font = MakeInterfaceFont(13.0f, Gdiplus::FontStyleRegular);
+    Gdiplus::SolidBrush ink(IconInk());
+    Gdiplus::StringFormat format;
+    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    graphics.DrawString(text.c_str(), -1, &font,
+        Gdiplus::RectF(body.X + 12, body.Y,
+            body.Width - (layout == HintLayout::AutoSkip ? 64 : 24),
+            body.Height),
+        &format, &ink);
+    if (layout == HintLayout::AutoSkip) {
+      auto action = MakeInterfaceFont(12.0f, Gdiplus::FontStyleRegular);
+      format.SetAlignment(Gdiplus::StringAlignmentCenter);
+      graphics.DrawString(L"取消", -1, &action,
+          Gdiplus::RectF(body.GetRight() - 48, body.Y, 40, body.Height),
+          &format, &ink);
+    }
+    return;
   }
   FillHintGlassSurface(graphics, path, body);
   StrokeStaticPlayerMenuEdge(graphics, path);
 
   const auto title_font = MakeHintFont();
   const auto detail_font = MakeHintDetailFont();
-  Gdiplus::SolidBrush hint_ink(Gdiplus::Color(250, 248, 249, 252));
-  Gdiplus::SolidBrush hint_muted(Gdiplus::Color(218, 211, 214, 221));
+  Gdiplus::SolidBrush hint_ink(IconInk());
+  Gdiplus::SolidBrush hint_muted(IconInk(0, 218));
   const float pad = static_cast<float>(kHintPadding);
   const float text_left = body.X + pad +
                           (icon != 0 ? static_cast<float>(kHintIconSpace) : 0.0f);
@@ -5822,6 +5871,10 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
                     line_y);
 }
 
+void HideAutoSkipHint() {
+  if (g_hint_layout == HintLayout::AutoSkip) HideHint();
+}
+
 void HideHint() {
   g_hint_mode = HintMode::Hidden;
   g_hint_layout = HintLayout::Standard;
@@ -5895,9 +5948,18 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
   const int anchor_top = frame.top + std::clamp(
       static_cast<int>((frame.bottom - frame.top) * .13), Scaled(76), Scaled(200));
   int y = anchor_top;
+  if (layout == HintLayout::AutoSkip || layout == HintLayout::SkipStatus) {
+    x = std::clamp(static_cast<int>(frame.left) + Scaled(32 - kHintMargin),
+                   limit_left, std::max(limit_left, usable_right - width));
+    y = DockTopScreen() - Scaled(24) - height + Scaled(kHintMargin);
+  }
   y = std::clamp(y, top_limit, std::max(top_limit, bottom_limit - height));
   g_hint_mode = mode;
   g_hint_layout = layout;
+  LONG_PTR style = GetWindowLongPtrW(g_hint, GWL_EXSTYLE);
+  if (layout == HintLayout::AutoSkip) style &= ~WS_EX_TRANSPARENT;
+  else style |= WS_EX_TRANSPARENT;
+  SetWindowLongPtrW(g_hint, GWL_EXSTYLE, style);
   g_hint_text = text;
   g_hint_detail = detail;
   g_hint_icon = icon;
@@ -6921,6 +6983,38 @@ LRESULT CALLBACK DanmakuProc(HWND window, UINT message, WPARAM wparam,
 LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
                           LPARAM lparam) {
   switch (message) {
+    case WM_MOUSEACTIVATE:
+      return MA_NOACTIVATE;
+    case WM_NCHITTEST: {
+      if (g_hint_layout != HintLayout::AutoSkip) return HTTRANSPARENT;
+      POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      ScreenToClient(window, &point);
+      RECT rect{};
+      GetClientRect(window, &rect);
+      return point.x >= rect.right - Scaled(kHintMargin + 48) &&
+                     point.x < rect.right - Scaled(kHintMargin + 8) &&
+                     point.y >= Scaled(kHintMargin) &&
+                     point.y < rect.bottom - Scaled(kHintMargin)
+                 ? HTCLIENT : HTTRANSPARENT;
+    }
+    case WM_SETCURSOR:
+      SetCursor(LoadCursorW(nullptr, IDC_HAND));
+      return TRUE;
+    case WM_LBUTTONUP: {
+      if (g_hint_layout != HintLayout::AutoSkip || g_skip_index < 0) return 0;
+      {
+        std::lock_guard<std::mutex> lock(g_segments_mutex);
+        if (static_cast<size_t>(g_skip_index) >= g_segments.size() ||
+            !SegmentActive(g_segments[g_skip_index], g_position.load(),
+                           g_duration.load()) ||
+            GetTickCount64() >= g_skip_deadline) return 0;
+        g_segments[g_skip_index].consumed = true;
+      }
+      g_skip_index = -1;
+      ShowHint(L"本次不跳过", L"", 0, HintMode::Toast, -1.0f, 0,
+               HintTone::Neutral, HintLayout::SkipStatus);
+      return 0;
+    }
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT: {
@@ -7040,17 +7134,28 @@ int TopHit(int x, int width) {
 // Only the value is rendered: the chip draws the wifi glyph, so repeating the
 // word "网络" inside a 12px pill was what forced the label onto three lines.
 std::wstring NetworkSpeedLabel() {
-  const double bytes_per_second = g_network_bytes_per_second.load();
-  if (bytes_per_second < 1.0) {
-    return g_buffering.load() ? L"读取中" : L"—";
+  const auto index = g_playlist_position.load();
+  if (index >= 0 && index < static_cast<int64_t>(g_media_urls.size())) {
+    const auto& url = g_media_urls[static_cast<size_t>(index)];
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+      return L"本地播放";
+    }
   }
+  const double bytes_per_second = g_network_bytes_per_second.load();
   wchar_t text[48]{};
-  if (bytes_per_second >= 1024.0 * 1024.0) {
+  if (!g_network_speed_available.load()) {
+    wcscpy_s(text, L"统计暂不可用");
+  } else if (bytes_per_second >= 1024.0 * 1024.0) {
     swprintf_s(text, L"%.1f MB/s", bytes_per_second / (1024.0 * 1024.0));
   } else {
     swprintf_s(text, L"%.0f KB/s", bytes_per_second / 1024.0);
   }
-  return text;
+  const int seconds = static_cast<int>(std::max(0.0, g_buffered_seconds.load()));
+  const std::wstring status = g_buffering.load() ? L"缓冲中" :
+      g_paused.load() ? L"已暂停" : bytes_per_second > 0 ?
+      L"可播 " + std::to_wstring(seconds) + L"s" : seconds > 0 ?
+      L"已缓冲 " + std::to_wstring(seconds) + L"s" : L"等待数据";
+  return std::wstring(text) + L" · " + status;
 }
 
 LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
@@ -7093,12 +7198,19 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         Gdiplus::SolidBrush title_shadow(Gdiplus::Color(180, 0, 0, 0));
         auto title_font = MakeInterfaceFont(15, Gdiplus::FontStyleBold);
         auto network_font = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
+        const std::wstring network = NetworkSpeedLabel();
+        Gdiplus::StringFormat chip_measure;
+        chip_measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        Gdiplus::RectF network_box;
+        graphics.MeasureString(network.c_str(), -1, &network_font,
+                               Gdiplus::PointF(0, 0), &chip_measure, &network_box);
+        const float network_reserved = 210.0f + network_box.Width;
         Gdiplus::StringFormat title_format;
         title_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         title_format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
         if (g_series_logo && g_series_logo->GetLastStatus() == Gdiplus::Ok &&
             g_series_logo->GetWidth() > 0 && g_series_logo->GetHeight() > 0) {
-          const float max_width = std::min(220.0f, rect.right - 300.0f);
+          const float max_width = std::max(0.0f, std::min(220.0f, rect.right - network_reserved));
           const float max_height = 44.0f;
           const float scale =
               std::min(max_width / g_series_logo->GetWidth(),
@@ -7114,7 +7226,7 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
               !g_playlist_details[static_cast<size_t>(index)].empty()) {
             const float detail_x = 8.0f + logo_width + 18.0f;
             const float detail_width =
-                std::max(0.0f, rect.right - detail_x - 286.0f);
+                std::max(0.0f, rect.right - detail_x - network_reserved);
             graphics.DrawString(
                 g_playlist_details[static_cast<size_t>(index)].c_str(), -1,
                 &title_font,
@@ -7130,23 +7242,16 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
           }
         } else {
           graphics.DrawString(g_media_title.c_str(), -1, &title_font,
-                              Gdiplus::RectF(9, 2, rect.right - 297.0f,
+                              Gdiplus::RectF(9, 2, std::max(0.0f, rect.right - network_reserved),
                                              static_cast<float>(rect.bottom)),
                               &title_format, &title_shadow);
           graphics.DrawString(g_media_title.c_str(), -1, &title_font,
-                              Gdiplus::RectF(8, 0, rect.right - 297.0f,
+                              Gdiplus::RectF(8, 0, std::max(0.0f, rect.right - network_reserved),
                                              static_cast<float>(rect.bottom)),
                               &title_format, &title_brush);
         }
         // 网络状态做成和应用里同一枚胶囊：wifi 图标 + 数值，宽度跟着内容走，
         // 这样既不会再折行，也和播放页顶部的 _StateChip 是同一个形态。
-        const std::wstring network = NetworkSpeedLabel();
-        Gdiplus::StringFormat chip_measure;
-        chip_measure.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-        Gdiplus::RectF network_box;
-        graphics.MeasureString(network.c_str(), -1, &network_font,
-                               Gdiplus::PointF(0, 0), &chip_measure,
-                               &network_box);
         const float chip_icon = 15.0f;
         const float chip_height = 26.0f;
         const float chip_padding = 11.0f;
@@ -7874,6 +7979,32 @@ bool RunShortcut(int key) {
 void TickFrame() {
   AnimatePanelScroll();
   const double frame_now = NowMs();
+  static double last_network_sample_ms = 0.0;
+  if (frame_now - last_network_sample_ms >= 1000.0) {
+    last_network_sample_ms = frame_now;
+    const auto index = g_playlist_position.load();
+    const bool network = g_native_network_input.load();
+    g_buffered_seconds = std::max(0.0,
+        std::strtod(MpvString("demuxer-cache-duration").c_str(), nullptr));
+    const bool local = index >= 0 && index < static_cast<int64_t>(g_media_urls.size()) &&
+        g_media_urls[static_cast<size_t>(index)].rfind("http://", 0) != 0 &&
+        g_media_urls[static_cast<size_t>(index)].rfind("https://", 0) != 0;
+    if (network || local) {
+      // Native I/O one-second window, not bitrate/buffer-growth estimation.
+      // mpv may omit this property; do not manufacture throughput in that case.
+      const bool idle = MpvString("demuxer-cache-idle") == "yes";
+      const auto rate = network && !idle
+          ? MpvString("cache-speed") : std::string{};
+      g_network_speed_available = local || idle || !rate.empty();
+      g_network_bytes_per_second = std::max(0.0, std::strtod(rate.c_str(), nullptr));
+      const double end = std::strtod(MpvString("demuxer-cache-time").c_str(), nullptr);
+      const double duration = g_duration.load();
+      g_cache_fraction = local ? 1.0 : duration > 0.0
+          ? std::clamp(end / duration, 0.0, 1.0) : 0.0;
+      if (g_top_bar) InvalidateRect(g_top_bar, nullptr, FALSE);
+      if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
+    }
+  }
   // 第一帧没有「上一帧」可比，用一个等于当前节拍的 dt：对齐刷新时是刷新周期 ×
   // 分频，退回定时器时才是 kFrameIntervalMs。只影响第一帧，但拿错了转圈/淡出会
   // 在起始那一下跳一下。
@@ -8346,10 +8477,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       const auto item = static_cast<size_t>(index);
       const auto old_url = g_media_urls[item];
       const auto old_headers = g_playlist_headers[item];
+      const bool old_native = g_playlist_native_network[item];
       const bool old_header_override = g_playlist_header_overrides[item];
       g_media_urls[item] = std::move(update->url);
       g_playlist_headers[item] = std::move(update->headers);
       g_playlist_header_overrides[item] = true;
+      g_playlist_native_network[item] = update->native_network;
       if (item < g_playlist_resumes.size()) {
         g_playlist_resumes[item] = std::max(0.0, update->resume_seconds);
       }
@@ -8357,6 +8490,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         g_media_urls[item] = old_url;
         g_playlist_headers[item] = old_headers;
         g_playlist_header_overrides[item] = old_header_override;
+        g_playlist_native_network[item] = old_native;
         g_pending_episode_resources.reset();
         g_episode_search_pending = false;
         g_episode_search_index = -1;
@@ -8717,6 +8851,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           g_default_http_headers_set = true;
         } else if (name == "mova-playlist-title") {
           g_playlist_titles.push_back(argument.substr(equals + 1));
+        } else if (name == "mova-playlist-native") {
+          g_playlist_native_network.push_back(argument.substr(equals + 1) == L"yes");
         } else if (name == "mova-playlist-headers") {
           const std::string value = Utf8(argument.substr(equals + 1));
           const size_t divider = value.find('|');
@@ -8879,6 +9015,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   while (g_playlist_headers.size() < g_media_urls.size()) {
     g_playlist_headers.emplace_back();
   }
+  g_playlist_native_network.resize(g_media_urls.size(), false);
   while (g_playlist_header_overrides.size() < g_media_urls.size()) {
     g_playlist_header_overrides.push_back(false);
   }
@@ -8941,6 +9078,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     // 起播点必须显式设进 mpv：以前这一步是命令行 `--start=` 代劳的，但那个选项
     // 会一直留到后面每一次 loadfile（见 g_playlist_resumes 的注释）。
     ApplyPlaylistStart(start_index);
+    ApplyPlaylistHeaders(start_index);
+    g_native_network_input = g_playlist_native_network[static_cast<size_t>(start_index)];
     const char* load[] = {"loadfile",
                           g_media_urls[static_cast<size_t>(start_index)].c_str(),
                           "replace", nullptr};
@@ -9084,6 +9223,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
                   value.substr(second + 1, third - second - 1));
               update->resume_seconds = std::strtod(
                   value.c_str() + third + 1, nullptr);
+              const auto fourth = value.find('|', third + 1);
+              update->native_network = fourth != std::string::npos &&
+                  value.substr(fourth + 1) == "yes";
               auto* raw = update.release();
               if (!PostMessageW(g_window, kEpisodeResolved, 0,
                                 reinterpret_cast<LPARAM>(raw))) {
@@ -9139,6 +9281,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
             PostMessageW(g_window, kPlayerStateChanged, 0, 0);
           }
         } else if (line.rfind("MOVA_NETWORK=", 0) == 0) {
+          g_network_speed_available = true;
           g_network_bytes_per_second = std::max(
               0.0, std::strtod(line.c_str() + 13, nullptr));
           PostMessageW(g_window, kPlayerStateChanged, 0, 0);

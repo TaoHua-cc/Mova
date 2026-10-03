@@ -9,8 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 ///   的 `_findProxy` 统一处理，与本模块无关。
 /// - **服务器流量**（某个 Emby/Jellyfin 的浏览、聚合、元数据、图片）：默认**直连**，
 ///   只有用户在「设置 → 代理」里勾选了该服务器，才跟随系统代理。
-/// 播放内核不经过 Dart HttpClient；本设置控制软件对服务器发起的 API、媒体库、
-/// 聚合、元数据与图片请求。
+/// 原生取流或本机中转均遵守此开关：源站取流、视频缓存及长度探测与服务器
+/// API 使用同一个服务器开关，未勾选时直连。
 ///
 /// 开关集合持久化在 `yingji.proxy.servers`，存逗号分隔的服务器 id。
 abstract final class ProxyRouting {

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show PlatformViewHitTestBehavior;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
@@ -382,8 +383,11 @@ class _PlayerPageState extends State<PlayerPage> {
   StreamSubscription<Duration>? _bufferSubscription;
   Duration _lastBufferSample = Duration.zero;
   DateTime? _lastBufferSampleAt;
-  double _bufferRate = 0;
   double _networkBytesPerSecond = 0;
+  Timer? _readSpeedTimer;
+  final Stopwatch _readSpeedClock = Stopwatch()..start();
+  int _lastReadBytes = 0;
+  String? _readSpeedUrl;
   PlayerEpisode? _resourceOverride;
   Duration? _introEnd;
   Duration? _outroStart;
@@ -499,6 +503,10 @@ class _PlayerPageState extends State<PlayerPage> {
   PlayerEpisode get _activeEpisode => _resourceOverride ?? _baseEpisode;
 
   bool get _usesAndroidExo => widget.androidExo && !WindowHost.isDesktop;
+  // Native reads avoid the Dart disk/loopback path for unproxied Exo media.
+  bool get _nativeExoTransfer =>
+      _usesAndroidExo &&
+      !ProxyRouting.serverUsesProxy(_activeEpisode.sourceId ?? '');
   PlayerState get _state => _usesAndroidExo ? _exoState : _player!.state;
   Stream<Duration> get _positionStream => _usesAndroidExo
       ? _exoPositionController.stream
@@ -622,7 +630,9 @@ class _PlayerPageState extends State<PlayerPage> {
       if (mounted) setState(() => _error = error);
       return;
     }
-    final trackSignature = jsonEncode(event['tracks']);
+    final trackSignature = event.containsKey('tracks')
+        ? jsonEncode(event['tracks'])
+        : _exoTrackSignature;
     final tracksChanged = trackSignature != _exoTrackSignature;
     _exoTrackSignature = trackSignature;
     final audio = <AudioTrack>[];
@@ -661,6 +671,8 @@ class _PlayerPageState extends State<PlayerPage> {
     final buffer = Duration(
       milliseconds: (event['bufferedMs'] as num?)?.toInt() ?? 0,
     );
+    _networkBytesPerSecond =
+        (event['readBytesPerSecond'] as num?)?.toDouble() ?? 0;
     final playing = event['playing'] == true;
     final completed = event['completed'] == true;
     final previous = _exoState;
@@ -740,6 +752,9 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     });
     _initializePlayer();
+    _readSpeedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(_updateNetworkSpeed());
+    });
     _progressTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       if (_switchingEpisode) return;
       unawaited(_syncProgress());
@@ -780,7 +795,6 @@ class _PlayerPageState extends State<PlayerPage> {
         final elapsed = now.difference(previousAt).inMilliseconds;
         final delta = buffer.inMilliseconds - _lastBufferSample.inMilliseconds;
         if (elapsed > 100 && delta > 0 && mounted) {
-          _bufferRate = (delta / elapsed).clamp(0, 20);
           // 缓冲速率只在信息可见时才重建播放页；字段照常更新，
           // 控制条重新出现时读到的是最新值。
           if (_showControls || _settingsOpen) setState(() {});
@@ -788,7 +802,6 @@ class _PlayerPageState extends State<PlayerPage> {
       }
       _lastBufferSample = buffer;
       _lastBufferSampleAt = now;
-      await _updateNetworkSpeed();
     });
   }
 
@@ -1075,27 +1088,23 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _updateNetworkSpeed() async {
-    try {
-      if (_usesAndroidExo) throw StateError('Exo does not expose cache speed');
-      final raw = await (_player!.platform as dynamic).getProperty(
-        'cache-speed',
-      );
-      final bytes = double.tryParse('$raw') ?? 0;
-      if (mounted && bytes >= 0) {
-        _networkBytesPerSecond = bytes;
-        if (_showControls || _settingsOpen) setState(() {});
-      }
-    } catch (_) {
-      final match = RegExp(
-        r'(\d+(?:\.\d+)?)\s*Mbps',
-        caseSensitive: false,
-      ).firstMatch(_activeEpisode.resourceInfo ?? '');
-      final bitrate = double.tryParse(match?.group(1) ?? '') ?? 0;
-      if (mounted && bitrate > 0 && _bufferRate > 0) {
-        _networkBytesPerSecond = bitrate * _bufferRate * 1000000 / 8;
-        if (_showControls || _settingsOpen) setState(() {});
-      }
+    if (_usesAndroidExo) {
+      if (mounted && (_showControls || _settingsOpen)) setState(() {});
+      return;
     }
+    final url = _activeEpisode.url;
+    final bytes = _videoCache?.playbackBytesRead(url) ?? 0;
+    final elapsed = _readSpeedClock.elapsedMilliseconds;
+    _networkBytesPerSecond =
+        url == _readSpeedUrl && bytes >= _lastReadBytes && elapsed > 0
+        ? (bytes - _lastReadBytes) * 1000 / elapsed
+        : 0;
+    _readSpeedUrl = url;
+    _lastReadBytes = bytes;
+    _readSpeedClock
+      ..reset()
+      ..start();
+    if (mounted && (_showControls || _settingsOpen)) setState(() {});
   }
 
   Future<void> _initializePlayer() async {
@@ -1183,16 +1192,23 @@ class _PlayerPageState extends State<PlayerPage> {
     _playingCachedFile = cached != null;
     _persistentCacheFraction = cached == null ? 0 : 1;
     _videoCacheStatus = cached == null ? null : '已完整缓存';
+    if (cached == null && episode.initialPosition == Duration.zero) {
+      await _cacheCurrentEpisode(episode, opening: true);
+    }
     if (_usesAndroidExo) {
-      final playbackUrl = cached == null
-          ? await _videoCache?.playbackUrl(
+      final playbackUrl = cached != null
+          ? Uri.file(cached.path).toString()
+          : _nativeExoTransfer
+          ? null
+          : await _videoCache?.playbackUrl(
               episode.url,
               headers: episode.headers,
-            )
-          : Uri.file(cached.path).toString();
+              sourceId: episode.sourceId,
+            );
       _exoHeaders = cached == null && playbackUrl == null
           ? episode.headers
           : const {};
+      _exoTrackSignature = '';
       _exoState = _exoState.copyWith(
         position: episode.initialPosition,
         duration: Duration.zero,
@@ -1217,6 +1233,7 @@ class _PlayerPageState extends State<PlayerPage> {
       final playbackUrl = await _videoCache?.playbackUrl(
         episode.url,
         headers: episode.headers,
+        sourceId: episode.sourceId,
       );
       await _player!.open(
         Media(
@@ -1260,7 +1277,9 @@ class _PlayerPageState extends State<PlayerPage> {
         await _seek(target);
       }
     }
-    if (cached == null) unawaited(_cacheCurrentEpisode(episode));
+    if (cached == null && episode.initialPosition > Duration.zero) {
+      unawaited(_cacheCurrentEpisode(episode));
+    }
     if (_usesAndroidExo) {
       await _backendSetVolume(_volume);
       await _exoCommand('setRate', {'rate': _speed});
@@ -1319,7 +1338,11 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   /// 后台缓存当前播放点前方的一个有界窗口。
-  Future<void> _cacheCurrentEpisode(PlayerEpisode episode) async {
+  Future<void> _cacheCurrentEpisode(
+    PlayerEpisode episode, {
+    bool opening = false,
+  }) async {
+    if (_nativeExoTransfer) return;
     final store = _videoCache;
     if (!mounted || store == null || _activeEpisode.url != episode.url) return;
     final limit = await VideoCachePolicy.current();
@@ -1327,12 +1350,13 @@ class _PlayerPageState extends State<PlayerPage> {
     final job = store.download(
       url: episode.url,
       limitBytes: limit,
-      startPosition: _state.position > episode.initialPosition
+      startPosition: !opening && _state.position > episode.initialPosition
           ? _state.position
           : episode.initialPosition,
-      mediaDuration: _state.duration,
+      mediaDuration: opening ? Duration.zero : _state.duration,
       headers: episode.headers,
       title: episode.title,
+      sourceId: episode.sourceId,
     );
     await _watchVideoCacheJob(job, limit);
   }
@@ -1413,6 +1437,7 @@ class _PlayerPageState extends State<PlayerPage> {
         startBytes: playheadByte,
         headers: episode.headers,
         title: episode.title,
+        sourceId: episode.sourceId,
       );
       await _watchVideoCacheJob(next, limit);
     } finally {
@@ -1608,6 +1633,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _preloadNextIfNeeded() async {
+    if (_nativeExoTransfer) return;
     if (!_preloadNextEpisode ||
         _switchingEpisode ||
         widget.episodes.isEmpty ||
@@ -1635,6 +1661,7 @@ class _PlayerPageState extends State<PlayerPage> {
       targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
       headers: next.headers,
       title: next.title,
+      sourceId: next.sourceId,
     );
     _nextEpisodePreload = job;
     await job.done;
@@ -2273,6 +2300,7 @@ class _PlayerPageState extends State<PlayerPage> {
     // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
     unawaited(WindowHost.exitMediaSession());
     _subtitleSubscription?.cancel();
+    _readSpeedTimer?.cancel();
     _exoEventSubscription?.cancel();
     _exoPositionController.close();
     _exoBufferController.close();
@@ -2630,17 +2658,47 @@ class _PlayerPageState extends State<PlayerPage> {
                         return child!;
                       },
                       child: IgnorePointer(
-                        child: AndroidView(
+                        child: PlatformViewLink(
                           key: ValueKey<String>('exo:$_exoPlaybackUrl'),
                           viewType: 'mova/exo-video',
-                          onPlatformViewCreated: _attachExoView,
-                          creationParams: {
-                            'url': _exoPlaybackUrl,
-                            'headers': _exoHeaders,
-                            'container': widget.container,
-                            'positionMs': _state.position.inMilliseconds,
+                          surfaceFactory: (context, controller) =>
+                              AndroidViewSurface(
+                                controller: controller as AndroidViewController,
+                                hitTestBehavior:
+                                    PlatformViewHitTestBehavior.transparent,
+                                gestureRecognizers: const {},
+                              ),
+                          onCreatePlatformView: (params) {
+                            // SurfaceView must attach to the real display: AndroidView
+                            // falls back to a virtual display without HDR capabilities.
+                            final controller =
+                                PlatformViewsService.initExpensiveAndroidView(
+                                  id: params.id,
+                                  viewType: params.viewType,
+                                  layoutDirection: Directionality.of(context),
+                                  creationParams: {
+                                    'url': _exoPlaybackUrl,
+                                    'headers': _exoHeaders,
+                                    'transferTrace': const bool.fromEnvironment(
+                                      'MOVA_TRANSFER_TRACE',
+                                    ),
+                                    'container': widget.container,
+                                    'positionMs':
+                                        _state.position.inMilliseconds,
+                                  },
+                                  creationParamsCodec:
+                                      const StandardMessageCodec(),
+                                  onFocus: () => params.onFocusChanged(true),
+                                );
+                            controller.addOnPlatformViewCreatedListener(
+                              params.onPlatformViewCreated,
+                            );
+                            controller.addOnPlatformViewCreatedListener(
+                              _attachExoView,
+                            );
+                            unawaited(controller.create());
+                            return controller;
                           },
-                          creationParamsCodec: const StandardMessageCodec(),
                         ),
                       ),
                     )
@@ -2844,7 +2902,15 @@ class _PlayerPageState extends State<PlayerPage> {
                     ],
                   ),
                 ),
-                _StateChip(label: _networkSpeedLabel(), ok: !_state.buffering),
+                YingjiGlassTooltip(
+                  message: '当前资源每秒读取速度（非整机带宽）\n${_networkSpeedLabel()}',
+                  child: _StateChip(
+                    label: MediaQuery.sizeOf(context).width < 700
+                        ? _networkSpeedLabel().split(' · ').first
+                        : _networkSpeedLabel(),
+                    ok: !_state.buffering,
+                  ),
+                ),
                 if (_videoCacheStatus != null) ...[
                   const SizedBox(width: 8),
                   _StateChip(
@@ -3102,53 +3168,54 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 整层 IgnorePointer，避免它自己抢走后续的拖动事件。
   ///
   /// 出现 / 消失走 [MovaAppear]，和全软件其它浮层同一套时长与曲线。
-  Widget _gestureIndicator() => LayoutBuilder(
-    builder: (context, constraints) {
-      // 之前固定在 Alignment(0, -.42)，手机上正好压在人物脸上。现在按屏高的
-      // 13% 定位（并给顶部标题栏留出至少 76px），横条又薄，基本不挡画面。
-      final height = constraints.maxHeight;
-      final top = (height * .13).clamp(76.0, 200.0);
-      final y = (2 * (top + 19) / (height <= 0 ? 1 : height) - 1).clamp(
-        -1.0,
-        1.0,
-      );
-      final background = YingjiColors.elevated.withValues(
-        alpha: (.72 + YingjiGlass.blur / 200).clamp(.72, .94),
-      );
-      // 液态玻璃无描边：HUD 的边界靠「背后模糊、浮层不模糊」的反差自己显现。
-      final border = Colors.transparent;
-      return IgnorePointer(
-        child: MovaAppear(
-          visible: _gestureVisible,
-          animateOnMount: false,
-          beginScale: .92,
-          duration: MovaMotion.hudIn,
-          child: Align(
-            alignment: Alignment(0, y),
-            child: _gestureKind == _GestureKind.seek
-                ? MovaHud(
-                    icon: _gestureIcon,
-                    label: _gestureLabel,
-                    caption: _gestureCaption.isEmpty ? null : _gestureCaption,
-                    value: _gestureProgress,
-                    width: 292,
-                    background: background,
-                    borderColor: border,
-                    blur: 0,
-                  )
-                : MovaHud(
-                    icon: _gestureIcon,
-                    label: _gestureLabel,
-                    value: _gestureProgress,
-                    trackWidth: 104,
-                    background: background,
-                    borderColor: border,
-                    blur: 0,
-                  ),
+  Widget _gestureIndicator() => AnimatedBuilder(
+    animation: yingjiAppearance,
+    builder: (context, _) => LayoutBuilder(
+      builder: (context, constraints) {
+        // 之前固定在 Alignment(0, -.42)，手机上正好压在人物脸上。现在按屏高的
+        // 13% 定位（并给顶部标题栏留出至少 76px），横条又薄，基本不挡画面。
+        final height = constraints.maxHeight;
+        final top = (height * .13).clamp(76.0, 200.0);
+        final y = (2 * (top + 19) / (height <= 0 ? 1 : height) - 1).clamp(
+          -1.0,
+          1.0,
+        );
+        final background = YingjiGlass.fixedFrost();
+        // 液态玻璃无描边：HUD 的边界靠「背后模糊、浮层不模糊」的反差自己显现。
+        final border = Colors.transparent;
+        return IgnorePointer(
+          child: MovaAppear(
+            visible: _gestureVisible,
+            animateOnMount: false,
+            beginScale: .92,
+            duration: MovaMotion.hudIn,
+            child: Align(
+              alignment: Alignment(0, y),
+              child: _gestureKind == _GestureKind.seek
+                  ? MovaHud(
+                      icon: _gestureIcon,
+                      label: _gestureLabel,
+                      caption: _gestureCaption.isEmpty ? null : _gestureCaption,
+                      value: _gestureProgress,
+                      width: 292,
+                      background: background,
+                      borderColor: border,
+                      blur: 0,
+                    )
+                  : MovaHud(
+                      icon: _gestureIcon,
+                      label: _gestureLabel,
+                      value: _gestureProgress,
+                      trackWidth: 104,
+                      background: background,
+                      borderColor: border,
+                      blur: 0,
+                    ),
+            ),
           ),
-        ),
-      );
-    },
+        );
+      },
+    ),
   );
 
   /// 暂停时在画面正中放一个「继续播放」圆钮。
@@ -3207,12 +3274,19 @@ class _PlayerPageState extends State<PlayerPage> {
       '${value.inHours > 0 ? '${value.inHours}:' : ''}${(value.inMinutes % 60).toString().padLeft(2, '0')}:${(value.inSeconds % 60).toString().padLeft(2, '0')}';
 
   String _networkSpeedLabel() {
-    final bytes = _networkBytesPerSecond;
-    if (bytes <= 0) return _state.buffering ? '读取中' : '—';
-    if (bytes >= 1048576) {
-      return '${(bytes / 1048576).toStringAsFixed(1)} MB/s';
-    }
-    return '${(bytes / 1024).toStringAsFixed(0)} KB/s';
+    return playbackNetworkLabel(
+      bytesPerSecond: _networkBytesPerSecond,
+      position: _state.position,
+      buffer: _state.buffer,
+      buffering: _state.buffering,
+      playing: _state.playing,
+      local:
+          _playingCachedFile ||
+          !const [
+            'http',
+            'https',
+          ].contains(Uri.tryParse(_activeEpisode.url)?.scheme),
+    );
   }
 
   Widget _consolePanel(BuildContext context) => Positioned(

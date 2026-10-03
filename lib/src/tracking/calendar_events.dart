@@ -1,4 +1,5 @@
 import 'trakt_client.dart';
+import 'broadcast_platforms.dart';
 
 /// Presentation-only grouping; individual episode schedules remain intact.
 List<List<TraktEvent>> groupCalendarEvents(Iterable<TraktEvent> events) {
@@ -189,8 +190,45 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
         event.totalEpisodes,
         previous.totalEpisodes,
       ].whereType<int>().fold<int?>(null, (a, b) => a == null || b > a ? b : a),
-      platformLogoUrl: event.platformLogoUrl ?? previous.platformLogoUrl,
+      platformLogoUrl:
+          mergeBroadcastPlatforms([
+            previous.broadcastPlatforms,
+            event.broadcastPlatforms,
+          ])[broadcastPlatformName(
+            timed.platform ?? event.platform ?? previous.platform ?? '',
+          )] ??
+          (previous.platform == null && event.platform == null
+              ? event.platformLogoUrl ?? previous.platformLogoUrl
+              : timed.platformLogoUrl),
+      platforms: mergeBroadcastPlatforms([
+        previous.broadcastPlatforms,
+        event.broadcastPlatforms,
+      ]),
     );
+  }
+  // Some episode sources omit the show's network on individual dates.
+  // Unify observed platforms for the same identified show and season, including
+  // dates whose episode source returns only one of several broadcast platforms.
+  final showPlatforms = <(int, int?), Map<String, Uri?>>{};
+  for (final event in merged) {
+    if (event.tmdbId == null) continue;
+    final key = (event.tmdbId!, event.seasonNumber);
+    showPlatforms[key] = mergeBroadcastPlatforms([
+      showPlatforms[key] ?? const {},
+      event.broadcastPlatforms,
+    ]);
+  }
+  for (var i = 0; i < merged.length; i++) {
+    final event = merged[i];
+    if (event.tmdbId == null) continue;
+    final platforms = showPlatforms[(event.tmdbId!, event.seasonNumber)];
+    if (platforms == null || platforms.isEmpty) continue;
+    merged[i] = TraktEvent.fromJson({
+      ...event.toJson(),
+      'platforms': platforms.map(
+        (name, logo) => MapEntry(name, logo?.toString()),
+      ),
+    });
   }
   merged.sort((a, b) => a.airDate.compareTo(b.airDate));
   return merged;

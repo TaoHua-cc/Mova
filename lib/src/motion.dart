@@ -5,7 +5,7 @@
 // Curve，一律引用这里的常量。
 
 import 'dart:async';
-import 'dart:ui';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -367,9 +367,7 @@ class MovaHud extends StatelessWidget {
     }
     return ClipRRect(
       borderRadius: BorderRadius.circular(radius),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: blur, sigmaY: blur),
-        enabled: blur > 0,
+      child: RepaintBoundary(
         child: DecoratedBox(
           decoration: BoxDecoration(
             color: background,
@@ -493,8 +491,7 @@ class MovaHudPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ClipRRect(
     borderRadius: BorderRadius.circular(17),
-    child: BackdropFilter(
-      filter: ImageFilter.blur(sigmaX: blur, sigmaY: blur),
+    child: RepaintBoundary(
       child: DecoratedBox(
         decoration: BoxDecoration(
           color: background,

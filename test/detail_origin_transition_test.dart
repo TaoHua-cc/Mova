@@ -141,8 +141,8 @@ void main() {
     expect(unplayedAction.allMatches(mediaCenter), hasLength(1));
     // Detail actions remove local resume rows; the continue-watching action
     // overwrites the row at zero so it no longer carries stale progress.
-    expect(detail, contains('await watchStore.remove(mediaId)'));
-    expect(detail, contains('await store.remove(mediaId)'));
+    expect(detail, contains('await watchStore.setPlayed('));
+    expect(detail, contains('await store.setPlayed('));
     expect(
       mediaCenter,
       contains('position: played ? state.duration : Duration.zero'),

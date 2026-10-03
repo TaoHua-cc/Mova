@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="176" height="34" viewBox="0 0 176 34">
+<desc>示意素材；运行时用 Mova 内置字体测量文本，宽度为正文实测宽加64。</desc>
+<defs><linearGradient id="reflection" x2="0" y2="1"><stop stop-color="#fff" stop-opacity=".055"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient><linearGradient id="edge" x2="1" y2="1"><stop stop-color="#fff" stop-opacity=".361"/><stop offset="1" stop-color="#fff" stop-opacity=".137"/></linearGradient></defs>
+<rect width="176" height="34" rx="17" fill="#586062" fill-opacity=".52"/>
+<rect width="176" height="34" rx="17" fill="url(#reflection)"/>
+<rect x=".45" y=".45" width="175.1" height="33.1" rx="17" fill="none" stroke="url(#edge)" stroke-width=".9"/>
+<g fill="#f8f9fc" fill-opacity=".98" font-family="sans-serif"><text x="12" y="22" font-size="13">3 秒后跳过片头</text><text x="148" y="21" text-anchor="middle" font-size="12">取消</text></g></svg>

@@ -51,6 +51,7 @@ import 'sources/source_library_page.dart';
 import 'sources/webdav_client.dart';
 import 'tracking/trakt_client.dart';
 import 'tracking/calendar_events.dart';
+import 'tracking/broadcast_platforms.dart';
 import 'tracking/tracking_status_store.dart';
 import 'tracking/trakt_auth.dart';
 import 'tracking/trakt_watchlist_sync.dart';
@@ -1010,6 +1011,20 @@ class _FloatingHomeTopBar extends StatelessWidget {
   );
 }
 
+int retainedHomeHeroIndex(
+  List<TmdbItem> previous,
+  List<TmdbItem> next,
+  int selected,
+) {
+  if (previous.isEmpty || next.isEmpty) return 0;
+  final current = previous[selected.clamp(0, previous.length - 1)];
+  final index = next
+      .take(8)
+      .toList()
+      .indexWhere((item) => item.id == current.id && item.kind == current.kind);
+  return index < 0 ? 0 : index;
+}
+
 class _CinematicHome extends StatefulWidget {
   const _CinematicHome();
   @override
@@ -1026,6 +1041,7 @@ class _CinematicHomeState extends State<_CinematicHome>
   bool _historyReloadRequested = false;
   int _hero = 0;
   double _heroDragDistance = 0;
+  bool _heroDragging = false;
   // 轮播进度由 ValueNotifier 驱动：每 100ms 只刷新圆点层，避免整页重建。
   final ValueNotifier<double> _heroProgress = ValueNotifier<double>(0);
   double _carouselSeconds = 6;
@@ -1066,6 +1082,7 @@ class _CinematicHomeState extends State<_CinematicHome>
           WidgetsBinding.instance.lifecycleState ==
               AppLifecycleState.resumed) &&
       _autoCarousel &&
+      !_heroDragging &&
       _trendingValue.length > 1 &&
       yingjiSectionFocus.value == 'home' &&
       ModalRoute.of(context)?.isCurrent != false &&
@@ -1080,17 +1097,14 @@ class _CinematicHomeState extends State<_CinematicHome>
     }
     if (_heroTimer != null) return;
     final ticker = Stopwatch()..start();
-    final period = Platform.isAndroid
-        ? const Duration(milliseconds: 500)
-        : const Duration(milliseconds: 100);
+    const period = Duration(milliseconds: 100);
     _heroTimer = Timer.periodic(period, (_) {
       final items = _trendingValue;
       final elapsed = ticker.elapsedMilliseconds;
       ticker.reset();
       final next = _heroProgress.value + elapsed / (_carouselSeconds * 1000);
       if (next < 1) {
-        // 进度只更新圆点层；Android 平板将节拍放宽到 500ms，避免在 6MP
-        // 画布上每秒触发 10 次整帧合成。轮播倒计时仍由单调时钟保持准确。
+        // 两端采用同一节拍，只更新隔离的圆点层，不重建海报内容。
         _heroProgress.value = next;
         return;
       }
@@ -1189,7 +1203,16 @@ class _CinematicHomeState extends State<_CinematicHome>
     YingjiImageWarmup.items(items, backdrop: true, maxItems: 2);
     unawaited(_prefetchHeroDetails(items.take(2).toList(growable: false)));
     if (mounted) {
-      _hero = 0;
+      final selected = _trendingValue.isEmpty
+          ? null
+          : _trendingValue[_hero.clamp(0, _trendingValue.length - 1)];
+      _hero = retainedHomeHeroIndex(_trendingValue, items, _hero);
+      if (selected != null &&
+          (items.isEmpty ||
+              items[_hero].id != selected.id ||
+              items[_hero].kind != selected.kind)) {
+        _heroProgress.value = 0;
+      }
       _trendingValue = items;
       _syncHeroTimer();
     }
@@ -1320,11 +1343,15 @@ class _CinematicHomeState extends State<_CinematicHome>
   }
 
   void _selectHero(int index) {
+    if (_trendingValue.isEmpty) return;
+    index = index.clamp(0, math.min(_trendingValue.length, 8) - 1);
+    _heroTimer?.cancel();
+    _heroTimer = null;
     setState(() {
       _hero = index;
     });
     _heroProgress.value = 0;
-    if (_trendingValue.isEmpty) return;
+    _syncHeroTimer();
     unawaited(_loadHeroDetail(_trendingValue[index]));
     final nextIndex = (index + 1) % _trendingValue.length.clamp(1, 8);
     if (nextIndex != index) {
@@ -1399,7 +1426,11 @@ class _CinematicHomeState extends State<_CinematicHome>
                         onTap: () =>
                             _openHeroDetails(sourceContext, selected, tap),
                         onHorizontalDragStart: Platform.isAndroid
-                            ? (_) => _heroDragDistance = 0
+                            ? (_) {
+                                _heroDragDistance = 0;
+                                _heroDragging = true;
+                                _syncHeroTimer();
+                              }
                             : null,
                         onHorizontalDragUpdate: Platform.isAndroid
                             ? (details) => _heroDragDistance += details.delta.dx
@@ -1408,6 +1439,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                             ? (details) {
                                 final distance = _heroDragDistance;
                                 _heroDragDistance = 0;
+                                _heroDragging = false;
                                 final threshold = math.max(
                                   48.0,
                                   constraints.maxWidth * .07,
@@ -1415,6 +1447,7 @@ class _CinematicHomeState extends State<_CinematicHome>
                                 final velocity = details.primaryVelocity ?? 0;
                                 if (distance.abs() < threshold &&
                                     velocity.abs() < 650) {
+                                  _syncHeroTimer();
                                   return;
                                 }
                                 final direction = distance.abs() >= threshold
@@ -1424,6 +1457,13 @@ class _CinematicHomeState extends State<_CinematicHome>
                                   direction < 0 ? 1 : -1,
                                   carouselItemCount,
                                 );
+                              }
+                            : null,
+                        onHorizontalDragCancel: Platform.isAndroid
+                            ? () {
+                                _heroDragDistance = 0;
+                                _heroDragging = false;
+                                _syncHeroTimer();
                               }
                             : null,
                       );
@@ -5390,6 +5430,13 @@ class _RankingPageState extends State<_RankingPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
+    extendBodyBehindAppBar: true,
+    appBar: PreferredSize(
+      preferredSize: const Size.fromHeight(76),
+      child: SafeArea(
+        child: YingjiPageChrome(onBack: () => Navigator.pop(context)),
+      ),
+    ),
     body: YingjiBackdrop(
       overlay: DecoratedBox(
         // 遮罩只压 24%~40%：再深就把海报压成纯黑，玻璃再透明也透不出颜色
@@ -5402,9 +5449,9 @@ class _RankingPageState extends State<_RankingPage> {
           ),
         ),
         child: SafeArea(
+          top: false,
           child: Column(
             children: [
-              YingjiPageChrome(onBack: () => Navigator.pop(context)),
               Expanded(
                 child: FutureBuilder<Map<String, List<TmdbItem>>>(
                   future: _charts,
@@ -5439,7 +5486,7 @@ class _RankingPageState extends State<_RankingPage> {
                           SliverPadding(
                             padding: EdgeInsets.fromLTRB(
                               YingjiLayout.pageLeft,
-                              32,
+                              108,
                               YingjiLayout.pageRight,
                               24,
                             ),
@@ -5940,6 +5987,18 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
     );
     return Scaffold(
       backgroundColor: Colors.transparent,
+      extendBodyBehindAppBar: true,
+      appBar: PreferredSize(
+        preferredSize: const Size.fromHeight(76),
+        child: SafeArea(
+          child: YingjiPageChrome(
+            onBack: () async {
+              await _saveFilters();
+              if (context.mounted) Navigator.pop(context);
+            },
+          ),
+        ),
+      ),
       body: YingjiBackdrop(
         overlay: DecoratedBox(
           decoration: const BoxDecoration(
@@ -5951,14 +6010,9 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
             ),
           ),
           child: SafeArea(
+            top: false,
             child: Column(
               children: [
-                YingjiPageChrome(
-                  onBack: () async {
-                    await _saveFilters();
-                    if (context.mounted) Navigator.pop(context);
-                  },
-                ),
                 Expanded(
                   child: YingjiSmoothWheel(
                     controller: _controller,
@@ -5971,7 +6025,7 @@ class _DiscoverListPageState extends State<_DiscoverListPage> {
                         SliverPadding(
                           padding: EdgeInsets.fromLTRB(
                             YingjiLayout.pageLeft,
-                            32,
+                            108,
                             YingjiLayout.pageRight,
                             24,
                           ),
@@ -6288,6 +6342,7 @@ class _SearchPageState extends State<_SearchPage>
   Future<void> _search() async {
     final query = _controller.text.trim();
     if (query.isEmpty) return;
+    FocusManager.instance.primaryFocus?.unfocus();
     setState(() {
       _loading = true;
       _message = null;
@@ -8878,6 +8933,7 @@ class _CalendarPageState extends State<_CalendarPage>
                     backdropUrl: item.backdropUrl,
                     platform: next.network,
                     platformLogoUrl: next.networkLogoUrl,
+                    platforms: next.platforms,
                     totalEpisodes: next.totalEpisodes,
                     timeKnown: next.timeKnown,
                   ),
@@ -9604,16 +9660,14 @@ class _TrackingEventCard extends StatelessWidget {
                                       children: [
                                         Expanded(
                                           child: Center(
-                                            child:
-                                                event.platform?.isNotEmpty ==
-                                                    true
-                                                ? _CalendarPlatformLogo(
-                                                    platform: event.platform!,
-                                                    logoUrl:
-                                                        event.platformLogoUrl,
-                                                    compact: compact,
-                                                  )
-                                                : const SizedBox.shrink(),
+                                            child: _CalendarPlatforms(
+                                              platforms:
+                                                  mergeBroadcastPlatforms([
+                                                    for (final row in episodes)
+                                                      row.broadcastPlatforms,
+                                                  ]),
+                                              compact: compact,
+                                            ),
                                           ),
                                         ),
                                         Row(
@@ -9699,6 +9753,30 @@ Widget _calendarProgressiveBackdrop(ImageProvider provider) {
   );
 }
 
+class _CalendarPlatforms extends StatelessWidget {
+  const _CalendarPlatforms({required this.platforms, required this.compact});
+  final Map<String, Uri?> platforms;
+  final bool compact;
+  @override
+  Widget build(BuildContext context) => FittedBox(
+    fit: BoxFit.scaleDown,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final row in platforms.entries)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: _CalendarPlatformLogo(
+              platform: row.key,
+              logoUrl: row.value,
+              compact: compact || platforms.length > 1,
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
 class _CalendarPlatformLogo extends StatelessWidget {
   const _CalendarPlatformLogo({
     required this.platform,
@@ -9712,17 +9790,53 @@ class _CalendarPlatformLogo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final name = platform.toLowerCase();
+    final normalized = broadcastPlatformName(platform);
+    final name = normalized.toLowerCase();
+    final key = switch (normalized) {
+      '腾讯视频' => 'company:74457',
+      '爱奇艺' => 'company:172414',
+      '优酷' => 'company:48460',
+      '哔哩哔哩' => 'company:123270',
+      'Apple TV+' => 'watch:350',
+      _ => null,
+    };
+    final resolvedLogo = key == null
+        ? logoUrl
+        : _resolvedPlatformLogos[key] ?? logoUrl;
     final tencent = name.contains('tencent') || name.contains('腾讯');
     final apple = name.contains('apple tv');
     final tintMonochrome = apple || name.contains('hbo') || name == 'max';
-    final Widget logo = logoUrl == null
+    // Provider thumbnails may be opaque squares: tint only the transparent
+    // Apple glyph and wordmark, never the thumbnail's background.
+    final Widget logo = apple
+        ? Semantics(
+            label: normalized,
+            image: true,
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.apple, color: Colors.white, size: 32),
+                  Text(
+                    'tv+',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )
+        : resolvedLogo == null
         ? const Icon(Icons.live_tv_rounded, color: YingjiColors.ink, size: 28)
         : Semantics(
-            label: platform,
+            label: normalized,
             image: true,
             child: CachedNetworkImage(
-              imageUrl: logoUrl.toString(),
+              imageUrl: resolvedLogo.toString(),
               fit: BoxFit.contain,
               placeholder: (_, _) => const Icon(
                 Icons.live_tv_rounded,
@@ -9737,7 +9851,7 @@ class _CalendarPlatformLogo extends StatelessWidget {
             ),
           );
     return YingjiGlassTooltip(
-      message: platform,
+      message: normalized,
       child: SizedBox(
         width: compact ? 76 : 104,
         height: compact ? 40 : 52,
@@ -10039,11 +10153,6 @@ class _SettingsPageState extends State<SettingsPage>
   String _homeCarouselSource = 'trending';
   String _homeCarouselEffect = 'blur-dissolve';
   String _appearanceIcon = 'play';
-  double _appearanceGlassBlur = 30;
-
-  /// 拖动「模糊程度」时的实时预览节流：外观一变整棵树都要重建，逐帧 apply
-  /// 会明显掉帧，所以拖动中每 120ms 才推一次，松手时再落盘。
-  Timer? _appearanceBlurPreview;
   List<String> _playerToolOrder = YingjiPlayerTools.all
       .map((tool) => tool.id)
       .toList(growable: true);
@@ -10116,9 +10225,6 @@ class _SettingsPageState extends State<SettingsPage>
   static const _liveSettingKeys = <String>{
     'yingji.player.seek-seconds',
     'yingji.player.volume-step',
-    // 外观里的「模糊程度」：播放器（独立进程）不在应用里，拖完滑杆要把新值推给
-    // 正在播的那一集，否则「设置改了、播放器不动」。
-    'yingji.appearance.glass-blur',
     // 播放器偏好：改了要立刻作用到正在播放的那一集，同时与控件菜单里改的值
     // 保持同一个来源（改动方向反过来由原生回写这两个键）。
     'yingji.player.speed',
@@ -10219,11 +10325,6 @@ class _SettingsPageState extends State<SettingsPage>
             ? 'blur-dissolve'
             : savedEffect;
         _appearanceIcon = prefs.getString('yingji.appearance.icon') ?? 'play';
-        _appearanceGlassBlur =
-            (prefs.getDouble('yingji.appearance.glass-blur') ?? 30).clamp(
-              0,
-              40,
-            );
         _playerToolOrder = _sanitizePlayerToolOrder(
           prefs.getStringList('yingji.player.tool-order'),
         );
@@ -10366,7 +10467,6 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.home.carousel-source': _homeCarouselSource,
       'yingji.home.carousel-effect': _homeCarouselEffect,
       'yingji.appearance.icon': _appearanceIcon,
-      'yingji.appearance.glass-blur': _appearanceGlassBlur,
       'yingji.player.tool-order': _playerToolOrder,
       'yingji.player.tool-hidden': _playerToolHidden,
       'yingji.player.speed': _defaultSpeed,
@@ -10521,10 +10621,7 @@ class _SettingsPageState extends State<SettingsPage>
   }
 
   void _applyAppearance() {
-    yingjiAppearance.apply(
-      iconStyle: _appearanceIcon,
-      glassBlur: _appearanceGlassBlur,
-    );
+    yingjiAppearance.apply(iconStyle: _appearanceIcon);
   }
 
   Future<void> _testDanmaku([String? target]) async {
@@ -10910,7 +11007,6 @@ class _SettingsPageState extends State<SettingsPage>
     yingjiSectionFocus.removeListener(_handleSectionFocus);
     _activeSetting.removeListener(_revealActiveSettingChip);
     _settingsScroll.removeListener(_syncActiveSetting);
-    _appearanceBlurPreview?.cancel();
     _chipRevealTimer?.cancel();
     _chipScroll.dispose();
     _settingsScroll.dispose();
@@ -11108,40 +11204,18 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 8),
               const Text(
-                '全局统一为 Apple 液态玻璃：透光、带镜面高光边与厚度感；这里只调整模糊程度。',
+                '全局统一使用固定浓度的磨砂玻璃，带柔和高光与细描边；不读取背景画面。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
               ),
-              const SizedBox(height: 14),
-              Text(
-                '模糊程度  ${_appearanceGlassBlur.round()} px',
-                style: const TextStyle(fontWeight: FontWeight.w700),
+              const SizedBox(height: 10),
+              const Text(
+                '固定模糊玻璃',
+                style: TextStyle(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 2),
               const Text(
-                '左端完全无模糊，右端为完整毛玻璃；背景大图、卡片、按钮、HUD 与浮层同步使用，拖动时实时预览。',
+                '所有页面、按钮与播放器菜单使用一致的固定材质。',
                 style: TextStyle(color: Color(0xFFABB1BE)),
-              ),
-              Slider(
-                value: _appearanceGlassBlur,
-                min: 0,
-                max: 40,
-                divisions: 20,
-                label: '${_appearanceGlassBlur.round()} px',
-                onChanged: (value) {
-                  setState(() => _appearanceGlassBlur = value);
-                  _appearanceBlurPreview?.cancel();
-                  _appearanceBlurPreview = Timer(
-                    const Duration(milliseconds: 120),
-                    () {
-                      if (mounted) _applyAppearance();
-                    },
-                  );
-                },
-                onChangeEnd: (_) {
-                  _appearanceBlurPreview?.cancel();
-                  _applyAppearance();
-                  _save();
-                },
               ),
             ],
           ),
@@ -12164,7 +12238,7 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 8),
               Text(
                 WindowHost.isDesktop
-                    ? '从当前播放点向前缓存，所选容量是前向窗口上限；消耗约一半后继续预读，播完清理本集缓存。'
+                    ? '原生直连使用引擎内存预读，不保存离线视频；此容量用于代理中转缓存，已有完整缓存仍可播放。'
                     : '按当前网络从播放点向前缓存；消耗约一半后继续预读，播完清理本集缓存。移动数据默认不缓存。',
                 style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
@@ -13647,11 +13721,12 @@ class _RankHoverPreview extends StatelessWidget {
     height: 236,
     child: ClipRRect(
       borderRadius: BorderRadius.circular(14),
-      child: BackdropFilter(
-        filter: YingjiGlass.backdrop(),
+      child: YingjiGlassSurface(
+        radius: 14,
+        strength: 1.14,
         child: DecoratedBox(
           decoration: BoxDecoration(
-            color: YingjiGlass.surface(strength: 1.14),
+            color: Colors.transparent,
             borderRadius: BorderRadius.circular(16),
             gradient: YingjiGlass.depth,
             boxShadow: const [
@@ -13911,6 +13986,13 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     backgroundColor: Colors.transparent,
+    extendBodyBehindAppBar: true,
+    appBar: PreferredSize(
+      preferredSize: const Size.fromHeight(76),
+      child: SafeArea(
+        child: YingjiPageChrome(onBack: () => Navigator.pop(context)),
+      ),
+    ),
     body: YingjiBackdrop(
       overlay: DecoratedBox(
         decoration: const BoxDecoration(
@@ -13921,9 +14003,9 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
           ),
         ),
         child: SafeArea(
+          top: false,
           child: Column(
             children: [
-              YingjiPageChrome(onBack: () => Navigator.pop(context)),
               Expanded(
                 child: Builder(
                   builder: (context) {
@@ -13945,7 +14027,7 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
                           SliverPadding(
                             padding: EdgeInsets.fromLTRB(
                               YingjiLayout.pageLeft,
-                              30,
+                              106,
                               YingjiLayout.pageRight,
                               18,
                             ),
@@ -15221,34 +15303,41 @@ class _HeroProgressDots extends StatelessWidget {
         borderRadius: BorderRadius.circular(99),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 12),
-          child: Transform.translate(
-            offset: index == active
-                ? Offset(0, math.sin(progress * math.pi * 2) * 2)
-                : Offset.zero,
-            child: Transform.scale(
-              scale: index == active
-                  ? 1 + (.06 * math.sin(progress * math.pi * 2).abs())
-                  : 1,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 120),
-                curve: Curves.easeOutCubic,
-                width: index == active ? 8 + (24 * progress.clamp(0, 1)) : 7,
-                height: index == active ? 6 : 5,
-                decoration: BoxDecoration(
-                  color: index == active ? Colors.white : Colors.white54,
-                  borderRadius: BorderRadius.circular(99),
-                  boxShadow: index == active
-                      ? const [
-                          BoxShadow(
-                            color: Color(0xAAFFFFFF),
-                            blurRadius: 8,
-                            spreadRadius: -2,
+          child: SizedBox(
+            width: 24,
+            height: 6,
+            child: index != active
+                ? const Center(
+                    child: SizedBox(
+                      width: 6,
+                      height: 6,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: Colors.white54,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                    ),
+                  )
+                : ClipRRect(
+                    borderRadius: BorderRadius.circular(99),
+                    child: ColoredBox(
+                      color: Colors.white24,
+                      child: TweenAnimationBuilder<double>(
+                        key: ValueKey(active),
+                        tween: Tween(begin: 0, end: progress.clamp(0.0, 1.0)),
+                        duration: const Duration(milliseconds: 100),
+                        builder: (_, value, _) => Align(
+                          alignment: Alignment.centerLeft,
+                          child: FractionallySizedBox(
+                            widthFactor: value,
+                            heightFactor: 1,
+                            child: const ColoredBox(color: Colors.white),
                           ),
-                        ]
-                      : null,
-                ),
-              ),
-            ),
+                        ),
+                      ),
+                    ),
+                  ),
           ),
         ),
       ),
@@ -15276,21 +15365,12 @@ class _FrostSurface extends StatefulWidget {
 class _FrostSurfaceState extends State<_FrostSurface> {
   bool _hovered = false;
 
-  /// 归因开关命中时直接返回 [child]：**整条**跳过离屏背板模糊（含 layer 与全屏
-  /// 回读），而不只是把 sigma 归零。见 `FrameTrace.skipGlass`。
+  /// Fixed shared frost, with no diagnostic skip or live backdrop readback.
   Widget _frosted(BuildContext context, Widget child) {
-    if (FrameTrace.skipGlass('frost')) return child;
-    if (YingjiStableScrollGlass.enabled(context)) {
-      return BackdropFilter(filter: YingjiGlass.backdrop(), child: child);
-    }
-    return ValueListenableBuilder<bool>(
-      valueListenable: yingjiScrollInProgress,
+    return YingjiGlassSurface(
+      radius: widget.borderRadius,
+      strength: _hovered ? 1.14 : 1,
       child: child,
-      builder: (context, scrolling, child) => BackdropFilter(
-        filter: YingjiGlass.backdrop(),
-        enabled: !scrolling,
-        child: child,
-      ),
     );
   }
 
@@ -15302,21 +15382,6 @@ class _FrostSurfaceState extends State<_FrostSurface> {
       child: Padding(padding: widget.padding, child: widget.child),
     );
     if (widget.glass) {
-      surface = DecoratedBox(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(widget.borderRadius),
-          gradient: YingjiGlass.depth,
-        ),
-        child: surface,
-      );
-      surface = DecoratedBox(
-        // 无描边、无高光：悬停反馈用底色略微加深来表现玻璃层次。
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(widget.borderRadius),
-          color: YingjiGlass.surface(strength: hovered ? 1.14 : 1),
-        ),
-        child: surface,
-      );
       surface = _frosted(context, surface);
     }
     return MouseRegion(

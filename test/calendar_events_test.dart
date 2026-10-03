@@ -4,6 +4,77 @@ import 'package:yingji/src/tracking/trakt_client.dart';
 
 void main() {
   test(
+    'missing episode platform inherits observed same-season broadcast source',
+    () {
+      final rows = mergeCalendarEvents([
+        TraktEvent(
+          title: '剧集',
+          episode: 'Episode 1',
+          tmdbId: 1,
+          seasonNumber: 1,
+          episodeNumber: 1,
+          airDate: DateTime(2026, 10, 2),
+          platform: 'iQIYI',
+        ),
+        TraktEvent(
+          title: '剧集',
+          episode: 'Episode 2',
+          tmdbId: 1,
+          seasonNumber: 1,
+          episodeNumber: 2,
+          airDate: DateTime(2026, 10, 3),
+          platform: 'tencentQQ',
+        ),
+        TraktEvent(
+          title: '其他剧',
+          episode: 'Episode 2',
+          tmdbId: 2,
+          seasonNumber: 1,
+          episodeNumber: 2,
+          airDate: DateTime(2026, 10, 3),
+        ),
+      ]);
+      expect(rows[0].broadcastPlatforms.keys, ['爱奇艺', '腾讯视频']);
+      expect(rows[1].broadcastPlatforms.keys, ['爱奇艺', '腾讯视频']);
+      expect(rows[2].broadcastPlatforms, isEmpty);
+    },
+  );
+  test('broadcast platforms preserve source logos and survive cached JSON', () {
+    final tencent = Uri.parse('https://example.com/tencent.png');
+    final iqiyi = Uri.parse('https://example.com/iqiyi.png');
+    final rows = mergeCalendarEvents([
+      TraktEvent(
+        title: '剧集',
+        episode: 'Episode 1',
+        tmdbId: 1,
+        seasonNumber: 1,
+        episodeNumber: 1,
+        airDate: DateTime(2026, 10, 2),
+        platform: 'tencentQQ',
+        platformLogoUrl: tencent,
+      ),
+      TraktEvent(
+        title: '剧集',
+        episode: 'Episode 1',
+        tmdbId: 1,
+        seasonNumber: 1,
+        episodeNumber: 1,
+        airDate: DateTime(2026, 10, 2),
+        platform: 'iQIYI',
+        platformLogoUrl: iqiyi,
+      ),
+    ]);
+    expect(rows, hasLength(1));
+    expect(rows.single.broadcastPlatforms, {'腾讯视频': tencent, '爱奇艺': iqiyi});
+    expect(
+      TraktEvent.fromJson(rows.single.toJson()).broadcastPlatforms,
+      rows.single.broadcastPlatforms,
+    );
+    final legacy = Map<String, dynamic>.from(rows.single.toJson())
+      ..remove('platforms');
+    expect(TraktEvent.fromJson(legacy).broadcastPlatforms, isNotEmpty);
+  });
+  test(
     'Trakt conflicting absolute numbers cannot swap same-season episodes',
     () {
       TraktEvent local(int n, int day) => TraktEvent(

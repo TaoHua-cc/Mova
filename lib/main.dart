@@ -48,16 +48,8 @@ Future<void> _loadStartupSettings() async {
   final prefs = await SharedPreferences.getInstance();
   FrameTrace.mark('preferences_ready');
   ProxyRouting.loadFrom(prefs);
-  // 外观只保留「模糊程度」一项：底色、不透明度与色调固定为中性磨砂玻璃
-  // （见 YingjiGlass），颜色模式固定深色。旧的玻璃色调 / 不透明度 / 背景卡片
-  // 颜色与颜色模式偏好都不再读取，留在 SharedPreferences 里也不影响。
+  // 玻璃材质固定为统一浓度；旧玻璃滑块偏好保留在存储中但不再读取。
   yingjiAppearance.apply(
     iconStyle: prefs.getString('yingji.appearance.icon') ?? 'play',
-    // 默认值与 `YingjiAppearance.glassBlur` / 设置页保持一致，三处必须同数，
-    // 否则「首次启动」和「改过一次再启动」看到的玻璃厚度不一样。
-    // `MOVA_TRACE_BLUR` 只用于性能归因实验，不写回偏好。
-    glassBlur:
-        FrameTrace.glassBlurOverride ??
-        (prefs.getDouble('yingji.appearance.glass-blur') ?? 30).clamp(0, 40),
   );
 }

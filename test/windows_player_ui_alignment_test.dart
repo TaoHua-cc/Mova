@@ -16,7 +16,11 @@ void main() {
       source,
       contains('ShowHint(detail, std::wstring(), icon, HintMode::Toast'),
     );
-    expect(source, contains('enabled ? 24.0f + amount * 48.0f : 12.0f'));
+    expect(source, contains('constexpr double t = .65;'));
+    expect(
+      source,
+      isNot(contains('.55 + .30 * amount + .15 * PressAmount(id)')),
+    );
   });
 
   test(
@@ -50,8 +54,9 @@ void main() {
     expect(source, contains('kPanelContentWidth = 440'));
     expect(source, contains('kPanelPadding = 20'));
     expect(source, contains('kPanelTitleHeight = 46.0f'));
-    expect(source, contains('Color(top_alpha, 27, 29, 34)'));
-    expect(source, contains('.66 + g_glass_blur.load() / 240.0'));
+    expect(source, contains('Color(77, 88, 96, 98)'));
+    expect(source, isNot(contains('const BYTE top_alpha = 0')));
+    expect(source, isNot(contains('.66 + g_glass_blur.load() / 240.0')));
     expect(source, contains('PanelTitleHeight() +'));
     expect(source, contains('if (!item.selected && !opens_panel) return;'));
   });

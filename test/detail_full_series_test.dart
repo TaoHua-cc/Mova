@@ -104,6 +104,16 @@ void main() {
       season: 25,
       episode: 8,
     ));
+    expect(
+      detailInitialEpisode(
+        55,
+        history,
+        seasons,
+        initialSeason: 1,
+        initialEpisode: 2,
+      ),
+      (season: 1, episode: 2),
+    );
   });
 
   test(

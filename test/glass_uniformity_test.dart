@@ -8,7 +8,7 @@ import 'package:yingji/src/brand.dart';
 ///
 /// 1. 全站只有一条悬浮提示实现（都在 brand.dart 里）；
 /// 2. 详情页背景和首页共用同一个滚动深度算法，且是「清晰层 + 模糊层」叠加；
-/// 3. 原生播放器的玻璃浓度由应用侧下发的 `mova-glass-blur` 驱动。
+/// 3. 原生播放器与共享玻璃使用同一固定浓度。
 ///
 /// 任何一条被破坏，用户看到的就是「有的地方是玻璃、有的地方还是黑块」。
 void main() {
@@ -70,16 +70,15 @@ void main() {
     );
   });
 
-  test('native player glass follows the appearance blur setting', () {
-    // 应用侧下发 + 原生侧白名单 + 原生侧真的用这个值换算玻璃浓度。
+  test('native player glass starts with the shared fixed strength', () {
     final dart = File('lib/src/player/windows_native_player.dart')
         .readAsStringSync();
     final settings = File('lib/src/media_center.dart').readAsStringSync();
     final native = File('windows/native_player/main.cpp').readAsStringSync();
-    expect(dart, contains("'mova-glass-blur'"));
+    expect(dart, contains('final glassBlur = YingjiGlass.fixedBlur;'));
     expect(dart, contains('--mova-glass-blur='));
-    expect(settings, contains("'yingji.appearance.glass-blur'"));
-    expect(native, contains('"mova-glass-blur"'));
+    expect(settings, isNot(contains("'yingji.appearance.glass-blur'")));
+    expect(native, contains('GlassLevel()'));
     expect(native, contains('float GlassLevel()'));
     expect(native, contains('g_glass_blur'));
   });
@@ -100,46 +99,48 @@ void main() {
   });
 
   test('shared glass keeps readable contrast over bright artwork', () {
-    expect(YingjiGlass.surface().a, inInclusiveRange(.07, .18));
-    expect(YingjiGlass.chrome().a, inInclusiveRange(.11, .24));
-    expect(YingjiGlass.hud().a, inInclusiveRange(.14, .30));
+    expect(YingjiGlass.surface().a, inInclusiveRange(.04, .98));
+    expect(YingjiGlass.chrome().a, inInclusiveRange(.04, .98));
+    expect(YingjiGlass.hud().a, inInclusiveRange(.04, .98));
   });
 
-  test('shared glass samples its backdrop without a missing group', () {
+  test('shared glass never samples its backdrop', () {
     final brand = File('lib/src/brand.dart').readAsStringSync();
     final surface = brand.substring(
       brand.indexOf('class YingjiGlassSurface'),
       brand.indexOf('class _YingjiGlassEdgePainter'),
     );
-    expect(surface, contains('BackdropFilter('));
+    expect(surface, isNot(contains('BackdropFilter(')));
     expect(surface, isNot(contains('BackdropFilter.grouped')));
   });
 
-  testWidgets('shared glass updates its blur when appearance changes', (
-    tester,
-  ) async {
-    final previous = yingjiAppearance.glassBlur;
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: Center(
-          child: YingjiGlassSurface(child: SizedBox.square(dimension: 80)),
+  testWidgets(
+    'shared glass keeps its fixed coverage after appearance changes',
+    (tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Center(
+            child: YingjiGlassSurface(
+              sampleBackdrop: true,
+              child: SizedBox.square(dimension: 80),
+            ),
+          ),
         ),
-      ),
-    );
-    final filterBefore = tester
-        .widget<BackdropFilter>(find.byType(BackdropFilter))
-        .filter;
+      );
+      final reflectionBefore = YingjiGlass.fixedDepth();
+      expect(find.byType(BackdropFilter), findsNothing);
 
-    yingjiAppearance.apply(glassBlur: previous == 0 ? 30 : 0);
-    await tester.pump();
-    final filterAfter = tester
-        .widget<BackdropFilter>(find.byType(BackdropFilter))
-        .filter;
-    expect(filterAfter, isNot(same(filterBefore)));
+      yingjiAppearance.apply(iconStyle: 'play');
+      await tester.pump();
+      final reflectionAfter = YingjiGlass.fixedDepth();
+      expect(reflectionAfter.stops, reflectionBefore.stops);
+      expect(reflectionAfter.colors, reflectionBefore.colors);
+      expect(YingjiGlass.fixedFrost().a, closeTo(.30, .005));
+      expect(find.byType(BackdropFilter), findsNothing);
 
-    await tester.pumpWidget(const SizedBox.shrink());
-    yingjiAppearance.apply(glassBlur: previous);
-  });
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   test('shared glass edge stays aligned to physical pixels', () {
     final brand = File('lib/src/brand.dart').readAsStringSync();

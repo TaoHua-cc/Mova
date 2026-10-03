@@ -175,9 +175,41 @@ double? episodeResumeSeconds({double? progress, int? duration}) {
   return seconds >= 5 ? seconds : null;
 }
 
-bool _sameHeaders(Map<String, String> first, Map<String, String> second) =>
-    first.length == second.length &&
-    first.entries.every((entry) => second[entry.key] == entry.value);
+/// Keep explicit server proxies on the compatible relay; ordinary playback is
+/// native. Completed legacy cache files remain usable without origin traffic.
+Future<String> windowsPlaybackUrl(
+  String url, {
+  required VideoCacheStore? cache,
+  Map<String, String> headers = const {},
+  String? sourceId,
+}) async {
+  if (url.isEmpty) return url;
+  final cached = await cache?.cachedFile(url);
+  if (cached != null) return cached.path;
+  if (sourceId != null && ProxyRouting.serverUsesProxy(sourceId)) {
+    if (cache == null) throw StateError('服务器代理不可用，请检查存储空间后重试');
+    return cache.playbackUrl(url, headers: headers, sourceId: sourceId);
+  }
+  return url;
+}
+
+bool windowsNativeNetworkInput(String originalUrl, String playbackUrl) {
+  final scheme = Uri.tryParse(originalUrl)?.scheme.toLowerCase();
+  return originalUrl == playbackUrl && (scheme == 'http' || scheme == 'https');
+}
+
+Map<String, String> windowsPlaybackEnvironment(
+  Map<String, String> environment,
+) => Map.fromEntries(
+  environment.entries.where(
+    (entry) => !const {
+      'http_proxy',
+      'https_proxy',
+      'all_proxy',
+      'no_proxy',
+    }.contains(entry.key.toLowerCase()),
+  ),
+);
 
 /// 拉取到的弹幕：临时文件路径 + 播放器面板要显示的数据来源信息。
 class _DanmakuPayload {
@@ -348,14 +380,7 @@ class WindowsNativePlayer {
     final seekSeconds =
         preferences.getDouble('yingji.player.seek-seconds') ?? 10;
     final volumeStep = preferences.getDouble('yingji.player.volume-step') ?? 5;
-    // 外观 → 模糊程度：播放器的控件条 / 顶栏 / 菜单 / 提示都由它换算成玻璃浓度，
-    // 这样「设置里的那根滑杆」和播放器里的观感是同一份设置（播放中改动走
-    // pushLiveSettings 的 mova-glass-blur 热更新）。
-    final glassBlur =
-        (preferences.getDouble('yingji.appearance.glass-blur') ?? 30).clamp(
-          0,
-          40,
-        );
+    final glassBlur = YingjiGlass.fixedBlur;
     final danmakuEnabled =
         preferences.getBool('yingji.danmaku.enabled') ?? false;
     final autoSkipSegments =
@@ -445,13 +470,21 @@ class WindowsNativePlayer {
     final playbackUrls = <String>[];
     for (final entry in entries) {
       playbackUrls.add(
-        entry.url.isEmpty || cache == null
-            ? entry.url
-            : await cache.playbackUrl(entry.url, headers: entry.headers),
+        await windowsPlaybackUrl(
+          entry.url,
+          cache: cache,
+          headers: entry.headers,
+          sourceId: entry.sourceId,
+        ),
       );
     }
+    bool usesRelay(int index) =>
+        playbackUrls[index] != entries[index].url &&
+        playbackUrls[index].startsWith('http://127.0.0.1:');
     VideoCacheDownload? download;
-    if (cache != null && limit > 0) {
+    if (cache != null &&
+        limit > 0 &&
+        usesRelay(request.playlistIndex.clamp(0, entries.length - 1))) {
       final initialIndex = request.playlistIndex.clamp(0, entries.length - 1);
       final initialEntry = entries[initialIndex];
       download = cache.download(
@@ -461,6 +494,7 @@ class WindowsNativePlayer {
         mediaDuration: Duration(seconds: initialEntry.duration ?? 0),
         headers: request.headers,
         title: request.title,
+        sourceId: request.sourceId,
       );
     }
 
@@ -498,6 +532,12 @@ class WindowsNativePlayer {
       '--cache-pause=yes',
       '--cache-pause-wait=2',
       '--demuxer-readahead-secs=$cacheSeconds',
+      '--cache-secs=$cacheSeconds',
+      '--cache-on-disk=no',
+      '--demuxer-max-bytes=128MiB',
+      '--demuxer-max-back-bytes=32MiB',
+      '--http-proxy=',
+      '--tls-verify=yes',
       '--video-aspect-override=${_aspectValue(aspect)}',
       '--mova-seek-seconds=$seekSeconds',
       '--mova-volume-step=$volumeStep',
@@ -527,8 +567,6 @@ class WindowsNativePlayer {
         '--aid=${request.initialAudioTrack! + 1}',
       if (request.initialSubtitleTrack != null)
         '--sid=${request.initialSubtitleTrack == -1 ? 'no' : request.initialSubtitleTrack! + 1}',
-      if (cache == null && request.headers.isNotEmpty)
-        '--http-header-fields=${request.headers.entries.map((entry) => '${entry.key}: ${entry.value}').join(',')}',
       ...playerColorProperties(
         hdrEnabled:
             hdr || NativeDolbyVisionPlayer.isDolbyVision(request.videoRange),
@@ -537,13 +575,12 @@ class WindowsNativePlayer {
       r'--term-status-msg=MOVA_POSITION=${time-pos}|${duration}',
       '--mova-playlist-start=${request.playlistIndex.clamp(0, playbackUrls.length - 1)}',
       '--mova-live-episode-resolution=${request.onResolveEpisode == null ? 'no' : 'yes'}',
-      if (cache == null)
-        '--mova-default-headers=${Uri.encodeComponent(request.headers.entries.map((header) => '${header.key}: ${header.value}').join('\n'))}',
+      '--mova-default-headers=',
       ...entries.map((entry) => '--mova-playlist-title=${entry.title}'),
       for (var index = 0; index < entries.length; index++)
-        if (cache == null &&
-            !_sameHeaders(entries[index].headers, request.headers))
-          '--mova-playlist-headers=$index|${Uri.encodeComponent(entries[index].headers.entries.map((header) => '${header.key}: ${header.value}').join('\n'))}',
+        '--mova-playlist-headers=$index|${Uri.encodeComponent((windowsNativeNetworkInput(entries[index].url, playbackUrls[index]) ? entries[index].headers : const <String, String>{}).entries.map((header) => '${header.key}: ${header.value}').join('\n'))}',
+      for (var index = 0; index < entries.length; index++)
+        '--mova-playlist-native=${windowsNativeNetworkInput(entries[index].url, playbackUrls[index]) ? 'yes' : 'no'}',
       ...entries.map(
         (entry) => '--mova-playlist-detail=${_episodeLabel(entry)}',
       ),
@@ -608,30 +645,13 @@ class WindowsNativePlayer {
       arguments,
       workingDirectory: executable.parent.path,
       mode: ProcessStartMode.normal,
+      environment: windowsPlaybackEnvironment(Platform.environment),
+      includeParentEnvironment: false,
     );
-    var lastNetworkBytes = 0;
-    final networkSample = Stopwatch()..start();
     void sendCacheProgress(VideoCacheProgress progress) {
       process.stdin.writeln(
         'MOVA_CACHE=${progress.cachedEndBytes}|${progress.mediaTotalBytes}',
       );
-      final received = progress.receivedBytes;
-      final elapsedMilliseconds = networkSample.elapsedMilliseconds;
-      if (received < lastNetworkBytes) {
-        lastNetworkBytes = received;
-        networkSample
-          ..reset()
-          ..start();
-        process.stdin.writeln('MOVA_NETWORK=0');
-      } else if (elapsedMilliseconds >= 250) {
-        final bytesPerSecond =
-            (received - lastNetworkBytes) * 1000 / elapsedMilliseconds;
-        process.stdin.writeln('MOVA_NETWORK=$bytesPerSecond');
-        lastNetworkBytes = received;
-        networkSample
-          ..reset()
-          ..start();
-      }
     }
 
     StreamSubscription<VideoCacheProgress>? cacheProgress;
@@ -641,6 +661,26 @@ class WindowsNativePlayer {
     final completedCacheUrls = <String>{};
     final manualEpisodeMarks = <int, bool>{};
     var activeCacheIndex = request.playlistIndex.clamp(0, entries.length - 1);
+    var speedUrl = entries[activeCacheIndex].url;
+    var lastReadBytes = cache?.playbackBytesRead(speedUrl) ?? 0;
+    final speedClock = Stopwatch()..start();
+    final speedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final url = entries[activeCacheIndex].url;
+      final bytes = cache?.playbackBytesRead(url) ?? 0;
+      final elapsed = speedClock.elapsedMilliseconds;
+      final speed = url == speedUrl && bytes >= lastReadBytes && elapsed > 0
+          ? (bytes - lastReadBytes) * 1000 / elapsed
+          : 0.0;
+      speedUrl = url;
+      lastReadBytes = bytes;
+      speedClock
+        ..reset()
+        ..start();
+      if (!usesRelay(activeCacheIndex)) return;
+      try {
+        process.stdin.writeln('MOVA_NETWORK=$speed');
+      } catch (_) {}
+    });
     var cacheRefreshPending = false;
     var cacheIndexSwitchPending = false;
     var cacheSwitchGeneration = 0;
@@ -655,6 +695,7 @@ class WindowsNativePlayer {
       final store = cache;
       final active = download;
       if (store == null ||
+          !usesRelay(index) ||
           limit <= 0 ||
           active == null ||
           cacheRefreshPending ||
@@ -700,6 +741,7 @@ class WindowsNativePlayer {
           startBytes: playheadByte,
           headers: entry.headers,
           title: entry.title,
+          sourceId: entry.sourceId,
         );
         download = next;
         sendCacheProgress(next.state);
@@ -725,6 +767,7 @@ class WindowsNativePlayer {
       previousPreload?.cancel();
       nextEpisodePreload = null;
       cacheProgress = null;
+      download = null;
       try {
         await previousDownload?.done;
         await previousPreload?.done;
@@ -734,6 +777,7 @@ class WindowsNativePlayer {
             cacheSessionStopping) {
           return;
         }
+        if (!usesRelay(index)) return;
         final entry = entries[index];
         completedCacheUrls.remove(entry.url);
         final next = store.download(
@@ -743,6 +787,7 @@ class WindowsNativePlayer {
           mediaDuration: duration,
           headers: entry.headers,
           title: entry.title,
+          sourceId: entry.sourceId,
         );
         download = next;
         sendCacheProgress(next.state);
@@ -1114,16 +1159,16 @@ class WindowsNativePlayer {
                         return;
                       }
                       entries[index] = entry;
-                      final playbackUrl = cache == null
-                          ? entry.url
-                          : await cache.playbackUrl(
-                              entry.url,
-                              headers: entry.headers,
-                            );
+                      final playbackUrl = await windowsPlaybackUrl(
+                        entry.url,
+                        cache: cache,
+                        headers: entry.headers,
+                        sourceId: entry.sourceId,
+                      );
                       if (generation != episodeResolveGeneration) return;
                       playbackUrls[index] = playbackUrl;
                       final headers =
-                          (cache == null
+                          (windowsNativeNetworkInput(entry.url, playbackUrl)
                                   ? entry.headers
                                   : const <String, String>{})
                               .entries
@@ -1133,7 +1178,8 @@ class WindowsNativePlayer {
                         'MOVA_EPISODE_RESOLVED=$index|'
                         '${Uri.encodeComponent(playbackUrl)}|'
                         '${Uri.encodeComponent(headers)}|'
-                        '${entry.resumeSeconds ?? 0}',
+                        '${entry.resumeSeconds ?? 0}|'
+                        '${windowsNativeNetworkInput(entry.url, playbackUrl) ? 'yes' : 'no'}',
                       );
                     } catch (_) {
                       if (generation != episodeResolveGeneration) return;
@@ -1197,7 +1243,8 @@ class WindowsNativePlayer {
                   playlistPosition >= 0 &&
                   playlistPosition < entries.length - 1) {
                 final nextEntry = entries[playlistPosition + 1];
-                if (nextEntry.url.isNotEmpty &&
+                if (usesRelay(playlistPosition + 1) &&
+                    nextEntry.url.isNotEmpty &&
                     preloadedUrls.add(nextEntry.url)) {
                   nextEpisodePreload = cache.download(
                     url: nextEntry.url,
@@ -1205,6 +1252,7 @@ class WindowsNativePlayer {
                     targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
                     headers: nextEntry.headers,
                     title: nextEntry.title,
+                    sourceId: nextEntry.sourceId,
                   );
                 }
               }
@@ -1212,9 +1260,7 @@ class WindowsNativePlayer {
                 0,
                 entries.length - 1,
               );
-              if (cache != null &&
-                  limit > 0 &&
-                  nextCacheIndex != activeCacheIndex) {
+              if (nextCacheIndex != activeCacheIndex) {
                 activeCacheIndex = nextCacheIndex;
                 cacheSwitchTask = switchCacheEpisode(
                   nextCacheIndex,
@@ -1293,6 +1339,7 @@ class WindowsNativePlayer {
         );
     await process.stderr.drain<void>();
     final exitCode = await process.exitCode;
+    speedTimer.cancel();
     await outputDone.future;
     await progressWrites;
     cacheSessionStopping = true;
@@ -1367,27 +1414,24 @@ class WindowsNativePlayer {
       } else {
         final entry = entries[mark.key];
         final store = await WatchStateStore.create();
-        if (mark.value) {
-          final duration = Duration(seconds: entry.duration?.round() ?? 1);
-          await store.save(
-            WatchState(
-              mediaId: entry.url,
-              title: request.title,
-              position: duration,
-              duration: duration,
-              imageUrl: entry.imageUrl,
-              sourceId: entry.sourceId,
-              serverItemId: entry.serverItemId,
-              tmdbId: entry.tmdbId,
-              episodeTitle: entry.episodeTitle,
-              seasonNumber: entry.seasonNumber,
-              episodeNumber: entry.episodeNumber,
-              isPlayed: true,
-            ),
-          );
-        } else {
-          await store.remove(entry.url);
-        }
+        final duration = Duration(seconds: entry.duration?.round() ?? 1);
+        await store.setPlayed(
+          WatchState(
+            mediaId: entry.url,
+            title: request.title,
+            position: duration,
+            duration: duration,
+            imageUrl: entry.imageUrl,
+            sourceId: entry.sourceId,
+            serverItemId: entry.serverItemId,
+            tmdbId: entry.tmdbId,
+            episodeTitle: entry.episodeTitle,
+            seasonNumber: entry.seasonNumber,
+            episodeNumber: entry.episodeNumber,
+            isPlayed: true,
+          ),
+          mark.value,
+        );
       }
     }
     for (final path in downloadedSubtitlePaths) {
@@ -1858,14 +1902,6 @@ class WindowsNativePlayer {
       'yingji.player.volume-step',
       'mova-volume-step',
       (preferences.getDouble('yingji.player.volume-step') ?? 5).toString(),
-    );
-    // 外观 → 模糊程度：正在播的这一集也要跟着变。原生没有高斯背板，它把同一个
-    // 数值换算成玻璃浓度（控件条、顶栏、菜单、提示一起变透/变实），详见
-    // native_player/main.cpp 的 GlassLevel。
-    push(
-      'yingji.appearance.glass-blur',
-      'mova-glass-blur',
-      (preferences.getDouble('yingji.appearance.glass-blur') ?? 30).toString(),
     );
     // 播放器偏好：设置页里改了「默认播放速度 / 画面比例」要立刻作用到正在播的
     // 这一集（改亮度、音量也从这里走）。值域与起播时同源，两边不会各说各话。

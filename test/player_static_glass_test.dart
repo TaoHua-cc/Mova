@@ -36,7 +36,7 @@ void main() {
         ),
       ),
     );
-    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(find.byType(BackdropFilter), findsNothing);
   });
   testWidgets('player menu glass does not sample the moving video', (
     tester,
@@ -56,6 +56,6 @@ void main() {
         home: Scaffold(body: GlassPanel(child: Text('普通玻璃'))),
       ),
     );
-    expect(find.byType(BackdropFilter), findsOneWidget);
+    expect(find.byType(BackdropFilter), findsNothing);
   });
 }

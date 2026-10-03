@@ -3,6 +3,8 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
+import '../tracking/broadcast_platforms.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -194,6 +196,7 @@ class TmdbUpcomingEpisode {
     required this.airDate,
     this.network,
     this.networkLogoUrl,
+    this.platforms = const {},
     this.totalEpisodes,
     this.showTitle,
     this.showPosterPath,
@@ -209,6 +212,7 @@ class TmdbUpcomingEpisode {
   final String source;
   final String? network;
   final Uri? networkLogoUrl;
+  final Map<String, Uri?> platforms;
   final int? totalEpisodes;
   final String? showTitle;
   final String? showPosterPath;
@@ -797,6 +801,13 @@ class TmdbClient {
       /* Retain TMDB's date if the time source is unavailable. */
     }
     final networks = data['networks'] as List<dynamic>? ?? const [];
+    final networkLogos = <String, Uri?>{
+      for (final row in networks.whereType<Map>())
+        if ('${row['name'] ?? ''}'.isNotEmpty)
+          '${row['name']}': '${row['logo_path'] ?? ''}'.isEmpty
+              ? null
+              : Uri.https('image.tmdb.org', '/t/p/w300${row['logo_path']}'),
+    };
     final networkRow = networks
         .whereType<Map<String, dynamic>>()
         .where((entry) => '${entry['name'] ?? ''}'.isNotEmpty)
@@ -838,6 +849,7 @@ class TmdbClient {
               airDate: date,
               network: network.isEmpty ? null : network,
               networkLogoUrl: networkLogoUrl,
+              platforms: networkLogos,
               totalEpisodes: totalEpisodes,
               showTitle: showTitle,
               showPosterPath: showPosterPath,
@@ -861,6 +873,7 @@ class TmdbClient {
             airDate: date,
             network: network.isEmpty ? null : network,
             networkLogoUrl: networkLogoUrl,
+            platforms: networkLogos,
             totalEpisodes: totalEpisodes,
             showTitle: showTitle,
             showPosterPath: showPosterPath,
@@ -909,6 +922,14 @@ class TmdbClient {
           ? episode
           : (previous.timeKnown ? previous : episode);
       merged[key] = TmdbUpcomingEpisode(
+        platforms: mergeBroadcastPlatforms([
+          previous.platforms,
+          episode.platforms,
+          if (previous.network != null)
+            {previous.network!: previous.networkLogoUrl},
+          if (episode.network != null)
+            {episode.network!: episode.networkLogoUrl},
+        ]),
         seasonNumber: primary.seasonNumber,
         episodeNumber: primary.episodeNumber,
         title: primary.title.isNotEmpty
@@ -927,11 +948,13 @@ class TmdbClient {
             primary.network ??
             episode.network ??
             previous.network,
-        networkLogoUrl:
-            timing.networkLogoUrl ??
-            primary.networkLogoUrl ??
-            episode.networkLogoUrl ??
-            previous.networkLogoUrl,
+        networkLogoUrl: timing.network != null
+            ? timing.networkLogoUrl
+            : primary.network != null
+            ? primary.networkLogoUrl
+            : episode.network != null
+            ? episode.networkLogoUrl
+            : previous.networkLogoUrl,
         totalEpisodes:
             [
               primary.totalEpisodes,

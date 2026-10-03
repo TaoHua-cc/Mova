@@ -146,13 +146,15 @@ List<MediaItem> episodeResourcesForResume(
   final ordered = [...seasons]..sort((a, b) => a.number.compareTo(b.number));
   return (
     season:
-        recent?.seasonNumber ??
         initialSeason ??
+        recent?.seasonNumber ??
         ordered.firstOrNull?.number ??
         media?.seasonNumber,
     episode:
-        recent?.episodeNumber ??
         initialEpisode ??
+        (initialSeason != null && recent?.seasonNumber != initialSeason
+            ? null
+            : recent?.episodeNumber) ??
         (ordered.isEmpty ? media?.episodeNumber : null),
   );
 }
@@ -764,7 +766,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       });
       final traktCompleted = await _traktCompletedEpisodes();
       if (!mounted || generation != _searchGeneration) return;
-      final combined = _deriveProgress(resources, history, traktCompleted);
+      final freshHistory = (await WatchStateStore.create()).load();
+      if (!mounted || generation != _searchGeneration) return;
+      final combined = _deriveProgress(resources, freshHistory, traktCompleted);
       setState(() {
         _completedResourceIds = combined.completed;
         _episodeProgress = {..._episodeProgress, ...combined.progress};
@@ -1054,8 +1058,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           (sameSeason.isNotEmpty
               ? await _preferredResource(sameSeason)
               : await _initialResource(matches));
-      final history = (await WatchStateStore.create()).load();
       final traktCompleted = await _traktCompletedEpisodes();
+      final history = (await WatchStateStore.create()).load();
       final derived = _deriveProgress(matches, history, traktCompleted);
       if (mounted) {
         setState(() {
@@ -1110,26 +1114,40 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   /// Derives per-episode progress and the completed-resource set from watch
   /// history (local + server) and Trakt. Shared by the initial resource load
   /// and by the post-playback refresh so both stay on the same rules.
+  WatchState? _localWatch(MediaItem resource, List<WatchState> history) =>
+      history
+          .where(
+            (state) =>
+                (state.sourceId == resource.source.id &&
+                    state.serverItemId == resource.id) ||
+                state.mediaId == resource.playbackUrl?.toString() ||
+                (widget.item.id > 0 &&
+                    state.tmdbId == widget.item.id &&
+                    state.seasonNumber == resource.seasonNumber &&
+                    state.episodeNumber == resource.episodeNumber &&
+                    state.episodeNumber != null),
+          )
+          .firstOrNull;
+
   ({Set<String> completed, Map<String, double> progress}) _deriveProgress(
     List<MediaItem> resources,
     List<WatchState> history,
     Set<String> traktCompleted,
   ) {
     final completed = resources
-        .where(
-          (resource) =>
-              history.any(
-                (state) =>
-                    (state.serverItemId == resource.id ||
-                        state.mediaId == resource.playbackUrl?.toString()) &&
-                    state.progress >= .92,
-              ) ||
-              resource.isPlayed ||
-              _mediaProgress(resource) >= .92 ||
-              traktCompleted.contains(
-                _episodeKey(resource.seasonNumber, resource.episodeNumber),
-              ),
-        )
+        .where((resource) {
+          final local = _localWatch(resource, history);
+          return local != null
+              ? local.isCompleted
+              : resource.isPlayed ||
+                    _mediaProgress(resource) >= .92 ||
+                    traktCompleted.contains(
+                      _episodeKey(
+                        resource.seasonNumber,
+                        resource.episodeNumber,
+                      ),
+                    );
+        })
         .map((resource) => resource.id)
         .toSet();
     final progress = <String, double>{};
@@ -1145,13 +1163,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }
     final localKeys = progress.keys.toSet();
     for (final resource in resources) {
-      final local = history
-          .where(
-            (state) =>
-                state.serverItemId == resource.id ||
-                state.mediaId == resource.playbackUrl?.toString(),
-          )
-          .firstOrNull;
+      final local = _localWatch(resource, history);
       final localProgress = local?.progress ?? 0;
       final serverDuration = resource.runtime;
       final serverProgress =
@@ -1190,8 +1202,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   Future<void> _refreshProgressAfterPlayback() async {
     if (!mounted || _loadingResources) return;
     await _refreshLocalProgress();
-    final history = (await WatchStateStore.create()).load();
     final traktCompleted = await _traktCompletedEpisodes();
+    final history = (await WatchStateStore.create()).load();
     final derived = _deriveProgress(_resources, history, traktCompleted);
     if (!mounted) return;
     setState(() {
@@ -1391,15 +1403,11 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       });
     final history = (await WatchStateStore.create()).load();
     bool matches(WatchState state, MediaItem resource) =>
-        state.serverItemId == resource.id ||
-        state.mediaId == resource.playbackUrl?.toString();
+        _localWatch(resource, [state]) != null &&
+        (state.position > Duration.zero || state.isCompleted);
     double progressFor(MediaItem resource) {
-      final local = history
-          .where((state) => matches(state, resource))
-          .map((state) => state.progress)
-          .fold<double>(0, math.max);
-      final server = _mediaProgress(resource);
-      return math.max(local, server);
+      return _localWatch(resource, history)?.progress ??
+          _mediaProgress(resource);
     }
 
     final resumable = ordered.where((resource) {
@@ -1409,7 +1417,9 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (resumable.isNotEmpty) return resumable.first;
     final played = <String>{};
     for (final resource in ordered) {
-      if (history.any((state) => matches(state, resource))) {
+      final local = _localWatch(resource, history);
+      if (local != null &&
+          (local.position > Duration.zero || local.isCompleted)) {
         played.add(resource.id);
       }
     }
@@ -1587,29 +1597,25 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       });
     }
     final watchStore = await WatchStateStore.create();
-    for (final version in versions) {
-      final mediaId = version.playbackUrl?.toString() ?? version.id;
-      if (completed) {
-        final duration = version.runtime ?? const Duration(seconds: 1);
-        await watchStore.save(
-          WatchState(
-            mediaId: mediaId,
-            serverItemId: version.id,
-            sourceId: version.source.id,
-            tmdbId: widget.item.id,
-            title: version.title,
-            episodeTitle: version.title,
-            seasonNumber: version.seasonNumber,
-            episodeNumber: version.episodeNumber,
-            imageUrl: version.imageUrl?.toString(),
-            position: duration,
-            duration: duration,
-          ),
-        );
-      } else {
-        await watchStore.remove(mediaId);
-      }
-    }
+    final version = resource;
+    final mediaId = version.playbackUrl?.toString() ?? version.id;
+    final duration = version.runtime ?? const Duration(seconds: 1);
+    await watchStore.setPlayed(
+      WatchState(
+        mediaId: mediaId,
+        serverItemId: version.id,
+        sourceId: version.source.id,
+        tmdbId: widget.item.id,
+        title: widget.item.title,
+        episodeTitle: version.title,
+        seasonNumber: version.seasonNumber,
+        episodeNumber: version.episodeNumber,
+        imageUrl: version.imageUrl?.toString(),
+        position: duration,
+        duration: duration,
+      ),
+      completed,
+    );
     if (await WatchStateStore.localOnly()) {
       // 「观看记录只保存在本机」：本机记录上面已经写好，这里不再回写媒体
       // 服务器与 Trakt，只如实告诉用户这次标记存在了哪里。
@@ -1711,24 +1717,21 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       );
     }
     final store = await WatchStateStore.create();
-    if (completed) {
-      final duration = Duration(minutes: episode.runtime ?? 1);
-      await store.save(
-        WatchState(
-          mediaId: mediaId,
-          tmdbId: widget.item.id,
-          title: widget.item.title,
-          episodeTitle: episode.name,
-          seasonNumber: episode.seasonNumber,
-          episodeNumber: episode.episodeNumber,
-          imageUrl: episode.stillUrl?.toString(),
-          position: duration,
-          duration: duration,
-        ),
-      );
-    } else {
-      await store.remove(mediaId);
-    }
+    final duration = Duration(minutes: episode.runtime ?? 1);
+    await store.setPlayed(
+      WatchState(
+        mediaId: mediaId,
+        tmdbId: widget.item.id,
+        title: widget.item.title,
+        episodeTitle: episode.name,
+        seasonNumber: episode.seasonNumber,
+        episodeNumber: episode.episodeNumber,
+        imageUrl: episode.stillUrl?.toString(),
+        position: duration,
+        duration: duration,
+      ),
+      completed,
+    );
     if (!mounted) return;
     if (await WatchStateStore.localOnly()) return;
     final credentials = await TraktCredentials.read();
@@ -2343,15 +2346,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                 ),
               ),
               SafeArea(
-                child: Column(
+                child: Stack(
+                  fit: StackFit.expand,
                   children: [
-                    RepaintBoundary(
-                      child: _DetailTopBar(
-                        onBack: () => Navigator.pop(context),
-                        onSearch: () => _showResourceSearch(context),
-                      ),
-                    ),
-                    Expanded(
+                    Positioned.fill(
                       child: YingjiSmoothWheel(
                         controller: _pageScroll,
                         // 桌面详情页外层同时移动背景、海报货架和多个玻璃面；
@@ -2372,7 +2370,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                               ),
                           padding: EdgeInsets.fromLTRB(
                             YingjiLayout.pageLeft,
-                            10,
+                            92,
                             YingjiLayout.pageRight,
                             80,
                           ),
@@ -2469,6 +2467,15 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                         ),
                       ),
                     ),
+                    Align(
+                      alignment: Alignment.topCenter,
+                      child: RepaintBoundary(
+                        child: _DetailTopBar(
+                          onBack: () => Navigator.pop(context),
+                          onSearch: () => _showResourceSearch(context),
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -2481,17 +2488,13 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
 
   Future<void> _play(BuildContext context, TmdbItem item) async {
     final resource = _selectedResource;
-    if (resource?.playbackUrl == null) return;
+    if (resource == null || resource.playbackUrl == null) return;
     final watchStore = await WatchStateStore.create();
-    final saved = watchStore.load().where((state) {
-      return state.serverItemId == resource!.id ||
-          state.mediaId == resource.playbackUrl.toString();
-    }).firstOrNull;
-    final remotePosition = resource!.playbackPosition ?? Duration.zero;
+    final saved = _localWatch(resource, watchStore.load());
+    final remotePosition = resource.playbackPosition ?? Duration.zero;
     final savedPosition = saved?.position ?? Duration.zero;
-    var resumePosition = remotePosition > savedPosition
-        ? remotePosition
-        : savedPosition;
+    var resumePosition = saved != null ? savedPosition : remotePosition;
+    if (saved?.isCompleted == true) resumePosition = Duration.zero;
     if (!context.mounted) return;
     // 展示目录来自全部季/集元数据，不以当前只搜索过资源的集数裁剪列表。
     // 对没有 URL 的目录项，用户选中后才触发该集的服务器聚合。
@@ -2535,7 +2538,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       final progressPosition = savedSeconds == null
           ? Duration.zero
           : Duration(milliseconds: (savedSeconds * 1000).round());
-      final resourcePosition = episode == null || _mediaProgress(episode) >= .95
+      final resourcePosition =
+          episode == null ||
+              _episodeProgress.containsKey(option.key) ||
+              _mediaProgress(episode) >= .95
           ? Duration.zero
           : episode.playbackPosition ?? Duration.zero;
       final resumePosition = [
@@ -2957,16 +2963,12 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                 selected?.playbackUrl != null;
             if (found) {
               activeResource = selected!;
-              final savedNext = watchStore.load().where((state) {
-                return state.serverItemId == activeResource.id ||
-                    state.mediaId == activeResource.playbackUrl.toString();
-              }).firstOrNull;
+              final savedNext = _localWatch(activeResource, watchStore.load());
               final remoteNext =
                   activeResource.playbackPosition ?? Duration.zero;
               final savedPositionNext = savedNext?.position ?? Duration.zero;
-              startAt = remoteNext > savedPositionNext
-                  ? remoteNext
-                  : savedPositionNext;
+              startAt = savedNext != null ? savedPositionNext : remoteNext;
+              if (savedNext?.isCompleted == true) startAt = Duration.zero;
               final key = _episodeKey(requestedSeason, requestedEpisode);
               final index = episodeOptions.indexWhere(
                 (option) => option.key == key,
@@ -3728,10 +3730,12 @@ class _PublishedEpisodeNumbers extends StatelessWidget {
     required this.episodes,
     required this.selected,
     required this.onSelect,
+    required this.controller,
   });
   final List<TmdbEpisode> episodes;
   final int? selected;
   final ValueChanged<TmdbEpisode> onSelect;
+  final ScrollController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -3748,6 +3752,7 @@ class _PublishedEpisodeNumbers extends StatelessWidget {
       height: 48,
       child: MovaHorizontalDrag(
         child: ListView.separated(
+          controller: controller,
           scrollDirection: Axis.horizontal,
           physics: const BouncingScrollPhysics(),
           itemCount: published.length,
@@ -3824,6 +3829,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
   static const _episodeItemExtent = 256.0;
   final _controller = ScrollController();
   final _allEpisodesController = ScrollController();
+  final _numberController = ScrollController();
 
   @override
   void initState() {
@@ -3831,11 +3837,12 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
     _centerSelected();
   }
 
-  void _centerSelected() {
+  void _centerSelected({int? number}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_controller.hasClients) return;
       final index = widget.episodes.indexWhere(
-        (episode) => episode.episodeNumber == widget.selectedEpisode,
+        (episode) =>
+            episode.episodeNumber == (number ?? widget.selectedEpisode),
       );
       if (index < 0) return;
       final position = _controller.position;
@@ -3849,6 +3856,32 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
         duration: const Duration(milliseconds: 360),
         curve: Curves.easeOutCubic,
       );
+      if (_numberController.hasClients) {
+        final now = DateTime.now();
+        final tomorrow = DateTime(now.year, now.month, now.day + 1);
+        final published = widget.episodes
+            .where(
+              (episode) =>
+                  episode.airDate != null &&
+                  episode.airDate!.isBefore(tomorrow),
+            )
+            .toList();
+        final numberIndex = published.indexWhere(
+          (episode) =>
+              episode.episodeNumber == (number ?? widget.selectedEpisode),
+        );
+        if (numberIndex >= 0) {
+          final position = _numberController.position;
+          _numberController.animateTo(
+            (numberIndex * 48 + 22 - position.viewportDimension / 2).clamp(
+              0.0,
+              position.maxScrollExtent,
+            ),
+            duration: const Duration(milliseconds: 360),
+            curve: Curves.easeOutCubic,
+          );
+        }
+      }
     });
   }
 
@@ -3920,6 +3953,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
   void dispose() {
     _controller.dispose();
     _allEpisodesController.dispose();
+    _numberController.dispose();
     super.dispose();
   }
 
@@ -3943,8 +3977,7 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                   maxWidth: 720,
                   maxHeight: 760,
                 ),
-                child: GlassPanel(
-                  radius: 22,
+                child: Padding(
                   padding: EdgeInsets.zero,
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -3976,248 +4009,267 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                         color: YingjiGlass.line(strength: .85),
                       ),
                       Flexible(
-                        child: ScrollConfiguration(
-                          behavior: ScrollConfiguration.of(context)
-                              .copyWith(scrollbars: false),
-                          child: ListView.builder(
-                            controller: _allEpisodesController,
-                            physics: yingjiWheelPhysics,
-                            padding: const EdgeInsets.fromLTRB(14, 12, 14, 16),
-                            itemCount: widget.episodes.length,
-                            itemBuilder: (context, index) {
-                              final episode = widget.episodes[index];
-                              final key = _episodeKey(
-                                episode.seasonNumber,
-                                episode.episodeNumber,
-                              );
-                              final progress = progressByEpisode[key] ?? 0;
-                              final selected =
-                                  episode.episodeNumber ==
-                                  dialogSelectedEpisode;
-                              final played = progress >= .92;
-                              final hovered =
-                                  hoveredEpisodeNumber == episode.episodeNumber;
-                              final overview = episode.overview?.trim();
-                              return Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.stretch,
-                                  children: [
-                                    _contextEpisode(
-                                      episode,
-                                      MouseRegion(
-                                        cursor: SystemMouseCursors.click,
-                                        onEnter: (_) => updateDialog(
-                                          () => hoveredEpisodeNumber =
-                                              episode.episodeNumber,
-                                        ),
-                                        onExit: (_) {
-                                          if (hoveredEpisodeNumber ==
-                                              episode.episodeNumber) {
-                                            updateDialog(
-                                              () => hoveredEpisodeNumber = null,
-                                            );
-                                          }
-                                        },
-                                        child: AnimatedContainer(
-                                          duration: MovaMotion.standard,
-                                          curve: MovaMotion.standardEase,
-                                          decoration: BoxDecoration(
-                                            color: selected
-                                                ? Colors.white.withValues(
-                                                    alpha: .12,
-                                                  )
-                                                : hovered
-                                                ? Colors.white.withValues(
-                                                    alpha: .055,
-                                                  )
-                                                : Colors.transparent,
-                                            borderRadius: BorderRadius.circular(
-                                              14,
-                                            ),
-                                            border: Border.all(
+                        child: GlassPanel(
+                          radius: 22,
+                          padding: EdgeInsets.zero,
+                          child: ScrollConfiguration(
+                            behavior: ScrollConfiguration.of(context)
+                                .copyWith(scrollbars: false),
+                            child: ListView.builder(
+                              controller: _allEpisodesController,
+                              physics: yingjiWheelPhysics,
+                              padding: const EdgeInsets.fromLTRB(
+                                14,
+                                12,
+                                14,
+                                16,
+                              ),
+                              itemCount: widget.episodes.length,
+                              itemBuilder: (context, index) {
+                                final episode = widget.episodes[index];
+                                final key = _episodeKey(
+                                  episode.seasonNumber,
+                                  episode.episodeNumber,
+                                );
+                                final progress = progressByEpisode[key] ?? 0;
+                                final selected =
+                                    episode.episodeNumber ==
+                                    dialogSelectedEpisode;
+                                final played = progress >= .92;
+                                final hovered =
+                                    hoveredEpisodeNumber ==
+                                    episode.episodeNumber;
+                                final overview = episode.overview?.trim();
+                                return Padding(
+                                  padding: const EdgeInsets.only(bottom: 8),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      _contextEpisode(
+                                        episode,
+                                        MouseRegion(
+                                          cursor: SystemMouseCursors.click,
+                                          onEnter: (_) => updateDialog(
+                                            () => hoveredEpisodeNumber =
+                                                episode.episodeNumber,
+                                          ),
+                                          onExit: (_) {
+                                            if (hoveredEpisodeNumber ==
+                                                episode.episodeNumber) {
+                                              updateDialog(
+                                                () =>
+                                                    hoveredEpisodeNumber = null,
+                                              );
+                                            }
+                                          },
+                                          child: AnimatedContainer(
+                                            duration: MovaMotion.standard,
+                                            curve: MovaMotion.standardEase,
+                                            decoration: BoxDecoration(
                                               color: selected
                                                   ? Colors.white.withValues(
-                                                      alpha: .78,
+                                                      alpha: .12,
                                                     )
                                                   : hovered
                                                   ? Colors.white.withValues(
-                                                      alpha: .58,
+                                                      alpha: .055,
                                                     )
                                                   : Colors.transparent,
-                                              width: 1.4,
-                                            ),
-                                          ),
-                                          child: ListTile(
-                                            selected: false,
-                                            shape: RoundedRectangleBorder(
                                               borderRadius:
                                                   BorderRadius.circular(14),
+                                              border: Border.all(
+                                                color: selected
+                                                    ? Colors.white.withValues(
+                                                        alpha: .78,
+                                                      )
+                                                    : hovered
+                                                    ? Colors.white.withValues(
+                                                        alpha: .58,
+                                                      )
+                                                    : Colors.transparent,
+                                                width: 1.4,
+                                              ),
                                             ),
-                                            contentPadding:
-                                                const EdgeInsets.symmetric(
-                                                  horizontal: 8,
-                                                  vertical: 5,
-                                                ),
-                                            leading: SizedBox(
-                                              width: 112,
-                                              height: 64,
-                                              child: ClipRRect(
+                                            child: ListTile(
+                                              selected: false,
+                                              shape: RoundedRectangleBorder(
                                                 borderRadius:
-                                                    BorderRadius.circular(8),
-                                                child: episode.stillUrl == null
-                                                    ? const _EpisodeArtworkFallback()
-                                                    : CachedNetworkImage(
-                                                        imageUrl: episode
-                                                            .stillUrl
-                                                            .toString(),
-                                                        fit: BoxFit.cover,
-                                                        errorWidget: (_, _, _) =>
-                                                            const _EpisodeArtworkFallback(),
+                                                    BorderRadius.circular(14),
+                                              ),
+                                              contentPadding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 8,
+                                                    vertical: 5,
+                                                  ),
+                                              leading: SizedBox(
+                                                width: 112,
+                                                height: 64,
+                                                child: ClipRRect(
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                  child:
+                                                      episode.stillUrl == null
+                                                      ? const _EpisodeArtworkFallback()
+                                                      : CachedNetworkImage(
+                                                          imageUrl: episode
+                                                              .stillUrl
+                                                              .toString(),
+                                                          fit: BoxFit.cover,
+                                                          errorWidget: (
+                                                            _,
+                                                            _,
+                                                            _,
+                                                          ) => const _EpisodeArtworkFallback(),
+                                                        ),
+                                                ),
+                                              ),
+                                              title: Text(
+                                                '第 ${episode.episodeNumber} 集 · ${episode.name}',
+                                              ),
+                                              subtitle: Text(
+                                                [
+                                                      _dateLabel(
+                                                        episode.airDate,
+                                                      ),
+                                                      if (episode.runtime !=
+                                                          null)
+                                                        '${episode.runtime} 分钟',
+                                                    ]
+                                                    .where(
+                                                      (part) => part.isNotEmpty,
+                                                    )
+                                                    .join(' · '),
+                                              ),
+                                              onTap: () {
+                                                if (selected) {
+                                                  Navigator.pop(dialogContext);
+                                                  widget.onPlay(episode);
+                                                } else {
+                                                  dialogSelectedEpisode =
+                                                      episode.episodeNumber;
+                                                  widget.onSelect(episode);
+                                                  updateDialog(() {});
+                                                }
+                                              },
+                                              trailing: AnimatedSwitcher(
+                                                duration: MovaMotion.standard,
+                                                switchInCurve:
+                                                    MovaMotion.spring,
+                                                switchOutCurve: MovaMotion.exit,
+                                                transitionBuilder:
+                                                    (child, animation) =>
+                                                        ScaleTransition(
+                                                          scale: animation,
+                                                          child: FadeTransition(
+                                                            opacity: animation,
+                                                            child: child,
+                                                          ),
+                                                        ),
+                                                child: played
+                                                    ? Container(
+                                                        key: const ValueKey(
+                                                          'played',
+                                                        ),
+                                                        padding:
+                                                            const EdgeInsets.symmetric(
+                                                              horizontal: 10,
+                                                              vertical: 6,
+                                                            ),
+                                                        decoration: BoxDecoration(
+                                                          color:
+                                                              const Color(
+                                                                0xFF6AD7A1,
+                                                              ).withValues(
+                                                                alpha: .19,
+                                                              ),
+                                                          borderRadius:
+                                                              BorderRadius.circular(
+                                                                999,
+                                                              ),
+                                                          border: Border.all(
+                                                            color:
+                                                                const Color(
+                                                                  0xFF8CE9B5,
+                                                                ).withValues(
+                                                                  alpha: .72,
+                                                                ),
+                                                          ),
+                                                        ),
+                                                        child: const Row(
+                                                          mainAxisSize:
+                                                              MainAxisSize.min,
+                                                          children: [
+                                                            Icon(
+                                                              YingjiIcons
+                                                                  .checkmark_circle_fill,
+                                                              size: 16,
+                                                              color: Color(
+                                                                0xFF9BF1BF,
+                                                              ),
+                                                            ),
+                                                            SizedBox(width: 6),
+                                                            Text(
+                                                              '已播放',
+                                                              style: TextStyle(
+                                                                fontSize: 12,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .w800,
+                                                                color: Color(
+                                                                  0xFFB9F6D0,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      )
+                                                    : Icon(
+                                                        YingjiIcons.play_circle,
+                                                        key: const ValueKey(
+                                                          'unplayed',
+                                                        ),
+                                                        color: selected
+                                                            ? Colors.white
+                                                            : Colors.white54,
                                                       ),
                                               ),
                                             ),
-                                            title: Text(
-                                              '第 ${episode.episodeNumber} 集 · ${episode.name}',
-                                            ),
-                                            subtitle: Text(
-                                              [
-                                                    _dateLabel(episode.airDate),
-                                                    if (episode.runtime != null)
-                                                      '${episode.runtime} 分钟',
-                                                  ]
-                                                  .where(
-                                                    (part) => part.isNotEmpty,
-                                                  )
-                                                  .join(' · '),
-                                            ),
-                                            onTap: () {
-                                              if (selected) {
-                                                Navigator.pop(dialogContext);
-                                                widget.onPlay(episode);
-                                              } else {
-                                                dialogSelectedEpisode =
-                                                    episode.episodeNumber;
-                                                widget.onSelect(episode);
-                                                updateDialog(() {});
-                                              }
-                                            },
-                                            trailing: AnimatedSwitcher(
-                                              duration: MovaMotion.standard,
-                                              switchInCurve: MovaMotion.spring,
-                                              switchOutCurve: MovaMotion.exit,
-                                              transitionBuilder:
-                                                  (child, animation) =>
-                                                      ScaleTransition(
-                                                        scale: animation,
-                                                        child: FadeTransition(
-                                                          opacity: animation,
-                                                          child: child,
-                                                        ),
-                                                      ),
-                                              child: played
-                                                  ? Container(
-                                                      key: const ValueKey(
-                                                        'played',
-                                                      ),
-                                                      padding:
-                                                          const EdgeInsets.symmetric(
-                                                            horizontal: 10,
-                                                            vertical: 6,
-                                                          ),
-                                                      decoration: BoxDecoration(
-                                                        color:
-                                                            const Color(
-                                                              0xFF6AD7A1,
-                                                            ).withValues(
-                                                              alpha: .19,
-                                                            ),
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                              999,
-                                                            ),
-                                                        border: Border.all(
-                                                          color:
-                                                              const Color(
-                                                                0xFF8CE9B5,
-                                                              ).withValues(
-                                                                alpha: .72,
-                                                              ),
-                                                        ),
-                                                      ),
-                                                      child: const Row(
-                                                        mainAxisSize:
-                                                            MainAxisSize.min,
-                                                        children: [
-                                                          Icon(
-                                                            YingjiIcons
-                                                                .checkmark_circle_fill,
-                                                            size: 16,
-                                                            color: Color(
-                                                              0xFF9BF1BF,
-                                                            ),
-                                                          ),
-                                                          SizedBox(width: 6),
-                                                          Text(
-                                                            '已播放',
-                                                            style: TextStyle(
-                                                              fontSize: 12,
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .w800,
-                                                              color: Color(
-                                                                0xFFB9F6D0,
-                                                              ),
-                                                            ),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    )
-                                                  : Icon(
-                                                      YingjiIcons.play_circle,
-                                                      key: const ValueKey(
-                                                        'unplayed',
-                                                      ),
-                                                      color: selected
-                                                          ? Colors.white
-                                                          : Colors.white54,
-                                                    ),
+                                          ),
+                                        ),
+                                        onChoice: (played) => updateDialog(
+                                          () => progressByEpisode[key] = played
+                                              ? 1
+                                              : 0,
+                                        ),
+                                      ),
+                                      if (overview != null &&
+                                          overview.isNotEmpty)
+                                        Padding(
+                                          padding: const EdgeInsets.fromLTRB(
+                                            12,
+                                            5,
+                                            12,
+                                            1,
+                                          ),
+                                          child: YingjiGlassTooltip(
+                                            message: overview,
+                                            child: Text(
+                                              overview,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                color: YingjiColors.muted,
+                                                fontSize: 12,
+                                              ),
                                             ),
                                           ),
                                         ),
-                                      ),
-                                      onChoice: (played) => updateDialog(
-                                        () => progressByEpisode[key] = played
-                                            ? 1
-                                            : 0,
-                                      ),
-                                    ),
-                                    if (overview != null && overview.isNotEmpty)
-                                      Padding(
-                                        padding: const EdgeInsets.fromLTRB(
-                                          12,
-                                          5,
-                                          12,
-                                          1,
-                                        ),
-                                        child: YingjiGlassTooltip(
-                                          message: overview,
-                                          child: Text(
-                                            overview,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              color: YingjiColors.muted,
-                                              fontSize: 12,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              );
-                            },
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
                           ),
                         ),
                       ),
@@ -4262,7 +4314,13 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
       _PublishedEpisodeNumbers(
         episodes: widget.episodes,
         selected: widget.selectedEpisode,
-        onSelect: widget.onSelect,
+        controller: _numberController,
+        onSelect: (episode) {
+          _centerSelected(number: episode.episodeNumber);
+          if (episode.episodeNumber != widget.selectedEpisode) {
+            widget.onSelect(episode);
+          }
+        },
       ),
       SizedBox(
         height: 236,
@@ -4299,9 +4357,12 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                       children: [
                         InkWell(
                           borderRadius: BorderRadius.circular(11),
-                          onTap: () => selected
-                              ? widget.onPlay(episode)
-                              : widget.onSelect(episode),
+                          onTap: () {
+                            _centerSelected(number: episode.episodeNumber);
+                            selected
+                                ? widget.onPlay(episode)
+                                : widget.onSelect(episode);
+                          },
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -4871,6 +4932,7 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
           final unplayedCount =
               widget.resources.length - playedCount - watchingCount;
           return YingjiPinnedDialog(
+            transparentHeader: true,
             maxWidth: 1180,
             maxHeight: 820,
             insetPadding: const EdgeInsets.all(24),
@@ -6189,8 +6251,9 @@ class _ResourceCard extends StatelessWidget {
     selected: selected,
     child: ClipRRect(
       borderRadius: BorderRadius.circular(16),
-      child: BackdropFilter(
-        filter: YingjiGlass.backdrop(),
+      child: YingjiGlassSurface(
+        radius: 16,
+        strength: selected ? 1.28 : .86,
         child: InkWell(
           onTap: onSelect,
           borderRadius: BorderRadius.circular(16),
@@ -6199,9 +6262,7 @@ class _ResourceCard extends StatelessWidget {
             width: 268,
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 13),
             decoration: BoxDecoration(
-              color: selected
-                  ? YingjiGlass.surface(strength: 1.28)
-                  : YingjiGlass.surface(strength: .86),
+              color: Colors.transparent,
               borderRadius: BorderRadius.circular(16),
               border: Border.all(
                 color: selected ? Colors.white : YingjiGlass.line(),
@@ -6890,8 +6951,7 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
           child: Padding(
             padding: const EdgeInsets.all(18),
             child: YingjiStableScrollGlass(
-              child: GlassPanel(
-                radius: 22,
+              child: Padding(
                 padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
                 child: SizedBox(
                   height: MediaQuery.sizeOf(context).height * .78,
@@ -6933,9 +6993,13 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                       ),
                       const SizedBox(height: 4),
                       Expanded(
-                        child: YingjiSmoothWheel(
-                          controller: controller,
-                          child: childBuilder(controller),
+                        child: GlassPanel(
+                          radius: 22,
+                          padding: EdgeInsets.zero,
+                          child: YingjiSmoothWheel(
+                            controller: controller,
+                            child: childBuilder(controller),
+                          ),
                         ),
                       ),
                     ],

@@ -111,7 +111,9 @@ void main() {
         .whereType<BoxDecoration>()
         .where((decoration) => decoration.color != null);
     expect(
-      material.any((decoration) => decoration.color == YingjiGlass.chrome()),
+      material.any(
+        (decoration) => decoration.color == YingjiGlass.chrome(strength: 1),
+      ),
       isTrue,
     );
     final owner = Object();
