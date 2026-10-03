@@ -20,6 +20,11 @@ import 'package:window_manager/window_manager.dart';
 class WindowHost {
   WindowHost._();
 
+  static Future<String?> pickSubtitleFile() async {
+    if (kIsWeb || !Platform.isAndroid) return null;
+    return _platformChannel.invokeMethod<String>('pickSubtitleFile');
+  }
+
   /// 是否为桌面平台。用于决定是否渲染自定义标题栏 / 窗口控制按钮。
   static bool get isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
@@ -145,6 +150,19 @@ class WindowHost {
       return false;
     } on MissingPluginException {
       return false;
+    }
+  }
+
+  static Future<void> setAutoPictureInPicture(bool enabled) async {
+    if (!isAndroid) return;
+    try {
+      await _platformChannel.invokeMethod<void>('setAutoPictureInPicture', {
+        'enabled': enabled,
+      });
+    } on PlatformException {
+      // OEM policies may disable picture-in-picture.
+    } on MissingPluginException {
+      // Older host builds retain manual playback behavior.
     }
   }
 

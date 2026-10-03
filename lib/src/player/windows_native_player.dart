@@ -986,7 +986,7 @@ class WindowsNativePlayer {
     }
 
     String subtitleKey(SubtitleSearchResult result) =>
-        '${result.provider}:${result.providerId}';
+        '$extrasEpisode:${result.provider}:${result.providerId}';
 
     String transportText(String value) => value
         .replaceAll(RegExp(r'[\t\r\n]+'), ' ')
@@ -1018,7 +1018,7 @@ class WindowsNativePlayer {
         sendLine(
           'MOVA_SUBTITLE_SEARCH_RESULT=$index\t'
           '${transportText(result.title)}\t'
-          '${transportText('${result.provider} · ${result.language} · ${result.fileName}')}\t'
+          '${transportText('${result.matchLabel} · ${result.provider} · ${result.language} · ${result.fileName}')}\t'
           '${transportText(state)}\t${appliedSubtitleKeys.contains(key) ? 1 : 0}',
         );
       }
@@ -1045,11 +1045,25 @@ class WindowsNativePlayer {
       final resultsBySource = <String, List<SubtitleSearchResult>>{};
       subtitleSearchLoading = true;
       subtitleSearchError = null;
-      subtitleSearchStatuses = const {'SubHD': '正在搜索', 'Gestdown': '正在搜索'};
+      subtitleSearchStatuses = const {'SubHD': '正在搜索'};
       subtitleSearchResults = const [];
       publishSubtitleSearch();
       try {
         final service = subtitleSearchService ??= SubtitleSearchService();
+        final saved = await service.savedDownloads(
+          SubtitleSearchQuery(
+            title: request.title,
+            season: entry.seasonNumber,
+            episode: entry.episodeNumber,
+          ),
+        );
+        if (generation != subtitleSearchGeneration) return;
+        resultsBySource['已下载字幕'] = saved.map((item) => item.$1).toList();
+        for (final (result, file) in saved) {
+          downloadedSubtitles[subtitleKey(result)] = file;
+        }
+        mergeSubtitleResults(resultsBySource);
+        publishSubtitleSearch();
         final response = await service.search(
           SubtitleSearchQuery(
             title: request.title,
@@ -1086,6 +1100,7 @@ class WindowsNativePlayer {
       if (index < 0 || index >= subtitleSearchResults.length) return;
       if (downloadingSubtitleKey != null) return;
       final result = subtitleSearchResults[index];
+      final episodeIndex = extrasEpisode;
       final key = subtitleKey(result);
       downloadingSubtitleKey = key;
       subtitleSearchError = null;
@@ -1095,9 +1110,19 @@ class WindowsNativePlayer {
             downloadedSubtitles[key] ??
             await (subtitleSearchService ??= SubtitleSearchService()).download(
               result,
+              query: SubtitleSearchQuery(
+                title: request.title,
+                season: entries[episodeIndex].seasonNumber,
+                episode: entries[episodeIndex].episodeNumber,
+              ),
             );
         downloadedSubtitles[key] = subtitle;
-        downloadedSubtitlePaths.add(subtitle.path);
+        if (!subtitle.persistent) downloadedSubtitlePaths.add(subtitle.path);
+        if (episodeIndex != extrasEpisode) return;
+        subtitleSearchResults = [
+          result,
+          ...subtitleSearchResults.where((r) => subtitleKey(r) != key),
+        ];
         sendLine('MOVA_SUBTITLE_PATH=${subtitle.path}');
         appliedSubtitleKeys.add(key);
       } catch (error) {
@@ -1280,6 +1305,12 @@ class WindowsNativePlayer {
               // 换集了：弹幕与片头片尾都得按新的一集重来，否则面板里显示的还是
               // 上一集的数据、自动跳过也会对着上一集的片头时间点跳。
               if (playlistPosition != extrasEpisode) {
+                subtitleSearchGeneration++;
+                subtitleSearchLoading = false;
+                subtitleSearchResults = const [];
+                subtitleSearchStatuses = const {'SubHD': '剧集已切换，请重新搜索当前集'};
+                subtitleSearchError = null;
+                publishSubtitleSearch();
                 unawaited(loadEpisodeExtras(playlistPosition));
               }
             }
@@ -1289,6 +1320,27 @@ class WindowsNativePlayer {
               final index = int.tryParse(match.group(1) ?? '');
               if (index != null && index >= 0 && index < entries.length) {
                 completedEpisodes.add(index);
+                unawaited(
+                  SubtitleSearchService.clearDownloads(
+                    SubtitleSearchQuery(
+                      title: request.title,
+                      season: entries[index].seasonNumber,
+                      episode: entries[index].episodeNumber,
+                    ),
+                  ).catchError((Object error) {}),
+                );
+                downloadedSubtitles.removeWhere(
+                  (key, _) => key.startsWith('$index:'),
+                );
+                if (index == extrasEpisode) {
+                  subtitleSearchGeneration++;
+                  subtitleSearchLoading = false;
+                  appliedSubtitleKeys.removeWhere(
+                    (key) => key.startsWith('$index:'),
+                  );
+                  subtitleSearchResults = const [];
+                  publishSubtitleSearch();
+                }
                 final completedUrl = entries[index].url;
                 completedCacheUrls.add(completedUrl);
                 final completedDownload = index == activeCacheIndex

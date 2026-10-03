@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,6 +13,8 @@ void main() {
     tester,
   ) async {
     final service = _DialogTestSubtitleSearchService();
+    final completion = StreamController<bool>.broadcast();
+    addTearDown(completion.close);
     var appliedCount = 0;
     String? appliedPath;
 
@@ -25,6 +28,7 @@ void main() {
               child: SubtitleSearchPanel(
                 query: const SubtitleSearchQuery(title: 'Demo'),
                 serviceFactory: () => service,
+                completion: completion.stream,
                 onApply: (subtitle) async {
                   appliedCount++;
                   appliedPath = subtitle.path;
@@ -55,6 +59,11 @@ void main() {
       await tester.pump(const Duration(milliseconds: 250));
     }
     expect(appliedCount, 2);
+    expect(find.text('已下载字幕'), findsOneWidget);
+    completion.add(true);
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('已下载字幕'), findsNothing);
   });
 }
 
@@ -106,10 +115,17 @@ class _DialogTestSubtitleSearchService extends SubtitleSearchService {
   }
 
   @override
-  Future<DownloadedSubtitle> download(SubtitleSearchResult result) async =>
-      const DownloadedSubtitle(
-        path: 'memory://subtitle.srt',
-        fileName: 'Demo.srt',
-        language: '中文',
-      );
+  Future<DownloadedSubtitle> download(
+    SubtitleSearchResult result, {
+    SubtitleSearchQuery? query,
+  }) async => const DownloadedSubtitle(
+    path: 'memory://subtitle.srt',
+    fileName: 'Demo.srt',
+    language: '中文',
+  );
+
+  @override
+  Future<List<(SubtitleSearchResult, DownloadedSubtitle)>> savedDownloads(
+    SubtitleSearchQuery query,
+  ) async => [];
 }

@@ -6,6 +6,10 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.os.Build
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -64,6 +68,39 @@ class ExoPlayerPlatformView(
     private var speedSampleMs = SystemClock.elapsedRealtime()
     private var readBytesPerSecond = 0.0
     private var tracksPending = true
+    private var pendingExternalSubtitle = false
+    private var menuVisible = false
+    private val menuSurfaceCallback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(holder: SurfaceHolder) { applyMenuFrameRate() }
+        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            applyMenuFrameRate()
+        }
+        override fun surfaceDestroyed(holder: SurfaceHolder) {}
+    }
+
+    private fun applyMenuFrameRate() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val surface = (playerView.videoSurfaceView as? SurfaceView)?.holder?.surface ?: return
+        if (!surface.isValid) return
+        val display = playerView.display ?: return
+        val rate = if (menuVisible) {
+            display.supportedModes.filter {
+                it.physicalWidth == display.mode.physicalWidth &&
+                    it.physicalHeight == display.mode.physicalHeight && it.refreshRate <= 120.1f
+            }.maxOfOrNull { it.refreshRate } ?: display.refreshRate
+        } else 0f
+        try {
+            surface.setFrameRate(rate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            if (contextForTrace.packageName.endsWith(".debug")) {
+                Log.i("MovaExoMenuRate", "visible=$menuVisible requested=$rate actual=${display.refreshRate}")
+            }
+        } catch (_: IllegalArgumentException) {
+            // A display/surface change can invalidate a formerly supported hint.
+        } catch (_: IllegalStateException) {
+            // Surface teardown must not interrupt playback or exit.
+        }
+    }
+    private val contextForTrace = context
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -125,11 +162,15 @@ class ExoPlayerPlatformView(
         val renderersFactory = DefaultRenderersFactory(context)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         exoPlayer = ExoPlayer.Builder(context, renderersFactory)
+            // Video cadence must not lower the refresh rate of Flutter menus.
+            // This changes display hints, not the decoded frame rate or quality.
+            .setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
         exoPlayer.addListener(this)
         exoPlayer.setAudioAttributes(AudioAttributes.DEFAULT, true)
         playerView.player = exoPlayer
+        (playerView.videoSurfaceView as? SurfaceView)?.holder?.addCallback(menuSurfaceCallback)
 
         val container = (creationParams["container"] as? String).orEmpty().lowercase()
         val mime = when (container) {
@@ -154,6 +195,11 @@ class ExoPlayerPlatformView(
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "setMenuVisible" -> {
+                menuVisible = call.argument<Boolean>("visible") == true
+                applyMenuFrameRate()
+                result.success(null)
+            }
             "play" -> { exoPlayer.play(); result.success(null) }
             "pause" -> { exoPlayer.pause(); result.success(null) }
             "toggle" -> { exoPlayer.playWhenReady = !exoPlayer.playWhenReady; result.success(null) }
@@ -170,6 +216,34 @@ class ExoPlayerPlatformView(
                 result.success(null)
             }
             "setTrack" -> selectTrack(call, result)
+            "addSubtitle" -> {
+                val path = call.argument<String>("path") ?: ""
+                val extension = path.substringAfterLast('.', "").lowercase()
+                val mime = when (extension) {
+                    "srt" -> androidx.media3.common.MimeTypes.APPLICATION_SUBRIP
+                    "ass", "ssa" -> androidx.media3.common.MimeTypes.TEXT_SSA
+                    "vtt" -> androidx.media3.common.MimeTypes.TEXT_VTT
+                    else -> { result.error("invalid_subtitle", "不支持的字幕格式", null); return }
+                }
+                val item = exoPlayer.currentMediaItem
+                if (item == null || !java.io.File(path).isFile) {
+                    result.error("invalid_subtitle", "字幕文件不可用", null); return
+                }
+                val subtitle = MediaItem.SubtitleConfiguration.Builder(Uri.fromFile(java.io.File(path)))
+                    .setId("mova-external")
+                    .setMimeType(mime).setLabel(call.argument<String>("label") ?: "本地字幕")
+                    .setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build()
+                val position = exoPlayer.currentPosition
+                val playing = exoPlayer.playWhenReady
+                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                    .clearOverridesOfType(C.TRACK_TYPE_TEXT).build()
+                pendingExternalSubtitle = true
+                exoPlayer.setMediaItem(item.buildUpon().setSubtitleConfigurations(listOf(subtitle)).build(), position)
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = playing
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }
@@ -186,7 +260,8 @@ class ExoPlayerPlatformView(
             .flatMap { group -> (0 until group.length).map { Triple(group, it, group.getTrackFormat(it)) } }
         if (flatIndex < 0) {
             exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                .buildUpon().setTrackTypeDisabled(type, true).build()
+                .buildUpon().clearOverridesOfType(type)
+                .setTrackTypeDisabled(type, call.argument<String>("selection") != "auto").build()
             result.success(null)
             return
         }
@@ -236,6 +311,18 @@ class ExoPlayerPlatformView(
         eventSink?.success(mapOf("error" to error.errorCodeName))
     }
     override fun onTracksChanged(tracks: Tracks) {
+        if (pendingExternalSubtitle) {
+            for (group in tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }) {
+                val index = (0 until group.length).firstOrNull { group.getTrackFormat(it).id == "mova-external" }
+                if (index != null && group.isTrackSupported(index)) {
+                    pendingExternalSubtitle = false
+                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, index)).build()
+                    break
+                }
+            }
+        }
         tracksPending = true
         emitState()
     }
@@ -289,6 +376,9 @@ class ExoPlayerPlatformView(
     override fun dispose() {
         if (released) return
         released = true
+        menuVisible = false
+        applyMenuFrameRate()
+        (playerView.videoSurfaceView as? SurfaceView)?.holder?.removeCallback(menuSurfaceCallback)
         mainHandler.removeCallbacks(ticker)
         eventSink = null
         methodChannel.setMethodCallHandler(null)

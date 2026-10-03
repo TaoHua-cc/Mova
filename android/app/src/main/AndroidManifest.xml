@@ -79,6 +79,10 @@
                 android:resource="@xml/file_paths"/>
         </provider>
 
+        <!-- Trial: supported Vulkan/API34+ devices use native surface composition. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableHcpp"
+            android:value="true"/>
         <meta-data
             android:name="flutterEmbedding"
             android:value="2"/>

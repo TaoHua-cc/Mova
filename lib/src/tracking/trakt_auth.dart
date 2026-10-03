@@ -484,7 +484,7 @@ TraktConnectButtonState traktConnectButtonState({
   );
 }
 
-/// 桌面走授权码 + loopback 回调；移动端保留 Trakt 设备码流程。
+/// Windows 与 Android 使用授权码 + loopback 回调，不收集登录凭据。
 /// 成功时返回访问/刷新令牌，取消或超时返回 null。
 class TraktAuthDialog extends StatefulWidget {
   const TraktAuthDialog({super.key, required this.clientId});
@@ -525,7 +525,7 @@ class _TraktAuthDialogState extends State<TraktAuthDialog> {
       _openedInBrowser = false;
     });
     try {
-      if (WindowHost.isDesktop) {
+      if (WindowHost.isDesktop || WindowHost.isAndroid) {
         final authorization = TraktDesktopAuthorization(client: _client);
         _desktopAuthorization = authorization;
         final token = await authorization.authorize(
@@ -615,7 +615,7 @@ class _TraktAuthDialogState extends State<TraktAuthDialog> {
   @override
   Widget build(BuildContext context) {
     final device = _device;
-    final desktop = WindowHost.isDesktop;
+    final desktop = WindowHost.isDesktop || WindowHost.isAndroid;
     return YingjiPinnedDialog(
       maxWidth: 470,
       header: Row(
@@ -638,8 +638,8 @@ class _TraktAuthDialogState extends State<TraktAuthDialog> {
         children: [
           Text(
             desktop
-                ? '点击后将在浏览器中打开 Trakt。登录并允许 Mova 访问后，浏览器会自动'
-                      '返回 Mova，连接完成后此窗口会自动关闭。'
+                ? '已为你打开 Trakt 官方网页。使用邮箱或已有账号登录，并允许 Mova 访问，'
+                      '授权后会自动连接。若浏览器未返回，请切回 Mova，无需输入授权码。'
                 : '在打开的网页中登录 Trakt，并把下面这串代码填进去。登录完成后无需'
                       '回到这里，窗口会自动关闭。',
             style: TextStyle(color: Color(0xFFABB1BE), height: 1.6),

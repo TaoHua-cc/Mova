@@ -9,10 +9,21 @@ void main() {
     );
   });
 
-  test('ordinary Windows video retains copy-back hardware decoding', () {
+  test('ordinary Windows video uses zero-copy hardware decoding', () {
     expect(
       playerHwdecValue(enabled: true, dolbyVision: false, isDesktop: true),
-      'd3d11va-copy',
+      'd3d11va',
+    );
+  });
+
+  test('software decoding stays selectable and Android is unchanged', () {
+    expect(
+      playerHwdecValue(enabled: false, dolbyVision: false, isDesktop: true),
+      'no',
+    );
+    expect(
+      playerHwdecValue(enabled: true, dolbyVision: false, isDesktop: false),
+      'mediacodec-copy',
     );
   });
 

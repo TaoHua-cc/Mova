@@ -15305,39 +15305,39 @@ class _HeroProgressDots extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 12),
           child: SizedBox(
             width: 24,
-            height: 6,
-            child: index != active
-                ? const Center(
-                    child: SizedBox(
-                      width: 6,
-                      height: 6,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: Colors.white54,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                    ),
-                  )
-                : ClipRRect(
-                    borderRadius: BorderRadius.circular(99),
-                    child: ColoredBox(
-                      color: Colors.white24,
-                      child: TweenAnimationBuilder<double>(
-                        key: ValueKey(active),
-                        tween: Tween(begin: 0, end: progress.clamp(0.0, 1.0)),
-                        duration: const Duration(milliseconds: 100),
-                        builder: (_, value, _) => Align(
-                          alignment: Alignment.centerLeft,
-                          child: FractionallySizedBox(
-                            widthFactor: value,
-                            heightFactor: 1,
-                            child: const ColoredBox(color: Colors.white),
-                          ),
-                        ),
-                      ),
+            height: 10,
+            child: Center(
+              child: AnimatedContainer(
+                duration: MediaQuery.disableAnimationsOf(context)
+                    ? Duration.zero
+                    : MovaMotion.emphasis,
+                curve: MovaMotion.spring,
+                width: index == active ? 24 : 6,
+                height: index == active ? 7 : 6,
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(99),
+                  color: index == active ? Colors.white24 : Colors.white54,
+                ),
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(
+                    begin: 0,
+                    end: index == active ? progress.clamp(0.0, 1.0) : 0,
+                  ),
+                  duration: MediaQuery.disableAnimationsOf(context)
+                      ? Duration.zero
+                      : MovaMotion.instant,
+                  builder: (_, value, _) => Align(
+                    alignment: Alignment.centerLeft,
+                    child: FractionallySizedBox(
+                      widthFactor: value,
+                      heightFactor: 1,
+                      child: const ColoredBox(color: Colors.white),
                     ),
                   ),
+                ),
+              ),
+            ),
           ),
         ),
       ),

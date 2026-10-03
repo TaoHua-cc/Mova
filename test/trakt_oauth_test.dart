@@ -49,6 +49,10 @@ void main() {
             expect(redirectUri.port, greaterThan(0));
             expect(redirectUri.path, traktDesktopCallbackPath);
             final state = authorize.queryParameters['state']!;
+            final missingCode = await browser.get(
+              redirectUri.replace(queryParameters: {'state': state}),
+            );
+            expect(missingCode.statusCode, 400);
             final rejected = await browser.get(
               redirectUri.replace(
                 queryParameters: {'state': 'wrong', 'code': 'ignored'},

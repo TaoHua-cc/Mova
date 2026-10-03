@@ -42,9 +42,36 @@ class MainActivity : FlutterActivity() {
         const val PLATFORM_CHANNEL = "mova/platform"
         const val SYSTEM_BRIGHTNESS_MAX = 255f
         const val DOLBY_VISION_REQUEST = 7301
+        const val SUBTITLE_REQUEST = 7302
     }
 
     private var pendingDolbyVisionResult: MethodChannel.Result? = null
+    private var pendingSubtitleResult: MethodChannel.Result? = null
+    private var autoPictureInPicture = false
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.S && autoPictureInPicture) {
+            enterPictureInPicture()
+        }
+    }
+
+    private fun configureAutoPictureInPicture(enabled: Boolean) {
+        autoPictureInPicture = enabled
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+            try {
+                setPictureInPictureParams(PictureInPictureParams.Builder()
+                    .setAspectRatio(Rational(16, 9))
+                    .setAutoEnterEnabled(enabled).build())
+            } catch (_: IllegalStateException) {
+                autoPictureInPicture = false
+            } catch (_: IllegalArgumentException) {
+                autoPictureInPicture = false
+            }
+        }
+    }
 
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
@@ -71,6 +98,22 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "pickSubtitleFile" -> {
+                        if (pendingSubtitleResult != null) {
+                            result.error("busy", "文件选择器已打开", null)
+                        } else {
+                            pendingSubtitleResult = result
+                            try {
+                                startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "*/*"
+                                }, SUBTITLE_REQUEST)
+                            } catch (_: Exception) {
+                                pendingSubtitleResult = null
+                                result.error("picker_unavailable", "无法打开文件选择器", null)
+                            }
+                        }
+                    }
                     "getMediaVolume", "setMediaVolume" -> {
                         val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                         val maximum = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
@@ -108,6 +151,10 @@ class MainActivity : FlutterActivity() {
                     )
                     "networkType" -> result.success(networkType())
                     "enterPictureInPicture" -> result.success(enterPictureInPicture())
+                    "setAutoPictureInPicture" -> {
+                        configureAutoPictureInPicture(call.argument<Boolean>("enabled") == true)
+                        result.success(null)
+                    }
                     "dolbyVisionCapabilities" -> result.success(
                         DolbyVisionSupport.query(this).asMap(),
                     )
@@ -192,6 +239,46 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Deprecated in Android")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == SUBTITLE_REQUEST) {
+            val pending = pendingSubtitleResult ?: return
+            pendingSubtitleResult = null
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) {
+                pending.success(null)
+                return
+            }
+            Thread {
+                var target: File? = null
+                try {
+                    val name = contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    } ?: throw IllegalArgumentException("没有文件名")
+                    val extension = name.substringAfterLast('.', "").lowercase()
+                    require(extension in listOf("srt", "ass", "ssa", "vtt")) { "不支持的字幕格式" }
+                    target = File.createTempFile("subtitle-", ".$extension", cacheDir)
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        target.outputStream().use { output ->
+                            val buffer = ByteArray(8192)
+                            var total = 0
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                total += count
+                                require(total <= 20 * 1024 * 1024) { "字幕超过 20 MB" }
+                                output.write(buffer, 0, count)
+                            }
+                            require(total > 0) { "字幕为空" }
+                        }
+                    } ?: throw IllegalArgumentException("无法读取字幕")
+                    val path = target.absolutePath
+                    runOnUiThread { pending.success(path) }
+                } catch (_: Exception) {
+                    target?.delete()
+                    runOnUiThread { pending.error("subtitle_import", "无法读取有效字幕文件", null) }
+                }
+            }.start()
+            return
+        }
         if (requestCode != DOLBY_VISION_REQUEST) return
         val pending = pendingDolbyVisionResult ?: return
         pendingDolbyVisionResult = null

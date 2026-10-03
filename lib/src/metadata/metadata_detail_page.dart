@@ -6750,6 +6750,10 @@ class _DetailExtrasSectionState extends State<_DetailExtrasSection> {
                           ),
                           builder: (context) => Dialog(
                             backgroundColor: Colors.transparent,
+                            elevation: 0,
+                            shadowColor: Colors.transparent,
+                            surfaceTintColor: Colors.transparent,
+                            shape: const RoundedRectangleBorder(),
                             child: ConstrainedBox(
                               constraints: const BoxConstraints(
                                 maxWidth: 1100,
@@ -7263,6 +7267,10 @@ class _ArtworkDetailCard extends StatelessWidget {
       animationStyle: MovaMotion.dialogAnimationStyle(context),
       builder: (context) => Dialog(
         backgroundColor: Colors.transparent,
+        elevation: 0,
+        shadowColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        shape: const RoundedRectangleBorder(),
         child: Stack(
           alignment: Alignment.topRight,
           children: [

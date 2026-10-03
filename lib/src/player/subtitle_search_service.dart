@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
@@ -59,6 +60,7 @@ class SubtitleSearchResult {
     required this.language,
     required this.downloadUri,
     required this.referrer,
+    this.matchLabel = '',
   });
 
   final String provider;
@@ -68,6 +70,7 @@ class SubtitleSearchResult {
   final String language;
   final Uri downloadUri;
   final Uri referrer;
+  final String matchLabel;
 }
 
 class SubtitleSearchResponse {
@@ -84,14 +87,90 @@ class DownloadedSubtitle {
     required this.path,
     required this.fileName,
     required this.language,
+    this.persistent = false,
   });
 
   final String path;
   final String fileName;
   final String language;
+  final bool persistent;
 }
 
 class SubtitleSearchService {
+  static final _downloadEpochs = <String, int>{};
+  static String _episodeKey(SubtitleSearchQuery query) => sha256
+      .convert(
+        utf8.encode(
+          '${query.title.trim().toLowerCase()}|${query.season}|${query.episode}',
+        ),
+      )
+      .toString();
+
+  static Future<Directory> _savedDirectory(
+    SubtitleSearchQuery query,
+    Directory? root,
+  ) async {
+    final base = root ?? await getApplicationSupportDirectory();
+    return Directory(
+      '${base.path}${Platform.pathSeparator}mova-saved-subtitles${Platform.pathSeparator}${_episodeKey(query)}',
+    );
+  }
+
+  Future<List<(SubtitleSearchResult, DownloadedSubtitle)>> savedDownloads(
+    SubtitleSearchQuery query,
+  ) async {
+    final directory = await _savedDirectory(query, temporaryDirectory);
+    if (!await directory.exists()) return [];
+    final saved = <(SubtitleSearchResult, DownloadedSubtitle)>[];
+    await for (final file in directory.list()) {
+      if (file is! File || !file.path.endsWith('.json')) continue;
+      try {
+        final data =
+            jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+        final name = data['file'] as String;
+        if (name != _safeFileName(name)) continue;
+        final subtitle = File(
+          '${directory.path}${Platform.pathSeparator}$name',
+        );
+        if (!await subtitle.exists() || await subtitle.length() == 0) continue;
+        final id = data['id'] as String;
+        final referrer = Uri.https(_subHdHost, '/a/$id');
+        saved.add((
+          SubtitleSearchResult(
+            provider: data['provider'] as String,
+            providerId: id,
+            title: data['title'] as String,
+            fileName: data['name'] as String,
+            language: data['language'] as String,
+            downloadUri: referrer,
+            referrer: referrer,
+            matchLabel: '已下载',
+          ),
+          DownloadedSubtitle(
+            path: subtitle.path,
+            fileName: data['name'] as String,
+            language: data['language'] as String,
+            persistent: true,
+          ),
+        ));
+      } catch (_) {
+        // An incomplete index or externally removed file must not hide other downloads.
+      }
+    }
+    saved.sort((a, b) => a.$1.title.compareTo(b.$1.title));
+    return saved;
+  }
+
+  static Future<void> clearDownloads(
+    SubtitleSearchQuery query, {
+    Directory? root,
+  }) async {
+    final key = _episodeKey(query);
+    _downloadEpochs[key] = (_downloadEpochs[key] ?? 0) + 1;
+    final directory = await _savedDirectory(query, root);
+    if (await directory.exists()) await directory.delete(recursive: true);
+  }
+
   SubtitleSearchService({http.Client? client, this.temporaryDirectory})
     : _client = client ?? createNetworkHttpClient(),
       _ownsClient = client == null;
@@ -122,10 +201,6 @@ class SubtitleSearchService {
           onSourceResults?.call(result.$1, result.$2, result.$3);
           return result;
         }),
-        _searchGestdown(query).then((result) {
-          onSourceResults?.call(result.$1, result.$2, result.$3);
-          return result;
-        }),
       ],
     );
     final results = <SubtitleSearchResult>[];
@@ -145,7 +220,11 @@ class SubtitleSearchService {
     SubtitleSearchQuery query,
   ) async {
     const provider = 'SubHD';
-    final searchUri = Uri.https(_subHdHost, '/search/${query.searchText}');
+    final title = query.title.trim();
+    final keyword = query.season == null || query.episode == null
+        ? title
+        : '$title S${query.season.toString().padLeft(2, '0')}E${query.episode.toString().padLeft(2, '0')}';
+    final searchUri = Uri.https(_subHdHost, '/search/$keyword');
     try {
       final response = await _send(
         http.Request('GET', searchUri)..headers['User-Agent'] = _userAgent,
@@ -153,7 +232,52 @@ class SubtitleSearchService {
       _checkStatus(provider, response, searchUri);
       final body = _decodeText(response.bodyBytes);
       _checkChallenge(provider, body, searchUri);
-      final entries = parseSubHdSearchPage(body, baseUri: searchUri);
+      final parsed = parseSubHdSearchPage(body, baseUri: searchUri);
+      if (keyword != title &&
+          !parsed.any(
+            (r) => episodeMatchRank('${r.title} ${r.fileName}', query) == 0,
+          )) {
+        final fallbackUri = Uri.https(_subHdHost, '/search/$title');
+        final fallback = await _send(
+          http.Request('GET', fallbackUri)..headers['User-Agent'] = _userAgent,
+        );
+        _checkStatus(provider, fallback, fallbackUri);
+        final seen = parsed.map((r) => r.providerId).toSet();
+        parsed.addAll(
+          parseSubHdSearchPage(
+            _decodeText(fallback.bodyBytes),
+            baseUri: fallbackUri,
+          ).where((r) => seen.add(r.providerId)),
+        );
+      }
+      final entries = <SubtitleSearchResult>[];
+      for (final result in parsed) {
+        final rank = episodeMatchRank(
+          '${result.title} ${result.fileName}',
+          query,
+        );
+        if (rank == 3) continue;
+        entries.add(
+          SubtitleSearchResult(
+            provider: result.provider,
+            providerId: result.providerId,
+            title: result.title,
+            fileName: result.fileName,
+            language: result.language,
+            downloadUri: result.downloadUri,
+            referrer: result.referrer,
+            matchLabel: query.episode == null
+                ? '影片字幕'
+                : ['本集 · 文件名匹配', '整季包 · 下载时核对本集', '集数未确认'][rank],
+          ),
+        );
+      }
+      entries.sort(
+        (a, b) => episodeMatchRank(
+          '${a.title} ${a.fileName}',
+          query,
+        ).compareTo(episodeMatchRank('${b.title} ${b.fileName}', query)),
+      );
       return (
         provider,
         entries,
@@ -170,74 +294,18 @@ class SubtitleSearchService {
     }
   }
 
-  Future<(String, List<SubtitleSearchResult>, String)> _searchGestdown(
-    SubtitleSearchQuery query,
-  ) async {
-    const provider = 'Gestdown';
-    if (query.season == null || query.episode == null) {
-      return (provider, const <SubtitleSearchResult>[], '需要剧集季数和集数');
-    }
-    try {
-      final showUri = Uri.https(
-        'api.gestdown.info',
-        '/shows/search/${query.title.trim()}',
-      );
-      final showResponse = await _send(
-        http.Request('GET', showUri)..headers['User-Agent'] = _userAgent,
-      );
-      _checkStatus(provider, showResponse, showUri);
-      final shows = _decodeJson(showResponse);
-      final show = _bestShow(shows, query.title);
-      if (show == null) {
-        return (provider, const <SubtitleSearchResult>[], '没有匹配剧集');
-      }
-      final showId = _firstString(show, const [
-        'showUniqueId',
-        'uniqueId',
-        'id',
-      ]);
-      if (showId == null || showId.isEmpty) {
-        return (provider, const <SubtitleSearchResult>[], '来源未提供剧集编号');
-      }
-      final subtitlesUri = Uri.https(
-        'api.gestdown.info',
-        '/subtitles/get/$showId/${query.season}/${query.episode}/${query.language}',
-      );
-      final subtitleResponse = await _send(
-        http.Request('GET', subtitlesUri)..headers['User-Agent'] = _userAgent,
-      );
-      if (subtitleResponse.statusCode == 404) {
-        return (provider, const <SubtitleSearchResult>[], '该集没有匹配字幕');
-      }
-      _checkStatus(provider, subtitleResponse, subtitlesUri);
-      final payload = _decodeJson(subtitleResponse);
-      final results = parseGestdownResults(
-        payload,
-        referrer: subtitlesUri,
-        queryLanguage: query.language,
-      );
-      return (
-        provider,
-        results,
-        results.isEmpty ? '该集没有匹配字幕' : '找到 ${results.length} 条',
-      );
-    } on SubtitleSourceException catch (error) {
-      return (provider, const <SubtitleSearchResult>[], error.message);
-    } on Object catch (error) {
-      return (
-        provider,
-        const <SubtitleSearchResult>[],
-        '搜索失败：${_cleanError(error)}',
-      );
-    }
-  }
-
-  Future<DownloadedSubtitle> download(SubtitleSearchResult result) async {
+  Future<DownloadedSubtitle> download(
+    SubtitleSearchResult result, {
+    SubtitleSearchQuery? query,
+  }) async {
+    final episodeKey = query == null ? null : _episodeKey(query);
+    final epoch = _downloadEpochs[episodeKey] ?? 0;
     final response = result.provider == 'SubHD'
         ? await _downloadSubHd(result)
         : await _downloadGestdown(result);
     final file = _subtitleFileFromResponse(
       response.bytes,
+      query: query,
       suggestedName: response.fileName.isEmpty
           ? result.fileName
           : response.fileName,
@@ -252,6 +320,45 @@ class SubtitleSearchService {
         '${sessionDirectory.path}${Platform.pathSeparator}'
         '${DateTime.now().microsecondsSinceEpoch}-$safeName';
     await File(path).writeAsBytes(file.bytes, flush: true);
+    if (query != null) {
+      final directory = await _savedDirectory(query, temporaryDirectory);
+      if ((_downloadEpochs[episodeKey] ?? 0) != epoch) {
+        await File(path).delete();
+        throw const FormatException('该集已播放完成，下载字幕不再保留');
+      }
+      await directory.create(recursive: true);
+      final id = sha256
+          .convert(utf8.encode('${result.provider}:${result.providerId}'))
+          .toString();
+      final cachedFile = File(
+        '${directory.path}${Platform.pathSeparator}$id${_extensionOf(safeName)}',
+      );
+      final index = File('${directory.path}${Platform.pathSeparator}$id.json');
+      await File(path).copy(cachedFile.path);
+      await index.writeAsString(
+        jsonEncode({
+          'file': cachedFile.uri.pathSegments.last,
+          'provider': result.provider,
+          'id': result.providerId,
+          'title': result.title,
+          'name': safeName,
+          'language': result.language,
+        }),
+        flush: true,
+      );
+      await File(path).delete();
+      if ((_downloadEpochs[episodeKey] ?? 0) != epoch) {
+        if (await cachedFile.exists()) await cachedFile.delete();
+        if (await index.exists()) await index.delete();
+        throw const FormatException('该集已播放完成，下载字幕不再保留');
+      }
+      return DownloadedSubtitle(
+        path: cachedFile.path,
+        fileName: safeName,
+        language: result.language,
+        persistent: true,
+      );
+    }
     return DownloadedSubtitle(
       path: path,
       fileName: safeName,
@@ -261,18 +368,64 @@ class SubtitleSearchService {
 
   Future<_DownloadedBytes> _downloadSubHd(SubtitleSearchResult result) async {
     final host = result.referrer.host;
-    final downPage = Uri.https(host, '/down/${result.providerId}');
     final detailResponse = await _send(
       http.Request('GET', result.referrer)..headers['User-Agent'] = _userAgent,
     );
     _checkStatus('SubHD', detailResponse, result.referrer);
+    _checkChallenge(
+      'SubHD',
+      _decodeText(detailResponse.bodyBytes),
+      result.referrer,
+    );
+    final prepareResponse = await _send(
+      http.Request('POST', Uri.https(host, '/api/sub/prepare-download'))
+        ..headers.addAll({
+          'User-Agent': _userAgent,
+          'Referer': result.referrer.toString(),
+          'Origin': 'https://$host',
+          'Content-Type': 'application/json',
+          if (_subHdCookies([detailResponse]).isNotEmpty)
+            'Cookie': _subHdCookies([detailResponse]),
+        })
+        ..body = jsonEncode({'sid': result.providerId}),
+    );
+    _checkStatus(
+      'SubHD',
+      prepareResponse,
+      result.referrer,
+      notFoundMessage: '下载接口未找到该字幕记录（HTTP 404）',
+    );
+    _checkChallenge(
+      'SubHD',
+      _decodeText(prepareResponse.bodyBytes),
+      result.referrer,
+    );
+    final prepared = _decodeJson(prepareResponse);
+    final address = prepared is Map && prepared['success'] == true
+        ? prepared['url']
+        : null;
+    final downPage = address is String
+        ? result.referrer.resolve(address)
+        : null;
+    if (downPage == null ||
+        downPage.scheme != 'https' ||
+        downPage.host != host ||
+        !downPage.path.startsWith('/down/')) {
+      throw SubtitleSourceException(
+        'SubHD',
+        prepared is Map
+            ? '${prepared['msg'] ?? '无法准备下载，请在网页检查登录或验证要求'}'
+            : '无法准备下载',
+        searchUri: result.referrer,
+      );
+    }
     final downResponse = await _send(
       http.Request('GET', downPage)
         ..headers.addAll({
           'User-Agent': _userAgent,
           'Referer': result.referrer.toString(),
-          if (_subHdCookies([detailResponse]).isNotEmpty)
-            'Cookie': _subHdCookies([detailResponse]),
+          if (_subHdCookies([detailResponse, prepareResponse]).isNotEmpty)
+            'Cookie': _subHdCookies([detailResponse, prepareResponse]),
         }),
     );
     _checkStatus(
@@ -281,7 +434,11 @@ class SubtitleSearchService {
       downPage,
       notFoundMessage: '下载页面未找到该字幕（HTTP 404）',
     );
-    final cookies = _subHdCookies([detailResponse, downResponse]);
+    final cookies = _subHdCookies([
+      detailResponse,
+      prepareResponse,
+      downResponse,
+    ]);
     final downloadApi = Uri.https(host, '/api/sub/down');
     final response = await _send(
       http.Request('POST', downloadApi)
@@ -454,9 +611,17 @@ class SubtitleSearchService {
       // not only the numeric ids used by older entries.
       final idMatch = RegExp(r'^/a/([A-Za-z0-9_-]+)/?$')
           .firstMatch(resultUri.path);
-      if (idMatch == null || !seen.add(idMatch.group(1)!)) continue;
+      if (idMatch == null) continue;
       final id = idMatch.group(1)!;
       final title = _plainText(match.group(2) ?? '');
+      if (!seen.add(id)) {
+        final index = found.indexWhere((result) => result.providerId == id);
+        if (index < 0 ||
+            !_episodeMarkers.hasMatch(title) ||
+            _episodeMarkers.hasMatch(found[index].title))
+          continue;
+        found.removeAt(index);
+      }
       final row = _outerElementForAnchor(html, match.start);
       final rowText = _plainText(row);
       final format = RegExp(
@@ -540,6 +705,7 @@ class SubtitleSearchService {
   static _DownloadedBytes _subtitleFileFromResponse(
     List<int> bytes, {
     required String suggestedName,
+    SubtitleSearchQuery? query,
   }) {
     if (bytes.isEmpty) throw const FormatException('下载到的字幕文件为空');
     if (bytes.length > _maxSubtitleBytes) {
@@ -556,12 +722,23 @@ class SubtitleSearchService {
       if (archive.files.length > 100) {
         throw const FormatException('字幕压缩包包含过多文件');
       }
-      final files = archive.files
+      var files = archive.files
           .where((file) => file.isFile && _supportedExtension(file.name))
           .where((file) => file.size > 0 && file.size <= _maxSubtitleBytes)
           .toList(growable: false);
       if (files.isEmpty) {
         throw const FormatException('压缩包内没有可用的 SRT/ASS/SSA/VTT 字幕');
+      }
+      if (query?.episode != null) {
+        final matched = files
+            .where((file) => episodeMatchRank(file.name, query!) == 0)
+            .toList();
+        if (matched.isNotEmpty) {
+          files = matched;
+        } else if (files.length > 1 ||
+            episodeMatchRank(files.single.name, query!) == 3) {
+          throw const FormatException('压缩包内未确认到当前集字幕，未自动应用；请解压后本地导入');
+        }
       }
       files.sort(
         (a, b) =>
@@ -590,7 +767,62 @@ class SubtitleSearchService {
     if (!_supportedExtension(name)) {
       throw FormatException('不支持的字幕格式：${_extensionOf(name)}');
     }
+    if (query?.episode != null && episodeMatchRank(name, query!) == 3) {
+      throw const FormatException('下载文件集数与当前集不一致，未应用');
+    }
     return _DownloadedBytes(bytes, name);
+  }
+
+  static final _episodeMarkers = RegExp(
+    r'S\d{1,2}|第\s*\d+\s*[季集]|\bE\d{1,3}',
+    caseSensitive: false,
+  );
+
+  /// 0: matching episode, 1: season pack, 2: unknown, 3: explicit mismatch.
+  static int episodeMatchRank(String name, SubtitleSearchQuery query) {
+    if (query.episode == null) return 2;
+    final range = RegExp(
+      r'S(\d{1,2})[ ._-]*E(\d{1,3})\s*[-~至]\s*(?:S\d{1,2})?E?(\d{1,3})(?!\d)',
+      caseSensitive: false,
+    ).firstMatch(name);
+    if (range != null) {
+      return (query.season == null || int.parse(range[1]!) == query.season) &&
+              query.episode! >= int.parse(range[2]!) &&
+              query.episode! <= int.parse(range[3]!)
+          ? 1
+          : 3;
+    }
+    final full = RegExp(
+      r'S(\d{1,2})[ ._-]*E(\d{1,3})(?!\d)',
+      caseSensitive: false,
+    ).allMatches(name).toList();
+    if (full.isNotEmpty) {
+      return full.any(
+            (m) =>
+                (query.season == null || int.parse(m[1]!) == query.season) &&
+                int.parse(m[2]!) == query.episode,
+          )
+          ? 0
+          : 3;
+    }
+    final season = RegExp(
+      r'S(\d{1,2})(?!\d)|第\s*(\d+)\s*季',
+      caseSensitive: false,
+    ).firstMatch(name);
+    if (season != null &&
+        query.season != null &&
+        int.parse(season[1] ?? season[2]!) != query.season)
+      return 3;
+    final episode = RegExp(
+      r'\bE(\d{1,3})(?!\d)|第\s*(\d+)\s*集',
+      caseSensitive: false,
+    ).firstMatch(name);
+    if (episode != null)
+      return int.parse(episode[1] ?? episode[2]!) == query.episode ? 0 : 3;
+    if (season != null &&
+        RegExp(r'全集|整季|全季|complete|pack', caseSensitive: false).hasMatch(name))
+      return 1;
+    return 2;
   }
 
   static String _candidateFileName({required String title, String? format}) {
@@ -604,25 +836,6 @@ class SubtitleSearchService {
         ? formatExt
         : '.srt';
     return '$normalizedTitle$ext';
-  }
-
-  static Map<String, dynamic>? _bestShow(Object? payload, String title) {
-    final shows = _deepMaps(payload)
-        .where(
-          (map) =>
-              _firstString(map, const ['showUniqueId', 'uniqueId', 'id']) !=
-              null,
-        )
-        .toList(growable: false);
-    if (shows.isEmpty) return null;
-    final normalized = _normalizeTitle(title);
-    for (final show in shows) {
-      final showTitle = _firstString(show, const ['name', 'title', 'showName']);
-      if (showTitle != null && _normalizeTitle(showTitle) == normalized) {
-        return show;
-      }
-    }
-    return shows.first;
   }
 
   static Object? _decodeJson(http.Response response) {
@@ -770,11 +983,6 @@ class SubtitleSearchService {
     };
     return language * 10 + extension;
   }
-
-  static String _normalizeTitle(String value) => value.toLowerCase().replaceAll(
-    RegExp(r'[^\p{L}\p{N}]', unicode: true),
-    '',
-  );
 
   static String _cleanError(Object error) => error
       .toString()

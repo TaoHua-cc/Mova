@@ -3,6 +3,8 @@
 #include <dwmapi.h>
 #include <mmsystem.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#pragma comment(lib, "comdlg32.lib")
 #include <gdiplus.h>
 #include "../runner/resource.h"
 // timeBeginPeriod / timeEndPeriod：把系统时钟粒度提到 1ms，帧定时器才准。
@@ -971,29 +973,6 @@ void StrokeStaticPlayerMenuEdge(Gdiplus::Graphics& graphics,
       Gdiplus::Color(static_cast<BYTE>(31 + 56 * t), 255, 255, 255));
   Gdiplus::Pen hairline(&edge, static_cast<float>(0.75 + .35 * t));
   graphics.DrawPath(&hairline, &path);
-  // A recessed inner rim gives thickness without tinting the clear centre.
-  const float inset = static_cast<float>(1.0 + 1.5 * t);
-  if (bounds.Width > inset * 4 && bounds.Height > inset * 4) {
-    std::unique_ptr<Gdiplus::GraphicsPath> inner(path.Clone());
-    const float sx = (bounds.Width - inset * 2) / bounds.Width;
-    const float sy = (bounds.Height - inset * 2) / bounds.Height;
-    Gdiplus::Matrix transform(sx, 0, 0, sy,
-        bounds.X * (1 - sx) + inset, bounds.Y * (1 - sy) + inset);
-    inner->Transform(&transform);
-    Gdiplus::LinearGradientBrush rim(
-        Gdiplus::PointF(bounds.X, bounds.Y),
-        Gdiplus::PointF(bounds.GetRight(), bounds.GetBottom()),
-        Gdiplus::Color(static_cast<BYTE>(26 + 30 * t), 255, 255, 255),
-        Gdiplus::Color(static_cast<BYTE>(20 + 26 * t), 255, 255, 255));
-    const Gdiplus::Color colors[] = {
-        Gdiplus::Color(static_cast<BYTE>(26 + 30 * t), 255, 255, 255),
-        Gdiplus::Color(0, 255, 255, 255),
-        Gdiplus::Color(static_cast<BYTE>(20 + 26 * t), 255, 255, 255)};
-    const float stops[] = {0, .55f, 1};
-    rim.SetInterpolationColors(colors, stops, 3);
-    Gdiplus::Pen inner_edge(&rim, .8f);
-    graphics.DrawPath(&inner_edge, inner.get());
-  }
 }
 
 /// 玻璃的一圈内描边（白 .16）。面板、提示、气泡共用同一个值：以前面板 46、
@@ -2042,7 +2021,7 @@ PanelItem PanelSlider(std::wstring label, std::string property, double value,
   return item;
 }
 
-void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
+void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor, bool main_subtitles = false) {
   (void)owner;
   g_subtitle_search_menu_open = false;
   const auto subtitles = ReadTracks("sub");
@@ -2090,9 +2069,22 @@ void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
     OpenPanel(std::move(items), anchor, PanelMetrics{});
     return;
   }
+  if (!main_subtitles) {
+    items.push_back(PanelHeader(kGlyphSubtitle, L"字幕", L""));
+    items.push_back(PanelOption(kGlyphSubtitle, L"主字幕", L"选择轨道、自动选择或关闭字幕",
+                                "mova-subtitle-main", "", "", false));
+    items.push_back(PanelOption(kGlyphSubtitle, L"字幕搜索", L"SubHD · 搜索当前季集字幕",
+                                "mova-subtitle-search", "", "", false));
+    items.push_back(PanelOption(kGlyphSubtitle, L"本地导入", L"从电脑选择字幕文件",
+                                "mova-subtitle-local", "", "", false));
+    OpenPanel(std::move(items), anchor, PanelMetrics{});
+    return;
+  }
   const std::string subtitle_id = MpvString("sid");
-  items.push_back(PanelHeader(kGlyphSubtitle, L"字幕",
+  items.push_back(PanelHeader(kGlyphSubtitle, L"主字幕",
                               std::to_wstring(subtitles.size()) + L" 条"));
+  items.push_back(PanelOption(0, L"返回字幕", L"返回功能菜单",
+                              "mova-subtitle-back", "", "", false));
   items.push_back(PanelNote(kGlyphInfo, L"字幕轨道  " + std::to_wstring(subtitles.size()) + L" 条 · 字幕延迟  " +
       std::to_wstring(static_cast<int>(std::strtod(MpvString("sub-delay").c_str(), nullptr) * 1000)) + L" ms"));
   add_track(kGlyphSparkles, L"自动选择", L"按字幕语言偏好智能选择",
@@ -2107,24 +2099,45 @@ void ShowTrackMenu(HWND owner, bool audio, PanelAnchor anchor) {
   if (subtitles.empty()) {
     items.push_back(PanelNote(kGlyphInfo, L"当前片源没有内嵌字幕"));
   }
-  add_track(kGlyphSubtitle, L"在线搜索字幕", L"结果在此菜单内显示和应用",
-            "mova-subtitle-search", "", "正在搜索字幕", false);
 
   PanelMetrics metrics;
   metrics.max_height = 560;
   OpenPanel(std::move(items), anchor, metrics);
 }
 
+void ShowLocalSubtitleMenu(PanelAnchor anchor) {
+  g_subtitle_search_menu_open = false;
+  std::vector<PanelItem> items;
+  items.push_back(PanelHeader(kGlyphSubtitle, L"本地导入", L""));
+  items.push_back(PanelOption(0, L"返回字幕", L"返回功能菜单",
+                              "mova-subtitle-back", "", "", false));
+  items.push_back(PanelOption(kGlyphSubtitle, L"选择字幕文件", L"SRT / ASS / SSA / VTT",
+                              "mova-subtitle-import", "", "", false));
+  items.push_back(PanelNote(kGlyphInfo, L"也可将字幕文件拖入播放器，导入后在主字幕选择"));
+  OpenPanel(std::move(items), anchor, PanelMetrics{});
+}
+
 void ShowSubtitleSearchMenu(PanelAnchor anchor, bool activate = true,
                             bool preserve_scroll = false) {
   std::vector<PanelItem> items;
   items.push_back(PanelHeader(
-      kGlyphSubtitle, L"在线搜索字幕",
+      kGlyphSubtitle, L"字幕搜索",
       g_subtitle_search_loading
           ? L"搜索中"
           : std::to_wstring(g_subtitle_search_results.size()) + L" 条"));
-  items.push_back(PanelOption(0, L"返回字幕与音轨", L"返回当前媒体轨道",
+  items.push_back(PanelOption(0, L"返回字幕", L"返回主字幕与本地导入",
                               "mova-subtitle-back", "", "", false));
+  const auto is_downloaded = [](const SubtitleSearchPanelResult& result) {
+    return result.badge.find(L"已下载") != std::wstring::npos;
+  };
+  if (std::any_of(g_subtitle_search_results.begin(), g_subtitle_search_results.end(), is_downloaded)) {
+    items.push_back(PanelHeader(kGlyphSubtitle, L"已下载字幕", L""));
+    for (const auto& result : g_subtitle_search_results) {
+      if (!is_downloaded(result)) continue;
+      items.push_back(PanelOption(kGlyphSubtitle, result.title, result.detail,
+          "mova-subtitle-download", std::to_string(result.index), "", result.selected, result.badge));
+    }
+  }
   for (const auto& status : g_subtitle_search_statuses) {
     items.push_back(PanelNote(kGlyphInfo, status));
   }
@@ -2135,6 +2148,7 @@ void ShowSubtitleSearchMenu(PanelAnchor anchor, bool activate = true,
     items.push_back(PanelNote(kGlyphInfo, L"这次没有找到字幕，可重新搜索或检查来源状态"));
   }
   for (const auto& result : g_subtitle_search_results) {
+    if (is_downloaded(result)) continue;
     items.push_back(PanelOption(
         kGlyphSubtitle, result.title, result.detail, "mova-subtitle-download",
         std::to_string(result.index), "", result.selected, result.badge));
@@ -2982,6 +2996,30 @@ void ApplyEpisodeResources(EpisodeResourcesUpdate update) {
 }
 
 void EmitProgress(double position, double duration) {
+  // Opt-in, numeric/codec-only diagnostics: never write URLs or HTTP headers.
+  static const std::wstring trace_path = [] {
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"MOVA_TRACE_VIDEO", path, MAX_PATH);
+    return length > 0 && length < MAX_PATH ? std::wstring(path) : std::wstring();
+  }();
+  static ULONGLONG last_trace = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (!trace_path.empty() && now - last_trace >= 1000) {
+    last_trace = now;
+    FILE* trace = nullptr;
+    if (_wfopen_s(&trace, trace_path.c_str(), L"a") == 0 && trace) {
+      std::fprintf(trace, "tick=%llu pos=%.3f", now, position);
+      for (const char* property : {
+               "video-codec", "hwdec-current", "speed", "container-fps", "estimated-vf-fps",
+               "display-fps", "estimated-display-fps", "frame-drop-count",
+               "decoder-frame-drop-count", "mistimed-frame-count", "vo-delayed-frame-count",
+               "avsync", "paused-for-cache", "demuxer-cache-duration"}) {
+        std::fprintf(trace, " %s=%s", property, MpvString(property).c_str());
+      }
+      std::fprintf(trace, "\n");
+      std::fclose(trace);
+    }
+  }
   char text[128]{};
   const int length = std::snprintf(text, sizeof(text),
                                    "MOVA_POSITION=%.3f|%.3f|%lld\r\n", position,
@@ -5180,6 +5218,30 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
             WriteFile(output, command, sizeof(command) - 1, &written, nullptr);
           }
         } else if (item.enabled &&
+                   item.property == "mova-subtitle-main") {
+          ShowTrackMenu(g_window, false, g_panel_anchor, true);
+        } else if (item.enabled &&
+                   item.property == "mova-subtitle-local") {
+          ShowLocalSubtitleMenu(g_panel_anchor);
+        } else if (item.enabled &&
+                   item.property == "mova-subtitle-import") {
+          ShowWindow(window, SW_HIDE);
+          wchar_t path[32768]{};
+          OPENFILENAMEW picker{};
+          picker.lStructSize = sizeof(picker);
+          picker.hwndOwner = g_window;
+          picker.lpstrFilter = L"字幕文件 (*.srt;*.ass;*.ssa;*.vtt)\0*.srt;*.ass;*.ssa;*.vtt\0\0";
+          picker.lpstrFile = path;
+          picker.nMaxFile = static_cast<DWORD>(std::size(path));
+          picker.lpstrTitle = L"导入本地字幕";
+          picker.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+          if (GetOpenFileNameW(&picker)) {
+            const std::string utf8_path = Utf8(path);
+            ShowToast(MpvCommand("sub-add", utf8_path.c_str(), "select")
+                          ? "已加载本地字幕" : "本地字幕加载失败");
+          }
+          ShowLocalSubtitleMenu(g_panel_anchor);
+        } else if (item.enabled &&
                    item.property == "mova-subtitle-back") {
           g_subtitle_search_menu_open = false;
           ShowTrackMenu(g_window, false, g_panel_anchor);
@@ -5731,6 +5793,38 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
             body.Height),
         &format, &ink);
     if (layout == HintLayout::AutoSkip) {
+      Gdiplus::GraphicsPath edge;
+      auto edge_body = body;
+      edge_body.Inflate(-1.0f, -1.0f);
+      AddRoundedRectPath(edge, edge_body, edge_body.Height / 2);
+      edge.Flatten(nullptr, .25f);
+      const int count = edge.GetPointCount();
+      std::vector<Gdiplus::PointF> points(count);
+      edge.GetPathPoints(points.data(), count);
+      float length = 0;
+      for (int i = 0; i < count; ++i) {
+        const auto& a = points[i];
+        const auto& b = points[(i + 1) % count];
+        length += std::hypot(b.X - a.X, b.Y - a.Y);
+      }
+      const auto countdown_now = GetTickCount64();
+      const double remaining = g_skip_deadline > countdown_now
+          ? (g_skip_deadline - countdown_now) / 1000.0 : 0.0;
+      float distance = length * static_cast<float>(std::clamp(
+          remaining / std::max(.001, g_skip_delay_seconds), 0.0, 1.0));
+      Gdiplus::Pen progress(Gdiplus::Color(255, 255, 255, 255), 1.5f);
+      progress.SetStartCap(Gdiplus::LineCapRound);
+      progress.SetEndCap(Gdiplus::LineCapRound);
+      for (int i = 0; i < count && distance > 0; ++i) {
+        const auto& a = points[i];
+        const auto& b = points[(i + 1) % count];
+        const float segment = std::hypot(b.X - a.X, b.Y - a.Y);
+        if (segment <= 0) continue;
+        const float t = std::min(1.0f, distance / segment);
+        graphics.DrawLine(&progress, a, Gdiplus::PointF(
+            a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t));
+        distance -= segment;
+      }
       auto action = MakeInterfaceFont(12.0f, Gdiplus::FontStyleRegular);
       format.SetAlignment(Gdiplus::StringAlignmentCenter);
       graphics.DrawString(L"取消", -1, &action,
@@ -5949,7 +6043,7 @@ void ShowHint(const std::wstring& text, const std::wstring& detail,
       static_cast<int>((frame.bottom - frame.top) * .13), Scaled(76), Scaled(200));
   int y = anchor_top;
   if (layout == HintLayout::AutoSkip || layout == HintLayout::SkipStatus) {
-    x = std::clamp(static_cast<int>(frame.left) + Scaled(32 - kHintMargin),
+    x = std::clamp(static_cast<int>(frame.right) - Scaled(32 - kHintMargin) - width,
                    limit_left, std::max(limit_left, usable_right - width));
     y = DockTopScreen() - Scaled(24) - height + Scaled(kHintMargin);
   }
@@ -7161,6 +7255,8 @@ std::wstring NetworkSpeedLabel() {
 LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
                             LPARAM lparam) {
   switch (message) {
+    case WM_KEYDOWN:
+      return SendMessageW(g_window, message, wparam, lparam);
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT: {
@@ -7376,6 +7472,8 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
 LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
                               LPARAM lparam) {
   switch (message) {
+    case WM_KEYDOWN:
+      return SendMessageW(g_window, message, wparam, lparam);
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT: {
@@ -8084,6 +8182,9 @@ void TickFrame() {
   }
   // 状态通知按自己的时限显示完整；控件条淡出不应让字幕/错误提示提前闪退。
   if (g_hint_mode != HintMode::Hidden) {
+    if (g_hint_layout == HintLayout::AutoSkip && g_hint && IsWindowVisible(g_hint)) {
+      InvalidateRect(g_hint, nullptr, FALSE);
+    }
     if (g_hint && IsWindowVisible(g_hint) && g_hint_fraction >= 0.0f &&
         g_hint_target_fraction >= 0.0f) {
       const float delta = g_hint_target_fraction - g_hint_fraction;
@@ -9035,6 +9136,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     }
   }
 
+  // Diagnostic A/B only; normal launches retain the application's hwdec choice.
+  wchar_t diagnostic_hwdec[32]{};
+  if (GetEnvironmentVariableW(L"MOVA_TRACE_VIDEO", nullptr, 0) > 0) {
+    const DWORD length = GetEnvironmentVariableW(
+        L"MOVA_DIAGNOSTIC_HWDEC", diagnostic_hwdec, 32);
+    if (length > 0 && length < 32 &&
+        (std::wstring(diagnostic_hwdec) == L"d3d11va" ||
+         std::wstring(diagnostic_hwdec) == L"d3d11va-copy" ||
+         std::wstring(diagnostic_hwdec) == L"no")) {
+      SetOption(g_handle, "hwdec", Utf8(diagnostic_hwdec));
+    }
+  }
   if (g_mpv.initialize(g_handle) < 0 || g_media_urls.empty()) {
     MessageBoxW(window, L"播放器初始化失败或没有可播放的地址。",
                 L"Mova 原生播放器", MB_ICONERROR);
@@ -9086,11 +9199,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     g_mpv.command(g_handle, load);
   }
   if (SystemAnimationsEnabled()) {
-    AnimateWindow(window, 180, AW_BLEND);
+    AnimateWindow(window, 180, AW_BLEND | AW_ACTIVATE);
   } else {
     ShowWindow(window, show_command);
   }
   UpdateWindow(window);
+  // Only hand keyboard focus to this already-active player, never steal it
+  // back after the user switched to another application during startup.
+  if (GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) == window) {
+    SetFocus(window);
+  }
   // 帧节拍的主路径现在是「对齐合成器的整数拍」（见 RefreshFramePacing 与主循环
   // 里的 DwmFlush 分支），这一段定时器只在「拿不到刷新周期 / 窗口不可见 / 暂停」
   // 时兜底。

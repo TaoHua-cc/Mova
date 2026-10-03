@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -108,6 +107,9 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
   int _received = 0;
   int _total = 0;
   bool _cancelled = false;
+  bool _running = false;
+  http.Client? _client;
+  final _notesController = ScrollController();
   File? _downloaded;
   DateTime _lastProgressPaint = DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -119,6 +121,9 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
 
   @override
   void dispose() {
+    _cancelled = true;
+    _client?.close();
+    _notesController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -147,51 +152,59 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
   // ── 动作 ──────────────────────────────────────────────────────────────
 
   Future<void> _start() async {
+    if (_running) return;
     if (!_plan.canDownload) {
       await WindowHost.openUrl(widget.release.pageUrl.toString());
       return;
     }
     _cancelled = false;
-    setState(() {
-      _stage = _Stage.downloading;
-      _message = '';
-      _received = 0;
-      _total = _plan.size;
-      _lastProgressPaint = DateTime.fromMillisecondsSinceEpoch(0);
-    });
-    final target = await _targetFile();
-    if (target == null) {
-      if (mounted) {
+    _running = true;
+    try {
+      setState(() {
+        _stage = _Stage.downloading;
+        _message = '';
+        _received = 0;
+        _total = _plan.size;
+        _lastProgressPaint = DateTime.fromMillisecondsSinceEpoch(0);
+      });
+      final target = await _targetFile();
+      if (target == null) {
+        if (mounted) {
+          setState(() {
+            _stage = _Stage.failed;
+            _message = '无法创建下载目录';
+          });
+        }
+        return;
+      }
+      final ok = await _download(target);
+      if (!mounted || _cancelled) return;
+      if (!ok) {
         setState(() {
           _stage = _Stage.failed;
-          _message = '无法创建下载目录';
+          _message = '下载失败，可能是网络中断';
         });
+        return;
       }
-      return;
-    }
-    final ok = await _download(target);
-    if (!mounted || _cancelled) return;
-    if (!ok) {
-      setState(() {
-        _stage = _Stage.failed;
-        _message = '下载失败，可能是网络中断';
-      });
-      return;
-    }
-    _downloaded = target;
-    switch (_plan.kind) {
-      case UpdateKind.windowsSetup:
-        await _installWindowsSetup(target);
-      case UpdateKind.windowsPortable:
-        await _revealPortable(target);
-      case UpdateKind.androidApk:
-        await _installAndroid(target);
-      case UpdateKind.pageOnly:
-        await WindowHost.openUrl(widget.release.pageUrl.toString());
+      _downloaded = target;
+      switch (_plan.kind) {
+        case UpdateKind.windowsSetup:
+          await _installWindowsSetup(target);
+        case UpdateKind.windowsPortable:
+          await _revealPortable(target);
+        case UpdateKind.androidApk:
+          await _installAndroid(target);
+        case UpdateKind.pageOnly:
+          await WindowHost.openUrl(widget.release.pageUrl.toString());
+      }
+    } finally {
+      _running = false;
+      if (mounted) setState(() {});
     }
   }
 
   Future<void> _cancel() async {
+    _client?.close();
     setState(() {
       _cancelled = true;
       _stage = _Stage.prompt;
@@ -234,6 +247,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
 
   Future<bool> _download(File target) async {
     final client = createNetworkHttpClient();
+    _client = client;
     IOSink? sink;
     try {
       final request = http.Request('GET', _plan.url);
@@ -263,7 +277,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
         return false;
       }
       _received = received;
-      return received > 0;
+      return received > 0 && (_total <= 0 || received == _total);
     } catch (_) {
       return false;
     } finally {
@@ -273,6 +287,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
         // 上面已经处理过失败路径了。
       }
       client.close();
+      if (identical(_client, client)) _client = null;
     }
   }
 
@@ -370,14 +385,28 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
   @override
   Widget build(BuildContext context) {
     final notes = widget.release.body.trim();
-    return AlertDialog(
-      title: Text(_title),
-      content: SizedBox(
-        width: math.max(
-          240.0,
-          math.min(468.0, MediaQuery.sizeOf(context).width - 88),
+    return PopScope(
+      canPop: !_running && _stage != _Stage.installing,
+      child: YingjiPinnedDialog(
+        maxWidth: 540,
+        maxHeight: 640,
+        insetPadding: const EdgeInsets.all(20),
+        scrollController: _notesController,
+        header: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _title,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '$movaVersion  →  ${widget.release.version} · $movaPlatform',
+              style: const TextStyle(fontSize: 13, color: YingjiColors.muted),
+            ),
+          ],
         ),
-        child: Column(
+        body: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -386,37 +415,36 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
               '${widget.release.publishedAt == null ? '' : '  ·  发布于 ${_date(widget.release.publishedAt!)}'}',
               style: const TextStyle(fontSize: 12.5, color: YingjiColors.muted),
             ),
-            if (notes.isNotEmpty) ...[
+            ...[
               const SizedBox(height: 14),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 208),
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: YingjiGlass.chrome(strength: .62),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-                    child: SingleChildScrollView(
-                      child: Text(
-                        notes,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          height: 1.55,
-                          color: YingjiColors.muted,
-                        ),
-                      ),
-                    ),
-                  ),
+              const Text('更新内容', style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 10),
+              Text(
+                notes.isEmpty ? '此版本未提供更新说明，可在发布页查看详情。' : notes,
+                style: const TextStyle(
+                  fontSize: 14,
+                  height: 1.55,
+                  color: YingjiColors.muted,
                 ),
               ),
             ],
-            const SizedBox(height: 16),
+          ],
+        ),
+        actions: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
             ..._status(),
+            const SizedBox(height: 14),
+            Wrap(
+              alignment: WrapAlignment.end,
+              spacing: 8,
+              runSpacing: 8,
+              children: _actions(),
+            ),
           ],
         ),
       ),
-      actions: _actions(),
     );
   }
 
@@ -481,7 +509,7 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
             child: const Text('跳过此版本'),
           ),
           FilledButton(
-            onPressed: () => unawaited(_start()),
+            onPressed: _running ? null : () => unawaited(_start()),
             child: Text(_plan.canDownload ? '立即更新' : '打开发布页'),
           ),
         ];
@@ -520,6 +548,10 @@ class _MovaUpdateDialogState extends State<MovaUpdateDialog>
         ];
       case _Stage.failed:
         return [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('稍后'),
+          ),
           TextButton(
             onPressed: () => unawaited(
               WindowHost.openUrl(widget.release.pageUrl.toString()),

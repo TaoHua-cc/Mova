@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../brand.dart';
@@ -10,11 +12,13 @@ class SubtitleSearchPanel extends StatefulWidget {
     required this.query,
     required this.onApply,
     this.serviceFactory,
+    this.completion,
   });
 
   final SubtitleSearchQuery query;
   final Future<void> Function(DownloadedSubtitle subtitle) onApply;
   final SubtitleSearchService Function()? serviceFactory;
+  final Stream<bool>? completion;
 
   @override
   State<SubtitleSearchPanel> createState() => _SubtitleSearchPanelState();
@@ -27,6 +31,8 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
   String? _error;
   String? _downloading;
   final Map<String, DownloadedSubtitle> _downloaded = {};
+  final Map<String, SubtitleSearchResult> _savedResults = {};
+  StreamSubscription<bool>? _completionSubscription;
   final Set<String> _applied = {};
   bool _searching = false;
   int _generation = 0;
@@ -46,12 +52,40 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
     super.initState();
     _service = widget.serviceFactory?.call() ?? SubtitleSearchService();
     _language = widget.query.language;
-    _search();
+    _completionSubscription = widget.completion?.listen((completed) {
+      if (!completed || !mounted) return;
+      _generation++;
+      setState(() {
+        _savedResults.clear();
+        _downloaded.clear();
+        _applied.clear();
+        _searching = false;
+      });
+    });
+    _loadSavedAndSearch();
+  }
+
+  Future<void> _loadSavedAndSearch() async {
+    final generation = _generation;
+    try {
+      final saved = await _service.savedDownloads(widget.query);
+      if (!mounted || generation != _generation) return;
+      setState(() {
+        for (final (result, file) in saved) {
+          _savedResults[_resultKey(result)] = result;
+          _downloaded[_resultKey(result)] = file;
+        }
+      });
+    } catch (_) {
+      /* Network search remains available when local storage fails. */
+    }
+    if (mounted && generation == _generation) await _search();
   }
 
   @override
   void dispose() {
     _generation++;
+    _completionSubscription?.cancel();
     _service.dispose();
     super.dispose();
   }
@@ -59,7 +93,7 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
   Future<void> _search() async {
     final generation = ++_generation;
     final resultsBySource = <String, List<SubtitleSearchResult>>{};
-    final status = <String, String>{'SubHD': '正在搜索', 'Gestdown': '正在搜索'};
+    final status = <String, String>{'SubHD': '正在搜索'};
     setState(() {
       _response = SubtitleSearchResponse(results: const [], status: status);
       _error = null;
@@ -116,10 +150,15 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
       _error = null;
     });
     try {
-      final downloaded = _downloaded[key] ?? await _service.download(result);
+      final downloaded =
+          _downloaded[key] ??
+          await _service.download(result, query: widget.query);
       if (!mounted) return;
       downloadCompleted = true;
-      setState(() => _downloaded[key] = downloaded);
+      setState(() {
+        _downloaded[key] = downloaded;
+        _savedResults[key] = result;
+      });
       await widget.onApply(downloaded);
       if (mounted) {
         setState(() {
@@ -220,6 +259,15 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
               : ListView(
                   padding: const EdgeInsets.only(bottom: 8),
                   children: [
+                    if (_savedResults.isNotEmpty) ...[
+                      const Text(
+                        '已下载字幕',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 6),
+                      ..._savedResults.values.map(_resultTile),
+                      const SizedBox(height: 8),
+                    ],
                     ...response.status.entries.map(
                       (entry) => Padding(
                         padding: const EdgeInsets.only(bottom: 6),
@@ -256,7 +304,11 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
                         ),
                       )
                     else
-                      ...response.results.map(_resultTile),
+                      ...response.results
+                          .where(
+                            (r) => !_savedResults.containsKey(_resultKey(r)),
+                          )
+                          .map(_resultTile),
                     if (_searching && response.results.isNotEmpty)
                       const Padding(
                         padding: EdgeInsets.symmetric(vertical: 8),
@@ -303,7 +355,7 @@ class _SubtitleSearchPanelState extends State<SubtitleSearchPanel> {
                     ),
                   ),
                   Text(
-                    '${result.provider} · ${result.language} · ${result.fileName}',
+                    '${result.matchLabel} · ${result.provider} · ${result.language} · ${result.fileName}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(

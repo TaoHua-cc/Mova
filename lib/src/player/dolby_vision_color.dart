@@ -13,7 +13,9 @@ String playerHwdecValue({
   if (!enabled) return 'no';
   final desktop = isDesktop ?? WindowHost.isDesktop;
   if (desktop && dolbyVision) return 'no';
-  return desktop ? 'd3d11va-copy' : 'mediacodec-copy';
+  // Keep decoded Windows frames on the GPU: the copy-back path stalls 4K60
+  // HEVC playback on the measured RTX 3080 setup. Android remains unchanged.
+  return desktop ? 'd3d11va' : 'mediacodec-copy';
 }
 
 /// libplacebo settings that map DV/HDR to the display's actual HDR10 or SDR

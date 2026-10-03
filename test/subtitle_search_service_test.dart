@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:async';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
@@ -9,6 +8,26 @@ import 'package:http/testing.dart';
 import 'package:yingji/src/player/subtitle_search_service.dart';
 
 void main() {
+  test('classifies current episode, packs, mismatches and unknown titles', () {
+    const query = SubtitleSearchQuery(title: 'Demo', season: 1, episode: 2);
+    expect(SubtitleSearchService.episodeMatchRank('Demo S01E02', query), 0);
+    expect(SubtitleSearchService.episodeMatchRank('Demo S02E02', query), 3);
+    expect(SubtitleSearchService.episodeMatchRank('Demo S01E03', query), 3);
+    expect(SubtitleSearchService.episodeMatchRank('Demo 第1季 第2集', query), 0);
+    expect(
+      SubtitleSearchService.episodeMatchRank('Demo S01 Complete', query),
+      1,
+    );
+    expect(SubtitleSearchService.episodeMatchRank('Demo S01E01-E10', query), 1);
+    expect(SubtitleSearchService.episodeMatchRank('Demo', query), 2);
+  });
+  test('prefers release filename over duplicate generic series link', () {
+    final results = SubtitleSearchService.parseSubHdSearchPage(
+      "<a href='/a/demo'>Demo</a><a href='/a/demo'>Demo S01E02 WEB-DL</a>",
+      baseUri: Uri.https('www.subhd.me', '/search/Demo'),
+    );
+    expect(results.single.title, 'Demo S01E02 WEB-DL');
+  });
   group('subtitle result parsing', () {
     test('parses numeric and alphanumeric SubHD ids, then deduplicates', () {
       final results = SubtitleSearchService.parseSubHdSearchPage('''
@@ -67,39 +86,137 @@ void main() {
     });
   });
 
-  test('searches the requested episode and emits source results as they arrive', () async {
-    final requestedPaths = <String>[];
-    final gestdownResponse = Completer<http.Response>();
-    final firstSubHdResult = Completer<void>();
-    var earlySubHdIds = <String>[];
-    var searchCompleted = false;
+  test(
+    'SubHD searches current season and episode without episode title',
+    () async {
+      final paths = <String>[];
+      final service = SubtitleSearchService(
+        client: MockClient((request) async {
+          if (request.url.path == '/api/sub/prepare-download') {
+            final sid = jsonDecode(request.body)['sid'];
+            return http.Response(
+              jsonEncode({'success': true, 'url': '/down/$sid'}),
+              200,
+            );
+          }
+          expect(request.url.host, 'www.subhd.me');
+          paths.add(request.url.path);
+          return http.Response("<a href='/a/abc123'>Demo S01E02</a>", 200);
+        }),
+      );
+      addTearDown(service.dispose);
+      final response = await service.search(
+        const SubtitleSearchQuery(
+          title: 'Demo',
+          season: 1,
+          episode: 2,
+          episodeTitle: 'Different episode name',
+        ),
+      );
+      expect(paths, ['/search/Demo%20S01E02']);
+      expect(response.results.single.providerId, 'abc123');
+      expect(response.status.keys, ['SubHD']);
+    },
+  );
+
+  test('empty SubHD search does not follow sidebar recommendations', () async {
     final service = SubtitleSearchService(
       client: MockClient((request) async {
-        requestedPaths.add(request.url.path);
-        if (request.url.host == 'www.subhd.me') {
-          return http.Response.bytes(
-            utf8.encode(
-              '<li><a href="/a/pQULiK">Demo S01E02</a><span>格式：SRT</span></li>',
-            ),
+        expect(request.url.path, '/search/Demo');
+        return http.Response('<h4>共 0 条</h4><a href="/d/123">热门电影</a>', 200);
+      }),
+    );
+    addTearDown(service.dispose);
+    final response = await service.search(
+      const SubtitleSearchQuery(title: 'Demo'),
+    );
+    expect(response.results, isEmpty);
+  });
+
+  test('falls back to title, labels packs and hides other episodes', () async {
+    final paths = <String>[];
+    final service = SubtitleSearchService(
+      client: MockClient((request) async {
+        paths.add(request.url.path);
+        return http.Response(
+          request.url.path == '/search/Demo'
+              ? "<a href='/a/other'>Demo S01E03</a><a href='/a/pack'>Demo S01 Complete</a><a href='/a/unknown'>Demo</a><a href='/a/current'>Demo S01E02</a>"
+              : '<h4>No results</h4>',
+          200,
+        );
+      }),
+    );
+    addTearDown(service.dispose);
+    final response = await service.search(
+      const SubtitleSearchQuery(title: 'Demo', season: 1, episode: 2),
+    );
+    expect(paths, ['/search/Demo%20S01E02', '/search/Demo']);
+    expect(response.results.map((r) => r.providerId), [
+      'current',
+      'pack',
+      'unknown',
+    ]);
+    expect(response.results.map((r) => r.matchLabel), [
+      '本集 · 文件名匹配',
+      '整季包 · 下载时核对本集',
+      '集数未确认',
+    ]);
+  });
+
+  test('downloads a zip and selects an applicable subtitle into temp storage', () async {
+    final temp = await Directory.systemTemp.createTemp('mova-subtitle-test-');
+    addTearDown(() => temp.delete(recursive: true));
+    final archive = Archive()
+      ..addFile(ArchiveFile('Demo.S01E01.chs.ass', 5, utf8.encode('wrong')))
+      ..addFile(
+        ArchiveFile(
+          'Demo.S01E02.en.srt',
+          utf8.encode('1\n00:00:01,000 --> 00:00:02,000\nHello\n').length,
+          utf8.encode('1\n00:00:01,000 --> 00:00:02,000\nHello\n'),
+        ),
+      );
+    final zipBytes = ZipEncoder().encode(archive);
+    final service = SubtitleSearchService(
+      temporaryDirectory: temp,
+      client: MockClient((request) async {
+        if (request.url.path == '/api/sub/prepare-download') {
+          final sid = jsonDecode(request.body)['sid'];
+          return http.Response(
+            jsonEncode({'success': true, 'url': '/down/$sid'}),
             200,
           );
         }
-        if (request.url.path == '/shows/search/Demo') {
-          return gestdownResponse.future;
-        }
-        if (request.url.path == '/subtitles/get/demo-id/1/2/en') {
+        if (request.method == 'POST' && request.url.path == '/api/sub/down') {
+          expect(jsonDecode(request.body)['sid'], 'pQULiK');
+          expect(
+            request.headers['referer'],
+            'https://www.subhd.me/down/pQULiK',
+          );
           return http.Response(
             jsonEncode({
-              'subtitles': [
-                {
-                  'subtitleId': 'episode-123',
-                  'fileName': 'Demo.S01E02.en.srt',
-                  'language': 'English',
-                },
-              ],
+              'success': true,
+              'url': 'https://cdn.subhd.tv/subtitle.zip',
             }),
             200,
             headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.host == 'cdn.subhd.tv') {
+          return http.Response.bytes(
+            zipBytes,
+            200,
+            headers: {
+              'content-type': 'application/zip',
+              'content-disposition': 'attachment; filename="subtitle.zip"',
+            },
+          );
+        }
+        if (request.url.path == '/a/pQULiK' ||
+            request.url.path == '/down/pQULiK') {
+          return http.Response(
+            'ok',
+            200,
+            headers: {'set-cookie': 'session=abc; Path=/'},
           );
         }
         return http.Response('', 404);
@@ -107,99 +224,42 @@ void main() {
     );
     addTearDown(service.dispose);
 
-    final search = service.search(
-      const SubtitleSearchQuery(
+    final downloaded = await service.download(
+      SubtitleSearchResult(
+        provider: 'SubHD',
+        providerId: 'pQULiK',
         title: 'Demo',
-        season: 1,
-        episode: 2,
-        language: 'en',
+        fileName: 'subtitle.zip',
+        language: 'English',
+        downloadUri: Uri.https('www.subhd.me', '/search/Demo'),
+        referrer: Uri.https('www.subhd.me', '/a/pQULiK'),
       ),
-      onSourceResults: (provider, results, _) {
-        if (provider == 'SubHD' && results.isNotEmpty) {
-          earlySubHdIds = results.map((result) => result.providerId).toList();
-          firstSubHdResult.complete();
-        }
-      },
+      query: const SubtitleSearchQuery(title: 'Demo', season: 1, episode: 2),
     );
-    search.then((_) => searchCompleted = true);
-    await firstSubHdResult.future.timeout(const Duration(seconds: 2));
-    expect(searchCompleted, isFalse);
-    expect(earlySubHdIds, ['pQULiK']);
-    gestdownResponse.complete(
-      http.Response(
-        jsonEncode([
-          {'showUniqueId': 'demo-id', 'name': 'Demo'},
-        ]),
-        200,
-        headers: {'content-type': 'application/json'},
+
+    expect(downloaded.fileName, 'Demo.S01E02.en.srt');
+    expect(downloaded.persistent, isTrue);
+    final reopened = SubtitleSearchService(temporaryDirectory: temp);
+    addTearDown(reopened.dispose);
+    const savedQuery = SubtitleSearchQuery(
+      title: 'Demo',
+      season: 1,
+      episode: 2,
+    );
+    final saved = await reopened.savedDownloads(savedQuery);
+    expect(saved.single.$2.path, downloaded.path);
+    await File(
+      '${File(downloaded.path).parent.path}${Platform.pathSeparator}broken.json',
+    ).writeAsString('{broken');
+    expect(await reopened.savedDownloads(savedQuery), hasLength(1));
+    expect(
+      await reopened.savedDownloads(
+        const SubtitleSearchQuery(title: 'Demo', season: 1, episode: 3),
       ),
+      isEmpty,
     );
-    final response = await search;
-
-    expect(requestedPaths, contains('/subtitles/get/demo-id/1/2/en'));
-    expect(response.results.map((result) => result.provider).toSet(), {
-      'SubHD',
-      'Gestdown',
-    }, reason: response.status.toString());
-    expect(response.status.keys, {'SubHD', 'Gestdown'});
-  });
-
-  test(
-    'downloads a zip and selects an applicable subtitle into temp storage',
-    () async {
-      final temp = await Directory.systemTemp.createTemp('mova-subtitle-test-');
-      addTearDown(() => temp.delete(recursive: true));
-      final archive = Archive()
-        ..addFile(
-          ArchiveFile(
-            'Demo.S01E02.en.srt',
-            utf8.encode('1\n00:00:01,000 --> 00:00:02,000\nHello\n').length,
-            utf8.encode('1\n00:00:01,000 --> 00:00:02,000\nHello\n'),
-          ),
-        );
-      final zipBytes = ZipEncoder().encode(archive);
-      final service = SubtitleSearchService(
-        temporaryDirectory: temp,
-        client: MockClient((request) async {
-          if (request.method == 'POST' && request.url.path == '/api/sub/down') {
-            expect(jsonDecode(request.body)['sid'], 'pQULiK');
-            expect(
-              request.headers['referer'],
-              'https://www.subhd.me/down/pQULiK',
-            );
-            return http.Response(
-              jsonEncode({
-                'success': true,
-                'url': 'https://cdn.subhd.tv/subtitle.zip',
-              }),
-              200,
-              headers: {'content-type': 'application/json'},
-            );
-          }
-          if (request.url.host == 'cdn.subhd.tv') {
-            return http.Response.bytes(
-              zipBytes,
-              200,
-              headers: {
-                'content-type': 'application/zip',
-                'content-disposition': 'attachment; filename="subtitle.zip"',
-              },
-            );
-          }
-          if (request.url.path == '/a/pQULiK' ||
-              request.url.path == '/down/pQULiK') {
-            return http.Response(
-              'ok',
-              200,
-              headers: {'set-cookie': 'session=abc; Path=/'},
-            );
-          }
-          return http.Response('', 404);
-        }),
-      );
-      addTearDown(service.dispose);
-
-      final downloaded = await service.download(
+    await expectLater(
+      service.download(
         SubtitleSearchResult(
           provider: 'SubHD',
           providerId: 'pQULiK',
@@ -209,16 +269,24 @@ void main() {
           downloadUri: Uri.https('www.subhd.me', '/search/Demo'),
           referrer: Uri.https('www.subhd.me', '/a/pQULiK'),
         ),
-      );
-
-      expect(downloaded.fileName, 'Demo.S01E02.en.srt');
-      expect(File(downloaded.path).existsSync(), isTrue);
-      expect(
-        await File(downloaded.path).readAsString(),
-        contains('00:00:01,000 --> 00:00:02,000'),
-      );
-    },
-  );
+        query: const SubtitleSearchQuery(title: 'Demo', season: 1, episode: 9),
+      ),
+      throwsA(isA<FormatException>()),
+    );
+    expect(File(downloaded.path).existsSync(), isTrue);
+    expect(
+      await File(downloaded.path).readAsString(),
+      contains('00:00:01,000 --> 00:00:02,000'),
+    );
+    await SubtitleSearchService.clearDownloads(savedQuery, root: temp);
+    expect(await reopened.savedDownloads(savedQuery), isEmpty);
+    expect(await File(downloaded.path).exists(), isFalse);
+    final pending = service.download(saved.single.$1, query: savedQuery);
+    final expectation = expectLater(pending, throwsA(isA<FormatException>()));
+    await SubtitleSearchService.clearDownloads(savedQuery, root: temp);
+    await expectation;
+    expect(await reopened.savedDownloads(savedQuery), isEmpty);
+  });
 
   test('rejects a web challenge returned as a subtitle download', () async {
     final temp = await Directory.systemTemp.createTemp('mova-subtitle-test-');
@@ -226,6 +294,13 @@ void main() {
     final service = SubtitleSearchService(
       temporaryDirectory: temp,
       client: MockClient((request) async {
+        if (request.url.path == '/api/sub/prepare-download') {
+          final sid = jsonDecode(request.body)['sid'];
+          return http.Response(
+            jsonEncode({'success': true, 'url': '/down/$sid'}),
+            200,
+          );
+        }
         if (request.method == 'POST') {
           return http.Response('{"url":"https://cdn.subhd.tv/cap.srt"}', 200);
         }
@@ -260,6 +335,13 @@ void main() {
   test('reports a missing SubHD download record as a download error', () async {
     final service = SubtitleSearchService(
       client: MockClient((request) async {
+        if (request.url.path == '/api/sub/prepare-download') {
+          final sid = jsonDecode(request.body)['sid'];
+          return http.Response(
+            jsonEncode({'success': true, 'url': '/down/$sid'}),
+            200,
+          );
+        }
         expect(request.url.host, 'www.subhd.me');
         if (request.url.path.startsWith('/a/') ||
             request.url.path.startsWith('/down/')) {
@@ -297,6 +379,13 @@ void main() {
   test('reports an expired SubHD file link separately from the API', () async {
     final service = SubtitleSearchService(
       client: MockClient((request) async {
+        if (request.url.path == '/api/sub/prepare-download') {
+          final sid = jsonDecode(request.body)['sid'];
+          return http.Response(
+            jsonEncode({'success': true, 'url': '/down/$sid'}),
+            200,
+          );
+        }
         if (request.method == 'POST') {
           return http.Response(
             jsonEncode({

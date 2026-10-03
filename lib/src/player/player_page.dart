@@ -27,6 +27,7 @@ import 'native_dolby_vision.dart';
 import 'subtitle_preference.dart';
 import 'subtitle_search_dialog.dart';
 import 'subtitle_search_service.dart';
+import 'skip_border_progress.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
@@ -302,6 +303,7 @@ class _PlayerPageState extends State<PlayerPage> {
   String? _error;
   WatchStateStore? _watchStore;
   bool _settingsOpen = false;
+  bool _exoHybridCompositionSupported = false;
   bool _exitStarted = false;
   bool _switchingEpisode = false;
   final Map<int, PlayerEpisode> _resolvedEpisodes = {};
@@ -384,6 +386,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Duration _lastBufferSample = Duration.zero;
   DateTime? _lastBufferSampleAt;
   double _networkBytesPerSecond = 0;
+  final _networkSpeedTick = ValueNotifier<int>(0);
   Timer? _readSpeedTimer;
   final Stopwatch _readSpeedClock = Stopwatch()..start();
   int _lastReadBytes = 0;
@@ -588,6 +591,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _setSubtitleTrack(SubtitleTrack track) async => _usesAndroidExo
       ? _exoCommand('setTrack', {
           'type': 'text',
+          'selection': track.id,
           'index': int.tryParse(track.id) ?? -1,
         })
       : _player!.setSubtitleTrack(track);
@@ -599,12 +603,14 @@ class _PlayerPageState extends State<PlayerPage> {
     try {
       await _exoCommands?.invokeMethod<void>(method, arguments);
     } on PlatformException catch (error) {
+      if (method == 'addSubtitle') rethrow;
       if (mounted) setState(() => _error = error.message ?? error.code);
     }
   }
 
   void _attachExoView(int viewId) {
     _exoCommands = MethodChannel('mova/exo/$viewId');
+    _notifyExoMenuVisibility();
     unawaited(
       _exoCommand('setVolume', {
         'volume': Platform.isAndroid ? 1.0 : _volume / 100,
@@ -771,6 +777,9 @@ class _PlayerPageState extends State<PlayerPage> {
     });
     _playingSubscription = _playingStream.listen((playing) {
       if (!mounted || _switchingEpisode) return;
+      unawaited(
+        WindowHost.setAutoPictureInPicture(playing && !_state.completed),
+      );
       setState(() {});
       if (playing) {
         // 至少真正播过一次，之后暂停才在画面中央显示「继续播放」；
@@ -786,6 +795,17 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     });
     _completedSubscription = _completedStream.listen((completed) {
+      if (completed)
+        unawaited(
+          SubtitleSearchService.clearDownloads(
+            SubtitleSearchQuery(
+              title: _activeEpisode.title,
+              season: _activeEpisode.seasonNumber,
+              episode: _activeEpisode.episodeNumber,
+            ),
+          ).catchError((Object error) {}),
+        );
+      if (completed) unawaited(WindowHost.setAutoPictureInPicture(false));
       if (completed) unawaited(_deleteCompletedVideoCache(_activeEpisode.url));
     });
     _bufferSubscription = _bufferStream.listen((buffer) async {
@@ -797,7 +817,11 @@ class _PlayerPageState extends State<PlayerPage> {
         if (elapsed > 100 && delta > 0 && mounted) {
           // 缓冲速率只在信息可见时才重建播放页；字段照常更新，
           // 控制条重新出现时读到的是最新值。
-          if (_showControls || _settingsOpen) setState(() {});
+          // Exo already publishes buffer/state events; the one-second speed
+          // ticker refreshes its read rate. Avoid a duplicate full-page build.
+          if (!_usesAndroidExo && (_showControls || _settingsOpen)) {
+            setState(() {});
+          }
         }
       }
       _lastBufferSample = buffer;
@@ -858,6 +882,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (!mounted) return;
     if (_settingsOpen) {
       setState(() => _settingsOpen = false);
+      _notifyExoMenuVisibility();
       return;
     }
     if (_showControls) {
@@ -1008,6 +1033,7 @@ class _PlayerPageState extends State<PlayerPage> {
         _settingsOpen = false;
         _quickMenuOpen = false;
       });
+      _notifyExoMenuVisibility();
       await Future<void>.delayed(MovaMotion.hudOut);
     }
     final entered = await WindowHost.enterPictureInPicture();
@@ -1058,11 +1084,22 @@ class _PlayerPageState extends State<PlayerPage> {
     return minutes > 0 ? '$sign$minutes:$rest' : '$sign${seconds}s';
   }
 
+  void _notifyExoMenuVisibility() {
+    if (!_usesAndroidExo || _exoCommands == null) return;
+    unawaited(_exoCommand('setMenuVisible', {'visible': _settingsOpen}));
+    if (const bool.fromEnvironment('MOVA_TRACE_FRAME_LOGCAT')) {
+      debugPrint(
+        'MOVA_EXO_COMPOSITION hcpp=$_exoHybridCompositionSupported menu=$_settingsOpen',
+      );
+    }
+  }
+
   void _toggleSettings() {
     setState(() {
       _settingsOpen = !_settingsOpen;
       _showControls = true;
     });
+    _notifyExoMenuVisibility();
     if (_settingsOpen) {
       _controlsTimer?.cancel();
     } else {
@@ -1080,6 +1117,7 @@ class _PlayerPageState extends State<PlayerPage> {
       }
       _showControls = true;
     });
+    _notifyExoMenuVisibility();
     if (_settingsOpen) {
       _controlsTimer?.cancel();
     } else {
@@ -1089,7 +1127,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _updateNetworkSpeed() async {
     if (_usesAndroidExo) {
-      if (mounted && (_showControls || _settingsOpen)) setState(() {});
+      if (mounted) _networkSpeedTick.value++;
       return;
     }
     final url = _activeEpisode.url;
@@ -1104,10 +1142,24 @@ class _PlayerPageState extends State<PlayerPage> {
     _readSpeedClock
       ..reset()
       ..start();
-    if (mounted && (_showControls || _settingsOpen)) setState(() {});
+    if (mounted) _networkSpeedTick.value++;
   }
 
   Future<void> _initializePlayer() async {
+    if (_usesAndroidExo) {
+      try {
+        _exoHybridCompositionSupported =
+            await HybridAndroidViewController.checkIfSupported();
+      } on PlatformException {
+        _exoHybridCompositionSupported = false;
+      } on MissingPluginException {
+        _exoHybridCompositionSupported = false;
+      }
+      if (!mounted) return;
+      if (const bool.fromEnvironment('MOVA_TRACE_FRAME_LOGCAT')) {
+        debugPrint('MOVA_EXO_COMPOSITION hcpp=$_exoHybridCompositionSupported');
+      }
+    }
     _watchStore = await WatchStateStore.create();
     _videoCache = await VideoCacheStore.tryCreate();
     _danmakuCache = await DanmakuCache.tryCreate();
@@ -1883,7 +1935,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Widget _segmentPrompt() => AnimatedPositioned(
-    right: 28,
+    right: 22 + MediaQuery.paddingOf(context).right,
     bottom: _showControls ? 170 : 32,
     duration: MovaMotion.standard,
     curve: MovaMotion.standardEase,
@@ -1891,58 +1943,46 @@ class _PlayerPageState extends State<PlayerPage> {
       beginScale: .94,
       slide: .06,
       duration: MovaMotion.standard,
-      child: GlassPanel(
-        radius: 16,
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _skipKind == 'intro'
-                  ? '片头 · 跳转至 ${_time(_introEnd!)}'
-                  : '片尾 · ${_activeEpisodeIndex < widget.episodes.length - 1 ? '播放下一集' : '跳转至结尾'}',
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-            if (_autoSkipSegments) ...[
-              const SizedBox(height: 6),
-              Text(
-                '${((10 - _skipTicks) / 2).ceil().clamp(0, 5)} 秒后自动跳过',
-                style: const TextStyle(fontSize: 12, color: YingjiColors.muted),
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(
+          end: _autoSkipSegments
+              ? (1 - _skipTicks / math.max(1, _autoSkipDelaySeconds * 2)).clamp(
+                  0,
+                  1,
+                )
+              : 0,
+        ),
+        duration: const Duration(milliseconds: 500),
+        builder: (context, remaining, child) => CustomPaint(
+          foregroundPainter: SkipBorderProgress(remaining),
+          child: child,
+        ),
+        child: GlassPanel(
+          radius: 22,
+          padding: const EdgeInsets.only(left: 12, right: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextButton(
+                onPressed: _performSegmentSkip,
+                child: Text(
+                  _autoSkipSegments
+                      ? '${(_autoSkipDelaySeconds - _skipTicks / 2).ceil().clamp(0, _autoSkipDelaySeconds.ceil())} 秒后跳过${_skipKind == 'intro' ? '片头' : '片尾'}'
+                      : '跳过${_skipKind == 'intro' ? '片头' : '片尾'}',
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
               ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: 224,
-                child: LinearProgressIndicator(
-                  value: (_skipTicks / 10).clamp(0, 1),
+              TextButton(
+                onPressed: () => setState(() {
+                  if (_skipKind != null) _skipDismissed.add(_skipKind!);
+                }),
+                child: const Text(
+                  '取消',
+                  style: TextStyle(color: Colors.white, fontSize: 12),
                 ),
               ),
             ],
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                MovaPress(
-                  scale: .94,
-                  visualOnly: true,
-                  child: TextButton.icon(
-                    onPressed: _performSegmentSkip,
-                    icon: const Icon(YingjiIcons.chevron_right, size: 16),
-                    label: const Text('立即跳过'),
-                  ),
-                ),
-                MovaPress(
-                  scale: .94,
-                  visualOnly: true,
-                  child: TextButton(
-                    onPressed: () => setState(() {
-                      if (_skipKind != null) _skipDismissed.add(_skipKind!);
-                    }),
-                    child: const Text('本次不跳过'),
-                  ),
-                ),
-              ],
-            ),
-          ],
+          ),
         ),
       ),
     ),
@@ -1965,16 +2005,42 @@ class _PlayerPageState extends State<PlayerPage> {
     _openConsoleTab('在线字幕');
   }
 
+  Future<void> _importLocalSubtitle() async {
+    try {
+      final path = await WindowHost.pickSubtitleFile();
+      if (path == null || !mounted) return;
+      await _applyOnlineSubtitle(
+        DownloadedSubtitle(
+          path: path,
+          fileName: path.split(Platform.pathSeparator).last,
+          language: '',
+        ),
+      );
+    } catch (_) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('字幕导入失败，请选择有效的 SRT/ASS/SSA/VTT 文件')),
+        );
+    }
+  }
+
   Future<void> _applyOnlineSubtitle(DownloadedSubtitle subtitle) async {
     if (!mounted) throw StateError('当前播放已结束，无法应用字幕');
-    _downloadedSubtitlePaths.add(subtitle.path);
-    await _setSubtitleTrack(
-      SubtitleTrack.uri(
-        Uri.file(subtitle.path).toString(),
-        title: subtitle.fileName,
-        language: subtitle.language,
-      ),
-    );
+    if (!subtitle.persistent) _downloadedSubtitlePaths.add(subtitle.path);
+    if (_usesAndroidExo) {
+      await _exoCommand('addSubtitle', {
+        'path': subtitle.path,
+        'label': subtitle.fileName,
+      });
+    } else {
+      await _setSubtitleTrack(
+        SubtitleTrack.uri(
+          Uri.file(subtitle.path).toString(),
+          title: subtitle.fileName,
+          language: subtitle.language,
+        ),
+      );
+    }
     _subtitleChosen = true;
   }
 
@@ -2297,10 +2363,12 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    unawaited(WindowHost.setAutoPictureInPicture(false));
     // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
     unawaited(WindowHost.exitMediaSession());
     _subtitleSubscription?.cancel();
     _readSpeedTimer?.cancel();
+    _networkSpeedTick.dispose();
     _exoEventSubscription?.cancel();
     _exoPositionController.close();
     _exoBufferController.close();
@@ -2573,6 +2641,7 @@ class _PlayerPageState extends State<PlayerPage> {
       SingleActivator(_shortcutKey(_shortcuts['exit']!)): () async {
         if (_settingsOpen) {
           setState(() => _settingsOpen = false);
+          _notifyExoMenuVisibility();
           return;
         }
         // 桌面端全屏时，Esc 先退回窗口、不退出播放，再按一次才关掉播放。
@@ -2671,25 +2740,26 @@ class _PlayerPageState extends State<PlayerPage> {
                           onCreatePlatformView: (params) {
                             // SurfaceView must attach to the real display: AndroidView
                             // falls back to a virtual display without HDR capabilities.
-                            final controller =
-                                PlatformViewsService.initExpensiveAndroidView(
-                                  id: params.id,
-                                  viewType: params.viewType,
-                                  layoutDirection: Directionality.of(context),
-                                  creationParams: {
-                                    'url': _exoPlaybackUrl,
-                                    'headers': _exoHeaders,
-                                    'transferTrace': const bool.fromEnvironment(
-                                      'MOVA_TRANSFER_TRACE',
-                                    ),
-                                    'container': widget.container,
-                                    'positionMs':
-                                        _state.position.inMilliseconds,
-                                  },
-                                  creationParamsCodec:
-                                      const StandardMessageCodec(),
-                                  onFocus: () => params.onFocusChanged(true),
-                                );
+                            final createController =
+                                _exoHybridCompositionSupported
+                                ? PlatformViewsService.initHybridAndroidView
+                                : PlatformViewsService.initExpensiveAndroidView;
+                            final controller = createController(
+                              id: params.id,
+                              viewType: params.viewType,
+                              layoutDirection: Directionality.of(context),
+                              creationParams: {
+                                'url': _exoPlaybackUrl,
+                                'headers': _exoHeaders,
+                                'transferTrace': const bool.fromEnvironment(
+                                  'MOVA_TRANSFER_TRACE',
+                                ),
+                                'container': widget.container,
+                                'positionMs': _state.position.inMilliseconds,
+                              },
+                              creationParamsCodec: const StandardMessageCodec(),
+                              onFocus: () => params.onFocusChanged(true),
+                            );
                             controller.addOnPlatformViewCreatedListener(
                               params.onPlatformViewCreated,
                             );
@@ -2902,13 +2972,16 @@ class _PlayerPageState extends State<PlayerPage> {
                     ],
                   ),
                 ),
-                YingjiGlassTooltip(
-                  message: '当前资源每秒读取速度（非整机带宽）\n${_networkSpeedLabel()}',
-                  child: _StateChip(
-                    label: MediaQuery.sizeOf(context).width < 700
-                        ? _networkSpeedLabel().split(' · ').first
-                        : _networkSpeedLabel(),
-                    ok: !_state.buffering,
+                ValueListenableBuilder<int>(
+                  valueListenable: _networkSpeedTick,
+                  builder: (context, _, _) => YingjiGlassTooltip(
+                    message: '当前资源每秒读取速度（非整机带宽）\n${_networkSpeedLabel()}',
+                    child: _StateChip(
+                      label: MediaQuery.sizeOf(context).width < 700
+                          ? _networkSpeedLabel().split(' · ').first
+                          : _networkSpeedLabel(),
+                      ok: !_state.buffering,
+                    ),
                   ),
                 ),
                 if (_videoCacheStatus != null) ...[
@@ -3297,71 +3370,77 @@ class _PlayerPageState extends State<PlayerPage> {
       560,
       math.max(120, MediaQuery.sizeOf(context).height - 188),
     ),
-    child: GlassPanel(
-      radius: 24,
-      sampleBackdrop: false,
-      padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              if (_consoleTab == '在线字幕')
+    child: RepaintBoundary(
+      child: GlassPanel(
+        radius: 24,
+        sampleBackdrop: false,
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                if (const ['在线字幕', '主字幕', '本地导入'].contains(_consoleTab))
+                  YingjiMotionIconButton(
+                    tooltip: '返回字幕',
+                    onPressed: () => _openConsoleTab('字幕'),
+                    icon: YingjiIcons.chevron_left,
+                    size: 34,
+                  ),
+                Text(
+                  _consoleTab == '在线字幕' ? '字幕搜索' : _consoleTab,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const Spacer(),
                 YingjiMotionIconButton(
-                  tooltip: '返回字幕',
-                  onPressed: () => _openConsoleTab('字幕'),
-                  icon: YingjiIcons.chevron_left,
-                  size: 34,
+                  tooltip: '关闭面板',
+                  onPressed: _toggleSettings,
+                  icon: YingjiIcons.xmark,
+                  size: 36,
                 ),
-              Text(
-                _consoleTab == '在线字幕' ? '在线搜索字幕' : _consoleTab,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const Spacer(),
-              YingjiMotionIconButton(
-                tooltip: '关闭面板',
-                onPressed: _toggleSettings,
-                icon: YingjiIcons.xmark,
-                size: 36,
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Expanded(
-            child: YingjiStableScrollGlass(
-              child: _consoleTab == '在线字幕'
-                  ? SubtitleSearchPanel(
-                      query: SubtitleSearchQuery(
-                        title: _activeEpisode.title,
-                        season: _activeEpisode.seasonNumber,
-                        episode: _activeEpisode.episodeNumber,
-                        episodeTitle: _activeEpisode.episodeTitle,
-                        language: _subtitleLanguage,
-                      ),
-                      onApply: _applyOnlineSubtitle,
-                    )
-                  : _consoleTab == '全集'
-                  ? ListView.builder(
-                      itemCount: widget.episodes.length,
-                      padding: const EdgeInsets.only(bottom: 8),
-                      itemBuilder: (_, index) => Padding(
-                        padding: EdgeInsets.only(
-                          bottom: index == widget.episodes.length - 1 ? 0 : 8,
-                        ),
-                        child: _episodeRow(index),
-                      ),
-                    )
-                  : ScrollConfiguration(
-                      behavior: ScrollConfiguration.of(context)
-                          .copyWith(scrollbars: false),
-                      child: ListView(children: _consoleContent()),
-                    ),
+              ],
             ),
-          ),
-        ],
+            const SizedBox(height: 10),
+            Expanded(
+              child: YingjiStableScrollGlass(
+                child: _consoleTab == '在线字幕'
+                    ? SubtitleSearchPanel(
+                        key: ValueKey(
+                          '${_activeEpisode.title}|${_activeEpisode.seasonNumber}|${_activeEpisode.episodeNumber}',
+                        ),
+                        completion: _completedStream,
+                        query: SubtitleSearchQuery(
+                          title: _activeEpisode.title,
+                          season: _activeEpisode.seasonNumber,
+                          episode: _activeEpisode.episodeNumber,
+                          episodeTitle: _activeEpisode.episodeTitle,
+                          language: _subtitleLanguage,
+                        ),
+                        onApply: _applyOnlineSubtitle,
+                      )
+                    : _consoleTab == '全集'
+                    ? ListView.builder(
+                        itemCount: widget.episodes.length,
+                        padding: const EdgeInsets.only(bottom: 8),
+                        itemBuilder: (_, index) => Padding(
+                          padding: EdgeInsets.only(
+                            bottom: index == widget.episodes.length - 1 ? 0 : 8,
+                          ),
+                          child: _episodeRow(index),
+                        ),
+                      )
+                    : ScrollConfiguration(
+                        behavior: ScrollConfiguration.of(context)
+                            .copyWith(scrollbars: false),
+                        child: ListView(children: _consoleContent()),
+                      ),
+              ),
+            ),
+          ],
+        ),
       ),
     ),
   );
@@ -3379,23 +3458,31 @@ class _PlayerPageState extends State<PlayerPage> {
         ];
       case '字幕':
         return [
+          for (final label in const ['主字幕', '字幕搜索', '本地导入'])
+            ListTile(
+              title: Text(label),
+              trailing: const Icon(YingjiIcons.chevron_right, size: 18),
+              onTap: () => label == '字幕搜索'
+                  ? _searchOnlineSubtitle()
+                  : _openConsoleTab(label),
+            ),
+        ];
+      case '本地导入':
+        return [
+          ListTile(
+            title: const Text('选择字幕文件'),
+            subtitle: const Text('SRT / ASS / SSA / VTT'),
+            onTap: _importLocalSubtitle,
+          ),
+        ];
+      case '主字幕':
+        return [
           _consoleGroup('字幕', [
             '字幕轨道  ${_state.tracks.subtitle.length} 条',
             '首选语言  ${_preferChineseSubtitle ? (subtitleLanguages[_subtitleLanguage] ?? '中文') : '跟随媒体默认'}',
             '字幕延迟  ${(_subtitleDelay * 1000).round()} ms',
           ]),
           _trackSelector(audio: false),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: YingjiGlassPillButton(
-              icon: YingjiIcons.search,
-              label: '在线搜索字幕',
-              compactLabel: '搜索字幕',
-              tooltip: '搜索当前剧集字幕并下载应用',
-              onPressed: _searchOnlineSubtitle,
-              height: 42,
-            ),
-          ),
         ];
       case '弹幕':
         return [
@@ -3760,7 +3847,17 @@ class _PlayerPageState extends State<PlayerPage> {
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(9),
                 child: episode.imageUrl?.isNotEmpty == true
-                    ? Image.network(episode.imageUrl!, fit: BoxFit.cover)
+                    ? Image.network(
+                        episode.imageUrl!,
+                        fit: BoxFit.cover,
+                        cacheWidth:
+                            (86 * MediaQuery.devicePixelRatioOf(context))
+                                .ceil(),
+                        errorBuilder: (_, _, _) => const ColoredBox(
+                          color: Colors.white10,
+                          child: Icon(YingjiIcons.film),
+                        ),
+                      )
                     : const ColoredBox(
                         color: Colors.white10,
                         child: Icon(YingjiIcons.film),
