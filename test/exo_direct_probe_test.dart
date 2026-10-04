@@ -9,13 +9,17 @@ void main() {
     expect(source, contains('!ProxyRouting.serverUsesProxy('));
     expect(
       RegExp(r'if \(_nativeExoTransfer\) return;').allMatches(source).length,
-      2,
+      1,
     );
     expect(source, contains('? episode.headers'));
     final native = File(
       'android/app/src/main/kotlin/com/taohua/mova/ExoPlayerPlatformView.kt',
     ).readAsStringSync();
     expect(native, contains('.setDefaultRequestProperties(headers)'));
+    // Current episode stays native, but bounded next-prefix warm-up is now allowed.
+    expect(native, contains('.setCacheWriteDataSinkFactory(null)'));
+    expect(native, contains('CacheWriter('));
+    expect(source, contains('ProxyRouting.serverUsesProxy(next.sourceId'));
     expect(source, contains("event['readBytesPerSecond']"));
     expect(
       source,

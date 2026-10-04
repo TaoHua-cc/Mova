@@ -34,18 +34,15 @@ import java.io.File
  * 3. 应用内更新——查「安装未知来源应用」的授权、跳授权页，以及把下载好的 APK
  *    交给系统安装器。Android 7.0 起不能再抛 file:// 的 URI（会
  *    FileUriExposedException），必须用 FileProvider 换成 content://。
- * 4. 原生 Dolby Vision——查询系统解码器与显示能力，并启动独立的
- *    SurfaceView 播放 Activity，避免视频帧经过 Flutter Texture。
+ * 4. Exo 视频通过原生 SurfaceView 承载，并提供系统解码器与显示能力查询。
  */
 class MainActivity : FlutterActivity() {
     private companion object {
         const val PLATFORM_CHANNEL = "mova/platform"
         const val SYSTEM_BRIGHTNESS_MAX = 255f
-        const val DOLBY_VISION_REQUEST = 7301
         const val SUBTITLE_REQUEST = 7302
     }
 
-    private var pendingDolbyVisionResult: MethodChannel.Result? = null
     private var pendingSubtitleResult: MethodChannel.Result? = null
     private var autoPictureInPicture = false
 
@@ -98,6 +95,9 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "cleanVideoCache" -> NextEpisodeCache.clean(this, call.argument<String>("url")) {
+                        runOnUiThread { result.success(null) }
+                    }
                     "pickSubtitleFile" -> {
                         if (pendingSubtitleResult != null) {
                             result.error("busy", "文件选择器已打开", null)
@@ -158,66 +158,9 @@ class MainActivity : FlutterActivity() {
                     "dolbyVisionCapabilities" -> result.success(
                         DolbyVisionSupport.query(this).asMap(),
                     )
-                    "playDolbyVision" -> playDolbyVision(call.arguments, result)
-                    "playExoPlayer" -> playDolbyVision(call.arguments, result, false)
                     else -> result.notImplemented()
                 }
             }
-    }
-
-    /** Starts the native SurfaceView player and keeps the channel reply pending. */
-    private fun playDolbyVision(arguments: Any?, result: MethodChannel.Result, requireDolbyVision: Boolean = true) {
-        if (pendingDolbyVisionResult != null) {
-            result.error("already_playing", "原生播放器已打开", null)
-            return
-        }
-        val args = arguments as? Map<*, *>
-        if (args == null) {
-            result.error("invalid_arguments", "原生播放器参数无效", null)
-            return
-        }
-        val url = args["url"] as? String
-        if (url.isNullOrBlank()) {
-            result.error("invalid_url", "播放地址为空", null)
-            return
-        }
-        val capabilities = if (requireDolbyVision) DolbyVisionSupport.query(this) else null
-        if (capabilities != null && !capabilities.supported) {
-            result.error("unsupported", "设备解码器或当前显示屏不支持 Dolby Vision", capabilities.asMap())
-            return
-        }
-        val rawHeaders = args["headers"] as? Map<*, *> ?: emptyMap<Any, Any>()
-        val headers = rawHeaders.entries
-            .mapNotNull { (key, value) ->
-                val name = key as? String ?: return@mapNotNull null
-                val headerValue = value as? String ?: return@mapNotNull null
-                name to headerValue
-            }
-        val intent = Intent(this, DolbyVisionPlayerActivity::class.java).apply {
-            putExtra(DolbyVisionPlayerActivity.EXTRA_URL, url)
-            putExtra(DolbyVisionPlayerActivity.EXTRA_TITLE, args["title"] as? String)
-            putExtra(DolbyVisionPlayerActivity.EXTRA_CONTAINER, args["container"] as? String)
-            putExtra(
-                DolbyVisionPlayerActivity.EXTRA_POSITION_MS,
-                (args["positionMs"] as? Number)?.toLong() ?: 0L,
-            )
-            putExtra(
-                DolbyVisionPlayerActivity.EXTRA_HEADER_NAMES,
-                headers.map { it.first }.toTypedArray(),
-            )
-            putExtra(
-                DolbyVisionPlayerActivity.EXTRA_HEADER_VALUES,
-                headers.map { it.second }.toTypedArray(),
-            )
-        }
-        pendingDolbyVisionResult = result
-        try {
-            @Suppress("DEPRECATION")
-            startActivityForResult(intent, DOLBY_VISION_REQUEST)
-        } catch (error: Exception) {
-            pendingDolbyVisionResult = null
-            result.error("launch_failed", "无法打开原生播放器", error.message)
-        }
     }
 
     private fun enterPictureInPicture(): Boolean {
@@ -279,45 +222,8 @@ class MainActivity : FlutterActivity() {
             }.start()
             return
         }
-        if (requestCode != DOLBY_VISION_REQUEST) return
-        val pending = pendingDolbyVisionResult ?: return
-        pendingDolbyVisionResult = null
-        if (resultCode != RESULT_OK) {
-            pending.error("player_closed", "原生播放器未返回播放状态", null)
-            return
-        }
-        pending.success(
-            mapOf(
-                "positionMs" to (data?.getLongExtra(
-                    DolbyVisionPlayerActivity.EXTRA_RESULT_POSITION_MS,
-                    0L,
-                ) ?: 0L),
-                "durationMs" to (data?.getLongExtra(
-                    DolbyVisionPlayerActivity.EXTRA_RESULT_DURATION_MS,
-                    0L,
-                ) ?: 0L),
-                "completed" to (data?.getBooleanExtra(
-                    DolbyVisionPlayerActivity.EXTRA_RESULT_COMPLETED,
-                    false,
-                ) ?: false),
-                "nativeDolbyVision" to (data?.getBooleanExtra(
-                    DolbyVisionPlayerActivity.EXTRA_RESULT_NATIVE_DV,
-                    false,
-                ) ?: false),
-                "error" to data?.getStringExtra(DolbyVisionPlayerActivity.EXTRA_RESULT_ERROR),
-            ),
-        )
     }
 
-    /**
-     * 当前网络类型，取值 `wifi` / `mobile` / `ethernet` / `other` / `none`。
-     *
-     * 视频缓存上限要按网络分开设置：移动数据是计量网络，默认不该整份缓存。
-     * 查询「当前活动的网络」不需要任何权限，拿不到就返回 `none`——调用方
-     * 会按「不在移动数据下」处理，也就是该缓存还是缓存，不至于因为权限
-     * 问题让用户干等。
-     */
-    @Suppress("DEPRECATION")
     private fun networkType(): String {
         return try {
             val manager =

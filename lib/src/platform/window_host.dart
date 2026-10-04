@@ -176,6 +176,18 @@ class WindowHost {
   /// 安卓宿主暴露的平台通道（见 MainActivity.kt）：屏幕亮度、打开外部链接、
   /// 安装 APK 与网络类型。
   static const MethodChannel _platformChannel = MethodChannel('mova/platform');
+  static Future<void> cleanNativeVideoCache({String? url}) async {
+    if (!isAndroid) return;
+    try {
+      await _platformChannel.invokeMethod<void>('cleanVideoCache', {
+        'url': url,
+      });
+    } on MissingPluginException {
+      // Older Android hosts have no native cache.
+    } on PlatformException {
+      // Cache maintenance must not interrupt playback.
+    }
+  }
 
   /// 用系统默认浏览器打开外部链接。
   ///

@@ -7,6 +7,114 @@ import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  test(
+    'missing resume date is enriched without losing unmatched records',
+    () async {
+      final client = EmbyClient(
+        client: MockClient(
+          (request) async => http.Response(
+            jsonEncode({
+              'Items': [
+                {
+                  'Id': 'e3',
+                  'Type': 'Episode',
+                  if (request.url.path.endsWith('/Resume'))
+                    'Name': 'Original episode title',
+                  'UserData': {
+                    'PlaybackPositionTicks': 9970000000,
+                    if (!request.url.path.endsWith('/Resume') &&
+                        request.url.queryParameters['Fields'] ==
+                            'UserData,UserDataLastPlayedDate')
+                      'LastPlayedDate': '2026-10-03T14:01:05Z',
+                  },
+                },
+                if (request.url.path.endsWith('/Resume'))
+                  {
+                    'Id': 'other',
+                    'UserData': {'PlaybackPositionTicks': 10000000},
+                  },
+              ],
+            }),
+            200,
+          ),
+        ),
+      );
+      final rows = await client.resumeItems(
+        EmbySession(
+          token: 'test-token',
+          source: MediaSource(
+            id: 'source',
+            name: 'Server',
+            kind: SourceKind.emby,
+            endpoint: Uri.parse('https://media.example/'),
+            userId: 'user',
+          ),
+        ),
+      );
+      expect(rows, hasLength(2));
+      expect(rows.first.lastPlayedAt, DateTime.utc(2026, 10, 3, 14, 1, 5));
+      expect(rows.first.title, 'Original episode title');
+      expect(rows.last.id, 'other');
+      expect(rows.last.lastPlayedAt, isNull);
+      client.dispose();
+    },
+  );
+  test(
+    'successful empty Resume falls back to real user playback progress',
+    () async {
+      final requests = <Uri>[];
+      final client = EmbyClient(
+        client: MockClient((request) async {
+          requests.add(request.url);
+          final requestsDate = request.url.queryParameters['Fields']!
+              .split(',')
+              .contains('UserDataLastPlayedDate');
+          return http.Response(
+            jsonEncode({
+              'Items': request.url.path.endsWith('/Resume')
+                  ? []
+                  : [
+                      {
+                        'Id': 'e21',
+                        'Name': 'Episode 21',
+                        'Type': 'Episode',
+                        'RunTimeTicks': 25908400000,
+                        'UserData': {
+                          'PlaybackPositionTicks': 16092000000,
+                          if (requestsDate)
+                            'LastPlayedDate': '2026-10-03T22:59:05Z',
+                          'Played': false,
+                        },
+                      },
+                    ],
+            }),
+            200,
+          );
+        }),
+      );
+      final rows = await client.resumeItems(
+        EmbySession(
+          token: 'test-token',
+          source: MediaSource(
+            id: 'source',
+            name: '服务器',
+            kind: SourceKind.emby,
+            endpoint: Uri.parse('https://media.example/'),
+            userId: 'user',
+          ),
+        ),
+      );
+      expect(requests, hasLength(2));
+      expect(requests.last.queryParameters['Filters'], 'IsResumable');
+      expect(rows.single.id, 'e21');
+      expect(
+        rows.single.playbackPosition,
+        const Duration(milliseconds: 1609200),
+      );
+      expect(rows.single.lastPlayedAt, DateTime.utc(2026, 10, 3, 22, 59, 5));
+      client.dispose();
+    },
+  );
   test('continue watching uses the dedicated server resume endpoint', () async {
     Uri? requested;
     final client = EmbyClient(
@@ -20,7 +128,10 @@ void main() {
                 'Name': '第一集',
                 'Type': 'Episode',
                 'RunTimeTicks': 6000000000,
-                'UserData': {'PlaybackPositionTicks': 1200000000},
+                'UserData': {
+                  'PlaybackPositionTicks': 1200000000,
+                  'LastPlayedDate': '2026-10-03T22:59:05Z',
+                },
               },
             ],
           }),
@@ -43,6 +154,8 @@ void main() {
     final items = await client.resumeItems(session);
 
     expect(requested?.path, '/Users/user-1/Items/Resume');
+    expect(requested?.queryParameters['SortBy'], 'DatePlayed');
+    expect(requested?.queryParameters['SortOrder'], 'Descending');
     expect(items.single.id, 'episode-1');
     expect(items.single.playbackPosition, const Duration(minutes: 2));
     client.dispose();

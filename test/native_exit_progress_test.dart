@@ -15,9 +15,10 @@ void main() {
       lessThan(source.indexOf('await process.stdin.close()')),
     );
     expect(
-      source.indexOf('unawaited(_syncServerWatchStates(savedStates))'),
+      source.indexOf('await _syncServerWatchStates(savedStates).timeout('),
       lessThan(source.indexOf('await download?.done')),
     );
+    expect(source, contains('const Duration(seconds: 4)'));
     final native = File('windows/native_player/main.cpp').readAsStringSync();
     expect(native, contains('case WM_NCACTIVATE:'));
     expect(native, contains('DWMNCRP_DISABLED'));

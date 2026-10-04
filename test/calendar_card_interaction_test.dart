@@ -113,7 +113,10 @@ void main() {
     );
     final localEventsEnd = source.indexOf('bool _isDropped', localEventsStart);
     final localEvents = source.substring(localEventsStart, localEventsEnd);
-    expect(localEvents, contains('next.showPosterUrl ?? next.stillUrl'));
+    expect(localEvents, contains('SeriesAiringStore'));
+    final airing = File('lib/src/metadata/series_airing.dart')
+        .readAsStringSync();
+    expect(airing, contains('next.showPosterUrl ?? next.stillUrl'));
   });
 
   test('共用图标按钮和状态胶囊使用同一套按下回弹节奏', () {

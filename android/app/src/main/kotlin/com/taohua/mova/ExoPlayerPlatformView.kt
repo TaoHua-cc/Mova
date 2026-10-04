@@ -22,6 +22,15 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.ContentMetadataMutations
+import androidx.media3.database.StandaloneDatabaseProvider
+import java.io.File
+import java.security.MessageDigest
+import java.util.concurrent.Executors
 import android.os.SystemClock
 import java.util.concurrent.atomic.AtomicLong
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -60,7 +69,13 @@ class ExoPlayerPlatformView(
     private val eventChannel = EventChannel(messenger, "mova/exo-events/$viewId")
     private val mainHandler = Handler(Looper.getMainLooper())
     private var eventSink: EventChannel.EventSink? = null
-    private var released = false
+    @Volatile private var released = false
+    private val preloadExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var preloadWriter: CacheWriter? = null
+    @Volatile private var preloadEpoch = 0
+    private val nativeCache = creationParams["nativeCache"] == true
+    private val originalUrl = (creationParams["cacheUrl"] as? String)
+        ?: (creationParams["url"] as? String).orEmpty()
     private val exoPlayer: ExoPlayer
     private val transferTrace = creationParams["transferTrace"] == true
     private var lastBufferTraceMs = 0L
@@ -121,6 +136,10 @@ class ExoPlayerPlatformView(
     }
 
     init {
+        NextEpisodeCache.protect(originalUrl)
+        NextEpisodeCache.touch(context, originalUrl,
+            (creationParams["headers"] as? Map<*, *> ?: emptyMap<Any, Any>())
+                .mapNotNull { (k, v) -> if (k is String && v is String) k to v else null }.toMap())
         methodChannel.setMethodCallHandler(this)
         eventChannel.setStreamHandler(this)
 
@@ -158,7 +177,15 @@ class ExoPlayerPlatformView(
                     if (transferTrace) Log.i("MovaExoTransfer", "event=end elapsedMs=${SystemClock.elapsedRealtime() - startedMs} bytes=$bytes")
                 }
             })
-        val dataSourceFactory = DefaultDataSource.Factory(context, httpFactory)
+        val upstream = DefaultDataSource.Factory(context, httpFactory)
+        val dataSourceFactory: DataSource.Factory = if (nativeCache) try {
+            CacheDataSource.Factory().setCache(NextEpisodeCache.get(context))
+                .setUpstreamDataSourceFactory(upstream)
+                .setCacheKeyFactory { spec -> NextEpisodeCache.key(spec.uri.toString(), headers) }
+                // Playback only reads the bounded preheated prefix; no second full download.
+                .setCacheWriteDataSinkFactory(null)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        } catch (_: Exception) { upstream } else upstream
         val renderersFactory = DefaultRenderersFactory(context)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         exoPlayer = ExoPlayer.Builder(context, renderersFactory)
@@ -195,6 +222,46 @@ class ExoPlayerPlatformView(
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
+            "cancelPreload" -> { cancelPreload(); result.success(null) }
+            "preloadNext" -> {
+                val url = call.argument<String>("url").orEmpty()
+                val uri = Uri.parse(url)
+                if (!nativeCache || uri.scheme !in listOf("http", "https") ||
+                    uri.path.orEmpty().lowercase().endsWith(".m3u8") ||
+                    uri.path.orEmpty().lowercase().endsWith(".mpd")) {
+                    result.success(false); return
+                }
+                val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
+                val epoch = preloadEpoch
+                preloadExecutor.execute {
+                    var complete = false
+                    try {
+                        val factory = CacheDataSource.Factory()
+                            .setCache(NextEpisodeCache.get(contextForTrace))
+                            .setUpstreamDataSourceFactory(DefaultHttpDataSource.Factory()
+                                .setUserAgent("Mova-Android-ExoPlayer")
+                                .setAllowCrossProtocolRedirects(true)
+                                .setConnectTimeoutMs(10000).setReadTimeoutMs(10000)
+                                .setDefaultRequestProperties(headers))
+                        val writer = CacheWriter(factory.createDataSource(), DataSpec.Builder()
+                            .setUri(uri).setKey(NextEpisodeCache.key(url, headers))
+                            .setLength(32L * 1024 * 1024).build(), null, null)
+                        preloadWriter = writer
+                        NextEpisodeCache.protect(url)
+                        try {
+                            if (!released && epoch == preloadEpoch) { writer.cache(); complete = true }
+                        } finally {
+                            NextEpisodeCache.touch(contextForTrace, url, headers)
+                            NextEpisodeCache.release(contextForTrace, url)
+                        }
+                    } catch (_: Exception) {
+                        // Optional warm-up failure must not interrupt the current episode.
+                    } finally {
+                        preloadWriter = null
+                        mainHandler.post { result.success(complete) }
+                    }
+                }
+            }
             "setMenuVisible" -> {
                 menuVisible = call.argument<Boolean>("visible") == true
                 applyMenuFrameRate()
@@ -286,7 +353,12 @@ class ExoPlayerPlatformView(
 
     override fun onCancel(arguments: Any?) { eventSink = null }
 
-    override fun onIsPlayingChanged(isPlaying: Boolean) = emitState()
+    private fun cancelPreload() { preloadEpoch++; preloadWriter?.cancel() }
+
+    override fun onIsPlayingChanged(isPlaying: Boolean) {
+        if (!isPlaying) cancelPreload()
+        emitState()
+    }
     override fun onPlaybackStateChanged(playbackState: Int) {
         tracePlayback("state=$playbackState")
         emitState()
@@ -376,6 +448,8 @@ class ExoPlayerPlatformView(
     override fun dispose() {
         if (released) return
         released = true
+        cancelPreload()
+        preloadExecutor.shutdownNow()
         menuVisible = false
         applyMenuFrameRate()
         (playerView.videoSurfaceView as? SurfaceView)?.holder?.removeCallback(menuSurfaceCallback)
@@ -386,7 +460,69 @@ class ExoPlayerPlatformView(
         playerView.player = null
         exoPlayer.removeListener(this)
         exoPlayer.release()
+        NextEpisodeCache.release(contextForTrace, originalUrl)
     }
+}
+
+/** Separate native cache; never changes or deletes legacy Dart cache files. */
+internal object NextEpisodeCache {
+    private var cache: SimpleCache? = null
+    private val maintenance = Executors.newSingleThreadExecutor()
+    private val active = mutableMapOf<String, Int>()
+    private val pending = mutableSetOf<String>()
+    @Synchronized fun protect(url: String) {
+        val id = key(url, emptyMap())
+        active[id] = (active[id] ?: 0) + 1
+    }
+    fun release(context: Context, url: String) {
+        synchronized(this) {
+            val id = key(url, emptyMap())
+            val count = (active[id] ?: 1) - 1
+            if (count <= 0) active.remove(id) else active[id] = count
+        }
+        clean(context)
+    }
+    fun touch(context: Context, url: String, headers: Map<String, String>) {
+        maintenance.execute {
+            try {
+                get(context).applyContentMetadataMutations(key(url, headers), ContentMetadataMutations()
+                    .set("mova.url", key(url, emptyMap()))
+                    .set("mova.lastUsed", System.currentTimeMillis()))
+            } catch (_: Exception) {}
+        }
+    }
+    fun clean(context: Context, url: String? = null, finished: (() -> Unit)? = null) {
+        maintenance.execute {
+            try {
+                val store = get(context)
+                synchronized(this) {
+                    if (url != null) pending.add(key(url, emptyMap()))
+                    val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+                    for (item in store.keys.toList()) {
+                        val meta = store.getContentMetadata(item)
+                        val id = meta.get("mova.url", "")
+                        if ((active[id] ?: 0) > 0) continue
+                        val touched = maxOf(meta.get("mova.lastUsed", 0L),
+                            store.getCachedSpans(item).maxOfOrNull { it.lastTouchTimestamp } ?: 0L)
+                        if (id in pending || touched <= cutoff) store.removeResource(item)
+                    }
+                    pending.removeAll { (active[it] ?: 0) == 0 }
+                }
+            } catch (_: Exception) {
+                // Failed maintenance can be retried on next launch/release.
+            } finally { finished?.invoke() }
+        }
+    }
+    @Synchronized fun get(context: Context): SimpleCache = cache ?: SimpleCache(
+        File(context.applicationContext.cacheDir, "exo-next-prefix"),
+        LeastRecentlyUsedCacheEvictor(128L * 1024 * 1024),
+        StandaloneDatabaseProvider(context.applicationContext),
+    ).also { cache = it }
+
+    fun key(url: String, headers: Map<String, String>): String = MessageDigest.getInstance("SHA-256")
+        .digest((url + "\n" + headers.toSortedMap().entries.joinToString("\n") {
+            "${it.key}:${it.value}"
+        }).toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }
 
 class ExoPlayerPlatformViewFactory(

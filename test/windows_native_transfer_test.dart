@@ -117,8 +117,8 @@ void main() {
       expect(dart, contains('includeParentEnvironment: false'));
       expect(dart, contains("'--tls-verify=yes'"));
       expect(dart, contains('if (!usesRelay(activeCacheIndex)) return;'));
-      expect(dart, contains('if (!usesRelay(index)) return;'));
-      expect(dart, contains('usesRelay(playlistPosition + 1)'));
+      expect(dart, contains('preparedIndices.contains(index)'));
+      expect(dart, contains('shouldPreloadNextEpisode('));
     },
   );
 }

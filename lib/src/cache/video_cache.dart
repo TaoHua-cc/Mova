@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import '../network/network_http_client.dart';
 import '../network/proxy_routing.dart';
 import '../platform/window_host.dart';
+import 'cache_retention.dart';
 
 const int _kb = 1024;
 const int _mb = 1024 * _kb;
@@ -134,8 +135,8 @@ class VideoCachePolicy {
   static const int defaultMobile = 0;
   static const int nextEpisodePreheatBytes = 2 * _mb;
 
-  static int readDesktop(SharedPreferences prefs) =>
-      prefs.getInt(desktopKey) ?? defaultDesktop;
+  // Desktop retention is software-managed; keep the legacy key for rollback.
+  static int readDesktop(SharedPreferences prefs) => defaultDesktop;
 
   static int readWifi(SharedPreferences prefs) =>
       prefs.getInt(wifiKey) ?? defaultWifi;
@@ -307,6 +308,13 @@ class VideoCacheStore {
     if (_proxySources.isEmpty) unawaited(_serveProxy(server));
     final key = _keyFor(url);
     _proxySources[key] = _ProxySource(url, headers, sourceId);
+    for (final file in [
+      File(_path(key)),
+      File('${_path(key)}.part'),
+      File(_windowPath(key)),
+    ]) {
+      if (await file.exists()) await file.setLastModified(DateTime.now());
+    }
     return 'http://${server.address.address}:${server.port}/media/$key';
   }
 
@@ -799,6 +807,7 @@ class VideoCacheStore {
     var removed = 0;
     await for (final entity in _root.list(followLinks: false)) {
       if (entity is! File) continue;
+      if (_protected(entity)) continue;
       if (entity.path.endsWith('.bin')) removed++;
       await _delete(entity);
     }
@@ -807,6 +816,7 @@ class VideoCacheStore {
 
   /// 删除一个剧集的旧完整缓存、旧前缀以及当前滚动窗口。
   Future<void> deleteEpisode(String url) async {
+    if (CacheRetention.isActive(url)) return;
     final key = _keyFor(url);
     for (final path in <String>[
       _path(key),
@@ -824,6 +834,7 @@ class VideoCacheStore {
   /// 分片（`.part`）也参与计数，否则用户看两分钟就退出的那些碎片会堆成
   /// 看不见的占用。
   Future<void> prune(int limitBytes) async {
+    await pruneExpired();
     if (limitBytes <= 0) {
       await clear();
       return;
@@ -835,6 +846,7 @@ class VideoCacheStore {
       final isMedia =
           entity.path.endsWith('.bin') || entity.path.endsWith('.part');
       if (isMedia) {
+        if (_protected(entity)) continue;
         final length = await _lengthOf(entity);
         total += length;
         files.add(_CacheFile(entity, length, await _lastUsed(entity)));
@@ -846,6 +858,28 @@ class VideoCacheStore {
       if (total <= limitBytes) break;
       await _delete(entry.file);
       total -= entry.length;
+    }
+  }
+
+  bool _protected(File file) {
+    final name = file.uri.pathSegments.last.split('.').first;
+    return CacheRetention.activeUrls.any((url) => _keyFor(url) == name) ||
+        _downloads.entries.any(
+          (entry) => entry.key == name && !entry.value._completer.isCompleted,
+        );
+  }
+
+  Future<void> pruneExpired({DateTime? now}) async {
+    final cutoff = (now ?? DateTime.now())
+        .subtract(CacheRetention.maxIdle)
+        .millisecondsSinceEpoch;
+    await for (final entity in _root.list(followLinks: false)) {
+      if (entity is! File ||
+          !(entity.path.endsWith('.bin') || entity.path.endsWith('.part')) ||
+          _protected(entity)) {
+        continue;
+      }
+      if (await _lastUsed(entity) <= cutoff) await _delete(entity);
     }
   }
 
@@ -868,6 +902,8 @@ class VideoCacheStore {
       return job;
     }
     _downloads[_keyFor(url)] = job;
+    final release = CacheRetention.protect(url);
+    unawaited(job.done.whenComplete(release));
     unawaited(
       _run(
         job,
@@ -1362,7 +1398,10 @@ class VideoCacheStore {
         try {
           final data = jsonDecode(await meta.readAsString());
           if (data is Map && data['lastUsedAt'] is int) {
-            return data['lastUsedAt'] as int;
+            final modified = (await file.lastModified()).millisecondsSinceEpoch;
+            return modified > (data['lastUsedAt'] as int)
+                ? modified
+                : data['lastUsedAt'] as int;
           }
         } catch (_) {}
       }
@@ -1386,7 +1425,9 @@ class VideoCacheStore {
   Future<void> _delete(File file) async {
     final path = file.path;
     final String metaPath;
-    if (path.endsWith('.part')) {
+    if (path.endsWith('.bin.part')) {
+      metaPath = '${path.substring(0, path.length - 9)}.json';
+    } else if (path.endsWith('.part')) {
       metaPath = '${path.substring(0, path.length - 5)}.json';
     } else if (path.endsWith('.bin')) {
       metaPath = '${path.substring(0, path.length - 4)}.json';

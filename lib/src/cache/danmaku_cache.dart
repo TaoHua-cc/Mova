@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 import '../player/danmaku_client.dart';
+import 'cache_retention.dart';
 
 /// 一次弹幕缓存的内容。
 class DanmakuCacheEntry {
@@ -45,7 +46,7 @@ class DanmakuCache {
   static const Duration refreshAfter = Duration(hours: 24);
 
   /// 缓存多久没用过就删掉，避免长期堆积。
-  static const Duration maxAge = Duration(days: 60);
+  static const Duration maxAge = CacheRetention.maxIdle;
 
   /// 最多缓存多少集。
   static const int maxEntries = 400;
@@ -91,12 +92,36 @@ class DanmakuCache {
 
   String _path(String key) => '${_root.path}${Platform.pathSeparator}$key.json';
 
-  Future<DanmakuCacheEntry?> read(String key) async {
+  Future<DanmakuCacheEntry?> read(
+    String key, {
+    String? title,
+    int? season,
+    int? episode,
+  }) async {
     final file = File(_path(key));
     if (!await file.exists()) return null;
     try {
+      if ((await file.lastModified()).isBefore(
+        DateTime.now().subtract(maxAge),
+      )) {
+        await file.delete();
+        return null;
+      }
       final data = jsonDecode(await file.readAsString());
       if (data is! Map) return null;
+      if (title != null && data['episodeKey'] == null) {
+        data['episodeKey'] = keyFor(
+          apis: const [],
+          title: title,
+          season: season,
+          episode: episode,
+        );
+        await file.writeAsString(
+          jsonEncode({'episodeKey': data['episodeKey'], ...data}),
+        );
+      } else {
+        await file.setLastModified(DateTime.now());
+      }
       final raw = data['comments'];
       if (raw is! List) return null;
       final comments = DanmakuClient.retainTimelineCoverage(
@@ -128,13 +153,27 @@ class DanmakuCache {
     List<DanmakuComment> comments, {
     String? matchedEpisode,
     String? source,
+    String? title,
+    int? season,
+    int? episode,
+    String? mediaUrl,
   }) async {
-    if (comments.isEmpty) return;
+    if (comments.isEmpty ||
+        (mediaUrl != null && CacheRetention.isFinished(mediaUrl))) {
+      return;
+    }
     try {
       final boundedComments = DanmakuClient.retainTimelineCoverage(comments);
       await File(_path(key)).writeAsString(
         jsonEncode(<String, dynamic>{
           'savedAt': DateTime.now().millisecondsSinceEpoch,
+          if (title != null)
+            'episodeKey': keyFor(
+              apis: const [],
+              title: title,
+              season: season,
+              episode: episode,
+            ),
           'matched': matchedEpisode,
           'source': source,
           'coverageVersion': DanmakuClient.timelineSamplingVersion,
@@ -143,7 +182,7 @@ class DanmakuCache {
               .toList(growable: false),
         }),
       );
-      unawaited(_evictIfNeeded());
+      unawaited(pruneExpired());
     } catch (_) {}
   }
 
@@ -181,15 +220,15 @@ class DanmakuCache {
 
   /// 超出份数或过期太久的缓存删掉。写缓存后顺手跑一次，不做成定时任务 ——
   /// 弹幕缓存很小，堆到几百份也才几 MB，没必要额外维护。
-  Future<void> _evictIfNeeded() async {
+  Future<void> pruneExpired({DateTime? now}) async {
     final files = <_EntryFile>[];
     await for (final entity in _root.list(followLinks: false)) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
-      files.add(_EntryFile(entity, await _savedAt(entity)));
+      files.add(_EntryFile(entity, await entity.lastModified()));
     }
-    final cutoff = DateTime.now().subtract(maxAge);
+    final cutoff = (now ?? DateTime.now()).subtract(maxAge);
     for (final entry in files) {
-      if (entry.savedAt.isBefore(cutoff)) {
+      if (!entry.savedAt.isAfter(cutoff)) {
         try {
           await entry.file.delete();
         } catch (_) {}
@@ -204,17 +243,39 @@ class DanmakuCache {
     }
   }
 
-  Future<DateTime> _savedAt(File file) async {
-    try {
-      final data = jsonDecode(await file.readAsString());
-      if (data is Map && data['savedAt'] is int) {
-        return DateTime.fromMillisecondsSinceEpoch(data['savedAt'] as int);
-      }
-    } catch (_) {}
-    try {
-      return await file.lastModified();
-    } catch (_) {
-      return DateTime.now();
+  Future<void> deleteEpisode({
+    required String title,
+    int? season,
+    int? episode,
+    List<String> legacyApis = const [],
+  }) async {
+    final identity = keyFor(
+      apis: const [],
+      title: title,
+      season: season,
+      episode: episode,
+    );
+    final legacyKey = keyFor(
+      apis: legacyApis,
+      title: title,
+      season: season,
+      episode: episode,
+    );
+    await for (final entity in _root.list(followLinks: false)) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      try {
+        // Identity is in the header: never decode thousands of comments for
+        // each history row during startup maintenance.
+        final bytes = await entity
+            .openRead(0, 256)
+            .fold<List<int>>([], (all, chunk) => all..addAll(chunk));
+        final headerKey = RegExp(r'"episodeKey"\s*:\s*"([0-9a-f]{8})"')
+            .firstMatch(latin1.decode(bytes))
+            ?.group(1);
+        if (headerKey == identity || entity.path == _path(legacyKey)) {
+          await entity.delete();
+        }
+      } catch (_) {}
     }
   }
 

@@ -1,16 +1,29 @@
 import 'dart:convert';
 
+import 'dart:async';
+
+import '../cache/cache_retention.dart';
+
 import 'package:flutter/foundation.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../tracking/tracking_status_store.dart';
 
-/// How many watch-state rows the local store retains. Emby resume rails can
-/// return up to 50 rows (server-side `Limit=50`), so the cache must be able
-/// to hold a full rail; the visible shelf is no longer truncated to this size
-/// when a server is reachable (the merge folds the whole rail in memory).
+/// Versioned within the existing artwork ledger so old poster attempts do not
+/// prevent a one-time episode-still upgrade.
+String watchArtworkResolutionId(WatchState row) =>
+    row.episodeNumber == null ? row.mediaId : '${row.mediaId}:episode-still-v2';
+
+bool needsWatchArtwork(WatchState row) =>
+    row.imageUrl == null ||
+    row.imageUrl!.isEmpty ||
+    (row.episodeNumber != null &&
+        !row.imageUrl!.contains('image.tmdb.org/t/p/w780/'));
+
+/// History retention is separate from the visible continue-watching limit.
 const int watchStateStoreCap = 60;
+const int continueWatchingLimit = 20;
 
 class WatchState {
   const WatchState({
@@ -51,7 +64,7 @@ class WatchState {
   /// In synced mode the continue shelf represents one shared server-backed
   /// history. Local-only mode keeps the actual source visible per row.
   String visibleProgressOrigin({required bool localOnly}) =>
-      localOnly ? progressOrigin : 'server';
+      localOnly || sourceId == null ? progressOrigin : 'server';
 
   bool get isCompleted =>
       isPlayed || (duration > Duration.zero && progress >= .92);
@@ -115,6 +128,7 @@ class WatchState {
     String? title,
     String? episodeTitle,
     int? tmdbId,
+    String? progressOriginName,
   }) => WatchState(
     mediaId: mediaId,
     title: title ?? this.title,
@@ -130,7 +144,7 @@ class WatchState {
     updatedAt: updatedAt,
     isPlayed: isPlayed,
     progressOrigin: progressOrigin,
-    progressOriginName: progressOriginName,
+    progressOriginName: progressOriginName ?? this.progressOriginName,
   );
 
   WatchState withProgress({
@@ -254,6 +268,9 @@ class WatchStateStore {
   /// server's real last-played time so remote records do not masquerade as
   /// freshly watched here.
   Future<void> save(WatchState state, {DateTime? updatedAt}) async {
+    final previouslyCompleted = load().any(
+      (row) => row.mediaId == state.mediaId && row.isCompleted,
+    );
     if (updatedAt == null &&
         state.seasonNumber != null &&
         (state.position > Duration.zero || state.isCompleted)) {
@@ -279,6 +296,7 @@ class WatchStateStore {
       }
     }
     revision.value++;
+    if (state.isCompleted && !previouslyCompleted) _cleanCompleted(state);
   }
 
   Future<void> remove(String mediaId) async {
@@ -329,6 +347,37 @@ class WatchStateStore {
           .toList(),
     );
     revision.value++;
+    if (played) {
+      for (final row in next.where((row) => row.isCompleted && matches(row))) {
+        _cleanCompleted(row);
+      }
+    } else {
+      for (final row in next.where(matches)) {
+        CacheRetention.cancelCompleted(row.mediaId);
+      }
+    }
+  }
+
+  static void _cleanCompleted(WatchState state) {
+    unawaited(
+      CacheRetention.completed(
+        url: state.mediaId,
+        title: state.title,
+        season: state.seasonNumber,
+        episode: state.episodeNumber,
+      ).catchError((_) {}),
+    );
+  }
+
+  Future<void> cleanCompletedCaches() async {
+    for (final state in load().where((row) => row.isCompleted)) {
+      await CacheRetention.completed(
+        url: state.mediaId,
+        title: state.title,
+        season: state.seasonNumber,
+        episode: state.episodeNumber,
+      );
+    }
   }
 
   /// Upserts [state] exactly as given without fabricating a timestamp: rows
@@ -355,6 +404,9 @@ class WatchStateStore {
           .map((item) => jsonEncode(item.toJson()))
           .toList(),
     );
+    if (state.isCompleted && existing?.isCompleted != true) {
+      _cleanCompleted(state);
+    }
   }
 
   /// Replaces the whole store with [states] in the given order. Called after a
@@ -366,6 +418,10 @@ class WatchStateStore {
   /// (home shelf, full list page) flashed that wrong order until the next
   /// network merge finished.
   Future<void> replaceAll(Iterable<WatchState> states) async {
+    final previouslyCompleted = load()
+        .where((row) => row.isCompleted)
+        .map((row) => row.mediaId)
+        .toSet();
     final merged = states.toList();
     for (final local in load()) {
       if (local.progressOrigin != 'local' || local.updatedAt == null) continue;
@@ -386,6 +442,11 @@ class WatchStateStore {
           .toList(),
     );
     revision.value++;
+    for (final row in merged.where(
+      (row) => row.isCompleted && !previouslyCompleted.contains(row.mediaId),
+    )) {
+      _cleanCompleted(row);
+    }
   }
 
   Future<void> clear() async {
@@ -521,6 +582,7 @@ List<WatchState> continueWatchingRows(Iterable<WatchState> history) {
     }
     seen.addAll(aliases);
     result.add(row);
+    if (result.length >= continueWatchingLimit) break;
   }
   return result;
 }

@@ -50,6 +50,7 @@ class SegmentSourceSettings {
 class PlaybackSegmentQuery {
   const PlaybackSegmentQuery({
     this.tmdbId,
+    this.title,
     this.seasonNumber,
     this.episodeNumber,
     this.sourceId,
@@ -60,6 +61,9 @@ class PlaybackSegmentQuery {
   });
 
   final int? tmdbId;
+
+  /// Only for local preference compatibility; never sent to public providers.
+  final String? title;
   final int? seasonNumber;
   final int? episodeNumber;
 
@@ -102,6 +106,63 @@ String? playbackSegmentPreferencePrefix(PlaybackSegmentQuery query) {
         '${Uri.encodeComponent(item)}';
   }
   return null;
+}
+
+String? playbackSeasonSegmentPreferencePrefix(PlaybackSegmentQuery query) {
+  final season = query.seasonNumber;
+  if (season == null) return null;
+  final id = query.tmdbId;
+  if (id != null && id > 0) return 'yingji.segment.manual.tmdb.$id.s$season';
+  final title = query.title;
+  final source = query.sourceId;
+  if (title == null || title.isEmpty || source == null || source.isEmpty) {
+    return null;
+  }
+  return 'yingji.segment.manual.source.${Uri.encodeComponent(source)}.'
+      '${Uri.encodeComponent(title)}.s$season';
+}
+
+int? readManualPlaybackSegment(
+  SharedPreferences prefs,
+  PlaybackSegmentQuery query,
+  String kind,
+) {
+  final episode = playbackSegmentPreferencePrefix(query);
+  final season = playbackSeasonSegmentPreferencePrefix(query);
+  final title = query.title;
+  return (episode == null ? null : prefs.getInt('$episode.$kind')) ??
+      (season == null ? null : prefs.getInt('$season.$kind')) ??
+      (title == null || title.isEmpty || query.seasonNumber == null
+          ? null
+          : prefs.getInt('yingji.segment.$title.${query.seasonNumber}.$kind'));
+}
+
+Future<void> saveManualPlaybackSegment(
+  SharedPreferences prefs,
+  PlaybackSegmentQuery query,
+  String kind,
+  int? milliseconds, {
+  bool seasonScope = true,
+}) async {
+  if (kind != 'intro' && kind != 'outro') return;
+  final episode = playbackSegmentPreferencePrefix(query);
+  final season = playbackSeasonSegmentPreferencePrefix(query);
+  final prefix = seasonScope ? season ?? episode : episode;
+  if (prefix == null) return;
+  if (milliseconds == null) {
+    await prefs.remove('$prefix.$kind');
+    // A clear must not resurrect the old title/season mark.
+    if (seasonScope && query.title != null && query.seasonNumber != null) {
+      await prefs.remove(
+        'yingji.segment.${query.title}.${query.seasonNumber}.$kind',
+      );
+    }
+  } else {
+    await prefs.setInt('$prefix.$kind', milliseconds);
+    if (seasonScope && season != null && episode != null) {
+      await prefs.remove('$episode.$kind');
+    }
+  }
 }
 
 List<PlaybackSegment> applyManualPlaybackSegments(

@@ -1,8 +1,21 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:yingji/src/cache/video_cache.dart';
 
 void main() {
+  test(
+    'desktop cache is automatically managed without rewriting legacy prefs',
+    () async {
+      SharedPreferences.setMockInitialValues({VideoCachePolicy.desktopKey: 0});
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        VideoCachePolicy.readDesktop(prefs),
+        VideoCachePolicy.defaultDesktop,
+      );
+      expect(prefs.getInt(VideoCachePolicy.desktopKey), 0);
+    },
+  );
   test('next episode preheat stays small without shrinking retention', () {
     const retention = 2 * 1024 * 1024 * 1024;
 

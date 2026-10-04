@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'src/app.dart';
 import 'src/brand.dart';
 import 'src/cache/windows_metadata_cache.dart';
+import 'src/cache/cache_retention.dart';
+import 'src/history/watch_state_store.dart';
 import 'src/diagnostics/frame_trace.dart';
 import 'src/network/network_http_client.dart';
 import 'src/network/proxy_routing.dart';
@@ -32,6 +34,12 @@ Future<void> main() async {
   runApp(YingjiApp(startup: WindowHost.isAndroid ? null : startup));
 
   WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(
+      () async {
+        await CacheRetention.maintain();
+        await (await WatchStateStore.create()).cleanCompletedCaches();
+      }().catchError((_) {}),
+    );
     unawaited(
       WindowHost.showAppWindow(
         size: const Size(1440, 900),

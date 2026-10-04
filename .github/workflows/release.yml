@@ -329,6 +329,8 @@ jobs:
 
             Android Exo 播放期间剧集菜单滚动仍存在卡顿，尚未修复；mpv 可作为用户主动选择的兼容方案，但不保证杜比视界色彩正确。双端正式候选版长时间播放验收尚未完成，本构建不代表达到正式上架标准。
 
+            继续播放已修正服务器日期读取和单集预览图补全，但用户反馈“稳健115”记录展示仍不完整，正在复核；Windows同窗口切换资源已部署，实际切换验收尚未完成。
+
             **Windows**
             - `Mova-${{ needs.meta.outputs.version }}-Windows-x64-Setup.exe` — 安装程序（推荐）
             - `Mova-${{ needs.meta.outputs.version }}-Windows-x64-Portable.zip` — 免安装，解压即用

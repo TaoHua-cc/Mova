@@ -12,8 +12,8 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../platform/window_host.dart';
-import '../platform/native_video_host.dart';
 import 'playback_progress.dart';
+import 'next_episode_preload.dart';
 import 'playback_segments.dart';
 
 import '../brand.dart';
@@ -33,6 +33,7 @@ import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
 import '../cache/danmaku_cache.dart';
+import '../cache/cache_retention.dart';
 import '../cache/video_cache.dart';
 import '../tracking/trakt_client.dart';
 import '../tracking/trakt_auth.dart';
@@ -362,6 +363,16 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 只是少一层加速，不会因此打不开。
   VideoCacheStore? _videoCache;
   DanmakuCache? _danmakuCache;
+  final _cacheLeases = <String, void Function()>{};
+
+  void _releaseUnusedCacheLeases() {
+    for (final url
+        in _cacheLeases.keys
+            .where((url) => url != _activeEpisode.url)
+            .toList()) {
+      _cacheLeases.remove(url)?.call();
+    }
+  }
 
   /// 正在进行的后台视频缓存任务。切集或退出必须打断：否则它既继续占带宽，
   /// 又会把下一集的地址写进同一个分片文件。
@@ -409,7 +420,8 @@ class _PlayerPageState extends State<PlayerPage> {
   double _volumeStep = 5;
   Map<String, String> _shortcuts = Map.of(_defaultShortcuts);
   bool _preloadNextEpisode = true;
-  double _preloadLeadMinutes = 5;
+  bool _preloadPending = false;
+  final _preloadAttempts = <String, int>{};
   String? _preloadedUrl;
   Timer? _segmentTimer;
   bool _segmentActionPending = false;
@@ -551,6 +563,7 @@ class _PlayerPageState extends State<PlayerPage> {
       setState(() {
         _volume = next;
         _muted = next <= 0;
+        if (next > 0) _lastAudibleVolume = next;
       });
     } on PlatformException catch (_) {
       // Leave the current UI value intact when the host is unavailable.
@@ -567,6 +580,7 @@ class _PlayerPageState extends State<PlayerPage> {
         setState(() {
           _volume = actual * 100;
           _muted = _volume <= 0;
+          if (_volume > 0) _lastAudibleVolume = _volume;
         });
       }
       if (_usesAndroidExo) {
@@ -680,6 +694,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _networkBytesPerSecond =
         (event['readBytesPerSecond'] as num?)?.toDouble() ?? 0;
     final playing = event['playing'] == true;
+    if (playing) _releaseUnusedCacheLeases();
     final completed = event['completed'] == true;
     final previous = _exoState;
     _exoState = _exoState.copyWith(
@@ -1183,8 +1198,6 @@ class _PlayerPageState extends State<PlayerPage> {
     _audioLanguage = prefs.getString('yingji.player.audio-language') ?? 'zh';
     _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
     _preloadNextEpisode = prefs.getBool('yingji.player.preload-next') ?? true;
-    _preloadLeadMinutes =
-        prefs.getDouble('yingji.player.preload-lead-minutes') ?? 5;
     _seekSeconds = prefs.getDouble('yingji.player.seek-seconds') ?? 10;
     _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
     final shortcutJson = prefs.getString('yingji.player.shortcuts');
@@ -1218,7 +1231,6 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_danmakuEnabled && _danmakuApis.isNotEmpty) {
       unawaited(_loadDanmaku(prefs.getString('yingji.danmaku.token') ?? ''));
     }
-    if (!await _attachNativeVideoHost()) return;
     if (!_usesAndroidExo) await _applyMpvPreferences();
     await _openCurrentMedia();
     unawaited(_loadSegmentData());
@@ -1227,6 +1239,10 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _openCurrentMedia() async {
     final episode = _activeEpisode;
+    _cacheLeases.putIfAbsent(
+      episode.url,
+      () => CacheRetention.beginPlayback(episode.url),
+    );
     if (!_usesAndroidExo) await _applyVideoPipeline(episode);
     _subtitleChosen = false;
     _audioChosen = false;
@@ -1337,55 +1353,7 @@ class _PlayerPageState extends State<PlayerPage> {
       await _exoCommand('setRate', {'rate': _speed});
     } else {
       await _backendSetVolume(_volume);
-    }
-  }
-
-  Future<bool> _attachNativeVideoHost() async {
-    if (!WindowHost.isDesktop) return true;
-    try {
-      final handle = await NativeVideoHost.create();
-      if (handle == null || handle == 0) {
-        throw StateError('Windows 原生视频宿主创建失败');
-      }
-      // Bind this existing media_kit Player before opening media. The native
-      // gpu-next VO then presents straight into the Win32 child HWND. mpv's
-      // Win32 contract takes the HWND as an unsigned 32-bit value even in a
-      // 64-bit process; passing the sign-extended/pointer-sized representation
-      // can leave audio running while the video VO never attaches.
-      final mpvWindowId = handle & 0xffffffff;
-      await _setRequiredMpvProperty('wid', '$mpvWindowId');
-      await _setRequiredMpvProperty('vo', 'gpu-next');
-      // Do not let gpu-next auto-select Vulkan/ANGLE for an embedded HWND.
-      // D3D11 is mpv's native Windows presentation path and is also the path
-      // used by D3D11VA hardware decoding.
-      await _setRequiredMpvProperty('gpu-api', 'd3d11');
-      await _setRequiredMpvProperty('gpu-context', 'd3d11');
-      // media_kit initializes every Player with `vid=no` and normally changes
-      // it to `auto` from VideoController. Windows deliberately has no
-      // VideoController because gpu-next renders into the native HWND, so the
-      // video track must be enabled here or playback is audio-only.
-      await _setRequiredMpvProperty('vid', 'auto');
-      // Raw HWND embedding cannot be composited with Flutter widgets. Let mpv
-      // draw the playback controls in the same native surface instead.
-      await _setRequiredMpvProperty('osc', 'yes');
-      await _setRequiredMpvProperty('osd-level', '1');
-      await _setRequiredMpvProperty('input-default-bindings', 'yes');
-      await _setRequiredMpvProperty('input-vo-keyboard', 'yes');
-      await _setMpvProperty(
-        'script-opts',
-        'osc-layout=floating,osc-floatingtitle=no,osc-floatingwidth=920,'
-            'osc-floatingalpha=125,osc-windowcontrols=no,'
-            'osc-tracknumberswidth=0,osc-seekbarstyle=bar,'
-            'osc-seekrangestyle=bar,osc-timetotal=yes,'
-            'osc-icon_style=fluent,osc-hidetimeout=1800,'
-            'osc-fadeduration=180,osc-fadein=yes,osc-deadzonesize=0.82',
-      );
-      return true;
-    } catch (error) {
-      if (mounted) {
-        setState(() => _error = 'Windows 原生视频输出不可用：$error');
-      }
-      return false;
+      _releaseUnusedCacheLeases();
     }
   }
 
@@ -1498,13 +1466,19 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _deleteCompletedVideoCache(String url) async {
+    final episode = _activeEpisode;
     _completedCacheEpisodes.add(url);
     if (_activeEpisode.url == url) {
       _videoDownload?.cancel();
       await _videoDownload?.done;
       await _videoCacheProgressSubscription?.cancel();
     }
-    await _videoCache?.deleteEpisode(url);
+    await CacheRetention.completed(
+      url: url,
+      title: episode.title,
+      season: episode.seasonNumber,
+      episode: episode.episodeNumber,
+    );
     if (mounted && _activeEpisode.url == url) {
       setState(() {
         _persistentCacheFraction = 0;
@@ -1623,6 +1597,11 @@ class _PlayerPageState extends State<PlayerPage> {
         ).catchError((_) {}),
       );
       final preload = _nextEpisodePreload;
+      if (_nativeExoTransfer) {
+        try {
+          await _exoCommands?.invokeMethod<void>('cancelPreload');
+        } catch (_) {}
+      }
       preload?.cancel();
       await preload?.done;
       _nextEpisodePreload = null;
@@ -1685,40 +1664,142 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _preloadNextIfNeeded() async {
-    if (_nativeExoTransfer) return;
+    if (_state.buffering || !_state.playing) {
+      _nextEpisodePreload?.cancel();
+      if (_nativeExoTransfer && _preloadPending) {
+        try {
+          await _exoCommands?.invokeMethod<void>('cancelPreload');
+        } catch (_) {}
+      }
+      return;
+    }
     if (!_preloadNextEpisode ||
+        _preloadPending ||
+        _exitStarted ||
         _switchingEpisode ||
         widget.episodes.isEmpty ||
         _activeEpisodeIndex >= widget.episodes.length - 1) {
       return;
     }
-    final duration = _state.duration;
-    final position = _state.position;
-    if (duration <= Duration.zero ||
-        duration - position > Duration(minutes: _preloadLeadMinutes.round())) {
+    if (!shouldPreloadNextEpisode(
+      position: _state.position,
+      duration: _state.duration,
+      bufferedEnd: _state.buffer,
+      outroStart: _outroStart,
+      buffering: _state.buffering,
+    )) {
       return;
     }
-    final next = _episodeAt(_activeEpisodeIndex + 1);
-    if (_preloadedUrl == next.url) return;
-    _preloadedUrl = next.url;
-    final uri = Uri.tryParse(next.url);
-    if (uri == null || !['http', 'https'].contains(uri.scheme)) return;
-    final store = _videoCache;
-    if (store == null) return;
-    final limit = await VideoCachePolicy.current();
-    if (limit <= 0) return;
-    final job = store.download(
-      url: next.url,
-      limitBytes: limit,
-      targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
-      headers: next.headers,
-      title: next.title,
-      sourceId: next.sourceId,
-    );
-    _nextEpisodePreload = job;
-    await job.done;
-    if (job.state.status == VideoCacheStatus.unavailable) {
-      _preloadedUrl = null;
+    final index = _activeEpisodeIndex;
+    final attemptKey = '${_activeEpisode.url}:$index';
+    if ((_preloadAttempts[attemptKey] ?? 0) >= 2) return;
+    _preloadPending = true;
+    try {
+      var next = _episodeAt(index + 1);
+      if (next.url.isNotEmpty && _preloadedUrl == next.url) return;
+      _preloadAttempts[attemptKey] = (_preloadAttempts[attemptKey] ?? 0) + 1;
+      final limit = await VideoCachePolicy.current();
+      if (limit <= 0) return;
+      if (next.url.isEmpty) {
+        next = await _prepareNextResource(next)
+            .timeout(const Duration(seconds: 25), onTimeout: () => next);
+      }
+      if (!mounted ||
+          _exitStarted ||
+          _switchingEpisode ||
+          index != _activeEpisodeIndex ||
+          !_state.playing ||
+          _state.buffering) {
+        return;
+      }
+      final uri = Uri.tryParse(next.url);
+      if (uri == null || !['http', 'https'].contains(uri.scheme)) return;
+      if (_nativeExoTransfer) {
+        if (ProxyRouting.serverUsesProxy(next.sourceId ?? '')) return;
+        final ready = await _exoCommands?.invokeMethod<bool>('preloadNext', {
+          'url': next.url,
+          'headers': next.headers,
+        });
+        if (ready == true && mounted && index == _activeEpisodeIndex) {
+          _preloadedUrl = next.url;
+        }
+        return;
+      }
+      final store = _videoCache;
+      if (store == null) return;
+      final job = store.download(
+        url: next.url,
+        limitBytes: limit,
+        targetBytes: VideoCachePolicy.nextEpisodePreheatBytes,
+        headers: next.headers,
+        title: next.title,
+        sourceId: next.sourceId,
+      );
+      _nextEpisodePreload = job;
+      await job.done;
+      if (!job.isCancelled &&
+          job.state.status != VideoCacheStatus.unavailable &&
+          job.state.receivedBytes > 0 &&
+          mounted &&
+          index == _activeEpisodeIndex) {
+        _preloadedUrl = next.url;
+      }
+    } catch (_) {
+      // Optional preloading never interrupts playback or changes selection.
+    } finally {
+      _preloadPending = false;
+    }
+  }
+
+  Future<PlayerEpisode> _prepareNextResource(PlayerEpisode next) async {
+    final current = _activeEpisode;
+    final store = await SourceStore.create();
+    final source = store
+        .load()
+        .where((row) => row.id == current.sourceId)
+        .firstOrNull;
+    final itemId = current.serverItemId;
+    if (source == null || source.kind == SourceKind.webdav || itemId == null) {
+      return next;
+    }
+    final token = store.tokenFor(source);
+    if (token == null || token.isEmpty) return next;
+    final client = EmbyClient(proxy: ProxyRouting.serverUsesProxy(source.id));
+    try {
+      final session = await client.resolveSession(
+        EmbySession(source: source, token: token),
+      );
+      final currentItem = await client.itemById(session, itemId);
+      final seriesId = currentItem.seriesId;
+      if (seriesId == null || seriesId.isEmpty) return next;
+      final rows = await client.episodesForSeries(
+        session,
+        seriesId,
+        seasonNumber: next.seasonNumber,
+        episodeNumber: next.episodeNumber,
+      );
+      final resource = rows
+          .where(
+            (row) =>
+                row.seasonNumber == next.seasonNumber &&
+                row.episodeNumber == next.episodeNumber &&
+                row.playbackUrl != null,
+          )
+          .firstOrNull;
+      if (resource == null) return next;
+      return next.withResource(
+        PlayerResourceOption(
+          url: resource.playbackUrl.toString(),
+          label: next.resourceInfo ?? '',
+          headers: resource.headers,
+          sourceId: source.id,
+          serverItemId: resource.id,
+          source: source,
+          videoRange: resource.videoRange,
+        ),
+      );
+    } finally {
+      client.dispose();
     }
   }
 
@@ -1754,6 +1835,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   PlaybackSegmentQuery get _activeSegmentQuery => PlaybackSegmentQuery(
+    title: _activeEpisode.title,
     tmdbId: _activeEpisode.tmdbId,
     seasonNumber: _activeEpisode.seasonNumber,
     episodeNumber: _activeEpisode.episodeNumber,
@@ -1762,19 +1844,22 @@ class _PlayerPageState extends State<PlayerPage> {
   );
 
   Future<void> _loadSegmentPreferences(SharedPreferences prefs) async {
-    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
-    final manualIntro = prefix == null ? null : prefs.getInt('$prefix.intro');
-    final manualOutro = prefix == null ? null : prefs.getInt('$prefix.outro');
-    final intro =
-        manualIntro ?? prefs.getInt('yingji.segment.$_segmentKey.intro');
-    final outro =
-        manualOutro ?? prefs.getInt('yingji.segment.$_segmentKey.outro');
+    final intro = readManualPlaybackSegment(
+      prefs,
+      _activeSegmentQuery,
+      'intro',
+    );
+    final outro = readManualPlaybackSegment(
+      prefs,
+      _activeSegmentQuery,
+      'outro',
+    );
     if (!mounted) return;
     setState(() {
       _introEnd = intro == null ? null : Duration(milliseconds: intro);
       _outroStart = outro == null ? null : Duration(milliseconds: outro);
-      _manualIntro = manualIntro != null;
-      _manualOutro = manualOutro != null;
+      _manualIntro = intro != null;
+      _manualOutro = outro != null;
       _autoSkipSegments =
           prefs.getBool('yingji.segment.$_segmentKey.enabled') ??
           prefs.getBool('yingji.segment.auto-skip') ??
@@ -1796,6 +1881,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _loadSegmentData() async {
     final episode = _activeEpisode;
+    final episodeIndex = _activeEpisodeIndex;
     // 片头片尾的取数逻辑与 Windows 原生播放器共用一份（playback_segments.dart）：
     // 两条链路读同一批来源开关，设置里关掉哪个来源就都不会去查。
     final result = await loadPlaybackSegments(
@@ -1816,8 +1902,16 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       ),
     );
-    if (!mounted) return;
-    final segments = result.segments;
+    if (!mounted ||
+        episodeIndex != _activeEpisodeIndex ||
+        episode.url != _activeEpisode.url) {
+      return;
+    }
+    final segments = applyManualPlaybackSegments(
+      result.segments,
+      introEnd: _manualIntro ? _introEnd : null,
+      outroStart: _manualOutro ? _outroStart : null,
+    );
     final intro = segments
         .where((item) => item.type == PlaybackSegmentType.intro)
         .firstOrNull;
@@ -1835,14 +1929,16 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _setSegment({required bool intro}) async {
     // A manual mark intentionally overrides any provider data for this title.
     final value = _state.position;
+    final query = _activeSegmentQuery;
+    final episodeIndex = _activeEpisodeIndex;
     final prefs = await SharedPreferences.getInstance();
-    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
-    if (prefix == null) return;
-    await prefs.setInt(
-      '$prefix.${intro ? 'intro' : 'outro'}',
+    await saveManualPlaybackSegment(
+      prefs,
+      query,
+      intro ? 'intro' : 'outro',
       value.inMilliseconds,
     );
-    if (!mounted) return;
+    if (!mounted || episodeIndex != _activeEpisodeIndex) return;
     setState(() {
       if (intro) {
         _introEnd = value;
@@ -1851,15 +1947,25 @@ class _PlayerPageState extends State<PlayerPage> {
         _outroStart = value;
         _manualOutro = true;
       }
+      _segments = applyManualPlaybackSegments(
+        _segments,
+        introEnd: _manualIntro ? _introEnd : null,
+        outroStart: _manualOutro ? _outroStart : null,
+      );
     });
   }
 
   Future<void> _clearSegment({required bool intro}) async {
-    final prefix = playbackSegmentPreferencePrefix(_activeSegmentQuery);
-    if (prefix == null) return;
+    final query = _activeSegmentQuery;
+    final episodeIndex = _activeEpisodeIndex;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('$prefix.${intro ? 'intro' : 'outro'}');
-    if (!mounted) return;
+    await saveManualPlaybackSegment(
+      prefs,
+      query,
+      intro ? 'intro' : 'outro',
+      null,
+    );
+    if (!mounted || episodeIndex != _activeEpisodeIndex) return;
     setState(() {
       if (intro) {
         _introEnd = null;
@@ -1869,6 +1975,7 @@ class _PlayerPageState extends State<PlayerPage> {
         _manualOutro = false;
       }
     });
+    await _loadSegmentPreferences(prefs);
     await _loadSegmentData();
   }
 
@@ -2067,13 +2174,21 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     final apis = _danmakuApis.isEmpty ? [_danmakuUrl] : _danmakuApis;
     final cache = _danmakuCache;
+    final cacheEpisode = _activeEpisode;
     final cacheKey = DanmakuCache.keyFor(
       apis: apis,
       title: _activeEpisode.title,
       season: _activeEpisode.seasonNumber,
       episode: _activeEpisode.episodeNumber,
     );
-    final cached = cache == null ? null : await cache.read(cacheKey);
+    final cached = cache == null
+        ? null
+        : await cache.read(
+            cacheKey,
+            title: _activeEpisode.title,
+            season: _activeEpisode.seasonNumber,
+            episode: _activeEpisode.episodeNumber,
+          );
     if (cached != null && cached.comments.isNotEmpty) {
       if (!mounted || request != _danmakuRequest) return;
       setState(() {
@@ -2123,10 +2238,15 @@ class _PlayerPageState extends State<PlayerPage> {
           _danmakuError = null;
         });
       }
+      if (!mounted || request != _danmakuRequest) return;
       await cache?.write(
         cacheKey,
         comments.$2,
         matchedEpisode: source?.matchedEpisode,
+        title: cacheEpisode.title,
+        season: cacheEpisode.seasonNumber,
+        episode: cacheEpisode.episodeNumber,
+        mediaUrl: cacheEpisode.url,
       );
     } catch (error) {
       if (mounted && request == _danmakuRequest) {
@@ -2236,10 +2356,6 @@ class _PlayerPageState extends State<PlayerPage> {
     } catch (_) {
       // Keep playback available on libmpv builds without an optional property.
     }
-  }
-
-  Future<void> _setRequiredMpvProperty(String name, String value) async {
-    await (_player!.platform as dynamic).setProperty(name, value);
   }
 
   Future<void> _setAudioPreference({bool? downmix, bool? night}) async {
@@ -2404,6 +2520,12 @@ class _PlayerPageState extends State<PlayerPage> {
       // Subtitle cleanup still runs if the platform player fails to dispose.
     }
     await _deleteDownloadedSubtitles();
+    await _videoDownload?.done;
+    await _nextEpisodePreload?.done;
+    for (final release in _cacheLeases.values) {
+      release();
+    }
+    _cacheLeases.clear();
   }
 
   Future<void> _deleteDownloadedSubtitles() async {
@@ -2442,6 +2564,12 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       ),
     );
+    if (state.duration > Duration.zero &&
+        state.position.inMilliseconds / state.duration.inMilliseconds >= .92 &&
+        !_completedCacheEpisodes.contains(_activeEpisode.url)) {
+      _completedCacheEpisodes.add(_activeEpisode.url);
+      _videoDownload?.cancel();
+    }
   }
 
   /// Mints a fresh UUIDv4 for a playback session (RFC 4122 layout). Emby keys
@@ -2707,15 +2835,7 @@ class _PlayerPageState extends State<PlayerPage> {
                   //
                   // media_kit 自带的原生控制条也必须关掉，否则折叠模式下
                   // 会多出一条原生控制栏。
-                  if (WindowHost.isDesktop)
-                    NativeVideoSurface(
-                      visible:
-                          !_settingsOpen &&
-                          _error == null &&
-                          _skipKind == null &&
-                          !_gestureVisible,
-                    )
-                  else if (_usesAndroidExo && _exoPlaybackUrl != null)
+                  if (_usesAndroidExo && _exoPlaybackUrl != null)
                     AnimatedBuilder(
                       animation: ModalRoute.of(context)!.animation!,
                       builder: (context, child) {
@@ -2751,6 +2871,8 @@ class _PlayerPageState extends State<PlayerPage> {
                               creationParams: {
                                 'url': _exoPlaybackUrl,
                                 'headers': _exoHeaders,
+                                'nativeCache': _nativeExoTransfer,
+                                'cacheUrl': _activeEpisode.url,
                                 'transferTrace': const bool.fromEnvironment(
                                   'MOVA_TRANSFER_TRACE',
                                 ),
@@ -2917,13 +3039,14 @@ class _PlayerPageState extends State<PlayerPage> {
             padding: const EdgeInsets.fromLTRB(22, 14, 12, 0),
             child: Row(
               children: [
-                YingjiMotionIconButton(
-                  tooltip: '返回',
-                  onPressed: () => _exitPlayer(context),
-                  icon: YingjiIcons.chevron_left,
-                  size: 48,
-                ),
-                const SizedBox(width: 16),
+                if (!WindowHost.isAndroid)
+                  YingjiMotionIconButton(
+                    tooltip: '返回',
+                    onPressed: () => _exitPlayer(context),
+                    icon: YingjiIcons.chevron_left,
+                    size: 48,
+                  ),
+                if (!WindowHost.isAndroid) const SizedBox(width: 16),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -3002,7 +3125,7 @@ class _PlayerPageState extends State<PlayerPage> {
                             Orientation.portrait
                         ? '切换为横屏'
                         : '切换为竖屏',
-                    size: 46,
+                    size: 44,
                     onPressed: () => WindowHost.setPlayerOrientation(
                       portrait:
                           MediaQuery.orientationOf(context) ==
@@ -3013,8 +3136,15 @@ class _PlayerPageState extends State<PlayerPage> {
                   YingjiMotionIconButton(
                     icon: Icons.picture_in_picture_alt_rounded,
                     tooltip: '画中画',
-                    size: 46,
+                    size: 44,
                     onPressed: _enterPictureInPicture,
+                  ),
+                  const SizedBox(width: 8),
+                  YingjiMotionIconButton(
+                    icon: YingjiIcons.xmark,
+                    tooltip: '关闭播放器',
+                    size: 44,
+                    onPressed: () => _exitPlayer(context),
                   ),
                 ],
                 if (WindowHost.isDesktop) ...[
@@ -3713,6 +3843,11 @@ class _PlayerPageState extends State<PlayerPage> {
             ),
         ],
         const SizedBox(height: 12),
+        const Text(
+          '手动设置应用于当前季全部剧集',
+          style: TextStyle(fontSize: 12, color: Colors.white70),
+        ),
+        const SizedBox(height: 8),
         _consoleAction(
           YingjiIcons.scissors,
           _introEnd == null ? '将当前位置设为片头结束' : '片头结束 · ${_time(_introEnd!)}',
@@ -3978,7 +4113,7 @@ class _PlayerPageState extends State<PlayerPage> {
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
             YingjiMotionIconButton(
-              tooltip: _muted ? '恢复声音' : '静音',
+              tooltip: _muted ? '恢复上次音量' : '音量设为 0',
               onPressed: _toggleMute,
               icon: _muted
                   ? YingjiIcons.speaker_slash
@@ -3994,6 +4129,7 @@ class _PlayerPageState extends State<PlayerPage> {
                 value: _volume,
                 min: 0,
                 max: 100,
+                allowedInteraction: SliderInteraction.tapAndSlide,
                 onChanged: _setVolume,
               ),
             ),

@@ -5,6 +5,14 @@ import 'package:http/http.dart' as http;
 import '../metadata/tmdb_client.dart';
 import 'broadcast_platforms.dart';
 
+bool traktPublishedAirtime(String value) {
+  if (!RegExp(r'(Z|[+-]\d{2}:\d{2})$').hasMatch(value)) return false;
+  final aired = DateTime.tryParse(value);
+  if (aired == null) return false;
+  final utc = value.endsWith('Z') || value.endsWith('+00:00');
+  return !(utc && aired.hour == 0 && aired.minute == 0 && aired.second == 0);
+}
+
 class TraktEvent {
   const TraktEvent({
     required this.title,
@@ -22,6 +30,8 @@ class TraktEvent {
     this.totalEpisodes,
     this.platformLogoUrl,
     this.platforms = const {},
+    this.source = 'Trakt',
+    this.seriesFinale = false,
   });
   final String title;
   final String episode;
@@ -40,6 +50,8 @@ class TraktEvent {
   final int? totalEpisodes;
   final Uri? platformLogoUrl;
   final Map<String, Uri?> platforms;
+  final String source;
+  final bool seriesFinale;
   Map<String, Uri?> get broadcastPlatforms => mergeBroadcastPlatforms([
     platforms,
     if (platform?.isNotEmpty == true) {platform!: platformLogoUrl},
@@ -53,6 +65,8 @@ class TraktEvent {
     'backdropUrl': backdropUrl?.toString(),
     'platform': platform,
     'timeKnown': timeKnown,
+    'source': source,
+    'seriesFinale': seriesFinale,
     'tmdbId': tmdbId,
     'traktId': traktId,
     'seasonNumber': seasonNumber,
@@ -85,6 +99,9 @@ class TraktEvent {
           )
         : const {},
     timeKnown: value['timeKnown'] != false,
+    source:
+        '${value['source'] ?? (value['traktId'] != null ? 'Trakt' : '未知来源')}',
+    seriesFinale: value['seriesFinale'] == true,
     tmdbId: (value['tmdbId'] as num?)?.toInt(),
     traktId: (value['traktId'] as num?)?.toInt(),
     seasonNumber: (value['seasonNumber'] as num?)?.toInt(),
@@ -173,6 +190,58 @@ class TraktDiscoveryItem {
 class TraktClient {
   TraktClient({http.Client? client}) : _client = client ?? http.Client();
   final http.Client _client;
+
+  Future<({Map show, Map? next, Map? last})?> showAiring({
+    required int tmdbId,
+    required String clientId,
+    required String accessToken,
+  }) async {
+    final headers = {
+      'trakt-api-version': '2',
+      'trakt-api-key': clientId,
+      'Accept': 'application/json',
+      if (accessToken.isNotEmpty) 'Authorization': 'Bearer $accessToken',
+    };
+    Future<dynamic> get(String path, Map<String, String> query) async {
+      final response = await _client
+          .get(Uri.https('api.trakt.tv', path, query), headers: headers)
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode == 204) return null;
+      if (response.statusCode != 200) {
+        throw Exception('Trakt 播出安排读取失败（HTTP ${response.statusCode}）');
+      }
+      return jsonDecode(response.body);
+    }
+
+    final found = await get('/search/tmdb/$tmdbId', {
+      'type': 'show',
+      'extended': 'full',
+    });
+    if (found is! List) return null;
+    final show = found
+        .whereType<Map>()
+        .map((row) => row['show'])
+        .whereType<Map>()
+        .where(
+          (row) => row['ids'] is Map && (row['ids'] as Map)['tmdb'] == tmdbId,
+        )
+        .firstOrNull;
+    final id = show == null ? null : (show['ids'] as Map)['trakt'];
+    if (show == null || id is! num || id <= 0) return null;
+    final next = await get('/shows/${id.toInt()}/next_episode', {
+      'extended': 'full',
+    });
+    Map? last;
+    try {
+      final value = await get('/shows/${id.toInt()}/last_episode', {
+        'extended': 'full',
+      });
+      last = value is Map ? value : null;
+    } catch (_) {
+      // The upcoming schedule remains usable when no last episode is available.
+    }
+    return (show: show, next: next is Map ? next : null, last: last);
+  }
 
   Future<String> accountUuid({
     required String clientId,
@@ -481,6 +550,8 @@ class TraktClient {
               ? fanart['full'] as String?
               : null;
           return TraktEvent(
+            source: 'Trakt',
+            seriesFinale: episode['episode_type'] == 'series_finale',
             tmdbId: ((show['ids'] as Map?)?['tmdb'] as num?)?.toInt(),
             traktId: ((show['ids'] as Map?)?['trakt'] as num?)?.toInt(),
             seasonNumber: (episode['season'] as num?)?.toInt(),
@@ -503,15 +574,7 @@ class TraktClient {
         .toList(growable: false);
   }
 
-  bool _hasPublishedAirtime(String value) {
-    if (!RegExp(r'(Z|[+-]\d{2}:\d{2})$').hasMatch(value)) return false;
-    final aired = DateTime.tryParse(value);
-    if (aired == null) return false;
-    // Trakt may encode a date-only placeholder as midnight UTC. Do not present
-    // that transport default as a confirmed local broadcast time.
-    final utc = value.endsWith('Z') || value.endsWith('+00:00');
-    return !(utc && aired.hour == 0 && aired.minute == 0 && aired.second == 0);
-  }
+  bool _hasPublishedAirtime(String value) => traktPublishedAirtime(value);
 
   /// Read both media types from the authenticated Trakt watchlist.
   Future<List<TmdbItem>> watchlist({

@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 3.1.120+131
+version: 3.1.121+132
 environment:
   sdk: ^3.13.2
 
@@ -71,9 +71,7 @@ flutter:
     - assets/defaults/
     - assets/defaults/posters/
     - app/assets/ratings/
-    - app/yingji-hero-original.png
-    - app/yingji-posters-original.png
-    - app/assets/
+    - app/assets/mova-logo.png
     - app/fonts/AlimamaFangYuanTi-Player.ttf
     # 注：已移除 windows/runner/resources/app_icon.ico
     # 该 .ico 由 Windows 打包流程直接使用，无需进入 Flutter assets；

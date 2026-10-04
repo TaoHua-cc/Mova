@@ -156,6 +156,26 @@ void main() {
   );
 
   test(
+    'finished next-episode preheat reuses prefix before fetching missing tail',
+    () async {
+      final job = store.download(
+        url: url(),
+        limitBytes: media.length,
+        targetBytes: 64 * 1024,
+      );
+      await job.done;
+      expect(job.state.status, VideoCacheStatus.buffered);
+      expect(job.state.receivedBytes, 64 * 1024);
+      final proxy = await store.playbackUrl(url());
+      final (response, bytes) = await play(proxy)
+          .timeout(const Duration(seconds: 10));
+      expect(response.statusCode, 206);
+      expect(bytes, orderedEquals(media));
+      expect(ranges, [null, 'bytes=65536-262143']);
+    },
+  );
+
+  test(
     'cancelled download retains prefix and playback recovers remaining bytes',
     () async {
       final proxy = await store.playbackUrl(url());

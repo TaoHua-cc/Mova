@@ -25,9 +25,6 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  native_video_host_ = std::make_unique<NativeVideoHost>(
-      flutter_controller_->engine()->messenger(),
-      flutter_controller_->view()->GetNativeWindow());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   // WindowHost shows the first frame after applying size, chrome and centering.
@@ -42,7 +39,6 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
-  native_video_host_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

@@ -193,8 +193,6 @@ void main() {
       RegExp(r'SyncGlassWindowOrigin\(window\);').allMatches(native).length,
       greaterThanOrEqualTo(2),
     );
-    expect(native, contains('(g_controls && IsWindowVisible(g_controls))'));
-    expect(native, contains('(g_top_bar && IsWindowVisible(g_top_bar))'));
     // 播放键使用轻量圆片，重播入口复用固定玻璃；均不采样视频。
     expect(native, contains('graphics.FillPath(&button_surface, &disc_path)'));
     expect(native, contains('FillGlassSurface(graphics, replay_path'));
@@ -209,26 +207,14 @@ void main() {
       ),
     );
     // 背景通过路径抗锯齿填充，避免图片硬裁切与播放键重叠光圈。
-    expect(native, contains('graphics.FillPath(&backdrop, &path)'));
     expect(native, isNot(contains('const float glow_size')));
     // 原生降采样已经自带低通，不能再按完整 DPI 强度把视频颜色洗成灰块。
-    expect(native, contains('g_glass_blur.load() * 0.55'));
     // 弹幕和 mpv 字幕都要避开播放器自己的顶部、底部控制区域。
     expect(native, contains('origin.y + safe_top'));
     expect(native, contains('SetOption(g_handle, "sub-pos", "84")'));
-    // 保留旧采样实现但不调用，固定玻璃不得启动实时视频采样。
-    expect(native, contains('std::thread glass_backdrop'));
-    expect(
-      native,
-      contains('constexpr ULONGLONG kGlassBackdropRefreshMs = 66;'),
-    );
-    expect(native, contains('constexpr int kGlassDownscale = 6;'));
-    expect(native, contains('Sleep(50);'));
-    expect(native, contains('bool CaptureGlassLayer('));
-    expect(native, isNot(contains('HDC screen = GetDC(nullptr);')));
-    expect(native, contains('const std::array<HWND, 2> windows'));
-    expect(native, contains('PrintWindow(g_window'));
-    expect(native, contains('g_backdrop.captured_at.load()'));
+    expect(native, isNot(contains('std::thread glass_backdrop')));
+    expect(native, isNot(contains('PrintWindow(')));
+    expect(native, isNot(contains('CaptureGlassLayer')));
     // 操作提示固定为同一种轻透明胶囊，不得等待视频背板后再切换模糊材质。
     final hintSurface = native.substring(
       native.indexOf('void FillHintGlassSurface('),

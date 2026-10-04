@@ -424,7 +424,10 @@ class EmbyClient {
       'IncludeItemTypes': 'Movie,Episode',
       'Recursive': 'true',
       'Limit': '50',
-      'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,ImageTags,SeriesPrimaryImageTag',
+      'SortBy': 'DatePlayed',
+      'SortOrder': 'Descending',
+      // Emby omits LastPlayedDate from list UserData unless explicitly requested.
+      'Fields': 'Overview,ProviderIds,MediaSources,RunTimeTicks,ProductionYear,PremiereDate,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,Chapters,UserData,UserDataLastPlayedDate,ImageTags,SeriesPrimaryImageTag',
       'api_key': session.token,
     };
     final headers = {
@@ -441,7 +444,16 @@ class EmbyClient {
           headers: headers,
         )
         .timeout(const Duration(seconds: 15));
-    if (response.statusCode == 404 || response.statusCode == 405) {
+    // Some servers return 200 with an empty Resume rail even though their
+    // per-user Items/IsResumable query has genuine saved playback progress.
+    final emptyResume =
+        response.statusCode == 200 &&
+        ((jsonDecode(response.body) as Map<String, dynamic>)['Items'] as List?)
+                ?.isNotEmpty !=
+            true;
+    if (response.statusCode == 404 ||
+        response.statusCode == 405 ||
+        emptyResume) {
       response = await _client
           .get(
             session.source.endpoint
@@ -462,11 +474,65 @@ class EmbyClient {
       throw Exception(_message(response.statusCode, '服务器继续观看读取失败'));
     }
     final data = jsonDecode(response.body) as Map<String, dynamic>;
-    return (data['Items'] as List<dynamic>? ?? const [])
+    final rows = (data['Items'] as List<dynamic>? ?? const [])
         .whereType<Map<String, dynamic>>()
         .map((item) => _item(session, item))
         .where((item) => item.playbackPosition != null)
         .toList(growable: false);
+    if (!emptyResume &&
+        rows.any(
+          (item) =>
+              item.playbackPosition! > Duration.zero &&
+              item.lastPlayedAt == null,
+        )) {
+      try {
+        final fallback = await _client
+            .get(
+              session.source.endpoint
+                  .resolve('Users/$userId/Items')
+                  .replace(
+                    queryParameters: {
+                      ...query,
+                      'Filters': 'IsResumable',
+                      'Fields': 'UserData,UserDataLastPlayedDate',
+                    },
+                  ),
+              headers: headers,
+            )
+            .timeout(const Duration(seconds: 15));
+        if (fallback.statusCode == 200) {
+          final root = jsonDecode(fallback.body) as Map<String, dynamic>;
+          final byId = {
+            for (final value
+                in (root['Items'] as List? ?? const [])
+                    .whereType<Map<String, dynamic>>())
+              '${value['Id']}': value,
+          };
+          return rows
+              .map((item) {
+                if (item.lastPlayedAt != null) return item;
+                final value = byId[item.id];
+                if (value == null) return item;
+                final date = (value['UserData'] as Map?)?['LastPlayedDate'];
+                if (DateTime.tryParse('$date') == null) return item;
+                final original = (data['Items'] as List)
+                    .whereType<Map<String, dynamic>>()
+                    .firstWhere((row) => '${row['Id']}' == item.id);
+                return _item(session, {
+                  ...original,
+                  'UserData': {
+                    ...?original['UserData'] as Map<String, dynamic>?,
+                    'LastPlayedDate': date,
+                  },
+                });
+              })
+              .toList(growable: false);
+        }
+      } catch (_) {
+        // Date enrichment must not discard otherwise usable resume records.
+      }
+    }
+    return rows;
   }
 
   Future<List<MediaItem>> search(

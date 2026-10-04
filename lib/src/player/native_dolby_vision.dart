@@ -33,36 +33,6 @@ class NativeDolbyVisionCapabilities {
   );
 }
 
-class NativeDolbyVisionPlaybackResult {
-  const NativeDolbyVisionPlaybackResult({
-    required this.position,
-    required this.duration,
-    required this.completed,
-    required this.nativeDolbyVision,
-    this.error,
-  });
-
-  final Duration position;
-  final Duration duration;
-  final bool completed;
-  final bool nativeDolbyVision;
-  final String? error;
-
-  factory NativeDolbyVisionPlaybackResult.fromMap(Map<Object?, Object?> value) {
-    return NativeDolbyVisionPlaybackResult(
-      position: Duration(
-        milliseconds: (value['positionMs'] as num?)?.toInt() ?? 0,
-      ),
-      duration: Duration(
-        milliseconds: (value['durationMs'] as num?)?.toInt() ?? 0,
-      ),
-      completed: value['completed'] == true,
-      nativeDolbyVision: value['nativeDolbyVision'] == true,
-      error: value['error'] as String?,
-    );
-  }
-}
-
 /// Bridge to Android's licensed Dolby Vision MediaCodec/display pipeline.
 class NativeDolbyVisionPlayer {
   NativeDolbyVisionPlayer._();
@@ -98,32 +68,5 @@ class NativeDolbyVisionPlayer {
     } on MissingPluginException {
       return NativeDolbyVisionCapabilities.unavailable;
     }
-  }
-
-  static Future<NativeDolbyVisionPlaybackResult> play({
-    required String url,
-    required String title,
-    required Map<String, String> headers,
-    required Duration initialPosition,
-    String? container,
-    bool useExoPlayer = false,
-  }) async {
-    final value = await _channel.invokeMapMethod<Object?, Object?>(
-      useExoPlayer ? 'playExoPlayer' : 'playDolbyVision',
-      {
-        'url': url,
-        'title': title,
-        'headers': headers,
-        'positionMs': initialPosition.inMilliseconds,
-        if (container != null) 'container': container,
-      },
-    );
-    if (value == null) {
-      throw PlatformException(
-        code: 'empty_result',
-        message: '原生 Dolby Vision 播放器未返回状态',
-      );
-    }
-    return NativeDolbyVisionPlaybackResult.fromMap(value);
   }
 }

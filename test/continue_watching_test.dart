@@ -1,9 +1,89 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:yingji/src/history/watch_state_store.dart';
 
 void main() {
+  test('episode posters upgrade once while resolved stills stay cached', () {
+    const row = WatchState(
+      mediaId: 'episode',
+      title: 'Series',
+      position: Duration(minutes: 2),
+      duration: Duration(minutes: 40),
+      episodeNumber: 3,
+      imageUrl: 'https://image.tmdb.org/t/p/w500/poster.jpg',
+    );
+    expect(needsWatchArtwork(row), isTrue);
+    expect(watchArtworkResolutionId(row), 'episode:episode-still-v2');
+    expect(
+      needsWatchArtwork(
+        row.withImage('https://image.tmdb.org/t/p/w780/still.jpg'),
+      ),
+      isFalse,
+    );
+  });
+  test(
+    'continue shelf returns latest 20 without deleting episode history',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final history = List.generate(
+        30,
+        (i) => WatchState(
+          mediaId: 'movie-$i',
+          title: '电影 $i',
+          position: const Duration(minutes: 5),
+          duration: const Duration(minutes: 90),
+          updatedAt: DateTime(2026, 10, 1).add(Duration(minutes: i)),
+        ),
+      );
+      final store = await WatchStateStore.create();
+      await store.replaceAll(history);
+      final visible = store.visibleContinueRows(store.load());
+      expect(visible, hasLength(20));
+      expect(visible.first.mediaId, 'movie-29');
+      expect(visible.last.mediaId, 'movie-10');
+      expect(store.load(), hasLength(30));
+      await store.hideFromContinueWatching(visible.first);
+      expect(store.visibleContinueRows(store.load()).last.mediaId, 'movie-9');
+    },
+  );
+
+  test('server name update preserves progress and playback identity', () {
+    final row = WatchState(
+      mediaId: 'url',
+      title: '剧名',
+      sourceId: 'a',
+      serverItemId: 'e2',
+      position: const Duration(minutes: 12),
+      duration: const Duration(minutes: 45),
+      updatedAt: DateTime(2026, 10, 4),
+    );
+    final named = row.withEpisodeMetadata(progressOriginName: '主线路');
+    expect(named.progressOriginName, '主线路');
+    expect(named.position, row.position);
+    expect(named.updatedAt, row.updatedAt);
+    expect(named.sourceId, 'a');
+    expect(WatchState.fromJson(named.toJson()).progressOriginName, '主线路');
+  });
+
+  test('resume refresh is wired without refreshing home posters', () {
+    final source = File('lib/src/media_center.dart').readAsStringSync();
+    expect(source, contains('onResume: _handleHomeFocus'));
+    expect(source, contains('AppLifecycleListener(onResume: _load)'));
+    expect(
+      source,
+      contains('WindowsNativePlayer.retryPendingWatchSync().timeout('),
+    );
+    expect(source, contains('state.progressOriginName!'));
+    final focus = source.substring(
+      source.indexOf('void _handleHomeFocus()'),
+      source.indexOf('/// 后台刷新可能'),
+    );
+    expect(focus, contains('_loadHistory()'));
+    expect(focus, isNot(contains('_loadCarouselItems()')));
+  });
   WatchState episode(
     String id,
     int seconds,
@@ -146,6 +226,7 @@ void main() {
         position: const Duration(minutes: 8),
         duration: const Duration(minutes: 45),
         progressOrigin: origin,
+        sourceId: 'server-a',
       );
 
       for (final origin in ['local', 'server', 'trakt']) {

@@ -34,6 +34,7 @@ import 'history/watch_state_store.dart';
 import 'history/watchlist_store.dart';
 import 'metadata/metadata_detail_page.dart';
 import 'metadata/tmdb_client.dart';
+import 'metadata/series_airing.dart';
 import 'metadata/ratings.dart';
 import 'playlists/playlist_store.dart';
 import 'playlists/playlist_detail_page.dart';
@@ -1062,11 +1063,13 @@ class _CinematicHomeState extends State<_CinematicHome>
     super.initState();
     _trending = _loadCarouselItems();
     _loadHomePreferences();
-    _lifecycle = AppLifecycleListener(onStateChange: (_) => _syncHeroTimer());
+    _lifecycle = AppLifecycleListener(
+      onStateChange: (_) => _syncHeroTimer(),
+      onResume: _handleHomeFocus,
+    );
     _loadHistory();
     yingjiHomeFocusTick.addListener(_handleHomeFocus);
     WatchStateStore.revision.addListener(_refreshLocalWatchHistory);
-    unawaited(WindowsNativePlayer.retryPendingWatchSync());
     yingjiSectionFocus.addListener(_syncHeroTimer);
     yingjiHomeScrollDepth.addListener(_syncHeroTimer);
     // 后台把轮播那批元数据刷新回来后换上新内容（FutureBuilder 会保留旧数据，
@@ -1688,17 +1691,33 @@ class _CinematicHomeState extends State<_CinematicHome>
 ///    and can therefore never clobber progress this device just saved.
 /// Whatever the merge adopts, the returned list is ordered for the shelf:
 /// rows with a real last-watch time first (newest first), then undated rows
-/// in the order the server returned them. It is not truncated here — when a
-/// server is configured its entire resume rail must surface, so the shelf
-/// matches the server instead of only the 60-row local cache.
+/// in the order the server returned them. Keep history intact, then project
+/// the latest 20 resumable titles for display.
 Future<List<WatchState>> _mergeServerWatchHistory(
   WatchStateStore store,
   List<WatchState> local,
 ) async {
+  // Flush an outstanding Windows exit report before reading its server rail.
+  if (WindowHost.isDesktop) {
+    try {
+      await WindowsNativePlayer.retryPendingWatchSync().timeout(
+        const Duration(seconds: 4),
+      );
+    } catch (_) {
+      // The existing persisted retry continues; offline servers retain cache.
+    }
+  }
   final merged = <WatchState>[...local];
   final remote = <WatchState>[];
   try {
     final sources = await SourceStore.create();
+    final names = {for (final source in sources.load()) source.id: source.name};
+    for (var i = 0; i < merged.length; i++) {
+      final name = names[merged[i].sourceId];
+      if (name != null) {
+        merged[i] = merged[i].withEpisodeMetadata(progressOriginName: name);
+      }
+    }
     for (final source in sources.load()) {
       if (source.kind == SourceKind.webdav) continue;
       final token = sources.tokenFor(source);
@@ -1854,12 +1873,15 @@ Future<List<WatchState>> _mergeServerWatchHistory(
             milliseconds: (current.duration.inMilliseconds * row.progress / 100)
                 .round(),
           );
-          if (!traktNewer && position <= current.position) continue;
+          if (!traktNewer &&
+              (row.pausedAt != null || position <= current.position)) {
+            continue;
+          }
           merged[index] = current.withProgress(
             position: position,
             updatedAt: row.pausedAt ?? current.updatedAt,
             origin: 'trakt',
-            originName: 'Trakt',
+            originName: current.progressOriginName,
           );
         }
       } finally {
@@ -8602,7 +8624,7 @@ class _CalendarPageState extends State<_CalendarPage>
       ...localCached,
       ...cachedAll,
       ...traktCached,
-    ]);
+    ], preferTrakt: connected);
     if (mounted && generation == _calendarGeneration) {
       setState(() {
         _events = cached;
@@ -8641,7 +8663,10 @@ class _CalendarPageState extends State<_CalendarPage>
         if (item.kind == '剧集' && item.id > 0) item.id: item,
     };
     final watchlistShowIds = tracked.keys.toSet();
-    final localEventsFuture = _localWatchlistEvents(tracked.values.toList());
+    final localEventsFuture = _localWatchlistEvents(
+      tracked.values.toList(),
+      credentials,
+    );
     final allCalendarFuture = watchlistShowIds.isEmpty
         ? Future.value(const <TraktEvent>[])
         : _trakt.allShowsCalendar(clientId: clientId);
@@ -8701,7 +8726,7 @@ class _CalendarPageState extends State<_CalendarPage>
       ...localEvents,
       ...allCalendarEvents,
       ...personalEvents,
-    ]);
+    ], preferTrakt: connected);
     if (mounted && generation == _calendarGeneration) {
       final visibleEvents = events;
       // 缓存里留着全部事件（含已弃剧的），只是不显示 —— 取消弃剧立刻回来。
@@ -8905,6 +8930,7 @@ class _CalendarPageState extends State<_CalendarPage>
 
   Future<List<TraktEvent>> _localWatchlistEvents(
     List<TmdbItem> watchlist,
+    TraktCredentials credentials,
   ) async {
     final items = watchlist.where((item) => item.kind == '剧集').toList();
     final result = <TraktEvent>[];
@@ -8915,29 +8941,16 @@ class _CalendarPageState extends State<_CalendarPage>
       final rows = await Future.wait(
         items.sublist(start, end).map((item) async {
           try {
-            final episodes = await _tmdb.upcomingEpisodes(item);
-            return episodes
-                .map(
-                  (next) => TraktEvent(
-                    tmdbId: item.id,
-                    seasonNumber: next.seasonNumber,
-                    episodeNumber: next.episodeNumber,
-                    title: next.showTitle?.trim().isNotEmpty == true
-                        ? next.showTitle!
-                        : item.title,
-                    episode:
-                        '第 ${next.seasonNumber} 季 · 第 ${next.episodeNumber} 集 · ${next.title}',
-                    airDate: next.airDate,
-                    posterUrl:
-                        item.posterUrl ?? next.showPosterUrl ?? next.stillUrl,
-                    backdropUrl: item.backdropUrl,
-                    platform: next.network,
-                    platformLogoUrl: next.networkLogoUrl,
-                    platforms: next.platforms,
-                    totalEpisodes: next.totalEpisodes,
-                    timeKnown: next.timeKnown,
-                  ),
-                )
+            final store = SeriesAiringStore(tmdb: _tmdb, trakt: _trakt);
+            final snapshot = await store.load(item, credentials: credentials);
+            final today = DateTime.now();
+            final earliest = DateTime(
+              today.year,
+              today.month,
+              today.day,
+            ).subtract(const Duration(days: 3));
+            return snapshot.events
+                .where((event) => !event.airDate.isBefore(earliest))
                 .toList(growable: false);
           } catch (_) {
             // A single metadata timeout cannot hide the other tracked shows.
@@ -9454,13 +9467,15 @@ class _TrackingEventCard extends StatelessWidget {
         ? '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}'
         : '时刻未公布';
     final parts = event.episode.split(' · ');
-    final seasonEpisode = episodes.length > 1
+    final seasonEpisodeBase = episodes.length > 1
         ? calendarEpisodeSummary(episodes)
         : event.seasonNumber != null && event.episodeNumber != null
         ? '第 ${event.seasonNumber} 季 · 第 ${event.episodeNumber} 集'
         : parts.length >= 2
         ? parts.take(2).join(' · ')
         : event.episode;
+    final seasonEpisode =
+        '$seasonEpisodeBase${calendarGroupCompleted(episodes) ? ' · 已完结' : ''}';
     final episodeTitle = episodes.length > 1
         ? '当日更新 ${episodes.length} 集 · 长按查看各集安排'
         : parts.length > 2
@@ -10172,7 +10187,6 @@ class _SettingsPageState extends State<SettingsPage>
   double _seekSeconds = 10;
   double _volumeStep = 5;
   bool _preloadNextEpisode = true;
-  double _preloadLeadMinutes = 5;
   Map<String, String> _shortcuts = Map.of(_defaultPlayerShortcuts);
   int _metadataCacheCount = 0;
   int _imageCacheBytes = 0;
@@ -10364,8 +10378,6 @@ class _SettingsPageState extends State<SettingsPage>
         _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
         _preloadNextEpisode =
             prefs.getBool('yingji.player.preload-next') ?? true;
-        _preloadLeadMinutes =
-            prefs.getDouble('yingji.player.preload-lead-minutes') ?? 5;
         final shortcutJson = prefs.getString('yingji.player.shortcuts');
         final shortcutData = shortcutJson == null
             ? null
@@ -10488,7 +10500,6 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.player.seek-seconds': _seekSeconds,
       'yingji.player.volume-step': _volumeStep,
       'yingji.player.preload-next': _preloadNextEpisode,
-      'yingji.player.preload-lead-minutes': _preloadLeadMinutes,
       'yingji.player.shortcuts': jsonEncode(_shortcuts),
       'yingji.tmdb.api-key': _tmdbApiKey.text.trim(),
       'yingji.danmaku.enabled': _danmakuEnabled,
@@ -11496,26 +11507,13 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               _ToggleRow(
                 title: '预加载下一集',
-                detail: '播放接近片尾时预热下一集，减少连续播放等待',
+                detail: '正片进度达到 80% 或缓冲到片尾时预热下一集；当前播放优先',
                 value: _preloadNextEpisode,
                 onChanged: (value) {
                   setState(() => _preloadNextEpisode = value);
                   _save();
                 },
               ),
-              if (_preloadNextEpisode) ...[
-                Text('距本集结束 ${_preloadLeadMinutes.round()} 分钟开始预加载'),
-                Slider(
-                  value: _preloadLeadMinutes,
-                  min: 1,
-                  max: 15,
-                  divisions: 14,
-                  label: '${_preloadLeadMinutes.round()} 分钟',
-                  onChanged: (value) =>
-                      setState(() => _preloadLeadMinutes = value),
-                  onChangeEnd: (_) => _save(),
-                ),
-              ],
               Text('快进 / 快退按键步长  ${_seekSeconds.round()} 秒'),
               Text(
                 WindowHost.isDesktop
@@ -12229,7 +12227,7 @@ class _SettingsPageState extends State<SettingsPage>
               ),
               const SizedBox(height: 16),
               Text(
-                WindowHost.isDesktop ? '视频缓存上限' : '视频缓存上限（按网络分别设置）',
+                WindowHost.isDesktop ? '视频缓存自动管理' : '视频缓存上限（按网络分别设置）',
                 style: const TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w700,
@@ -12238,32 +12236,33 @@ class _SettingsPageState extends State<SettingsPage>
               const SizedBox(height: 8),
               Text(
                 WindowHost.isDesktop
-                    ? '原生直连使用引擎内存预读，不保存离线视频；此容量用于代理中转缓存，已有完整缓存仍可播放。'
+                    ? '软件自动控制缓存占用并清理旧缓存，无需设置容量。预读秒数、下一集预加载开关在播放器行为中调整。'
                     : '按当前网络从播放点向前缓存；消耗约一半后继续预读，播完清理本集缓存。移动数据默认不缓存。',
                 style: const TextStyle(color: Color(0xFFABB1BE), fontSize: 12),
               ),
               const SizedBox(height: 10),
-              Wrap(
-                spacing: 10,
-                runSpacing: 8,
-                children: [
-                  YingjiGlassChoiceField<int>(
-                    label: WindowHost.isDesktop ? '上限' : '无线局域网',
-                    value: _videoCacheLimit,
-                    items: VideoCachePolicy.steps,
-                    labelBuilder: VideoCachePolicy.label,
-                    onChanged: _setVideoCacheLimit,
-                  ),
-                  if (!WindowHost.isDesktop)
+              if (!WindowHost.isDesktop)
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 8,
+                  children: [
                     YingjiGlassChoiceField<int>(
-                      label: '移动数据',
-                      value: _videoCacheMobileLimit,
+                      label: WindowHost.isDesktop ? '上限' : '无线局域网',
+                      value: _videoCacheLimit,
                       items: VideoCachePolicy.steps,
                       labelBuilder: VideoCachePolicy.label,
-                      onChanged: _setVideoCacheMobileLimit,
+                      onChanged: _setVideoCacheLimit,
                     ),
-                ],
-              ),
+                    if (!WindowHost.isDesktop)
+                      YingjiGlassChoiceField<int>(
+                        label: '移动数据',
+                        value: _videoCacheMobileLimit,
+                        items: VideoCachePolicy.steps,
+                        labelBuilder: VideoCachePolicy.label,
+                        onChanged: _setVideoCacheMobileLimit,
+                      ),
+                  ],
+                ),
               const SizedBox(height: 14),
               Wrap(
                 spacing: 10,
@@ -13921,6 +13920,7 @@ class _ContinueWatchingPage extends StatefulWidget {
 }
 
 class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
+  late final AppLifecycleListener _lifecycle;
   final _scroll = ScrollController();
   List<WatchState> _rows = const [];
   bool _historyLocalOnly = false;
@@ -13932,11 +13932,13 @@ class _ContinueWatchingPageState extends State<_ContinueWatchingPage> {
     super.initState();
     _rows = List.of(widget.initialRows);
     _historyLocalOnly = widget.localOnly;
+    _lifecycle = AppLifecycleListener(onResume: _load);
     _load();
   }
 
   @override
   void dispose() {
+    _lifecycle.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -14480,12 +14482,13 @@ class _ContinueArtwork extends StatelessWidget {
 String? _pickBetterArtwork(String? server, String? local) {
   if (server == null || server.isEmpty) return local;
   if (local == null || local.isEmpty) return server;
+  // Keep a resolved episode still rather than replacing it with a server poster.
+  if (local.contains('image.tmdb.org/t/p/w780/')) return local;
   return server;
 }
 
-/// 只对「封面缺失」的记录做一次 TMDB 解析补图（单集剧照 > 剧集海报 > 按剧名
-/// 搜索），写回 store 并返回更新后的列表；调用方刷新一次即可，之后渲染层不再
-/// 触碰网络，彻底消除闪烁。非空封面一律保留（它本就是详情页同款图，不应重解析）。
+/// 缺图及旧剧集海报做一次 TMDB 补图（单集剧照优先），写回 store。
+/// 已解析单集图直接复用；旧海报尝试标记不阻止此次单集图升级。
 /// 同一会话用静态缓存去重，避免重复打 TMDB。
 final Map<String, Future<String?>> _artworkResolutionCache = {};
 
@@ -14493,14 +14496,12 @@ Future<List<WatchState>> _resolveArtworkForRows(
   List<WatchState> rows,
   WatchStateStore store,
 ) async {
-  // 跳过「已经试过解析」的行（成功或失败都算，见 [WatchStateStore.markArtworkResolved]），
-  // 这样每行最多解析一次：新记录首次出现时补图，之后再打开软件不再为它打 TMDB，
-  // 彻底消除「每次启动都重新获取封面」的观感。非空行本来就直接保留，无需解析。
+  // 每种图片解析版本最多尝试一次，避免每次启动重复请求。
   final alreadyTried = await store.loadResolvedArtwork();
   final targets = <WatchState>[];
   for (final row in rows) {
-    final url = row.imageUrl;
-    if ((url == null || url.isEmpty) && !alreadyTried.contains(row.mediaId)) {
+    if (needsWatchArtwork(row) &&
+        !alreadyTried.contains(watchArtworkResolutionId(row))) {
       targets.add(row);
     }
   }
@@ -14513,7 +14514,7 @@ Future<List<WatchState>> _resolveArtworkForRows(
   final updates = <String, String>{};
   try {
     for (final row in targets) {
-      attempted.add(row.mediaId);
+      attempted.add(watchArtworkResolutionId(row));
       final url = await _artworkResolutionCache.putIfAbsent(
         '${row.mediaId}:${row.sourceId}:${row.serverItemId}',
         () => _resolvedArtworkFor(row, client),
@@ -14571,6 +14572,17 @@ Future<String?> _resolvedArtworkFor(WatchState row, TmdbClient client) async {
     for (final kind in kinds) {
       try {
         final hit = await client.searchFirst(title, type: kind);
+        if (hit != null && kind == 'tv' && row.episodeNumber != null) {
+          final episodes = await client.seasonEpisodes(
+            hit.id,
+            row.seasonNumber ?? 1,
+          );
+          final still = episodes
+              .where((e) => e.episodeNumber == row.episodeNumber)
+              .firstOrNull
+              ?.stillUrl;
+          if (still != null) return still.toString();
+        }
         final poster = hit?.posterUrl?.toString();
         if (poster != null && poster.isNotEmpty) return poster;
       } catch (_) {
@@ -14594,7 +14606,13 @@ class _WatchProgressOriginBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final origin = state.visibleProgressOrigin(localOnly: localOnly);
     final (icon, label) = switch (origin) {
-      'server' => (YingjiIcons.server, '服务器'),
+      'server' => (
+        YingjiIcons.server,
+        state.progressOriginName?.trim().isNotEmpty == true &&
+                state.progressOriginName != 'Trakt'
+            ? state.progressOriginName!
+            : '服务器',
+      ),
       'trakt' => (YingjiIcons.refresh, 'Trakt'),
       _ => (YingjiIcons.play_rectangle, '本机'),
     };

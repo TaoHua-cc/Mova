@@ -166,6 +166,13 @@ String _dateLabel(DateTime? date) => date == null
 String _minuteClock(int minutes) =>
     '${minutes ~/ 60 > 0 ? '${minutes ~/ 60}:' : ''}${(minutes % 60).toString().padLeft(2, '0')}:00';
 
+String episodeProgressTime(Duration value) {
+  final seconds = value.inSeconds.clamp(0, 86400000);
+  return '${seconds >= 3600 ? '${seconds ~/ 3600}:' : ''}'
+      '${(seconds ~/ 60 % 60).toString().padLeft(2, '0')}:'
+      '${(seconds % 60).toString().padLeft(2, '0')}';
+}
+
 class MetadataDetailPage extends StatefulWidget {
   const MetadataDetailPage({
     super.key,
@@ -291,6 +298,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   List<MediaItem> _resources = const [];
   Set<String> _completedResourceIds = const <String>{};
   Map<String, double> _episodeProgress = const <String, double>{};
+  List<WatchState> _episodeWatchHistory = const [];
   Map<int, Uri> _seasonPosters = const {};
   Map<String, TmdbEpisode> _episodeMetadata = const {};
   List<TmdbSeason> _catalogSeasons = const [];
@@ -371,6 +379,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     if (!mounted) return;
     setState(() {
       _catalogSeasons = seasons;
+      _episodeWatchHistory = history;
       _seasonPosters = {
         for (final season in seasons)
           if (season.posterUrl != null) season.number: season.posterUrl!,
@@ -1189,12 +1198,40 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   /// Re-derives episode progress after the player closes. The initial
   /// [_loadResources] snapshot predates playback, so without this the episode
   /// rails keep showing the position captured before the session started.
+  WatchState? _catalogWatchTime(TmdbEpisode episode) {
+    final saved = _episodeWatchHistory
+        .where(
+          (state) =>
+              state.tmdbId == widget.item.id &&
+              state.seasonNumber == episode.seasonNumber &&
+              state.episodeNumber == episode.episodeNumber,
+        )
+        .firstOrNull;
+    if (saved != null) return saved;
+    final resource = _resources
+        .where(
+          (row) =>
+              row.seasonNumber == episode.seasonNumber &&
+              row.episodeNumber == episode.episodeNumber,
+        )
+        .firstOrNull;
+    if (resource == null) return null;
+    return _localWatch(resource, _episodeWatchHistory) ??
+        WatchState(
+          mediaId: resource.id,
+          title: widget.item.title,
+          position: resource.playbackPosition ?? Duration.zero,
+          duration: resource.runtime ?? Duration.zero,
+        );
+  }
+
   Future<void> _refreshLocalProgress() async {
     final history = (await WatchStateStore.create()).load();
     if (!mounted) return;
     final derived = _deriveProgress(_resources, history, const {});
     setState(() {
       _episodeProgress = derived.progress;
+      _episodeWatchHistory = history;
       _completedResourceIds = derived.completed;
     });
   }
@@ -2420,6 +2457,16 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                                   episodes: _catalogEpisodeChoices,
                                   selectedEpisode: _selectedEpisodeNumber,
                                   progress: _episodeProgress,
+                                  timings: {
+                                    for (final episode
+                                        in _catalogEpisodeChoices)
+                                      _episodeKey(
+                                        episode.seasonNumber,
+                                        episode.episodeNumber,
+                                      ): _catalogWatchTime(
+                                        episode,
+                                      ),
+                                  },
                                   onSelect: _selectCatalogEpisode,
                                   onPlay: (episode) =>
                                       _playSelectedCatalogEpisode(
@@ -2686,9 +2733,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
     }
     if (!context.mounted) return;
     if (WindowHost.isDesktop) {
-      // 原生窗口的「资源」面板可以切到当前剧集在任意已连接服务器上的版本。
-      // 原生自己换不了 —— 播放列表、headers 与 hwdec 选择都绑在起播时那个
-      // 服务器上 —— 所以它把选择交回来，由这里用新资源重新起播。
+      // Resolve resource identity/headers in the app; load the new source in the
+      // existing native window instead of closing and launching another process.
       var available = _resourceVersionsFor(resource);
       var activeResource = resource;
       var startAt = resumePosition;
@@ -2745,6 +2791,54 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
             if ((metadata?.runtime ?? 0) > 0) '${metadata!.runtime} 分钟',
           ].join(' · '),
         );
+      }
+
+      Future<WindowsNativePlaylistEntry?> prepareNativeEpisode(
+        int season,
+        int episode,
+      ) async {
+        final current = activeResource;
+        final source = current.source;
+        if (!mounted || source.kind == SourceKind.webdav) return null;
+        final store = await SourceStore.create();
+        final token = store.tokenFor(source);
+        if (token == null || token.isEmpty) return null;
+        final client = EmbyClient(
+          proxy: ProxyRouting.serverUsesProxy(source.id),
+        );
+        try {
+          final session = await client.resolveSession(
+            EmbySession(source: source, token: token),
+          );
+          final seriesId = current.seriesId;
+          if (seriesId == null || seriesId.isEmpty) return null;
+          final rows = await client.episodesForSeries(
+            session,
+            seriesId,
+            seasonNumber: season,
+            episodeNumber: episode,
+          );
+          if (!mounted) return null;
+          final resource = rows
+              .where(
+                (row) =>
+                    row.playbackUrl != null &&
+                    row.seasonNumber == season &&
+                    row.episodeNumber == episode,
+              )
+              .firstOrNull;
+          final option = episodeOptions
+              .where(
+                (option) =>
+                    option.seasonNumber == season &&
+                    option.episodeNumber == episode,
+              )
+              .firstOrNull;
+          if (resource == null || option == null) return null;
+          return nativeEntry(option, overrideResource: resource);
+        } finally {
+          client.dispose();
+        }
       }
 
       Future<WindowsNativePlaylistEntry?> resolveNativeEpisode(
@@ -2939,6 +3033,28 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                 }
               },
               onResolveEpisode: resolveNativeEpisode,
+              onResolveResource: (index) async {
+                if (!mounted || index < 0 || index >= available.length) {
+                  return null;
+                }
+                final selected = available[index];
+                final key = _episodeKey(
+                  selected.seasonNumber,
+                  selected.episodeNumber,
+                );
+                final option =
+                    episodeOptions
+                        .where((option) => option.key == key)
+                        .firstOrNull ??
+                    _PlaybackEpisodeOption(
+                      seasonNumber: selected.seasonNumber,
+                      episodeNumber: selected.episodeNumber,
+                      resource: selected,
+                    );
+                activeResource = selected;
+                return nativeEntry(option, overrideResource: selected);
+              },
+              onPrepareEpisode: prepareNativeEpisode,
             ),
           );
           final requestedSeason = result.episodeSeason;
@@ -3803,11 +3919,74 @@ class _PublishedEpisodeNumbers extends StatelessWidget {
   }
 }
 
+class _EpisodeProgressOverlay extends StatelessWidget {
+  const _EpisodeProgressOverlay({
+    required this.progress,
+    this.watch,
+    this.duration,
+    this.position,
+  });
+  final double progress;
+  final WatchState? watch;
+  final Duration? duration;
+  final Duration? position;
+
+  @override
+  Widget build(BuildContext context) {
+    final total = watch != null && watch!.duration > Duration.zero
+        ? watch!.duration
+        : duration;
+    final exact = watch?.position ?? position;
+    final elapsed =
+        exact ??
+        (total == null
+            ? null
+            : Duration(
+                milliseconds: (total.inMilliseconds * progress.clamp(0, 1))
+                    .round(),
+              ));
+    return Positioned(
+      left: 8,
+      right: 8,
+      bottom: 6,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (elapsed != null)
+            Text(
+              '${exact == null ? '≈ ' : ''}${episodeProgressTime(elapsed)}${total != null && total > Duration.zero ? ' / ${episodeProgressTime(total)}' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontSize: 10.5,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+                shadows: [Shadow(color: Colors.black87, blurRadius: 3)],
+              ),
+            ),
+          const SizedBox(height: 3),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(99),
+            child: LinearProgressIndicator(
+              value: progress.clamp(0, 1),
+              minHeight: 3,
+              backgroundColor: Colors.white24,
+              color: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _CatalogEpisodeRail extends StatefulWidget {
   const _CatalogEpisodeRail({
     required this.episodes,
     required this.selectedEpisode,
     required this.progress,
+    required this.timings,
     required this.onSelect,
     required this.onPlay,
     required this.onMarkPlayed,
@@ -3816,6 +3995,7 @@ class _CatalogEpisodeRail extends StatefulWidget {
   final List<TmdbEpisode> episodes;
   final int? selectedEpisode;
   final Map<String, double> progress;
+  final Map<String, WatchState?> timings;
   final ValueChanged<TmdbEpisode> onSelect;
   final ValueChanged<TmdbEpisode> onPlay;
   final Future<void> Function(TmdbEpisode, bool) onMarkPlayed;
@@ -4417,14 +4597,18 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                                           ),
                                         ),
                                         if (progress > 0)
-                                          Align(
-                                            alignment: Alignment.bottomCenter,
-                                            child: LinearProgressIndicator(
-                                              value: progress,
-                                              minHeight: 4,
-                                              backgroundColor: Colors.white24,
-                                              color: Colors.white,
-                                            ),
+                                          _EpisodeProgressOverlay(
+                                            progress: progress,
+                                            watch:
+                                                widget.timings[_episodeKey(
+                                                  episode.seasonNumber,
+                                                  episode.episodeNumber,
+                                                )],
+                                            duration: episode.runtime == null
+                                                ? null
+                                                : Duration(
+                                                    minutes: episode.runtime!,
+                                                  ),
                                           ),
                                       ],
                                     ),
@@ -5243,16 +5427,14 @@ class _AllEpisodeRow extends StatelessWidget {
                                               const _EpisodeArtworkFallback(),
                                         ),
                                   if (progress > 0 || completed)
-                                    Align(
-                                      alignment: Alignment.bottomCenter,
-                                      child: LinearProgressIndicator(
-                                        value: completed
-                                            ? 1
-                                            : progress.clamp(0, 1),
-                                        minHeight: 3,
-                                        backgroundColor: Colors.white24,
-                                        color: Colors.white,
-                                      ),
+                                    _EpisodeProgressOverlay(
+                                      progress: completed ? 1 : progress,
+                                      duration:
+                                          episode.runtime ??
+                                          (runtime == null
+                                              ? null
+                                              : Duration(minutes: runtime!)),
+                                      position: episode.playbackPosition,
                                     ),
                                 ],
                               ),

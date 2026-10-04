@@ -1105,6 +1105,14 @@ class TmdbClient {
   }
 
   /// Compatibility helper for detail surfaces that only need the next item.
+  Future<Map<String, dynamic>> seriesAiringMetadata(TmdbItem item) => _get(
+    '/tv/${item.id}',
+    '',
+    {'language': 'zh-CN', 'append_to_response': 'external_ids'},
+    minRefreshInterval: const Duration(hours: 6),
+    awaitStaleRefresh: true,
+  );
+
   Future<TmdbUpcomingEpisode?> upcomingEpisode(
     TmdbItem item, {
     String apiKey = '',
@@ -1175,6 +1183,7 @@ class TmdbClient {
     String apiKey,
     Map<String, String> query, {
     Duration minRefreshInterval = const Duration(minutes: 10),
+    bool awaitStaleRefresh = false,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final effectiveApiKey = apiKey.trim().isNotEmpty
@@ -1221,6 +1230,23 @@ class TmdbClient {
           savedAt != null &&
           DateTime.now().difference(savedAt) < minRefreshInterval;
       if (!fresh) {
+        if (awaitStaleRefresh) {
+          await _refresh(uri, prefs, cacheKey);
+          final refreshed =
+              (await WindowsMetadataCache.read(
+                WindowsMetadataCache.tmdb,
+                cacheKey,
+              ))?.value ??
+              prefs.getString(cacheKey);
+          if (refreshed != null) {
+            try {
+              return jsonDecode(refreshed) as Map<String, dynamic>;
+            } catch (_) {
+              /* Keep the last valid metadata on malformed refresh. */
+            }
+          }
+          return data;
+        }
         if (Platform.isWindows) {
           _queueBackgroundRefresh(
             cacheKey,

@@ -161,6 +161,7 @@ struct EpisodeResolutionUpdate {
   std::string url;
   std::string headers;
   bool native_network = false;
+  bool prepared = false;
   double resume_seconds = 0.0;
   std::string error;
 };
@@ -175,6 +176,8 @@ struct EpisodeResourcesUpdate {
   std::vector<int> ranks;
 };
 std::atomic<bool> g_live_episode_resolution{false};
+std::atomic<bool> g_live_resource_resolution{false};
+int g_pending_resource_choice = -1;
 std::atomic<bool> g_episode_search_pending{false};
 std::atomic<int64_t> g_episode_search_index{-1};
 std::atomic<bool> g_running{true};
@@ -191,6 +194,7 @@ std::atomic<double> g_duration{0};
 std::atomic<double> g_last_valid_position{0};
 std::atomic<bool> g_paused{false};
 std::atomic<double> g_volume{100};
+std::atomic<double> g_last_audible_volume{100};
 std::atomic<double> g_speed{1};
 std::atomic<bool> g_muted{false};
 // 画面亮度（mpv 的 video equalizer，-100..100）。面板里用时读、由属性观察回填。
@@ -905,23 +909,11 @@ int GlassChromeAlpha(bool bottom) {
 constexpr float kGlyphShadowOffset = 1.0f;
 constexpr int kGlyphShadowAlpha = 118;
 
-// 背板模糊（原生侧的 BackdropFilter）—— 三个入口先声明在这里，实现在 PanelSurface
-// 之后（那边才有画板对象可用）：FillGlassSurface 要给玻璃铺背板，位置在这之前。
-void ReleaseGlassBackdrop();
-bool UpdateGlassBackdrop();
 void RefreshFramePacing();
-bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
-                       const Gdiplus::GraphicsPath& path,
-                       const Gdiplus::RectF& rect);
 
 /// 一片珍珠色玻璃的底色：基色渐变 + 应用侧 `YingjiGlass.depth` 那条「只沉底边」
 /// 的厚度。保留供播放器控件、网络状态和进度预览气泡使用。
 ///
-/// `use_backdrop` 打开时先铺一层「被模糊、轻微提饱和的背后画面」（见
-/// DrawGlassBackdrop）。这一层是不透明的，于是整块玻璃的合成变成
-/// `blur(背后) × (1−α) + frost × α` —— 与应用侧 `backdrop()` ＋ `surface()` 完全
-/// 同构。它不是「假透明」：真实的分层窗口透明度仍在（背板拿不到时就走原来的路），
-/// 只是换成了「背后画面先糊再混」这种更接近毛玻璃的合成方式。
 void FillStaticPlayerMenuSurface(Gdiplus::Graphics& graphics,
                                  const Gdiplus::GraphicsPath& path,
                                  const Gdiplus::RectF& rect);
@@ -1002,52 +994,6 @@ void DrawGlassText(Gdiplus::Graphics& graphics, const wchar_t* text,
   graphics.DrawString(text, -1, &font, box, &format, &brush);
 }
 
-// ------------------------------------------- 背板模糊（原生侧的 BackdropFilter）
-//
-// 原生没有 `BackdropFilter`：分层窗口只能「透」，不能「糊」。而应用里那层液态玻璃
-// 有一半的质感来自**背后那张被模糊、轻微提饱和的画面**
-// （`YingjiGlass.backdrop()`）—— 少了它，同一支 frost 基色、同一个浓度，在应用里
-// 是玻璃，在播放器里就是一块黑板。这里把缺的那半块补上：抓一帧背后的画面，降采样
-// ＋三次盒式模糊近似高斯＋轻微提饱和，画在 frost 底下。
-//
-// 从播放器 HWND 获取视频源，再裁切可见玻璃区域；不从桌面抓取自己的浮层，
-// 避免菜单反复进入背板造成白色残影。CPU 采集仍受窗口尺寸与驱动影响。
-//
-/// 全屏 PrintWindow 单次实测 20–28ms；调用方只在玻璃浮层显隐变化时采样。
-/// 该间隔用于合并短时间内连续到来的显隐变化，避免重复同步 D3D 表面。
-constexpr ULONGLONG kGlassBackdropRefreshMs = 66;
-/// 模糊在 1/6 尺寸上做：像素量只有原图的 1/36，给 60Hz 采集留出
-/// CPU 预算。HALFTONE 降采样已经提供一层低通，对最终本就需要强模糊的玻璃不会
-/// 损失可见细节。
-constexpr int kGlassDownscale = 6;
-/// 盒式模糊的遍数（三次已经足够接近高斯，再多只是更贵）。
-constexpr int kGlassBlurPasses = 3;
-
-struct GlassLayer {
-  HWND window = nullptr;
-  // 成员别叫 small：`rpcndr.h` 里有 `#define small char`。
-  PanelSurface* reduced = nullptr;       ///< UI 线程只读的最新完成帧
-  PanelSurface* reduced_back = nullptr;  ///< 后台线程写入的下一帧
-  std::vector<BYTE> scratch;
-  int source_width = 0;
-  int source_height = 0;
-  int origin_x = 0;
-  int origin_y = 0;
-  bool ready = false;
-};
-
-struct GlassBackdrop {
-  PanelSurface* video = nullptr;  ///< 仅播放器窗口的画面，不含独立浮层
-  RECT video_frame{};             ///< 最近一次抓屏对应的窗口区域（屏幕坐标）
-  std::array<GlassLayer, 4> layers{};
-  std::mutex mutex;                      ///< 只保护前后帧交换与读取
-  std::atomic<ULONGLONG> captured_at{0};
-  // 「最后一次尝试」的 tick，成功失败都记。失败（黑屏 / 抓不动）时如果只看
-  // captured_at，节流条件永远不满足，会在失败时空转。失败也要进节流。
-  ULONGLONG attempted_at = 0;
-};
-
-GlassBackdrop g_backdrop;
 
 /// 正在绘制的这块玻璃所在窗口的客户区 (0,0) 在屏幕上的位置。设计稿矩形要映射回
 /// 背板的像素就靠它 —— 每个窗口在开画前设一次（面板与提示各一处）。
@@ -1460,8 +1406,7 @@ void ApplyPlaylistHeaders(int64_t index) {
   const std::string& source_headers = has_header_override
                                           ? g_playlist_headers[static_cast<size_t>(index)]
                                           : g_default_http_headers;
-  if (g_default_http_headers_set ||
-      (has_header_override && !source_headers.empty())) {
+  if (g_default_http_headers_set || has_header_override) {
     const std::string headers = MpvHeaderFields(source_headers);
     MpvCommand("set", "http-header-fields", headers.c_str());
   }
@@ -2526,7 +2471,8 @@ bool ApplyLiveOption(const std::string& name, const std::string& value) {
   // 播放的这一集，走的就是面板点击那条 mpv 属性写入路径，改完的提示与数值回填
   // 也一致。它们不是 mova- 前缀的参数，所以单列一组（见 IsLiveApplyName）。
   if (name == "speed" || name == "volume" || name == "brightness" ||
-      name == "video-aspect-override") {
+      name == "video-aspect-override" || name == "cache-secs" ||
+      name == "demuxer-readahead-secs") {
     MpvCommand("set", name.c_str(), value.c_str());
     return true;
   }
@@ -2548,7 +2494,8 @@ bool IsLiveSettingName(const std::string& name) {
 /// 免得起播时也被当成「热更新」处理一遍。
 bool IsLiveApplyName(const std::string& name) {
   return IsLiveSettingName(name) || name == "speed" || name == "volume" ||
-         name == "brightness" || name == "video-aspect-override";
+         name == "brightness" || name == "video-aspect-override" ||
+         name == "cache-secs" || name == "demuxer-readahead-secs";
 }
 
 void ShowDanmakuMenu(PanelAnchor anchor) {
@@ -2671,6 +2618,7 @@ void ShowSegmentMenu(PanelAnchor anchor) {
       "mova-auto-skip-segments", g_auto_skip_segments ? "false" : "true", "",
       g_auto_skip_segments));
   const double position = std::max(0.0, g_position.load());
+  items.push_back(PanelNote(kGlyphInfo, L"手动设置应用于当前季全部剧集"));
   items.push_back(PanelOption(
       kGlyphScissors, L"将当前位置设为片头结束",
       L"当前 " + ClockLabel(position) + L" · 手动设置优先于自动来源",
@@ -3032,11 +2980,8 @@ void EmitProgress(double position, double duration) {
   }
 }
 
-// 换资源只能由应用重建播放：原生的播放列表、http headers 与 hwdec 选择都绑在
-// 起播时那个服务器上，本地换个地址会静默播错甚至失败。所以这里只把用户选中的
-// 下标回传（应用自己持有完整资源表），然后干净退出，让应用用新资源重新起播。
-//
-// 顺带带上当前播放位置：应用拿它当新资源的起播点，否则换一次资源就要从头看。
+// Application resolves the selected resource and its own headers. Live callers
+// reply with the existing episode-resolution protocol; the window stays open.
 void EmitResourceChoice(int index) {
   const double position = std::atof(MpvString("time-pos").c_str());
   char text[96]{};
@@ -4568,17 +4513,6 @@ const std::wstring& TraceDirectory() {
   return directory;
 }
 
-/// 背板不是每次都能拿到（没出画面、抓不动、被独占挡住）。为什么没拿到要能事后查，
-/// 不然现场只剩一句「提示这次没铺上背板」，只能靠猜。写到 backdrop.log。
-void TraceGlassBackdropNote(const std::wstring& note) {
-  const std::wstring& directory = TraceDirectory();
-  if (directory.empty()) return;
-  FILE* handle = nullptr;
-  const std::wstring path = directory + L"\\backdrop.log";
-  if (_wfopen_s(&handle, path.c_str(), L"a, ccs=UTF-8") != 0 || !handle) return;
-  fwprintf(handle, L"%s\n", note.c_str());
-  fclose(handle);
-}
 
 void TracePanelSurface(const PanelSurface& surface, const wchar_t* prefix,
                        int limit) {
@@ -4606,250 +4540,6 @@ void TracePanelSurface(const PanelSurface& surface,
 ///
 /// `scratch` 与 `data` 同尺寸，当双缓冲用：每个方向都从一块读、往另一块写，滑窗就
 /// 不会读到自己刚写下的模糊值。三次往返是偶数次，结果最终落回 `data`。
-void BoxBlurPasses(BYTE* data, BYTE* scratch, int width, int height,
-                   int radius) {
-  if (radius < 1) return;
-  const int window = radius * 2 + 1;
-  const size_t stride = static_cast<size_t>(width) * 4u;
-  BYTE* source = data;
-  BYTE* target = scratch;
-  for (int pass = 0; pass < kGlassBlurPasses; ++pass) {
-    for (int y = 0; y < height; ++y) {
-      const BYTE* row = source + static_cast<size_t>(y) * stride;
-      BYTE* out_row = target + static_cast<size_t>(y) * stride;
-      int sum[4] = {0, 0, 0, 0};
-      for (int k = -radius; k <= radius; ++k) {
-        const BYTE* pixel =
-            row + static_cast<size_t>(k < 0 ? 0 : std::min(k, width - 1)) * 4u;
-        for (int channel = 0; channel < 4; ++channel) sum[channel] += pixel[channel];
-      }
-      for (int x = 0; x < width; ++x) {
-        for (int channel = 0; channel < 4; ++channel) {
-          out_row[x * 4 + channel] = static_cast<BYTE>(sum[channel] / window);
-        }
-        const int add = x + radius + 1;
-        const int sub = x - radius;
-        const BYTE* added =
-            row + static_cast<size_t>(add < width ? add : width - 1) * 4u;
-        const BYTE* removed = row + static_cast<size_t>(sub > 0 ? sub : 0) * 4u;
-        for (int channel = 0; channel < 4; ++channel) {
-          sum[channel] += added[channel] - removed[channel];
-        }
-      }
-    }
-    std::swap(source, target);
-    for (int x = 0; x < width; ++x) {
-      const BYTE* column = source + static_cast<size_t>(x) * 4u;
-      BYTE* out_column = target + static_cast<size_t>(x) * 4u;
-      int sum[4] = {0, 0, 0, 0};
-      for (int k = -radius; k <= radius; ++k) {
-        const BYTE* pixel =
-            column +
-            static_cast<size_t>(k < 0 ? 0 : std::min(k, height - 1)) * stride;
-        for (int channel = 0; channel < 4; ++channel) sum[channel] += pixel[channel];
-      }
-      for (int y = 0; y < height; ++y) {
-        for (int channel = 0; channel < 4; ++channel) {
-          out_column[static_cast<size_t>(y) * stride + channel] =
-              static_cast<BYTE>(sum[channel] / window);
-        }
-        const int add = y + radius + 1;
-        const int sub = y - radius;
-        const BYTE* added = column +
-                            static_cast<size_t>(add < height ? add : height - 1) *
-                                stride;
-        const BYTE* removed =
-            column + static_cast<size_t>(sub > 0 ? sub : 0) * stride;
-        for (int channel = 0; channel < 4; ++channel) {
-          sum[channel] += added[channel] - removed[channel];
-        }
-      }
-    }
-    std::swap(source, target);
-  }
-  if (source != data) {
-    memcpy(data, source, stride * static_cast<size_t>(height));
-  }
-}
-
-/// 应用侧 `YingjiGlass.backdrop()` 里 colorMatrix 的等价物：只轻微增加饱和度，
-/// 不再提亮。亮色视频本身已经接近白色，再提亮会让菜单和按钮一起过曝。
-///
-/// 顺手把 alpha 补成 255：GDI 不管 alpha 通道，PrintWindow / StretchBlt 留下的第
-/// 4 字节是 0，而绘制端用的是预乘 ARGB —— 不补就是「画了等于没画」。
-void ApplyGlassVibrancy(BYTE* data, size_t pixels) {
-  constexpr double kSaturation = 1.35;
-  for (size_t index = 0; index < pixels; ++index) {
-    BYTE* pixel = data + index * 4u;
-    const double luma =
-        0.213 * pixel[2] + 0.715 * pixel[1] + 0.072 * pixel[0];
-    for (int channel = 0; channel < 3; ++channel) {
-      const double value = luma + (pixel[channel] - luma) * kSaturation;
-      pixel[channel] = static_cast<BYTE>(std::clamp(value, 0.0, 255.0));
-    }
-    pixel[3] = 255;
-  }
-}
-
-// QPC 时钟（定义在后面的帧循环一节）。背板各步的耗时要用它量：GetTickCount64 即使
-// 开了 timeBeginPeriod(1) 也只以 15/16ms 的台阶推进，量单步会有半个节拍的误差。
-double NowMs();
-
-void ReleaseGlassBackdrop() {
-  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
-  delete g_backdrop.video;
-  g_backdrop.video = nullptr;
-  for (GlassLayer& layer : g_backdrop.layers) {
-    delete layer.reduced;
-    layer.reduced = nullptr;
-    delete layer.reduced_back;
-    layer.reduced_back = nullptr;
-    layer.scratch.clear();
-    layer.ready = false;
-  }
-  g_backdrop.captured_at = 0;
-}
-
-bool CaptureGlassLayer(GlassLayer& layer, HWND window, HDC video,
-                       const RECT& video_frame) {
-  RECT frame{};
-  if (!window || !IsWindowVisible(window) || !GetWindowRect(window, &frame)) {
-    return false;
-  }
-  const int width = frame.right - frame.left;
-  const int height = frame.bottom - frame.top;
-  if (width < 8 || height < 8) return false;
-  const int reduced_width = (width + kGlassDownscale - 1) / kGlassDownscale;
-  const int reduced_height = (height + kGlassDownscale - 1) / kGlassDownscale;
-  if (!layer.reduced_back) layer.reduced_back = new PanelSurface();
-  if (!layer.reduced_back->Matches(reduced_width, reduced_height) &&
-      !layer.reduced_back->Create(reduced_width, reduced_height)) {
-    return false;
-  }
-
-  // 从播放器专属画面裁取区域。不能读桌面 DC：现代 DWM 合成下即使没有
-  // CAPTUREBLT，也不能保证排除自己的浮层，反复采集会累积成白色残影。
-  SetStretchBltMode(layer.reduced_back->dc, HALFTONE);
-  SetBrushOrgEx(layer.reduced_back->dc, 0, 0, nullptr);
-  if (!StretchBlt(layer.reduced_back->dc, 0, 0, reduced_width, reduced_height,
-                  video, frame.left - video_frame.left,
-                  frame.top - video_frame.top, width, height, SRCCOPY)) {
-    return false;
-  }
-  // GDI batches writes to DIB sections. Complete them before CPU blur reads
-  // and rewrites these bytes, otherwise a pending blit can overwrite the blur.
-  GdiFlush();
-
-  const size_t pixels = static_cast<size_t>(reduced_width) *
-                        static_cast<size_t>(reduced_height);
-  layer.scratch.resize(pixels * 4u);
-  const double sigma_reduced =
-      g_glass_blur.load() * 0.55 * static_cast<double>(UiScale()) /
-      static_cast<double>(kGlassDownscale);
-  const int radius = static_cast<int>(std::lround(sigma_reduced / 1.05));
-  BoxBlurPasses(layer.reduced_back->bits, layer.scratch.data(), reduced_width,
-                reduced_height, radius);
-
-  // 黑色也是合法视频内容，必须发布；跳过黑帧会留下上一场景的亮色残影。
-  ApplyGlassVibrancy(layer.reduced_back->bits, pixels);
-
-  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
-  std::swap(layer.reduced, layer.reduced_back);
-  layer.window = window;
-  layer.source_width = width;
-  layer.source_height = height;
-  layer.origin_x = frame.left;
-  layer.origin_y = frame.top;
-  layer.ready = true;
-  return true;
-}
-
-/// 重抓一帧背后的画面。按 `kGlassBackdropRefreshMs` 节流；共用播放器源帧，
-/// 只模糊可见玻璃区域。
-bool UpdateGlassBackdrop() {
-  if (!g_window) return false;
-  const ULONGLONG now = GetTickCount64();
-  if (now - g_backdrop.attempted_at < kGlassBackdropRefreshMs) {
-    return false;
-  }
-  g_backdrop.attempted_at = now;
-  const double started = NowMs();
-  RECT video_frame{};
-  if (IsIconic(g_window) || !GetWindowRect(g_window, &video_frame)) return false;
-  const int width = video_frame.right - video_frame.left;
-  const int height = video_frame.bottom - video_frame.top;
-  if (width < 1 || height < 1) return false;
-  if (!g_backdrop.video) g_backdrop.video = new PanelSurface();
-  if (!g_backdrop.video->Matches(width, height) &&
-      !g_backdrop.video->Create(width, height)) return false;
-  // PW_RENDERFULLCONTENT includes the D3D video content of this HWND only.
-  if (!PrintWindow(g_window, g_backdrop.video->dc, 0x00000002)) return false;
-  g_backdrop.video_frame = video_frame;
-  GdiFlush();
-  TracePanelSurface(*g_backdrop.video, L"video-source", 3);
-  // 提示和二级菜单使用固定材质；这里只为保留现有按钮效果采样控件条与顶栏。
-  const std::array<HWND, 2> windows = {g_controls, g_top_bar};
-  bool updated = false;
-  for (size_t index = 0; index < windows.size(); ++index) {
-    updated = CaptureGlassLayer(g_backdrop.layers[index], windows[index],
-                                g_backdrop.video->dc, video_frame) || updated;
-  }
-  if (!TraceDirectory().empty()) {
-    wchar_t note[128]{};
-    swprintf_s(note, L"regions %s  total %.1fms",
-               updated ? L"ok" : L"skip", NowMs() - started);
-    TraceGlassBackdropNote(note);
-  }
-  if (updated) g_backdrop.captured_at = now;
-  return updated;
-}
-
-bool DrawGlassBackdrop(Gdiplus::Graphics& graphics,
-                       const Gdiplus::GraphicsPath& path,
-                       const Gdiplus::RectF& rect) {
-  std::lock_guard<std::mutex> guard(g_backdrop.mutex);
-  GlassLayer* selected = nullptr;
-  for (GlassLayer& layer : g_backdrop.layers) {
-    if (layer.ready && layer.reduced && layer.reduced->bits &&
-        layer.origin_x == g_glass_window_origin.x &&
-        layer.origin_y == g_glass_window_origin.y) {
-      selected = &layer;
-      break;
-    }
-  }
-  if (!selected) return false;
-  const float scale = UiScale();
-  const float full_x = rect.X * scale;
-  const float full_y = rect.Y * scale;
-  const float full_width = rect.Width * scale;
-  const float full_height = rect.Height * scale;
-  const float full_x1 = full_x + full_width;
-  const float full_y1 = full_y + full_height;
-  // 窗口被挪到背板范围之外（挪窗、换分辨率）时宁可不画：画错位比不画更难看。
-  if (full_width <= 0.0f || full_height <= 0.0f || full_x < 0.0f ||
-      full_y < 0.0f ||
-      full_x1 > static_cast<float>(selected->source_width) ||
-      full_y1 > static_cast<float>(selected->source_height)) {
-    return false;
-  }
-  const Gdiplus::GraphicsState state = graphics.Save();
-  // 源是已经糊透的降采样图，放大用双线性即可 —— 它本来就是平滑的，不会放大出细节，
-  // 也不会像最近邻那样露出块状边缘。
-  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
-  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-  // FillPath applies antialias coverage; SetClip(path)+DrawImage cuts a binary
-  // edge and leaves stair steps on the transparent layered-window surface.
-  Gdiplus::TextureBrush backdrop(selected->reduced->target,
-                                 Gdiplus::WrapModeTileFlipXY);
-  backdrop.ScaleTransform(
-      static_cast<float>(selected->source_width) /
-          static_cast<float>(selected->reduced->width) / scale,
-      static_cast<float>(selected->source_height) /
-          static_cast<float>(selected->reduced->height) / scale);
-  graphics.FillPath(&backdrop, &path);
-  graphics.Restore(state);
-  return true;
-}
 
 void PaintPanelContent(Gdiplus::Graphics& graphics, const PanelSkin& skin,
                        float width, float height) {
@@ -5123,7 +4813,19 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
           // 「更多」的二级面板就会叠到一级面板上。
           OpenToolPanel(control, g_panel_anchor);
         } else if (item.enabled && item.property == "mova-resource") {
-          // 换资源必须由应用重建播放，这里只回传选择然后干净退出。
+          if (g_live_resource_resolution.load()) {
+            if (g_episode_search_pending.load()) return 0;
+            g_episode_search_pending = true;
+            g_episode_search_index = g_playlist_position.load();
+            g_pending_resource_choice = std::atoi(item.value.c_str());
+            MpvCommand("set", "pause", "yes");
+            EmitResourceChoice(std::atoi(item.value.c_str()));
+            ShowWindow(window, SW_HIDE);
+            SetFocus(g_window);
+            ShowControls();
+            return 0;
+          }
+          // Compatibility for callers without a live resource resolver.
           EmitResourceChoice(std::atoi(item.value.c_str()));
           ShowWindow(window, SW_HIDE);
           SendMessageW(g_window, WM_CLOSE, 0, 0);
@@ -7195,9 +6897,22 @@ void ApplyVolumeTarget(double volume, bool show_hint) {
   // mpv 属性事件是异步回写的；先更新本地目标值，保证快速滚轮/快捷键连按会
   // 以上一次用户操作为基准，而不是反复读到尚未回报的旧音量。
   g_volume.store(volume);
+  if (volume > 0) g_last_audible_volume.store(volume);
+  g_muted.store(false);
+  MpvCommand("set", "mute", "no");
   const std::string value = std::to_string(volume);
   MpvCommand("set", "volume", value.c_str());
   if (show_hint) ShowVolumeHint(volume);
+}
+
+void ToggleZeroVolume() {
+  const double current = g_volume.load();
+  if (current <= 0 || g_muted.load()) {
+    ApplyVolumeTarget(g_last_audible_volume.load(), true);
+  } else {
+    g_last_audible_volume.store(current);
+    ApplyVolumeTarget(0, true);
+  }
 }
 
 int g_top_hover = 0;
@@ -7728,8 +7443,9 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
         const float volume_start = VolumeStart(static_cast<int>(width));
         const float volume_end = volume_start + 58.0f;
         DrawHover(graphics, kMute, volume_start - 24, controls_y, 40,
-                  g_muted.load());
-        DrawSpeaker(graphics, volume_start - 24, controls_y, g_muted.load(),
+                  g_volume.load() <= 0 || g_muted.load());
+        DrawSpeaker(graphics, volume_start - 24, controls_y,
+                    g_volume.load() <= 0 || g_muted.load(),
                     HoverAmount(kMute));
         Gdiplus::Pen volume_track(Gdiplus::Color(120, 174, 176, 184), 3);
         volume_track.SetStartCap(Gdiplus::LineCapRound);
@@ -7826,9 +7542,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
       } else {
         switch (hit) {
           case kMute: {
-            MpvCommand("cycle", "mute");
-            ShowAdjustHint(g_muted.load() ? L"取消静音" : L"已静音",
-                           std::wstring(), kGlyphSpeaker, -1.0f);
+            ToggleZeroVolume();
             break;
           }
           case kVolume: {
@@ -8044,9 +7758,7 @@ bool RunShortcut(int key) {
   } else if (action == "volumeDown") {
     ApplyVolumeTarget(g_volume.load() - g_volume_step, true);
   } else if (action == "mute") {
-    MpvCommand("cycle", "mute");
-    ShowAdjustHint(g_muted.load() ? L"取消静音" : L"已静音", std::wstring(),
-                   kGlyphSpeaker, -1.0f);
+    ToggleZeroVolume();
   } else if (action == "fullscreen") {
     ToggleFullscreen();
     ShowAdjustHint(g_fullscreen ? L"进入全屏" : L"退出全屏", L"再次按 F 可切换",
@@ -8102,6 +7814,28 @@ void TickFrame() {
       if (g_top_bar) InvalidateRect(g_top_bar, nullptr, FALSE);
       if (g_controls) InvalidateRect(g_controls, nullptr, FALSE);
     }
+    char preload_state[192]{};
+    const double buffered_end = local ? g_duration.load() : std::max(
+        g_position.load(),
+        std::strtod(MpvString("demuxer-cache-time").c_str(), nullptr));
+    double outro = 0.0;
+    for (const auto& segment : SegmentsSnapshot()) {
+      if (segment.kind == SegmentKind::credits &&
+          segment.start > g_duration.load() * 0.5 &&
+          segment.start < g_duration.load()) {
+        if (outro == 0.0 || segment.start < outro) outro = segment.start;
+      }
+    }
+    const int length = std::snprintf(preload_state, sizeof(preload_state),
+        "MOVA_PRELOAD_STATE=%lld|%.3f|%.3f|%.3f|%.3f|%d\r\n",
+        static_cast<long long>(index), g_position.load(), g_duration.load(),
+        buffered_end, outro,
+        g_buffering.load() || g_paused.load() ? 1 : 0);
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output && output != INVALID_HANDLE_VALUE && length > 0) {
+      DWORD written = 0;
+      WriteFile(output, preload_state, static_cast<DWORD>(length), &written, nullptr);
+    }
   }
   // 第一帧没有「上一帧」可比，用一个等于当前节拍的 dt：对齐刷新时是刷新周期 ×
   // 分频，退回定时器时才是 kFrameIntervalMs。只影响第一帧，但拿错了转圈/淡出会
@@ -8134,27 +7868,6 @@ void TickFrame() {
     // 避免稍后再收到一次 WM_PAINT 而重复画同一帧。
     ValidateRect(g_danmaku, nullptr);
     PaintDanmaku();
-  }
-  // 浮层出现时由后台线程采一帧背板，收到新时间戳后只重绘对应玻璃层。
-  // 不在视频播放期间周期性 PrintWindow，避免 D3D 表面同步拖慢画面和控件响应。
-  const bool glass_visible = (g_controls && IsWindowVisible(g_controls)) ||
-                             (g_top_bar && IsWindowVisible(g_top_bar)) ||
-                             (g_panel && IsWindowVisible(g_panel));
-  if (glass_visible) {
-    static ULONGLONG presented_stamp = 0;
-    const ULONGLONG stamp = g_backdrop.captured_at.load();
-    if (stamp != 0 && stamp != presented_stamp) {
-      presented_stamp = stamp;
-      if (g_panel && IsWindowVisible(g_panel)) {
-        InvalidateRect(g_panel, nullptr, FALSE);
-      }
-      if (g_controls && IsWindowVisible(g_controls)) {
-        InvalidateRect(g_controls, nullptr, FALSE);
-      }
-      if (g_top_bar && IsWindowVisible(g_top_bar)) {
-        InvalidateRect(g_top_bar, nullptr, FALSE);
-      }
-    }
   }
   // 音量是连续量（拖一次音量条会连出几十个值），回写偏好要等手停下来。
   FlushPendingPlayerPreferences();
@@ -8542,12 +8255,29 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     case kEpisodeResolved: {
       std::unique_ptr<EpisodeResolutionUpdate> update(
           reinterpret_cast<EpisodeResolutionUpdate*>(lparam));
+      if (update && update->prepared) {
+        // Preparing a next entry must never start playback or alter selection.
+        const auto item = update->index;
+        if (!g_episode_search_pending.load() && !update->url.empty() &&
+            static_cast<int64_t>(item) == g_playlist_position.load() + 1 &&
+            item < g_media_urls.size() && !g_media_urls[item].empty()) {
+          g_media_urls[item] = std::move(update->url);
+          g_playlist_headers[item] = std::move(update->headers);
+          g_playlist_header_overrides[item] = true;
+          g_playlist_native_network[item] = update->native_network;
+          g_playlist_resumes[item] = std::max(0.0, update->resume_seconds);
+        }
+        return 0;
+      }
       if (!update ||
           static_cast<int64_t>(update->index) != g_episode_search_index.load()) {
         return 0;
       }
       const auto index = static_cast<int64_t>(update->index);
       if (!update->error.empty() || update->url.empty()) {
+        ShowToast(update->error.empty() ? "切换失败，请重试" : update->error,
+                  HintTone::Error);
+        g_pending_resource_choice = -1;
         g_pending_episode_resources.reset();
         g_episode_search_pending = false;
         g_episode_search_index = -1;
@@ -8588,6 +8318,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         g_playlist_resumes[item] = std::max(0.0, update->resume_seconds);
       }
       if (!LoadPlaylistEntry(index)) {
+        g_pending_resource_choice = -1;
         g_media_urls[item] = old_url;
         g_playlist_headers[item] = old_headers;
         g_playlist_header_overrides[item] = old_header_override;
@@ -8612,6 +8343,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       }
       g_episode_search_pending = false;
       g_episode_search_index = -1;
+      if (g_pending_resource_choice >= 0) {
+        g_resource_current = g_pending_resource_choice;
+        g_pending_resource_choice = -1;
+        RefreshNativeResourceInfo();
+      }
       g_media_title = g_playlist_titles[item];
       if (g_top_bar) InvalidateRect(g_top_bar, nullptr, FALSE);
       MpvCommand("set", "pause", "no");
@@ -8947,6 +8683,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
               Utf8(argument.substr(equals + 1)).c_str()));
         } else if (name == "mova-live-episode-resolution") {
           g_live_episode_resolution = argument.substr(equals + 1) == L"yes";
+        } else if (name == "mova-live-resource-resolution") {
+          g_live_resource_resolution = argument.substr(equals + 1) == L"yes";
         } else if (name == "mova-default-headers") {
           g_default_http_headers = PercentDecode(Utf8(argument.substr(equals + 1)));
           g_default_http_headers_set = true;
@@ -9320,7 +9058,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
               // Ignore malformed incremental resource snapshots.
             }
           }
-        } else if (line.rfind("MOVA_EPISODE_RESOLVED=", 0) == 0) {
+        } else if (line.rfind("MOVA_EPISODE_RESOLVED=", 0) == 0 ||
+                   line.rfind("MOVA_EPISODE_PREPARED=", 0) == 0) {
           const std::string value = line.substr(22);
           const size_t first = value.find('|');
           const size_t second = first == std::string::npos
@@ -9332,6 +9071,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           if (first != std::string::npos && second != std::string::npos &&
               third != std::string::npos) {
             auto update = std::make_unique<EpisodeResolutionUpdate>();
+            update->prepared = line.rfind("MOVA_EPISODE_PREPARED=", 0) == 0;
             try {
               update->index = static_cast<size_t>(
                   std::stoul(value.substr(0, first)));
@@ -9656,6 +9396,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
             if (value > 0.0) g_duration = value;
           } else if (property->name && std::string(property->name) == "volume") {
             g_volume = value;
+            if (value > 0) g_last_audible_volume.store(value);
             // 音量从哪改的（面板、快捷键、滚轮、拖音量条）都会走到这里，统一在
             // 这里记账，改完等手停下来再回写一次偏好。
             NoteVolumeForPreference(value);
@@ -9684,33 +9425,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
 
   // 背板采集与 CPU 模糊不能跑在 UI 帧循环里。玻璃区域显隐变化时，后台线程采一帧
   // 并生成模糊层；同一组控件保持显示时复用缓存，避免持续播放期间反复同步抓屏。
-  std::atomic<bool> glass_backdrop_done{false};
-  std::thread glass_backdrop([&glass_backdrop_done] {
-    unsigned int previous_static_visibility = 0;
-    bool panel_was_visible = false;
-    while (g_running) {
-      const bool panel_visible = g_panel && IsWindowVisible(g_panel);
-      const unsigned int static_visibility =
-          (g_controls && IsWindowVisible(g_controls) ? 1u : 0u) |
-          (g_top_bar && IsWindowVisible(g_top_bar) ? 2u : 0u);
-      if (!panel_visible && static_visibility != 0 &&
-          static_visibility != previous_static_visibility) {
-        // PrintWindow synchronizes with the D3D video surface and costs about
-        // 20–28ms per full-frame capture. Take one backdrop when the static
-        // controls appear, then keep that blurred sample while they remain visible;
-        // continuous 15Hz capture was making the whole player miss frames.
-        // All chrome uses fixed material; synchronous video capture is obsolete.
-      } else if (panel_visible && !panel_was_visible) {
-        // 二级菜单使用固定材质，不采样视频画面。
-      }
-      previous_static_visibility = static_visibility;
-      panel_was_visible = panel_visible;
-      // UpdateGlassBackdrop 自己按 66ms 节流。这里只让出一个时间片，
-      // 避免原先的 8ms 睡眠把可达刷新率直接压到 30–40Hz。
-      Sleep(50);
-    }
-    glass_backdrop_done = true;
-  });
 
   MSG message{};
   bool pumping = true;
@@ -9796,17 +9510,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // 与 timeBeginPeriod 配对。漏掉它会让系统时钟一直停在 1ms 粒度上，
   // 本机其他程序的待机电耗会明显上升。
   timeEndPeriod(1);
-  // PrintWindow can synchronously send messages to this thread. Keep servicing
-  // them until capture exits, otherwise joining here can deadlock shutdown.
-  while (!glass_backdrop_done) {
-    MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
-    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-      if (message.message == WM_QUIT) continue;
-      TranslateMessage(&message);
-      DispatchMessageW(&message);
-    }
-  }
-  if (glass_backdrop.joinable()) glass_backdrop.join();
   if (events.joinable()) events.join();
   if (g_handle) {
     g_mpv.terminate_destroy(g_handle);
@@ -9816,9 +9519,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // 否则进程退出时它们的析构函数会调用已失效的 Gdip* 并触发访问冲突（0xC0000005）。
   ReleaseGlyphCache();
   ReleaseDanmakuSurface();
-  // 背板那两张全窗位图（各 32bpp，和整屏同量级）里的 Gdiplus::Bitmap 同样是 GDI+
-  // 对象，必须在 GdiplusShutdown 之前释放。
-  ReleaseGlassBackdrop();
   // 控件条那块 32bpp 面里的 Gdiplus::Bitmap 同样是 GDI+ 对象，必须在
   // GdiplusShutdown 之前释放（否则收尾时析构踩到已卸载的 Gdip*，0xC0000005）。
   delete g_controls_surface;

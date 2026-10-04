@@ -123,7 +123,10 @@ String _normalizedEpisodeLabel(String value) => value
     .replaceAll('·', '')
     .replaceAll('：', ':');
 
-List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
+List<TraktEvent> mergeCalendarEvents(
+  Iterable<TraktEvent> rows, {
+  bool preferTrakt = false,
+}) {
   final merged = <TraktEvent>[];
   for (final event in rows) {
     final index = merged.indexWhere((previous) {
@@ -172,12 +175,21 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
       continue;
     }
     final previous = merged[index];
-    final timed = previous.timeKnown ? previous : event;
+    final timed = preferTrakt && event.source == 'Trakt' && event.timeKnown
+        ? event
+        : preferTrakt && previous.source == 'Trakt' && previous.timeKnown
+        ? previous
+        : previous.timeKnown
+        ? previous
+        : event;
     merged[index] = TraktEvent(
       title: _preferredCalendarTitle(previous.title, event.title),
       episode: previous.episode.isNotEmpty ? previous.episode : event.episode,
       airDate: timed.airDate,
       timeKnown: timed.timeKnown,
+      source: timed.source,
+      seriesFinale: previous.seriesFinale || event.seriesFinale,
+      traktId: event.traktId ?? previous.traktId,
       posterUrl: event.posterUrl ?? previous.posterUrl,
       backdropUrl: event.backdropUrl ?? previous.backdropUrl,
       platform: timed.platform ?? event.platform ?? previous.platform,
@@ -232,6 +244,19 @@ List<TraktEvent> mergeCalendarEvents(Iterable<TraktEvent> rows) {
   }
   merged.sort((a, b) => a.airDate.compareTo(b.airDate));
   return merged;
+}
+
+bool calendarGroupCompleted(Iterable<TraktEvent> events, {DateTime? now}) {
+  final cutoff = now ?? DateTime.now();
+  return events.any(
+    (event) =>
+        event.seriesFinale &&
+        !event.airDate.isAfter(
+          event.timeKnown
+              ? cutoff
+              : DateTime(cutoff.year, cutoff.month, cutoff.day),
+        ),
+  );
 }
 
 String _preferredCalendarTitle(String previous, String incoming) {
