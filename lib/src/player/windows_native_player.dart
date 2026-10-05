@@ -20,6 +20,10 @@ import 'native_dolby_vision.dart';
 import 'next_episode_preload.dart';
 import 'playback_segments.dart';
 import 'subtitle_search_service.dart';
+import 'seek_preview.dart';
+import '../network/network_http_client.dart';
+
+import 'package:http/http.dart' as http;
 
 /// 可切换的资源版本。原生播放器只拿到显示用的服务器名、规格摘要与一张**本地
 /// 图标文件**的路径 —— 地址、请求头与视频范围都留在应用侧，因为换资源要靠应用
@@ -561,6 +565,8 @@ class WindowsNativePlayer {
         '--mova-danmaku-enabled=${danmakuEnabled ? 'yes' : 'no'}',
         ...danmakuStyleArgs,
         '--mova-auto-skip-segments=${autoSkipSegments ? 'yes' : 'no'}',
+        '--mova-seek-preview=${(preferences.getBool('yingji.player.seek-preview') ?? true) ? 'yes' : 'no'}',
+        '--mova-show-skip-after-cancel=${(preferences.getBool('yingji.segment.show-skip-after-cancel') ?? true) ? 'yes' : 'no'}',
         '--mova-skip-delay-seconds=$skipDelaySeconds',
         ...toolOrder.map((tool) => '--mova-tool-order=$tool'),
         ...toolHidden.map((tool) => '--mova-tool-hidden=$tool'),
@@ -1230,12 +1236,126 @@ class WindowsNativePlayer {
         }
       }
 
+      final previewDirectory = await Directory.systemTemp.createTemp(
+        'mova-seek-',
+      );
+      var previewClosed = false;
+      var previewBusy = false;
+      List<String>? pendingPreview;
+      String? previewIdentity;
+      ServerSeekPreview? serverPreview;
+      http.Client? previewClient;
+      Future<void> servePreview() async {
+        if (previewBusy || previewClosed) return;
+        previewBusy = true;
+        try {
+          while (pendingPreview != null && !previewClosed) {
+            final fields = pendingPreview!;
+            pendingPreview = null;
+            final id = int.tryParse(fields[0]);
+            final index = int.tryParse(fields[1]);
+            final seconds = double.tryParse(fields[2]);
+            if (id == null ||
+                index == null ||
+                seconds == null ||
+                !seconds.isFinite ||
+                seconds < 0 ||
+                index < 0 ||
+                index >= entries.length) {
+              continue;
+            }
+            if (!(preferences.getBool('yingji.player.seek-preview') ?? true)) {
+              continue;
+            }
+            final entry = entries[index];
+            final identity =
+                '${entry.sourceId}|${entry.serverItemId}|${entry.url}';
+            if (previewIdentity != identity) {
+              previewIdentity = identity;
+              previewClient?.close();
+              previewClient = null;
+              serverPreview = null;
+              final store = await SourceStore.create();
+              final sources = store.load().where((s) => s.id == entry.sourceId);
+              if (sources.isNotEmpty && entry.serverItemId != null) {
+                final source = sources.first;
+                final token = store.tokenFor(source);
+                if (source.kind != SourceKind.webdav && token != null) {
+                  previewClient = ProxyRouting.serverUsesProxy(source.id)
+                      ? createNetworkHttpClient()
+                      : http.Client();
+                  serverPreview = ServerSeekPreview(
+                    previewClient!,
+                    source,
+                    token,
+                    entry.serverItemId!,
+                    mediaSourceId: Uri.tryParse(entry.url)
+                        ?.queryParameters['MediaSourceId'],
+                  );
+                }
+              }
+            }
+            SeekPreviewFrame? frame;
+            try {
+              frame = await serverPreview?.frame(seconds);
+            } catch (_) {
+              // Timeouts and invalid tiles fall through to native extraction.
+            }
+            if (previewClosed ||
+                identity !=
+                    '${entries[index].sourceId}|${entries[index].serverItemId}|${entries[index].url}') {
+              continue;
+            }
+            if (frame == null) {
+              sendLine('MOVA_SEEK_PREVIEW=$id|$index|$seconds||0|0|0|0');
+            } else {
+              final file = File('${previewDirectory.path}/$id.jpg');
+              await file.writeAsBytes(frame.bytes, flush: false);
+              if (!previewClosed) {
+                sendLine(
+                  'MOVA_SEEK_PREVIEW=$id|$index|$seconds|${Uri.encodeComponent(file.path)}|${frame.x}|${frame.y}|${frame.width}|${frame.height}',
+                );
+              }
+              await for (final old in previewDirectory.list()) {
+                if (old is! File) {
+                  continue;
+                }
+                final name = old.uri.pathSegments.last;
+                final oldId = int.tryParse(name.replaceFirst('.jpg', ''));
+                if (oldId != null && oldId < id - 3) {
+                  try {
+                    await old.delete();
+                  } catch (_) {}
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // Failed previews must not stop playback or poison the stdout listener.
+        } finally {
+          previewBusy = false;
+          if (pendingPreview != null && !previewClosed) {
+            unawaited(servePreview());
+          }
+        }
+      }
+
       final outputDone = Completer<void>();
       final output = process.stdout
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen(
             (chunk) {
+              if (chunk.startsWith('MOVA_SEEK_PREVIEW_REQUEST=')) {
+                final fields = chunk
+                    .substring('MOVA_SEEK_PREVIEW_REQUEST='.length)
+                    .split('|');
+                if (fields.length == 3) {
+                  pendingPreview = fields;
+                  unawaited(servePreview());
+                }
+                return;
+              }
               if (chunk.startsWith('MOVA_PRELOAD_STATE=')) {
                 final fields = chunk
                     .substring('MOVA_PRELOAD_STATE='.length)
@@ -1606,6 +1726,14 @@ class WindowsNativePlayer {
           );
       await process.stderr.drain<void>();
       final exitCode = await process.exitCode;
+      previewClosed = true;
+      previewClient?.close();
+      while (previewBusy) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      try {
+        await previewDirectory.delete(recursive: true);
+      } catch (_) {}
       speedTimer.cancel();
       await outputDone.future;
       await progressWrites;
@@ -2198,6 +2326,20 @@ class WindowsNativePlayer {
       'mova-skip-delay-seconds',
       (preferences.getDouble('yingji.segment.skip-delay-seconds') ?? 5)
           .toString(),
+    );
+    push(
+      'yingji.player.seek-preview',
+      'mova-seek-preview',
+      (preferences.getBool('yingji.player.seek-preview') ?? true)
+          ? 'yes'
+          : 'no',
+    );
+    push(
+      'yingji.segment.show-skip-after-cancel',
+      'mova-show-skip-after-cancel',
+      (preferences.getBool('yingji.segment.show-skip-after-cancel') ?? true)
+          ? 'yes'
+          : 'no',
     );
     // 快进步长 / 音量步长：同属播放器设置，改了立刻生效才符合直觉。
     push(

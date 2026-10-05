@@ -10178,6 +10178,8 @@ class _SettingsPageState extends State<SettingsPage>
       _cacheSeconds = 30;
   String _aspect = '自动';
   bool _autoSkipSegments = true;
+  bool _seekPreview = true;
+  bool _showSkipAfterCancel = true;
   double _autoSkipDelaySeconds = 5;
   bool _segmentServerSource = true;
   bool _segmentIntroDbSource = true;
@@ -10362,6 +10364,9 @@ class _SettingsPageState extends State<SettingsPage>
         _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
         _aspect = prefs.getString('yingji.player.aspect') ?? '自动';
         _autoSkipSegments = prefs.getBool('yingji.segment.auto-skip') ?? true;
+        _seekPreview = prefs.getBool('yingji.player.seek-preview') ?? true;
+        _showSkipAfterCancel =
+            prefs.getBool('yingji.segment.show-skip-after-cancel') ?? true;
         _autoSkipDelaySeconds =
             prefs.getDouble('yingji.segment.skip-delay-seconds') ?? 5;
         _segmentServerSource =
@@ -10491,6 +10496,8 @@ class _SettingsPageState extends State<SettingsPage>
       'yingji.player.cache-seconds': _cacheSeconds,
       'yingji.player.aspect': _aspect,
       'yingji.segment.auto-skip': _autoSkipSegments,
+      'yingji.player.seek-preview': _seekPreview,
+      'yingji.segment.show-skip-after-cancel': _showSkipAfterCancel,
       'yingji.segment.skip-delay-seconds': _autoSkipDelaySeconds,
       'yingji.segment.source-server': _segmentServerSource,
       'yingji.segment.source-introdb': _segmentIntroDbSource,
@@ -11514,6 +11521,16 @@ class _SettingsPageState extends State<SettingsPage>
                   _save();
                 },
               ),
+              if (Platform.isWindows || Platform.isAndroid)
+                _ToggleRow(
+                  title: '拖动进度条预览画面',
+                  detail: '优先使用服务器缩略图，没有时尝试独立抽帧；关闭可减少网络与解码负担',
+                  value: _seekPreview,
+                  onChanged: (value) {
+                    setState(() => _seekPreview = value);
+                    _save();
+                  },
+                ),
               Text('快进 / 快退按键步长  ${_seekSeconds.round()} 秒'),
               Text(
                 WindowHost.isDesktop
@@ -11792,6 +11809,17 @@ class _SettingsPageState extends State<SettingsPage>
                 '自动跳过',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
               ),
+              if (Platform.isWindows || Platform.isAndroid) ...[
+                _ToggleRow(
+                  title: '取消自动跳过后保留跳过按钮',
+                  detail: '取消本段倒计时后，仍可手动点击跳过',
+                  value: _showSkipAfterCancel,
+                  onChanged: (value) {
+                    setState(() => _showSkipAfterCancel = value);
+                    _save();
+                  },
+                ),
+              ],
               _ToggleRow(
                 title: '自动跳过片头片尾',
                 detail: '播放器仍会先显示跳转提示，可手动取消',

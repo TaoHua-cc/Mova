@@ -1856,6 +1856,10 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       context: context,
       sheetAnimationStyle: MovaMotion.dialogAnimationStyle(context),
       backgroundColor: Colors.transparent,
+      // GlassPanel owns the surface; do not inherit the theme's second frame.
+      shape: const RoundedRectangleBorder(),
+      elevation: 0,
+      showDragHandle: false,
       barrierColor: Colors.black54,
       builder: (context) => YingjiStableScrollGlass(
         child: SafeArea(

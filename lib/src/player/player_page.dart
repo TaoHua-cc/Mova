@@ -28,6 +28,7 @@ import 'subtitle_preference.dart';
 import 'subtitle_search_dialog.dart';
 import 'subtitle_search_service.dart';
 import 'skip_border_progress.dart';
+import 'android_seek_preview.dart';
 import '../sources/emby_client.dart';
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
@@ -329,6 +330,9 @@ class _PlayerPageState extends State<PlayerPage> {
   final Map<String, String> _sessionMediaSourceIds = {};
   String _consoleTab = '声音';
   double? _sliderSeekPreview;
+  bool _seekPreviewEnabled = true;
+  bool _showSkipAfterCancel = true;
+  final Set<String> _skipCancelled = {};
   bool _hardware = true;
   bool _hdr = true;
   bool _downmix = false;
@@ -1199,6 +1203,9 @@ class _PlayerPageState extends State<PlayerPage> {
     _cacheSeconds = prefs.getDouble('yingji.player.cache-seconds') ?? 30;
     _preloadNextEpisode = prefs.getBool('yingji.player.preload-next') ?? true;
     _seekSeconds = prefs.getDouble('yingji.player.seek-seconds') ?? 10;
+    _seekPreviewEnabled = prefs.getBool('yingji.player.seek-preview') ?? true;
+    _showSkipAfterCancel =
+        prefs.getBool('yingji.segment.show-skip-after-cancel') ?? true;
     _volumeStep = prefs.getDouble('yingji.player.volume-step') ?? 5;
     final shortcutJson = prefs.getString('yingji.player.shortcuts');
     final shortcutData = shortcutJson == null ? null : jsonDecode(shortcutJson);
@@ -1238,6 +1245,8 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Future<void> _openCurrentMedia() async {
+    _sliderSeekPreview = null;
+    _skipCancelled.clear();
     final episode = _activeEpisode;
     _cacheLeases.putIfAbsent(
       episode.url,
@@ -2005,12 +2014,14 @@ class _PlayerPageState extends State<PlayerPage> {
     final kind = _currentSkipKind;
     if (kind != _skipKind) {
       setState(() {
+        if (_skipKind != null) _skipCancelled.remove(_skipKind);
         _skipKind = kind;
         _skipTicks = 0;
       });
     }
     if (kind == null ||
         _skipDismissed.contains(kind) ||
+        _skipCancelled.contains(kind) ||
         !_autoSkipSegments ||
         !_state.playing ||
         _state.buffering)
@@ -2052,7 +2063,7 @@ class _PlayerPageState extends State<PlayerPage> {
       duration: MovaMotion.standard,
       child: TweenAnimationBuilder<double>(
         tween: Tween(
-          end: _autoSkipSegments
+          end: _autoSkipSegments && !_skipCancelled.contains(_skipKind)
               ? (1 - _skipTicks / math.max(1, _autoSkipDelaySeconds * 2)).clamp(
                   0,
                   1,
@@ -2073,21 +2084,22 @@ class _PlayerPageState extends State<PlayerPage> {
               TextButton(
                 onPressed: _performSegmentSkip,
                 child: Text(
-                  _autoSkipSegments
+                  _autoSkipSegments && !_skipCancelled.contains(_skipKind)
                       ? '${(_autoSkipDelaySeconds - _skipTicks / 2).ceil().clamp(0, _autoSkipDelaySeconds.ceil())} 秒后跳过${_skipKind == 'intro' ? '片头' : '片尾'}'
                       : '跳过${_skipKind == 'intro' ? '片头' : '片尾'}',
                   style: const TextStyle(color: Colors.white, fontSize: 13),
                 ),
               ),
-              TextButton(
-                onPressed: () => setState(() {
-                  if (_skipKind != null) _skipDismissed.add(_skipKind!);
-                }),
-                child: const Text(
-                  '取消',
-                  style: TextStyle(color: Colors.white, fontSize: 12),
+              if (!_skipCancelled.contains(_skipKind))
+                TextButton(
+                  onPressed: () => setState(() {
+                    if (_skipKind != null) _skipCancelled.add(_skipKind!);
+                  }),
+                  child: const Text(
+                    '取消',
+                    style: TextStyle(color: Colors.white, fontSize: 12),
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -2479,6 +2491,13 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    if (Platform.isAndroid) {
+      unawaited(
+        _systemVolumeChannel
+            .invokeMethod<void>('closeSeekPreview')
+            .catchError((Object _) {}),
+      );
+    }
     unawaited(WindowHost.setAutoPictureInPicture(false));
     // 移动端：关闭常亮、恢复系统栏与竖屏（桌面端无操作）
     unawaited(WindowHost.exitMediaSession());
@@ -2969,8 +2988,56 @@ class _PlayerPageState extends State<PlayerPage> {
                   ),
                   if (_skipKind != null &&
                       !_skipDismissed.contains(_skipKind) &&
+                      (!_skipCancelled.contains(_skipKind) ||
+                          _showSkipAfterCancel) &&
                       !_settingsOpen)
                     _segmentPrompt(),
+                  if (Platform.isAndroid &&
+                      _seekPreviewEnabled &&
+                      _sliderSeekPreview != null)
+                    Positioned(
+                      left:
+                          28 +
+                          ((MediaQuery.sizeOf(context).width - 56 - 204) *
+                                  (_sliderSeekPreview! /
+                                      math.max(
+                                        1,
+                                        _state.duration.inMilliseconds,
+                                      )))
+                              .clamp(
+                                0.0,
+                                math.max(
+                                  0.0,
+                                  MediaQuery.sizeOf(context).width - 260,
+                                ),
+                              ),
+                      bottom: 190 + MediaQuery.paddingOf(context).bottom,
+                      child: AndroidSeekPreview(
+                        key: ValueKey(
+                          '${_activeEpisode.url}|$_activeEpisodeIndex',
+                        ),
+                        url: _activeEpisode.url,
+                        sourceId: _activeEpisode.sourceId,
+                        itemId: _activeEpisode.serverItemId,
+                        position: Duration(
+                          milliseconds: _sliderSeekPreview!.round(),
+                        ),
+                        fallbackUrl: () async {
+                          final episode = _activeEpisode;
+                          final cache = _videoCache;
+                          if (cache == null) {
+                            throw StateError('Playback cache unavailable');
+                          }
+                          final file = await cache.cachedFile(episode.url);
+                          return file?.path ??
+                              await cache.playbackUrl(
+                                episode.url,
+                                headers: episode.headers,
+                                sourceId: episode.sourceId,
+                              );
+                        },
+                      ),
+                    ),
                   if (_settingsOpen) _consolePanel(context),
                   if (_switchingEpisode)
                     Positioned(

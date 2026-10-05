@@ -95,6 +95,19 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "closeSeekPreview" -> {
+                        SeekPreview.close()
+                        result.success(null)
+                    }
+                    "seekPreviewFrame" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrBlank()) result.success(null)
+                        else SeekPreview.frame(url,
+                            call.argument<Map<String, String>>("headers") ?: emptyMap(),
+                            call.argument<Number>("milliseconds")?.toLong() ?: 0L) { bytes ->
+                            runOnUiThread { result.success(bytes) }
+                        }
+                    }
                     "cleanVideoCache" -> NextEpisodeCache.clean(this, call.argument<String>("url")) {
                         runOnUiThread { result.success(null) }
                     }
