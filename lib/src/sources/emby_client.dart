@@ -43,6 +43,13 @@ class MediaItem {
     this.lastPlayedAt,
   });
   final String id;
+
+  /// Playback variants share the server item id, not their media-source id.
+  String get resourceKey {
+    final version = playbackUrl?.queryParameters['MediaSourceId'];
+    return '${source.id}|$id${version == null || version.isEmpty ? '' : '|$version'}';
+  }
+
   final String title;
   final String type;
   final MediaSource source;
@@ -570,7 +577,7 @@ class EmbyClient {
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     return (data['Items'] as List<dynamic>? ?? const [])
         .whereType<Map<String, dynamic>>()
-        .map((item) => _item(session, item))
+        .expand((item) => _itemVersions(session, item))
         .toList(growable: false);
   }
 
@@ -606,6 +613,13 @@ class EmbyClient {
   /// names embed the series title, returns dozens of episodes that carry no
   /// TMDB provider id.
   Future<MediaItem> itemById(EmbySession session, String itemId) async {
+    return _item(session, await _itemDataById(session, itemId));
+  }
+
+  Future<Map<String, dynamic>> _itemDataById(
+    EmbySession session,
+    String itemId,
+  ) async {
     final userId = session.source.userId;
     if (userId == null || userId.isEmpty || itemId.isEmpty) {
       throw Exception('缺少媒体 ID');
@@ -629,7 +643,7 @@ class EmbyClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_message(response.statusCode, '条目读取失败'));
     }
-    return _item(session, jsonDecode(response.body) as Map<String, dynamic>);
+    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   Future<List<MediaItem>> findByTmdbId(
@@ -664,7 +678,7 @@ class EmbyClient {
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     return (data['Items'] as List<dynamic>? ?? const [])
         .whereType<Map<String, dynamic>>()
-        .map((item) => _item(session, item))
+        .expand((item) => _itemVersions(session, item))
         .toList(growable: false);
   }
 
@@ -711,23 +725,43 @@ class EmbyClient {
       final data = jsonDecode(response.body) as Map<String, dynamic>;
       final page = (data['Items'] as List<dynamic>? ?? const [])
           .whereType<Map<String, dynamic>>()
-          .map((item) => _item(session, item))
-          .toList(growable: false);
+          .expand((item) => _itemVersions(session, item))
+          .toList();
       if (page.isEmpty) break;
+      // Episode lists can omit alternate versions (Echo does this). Hydrate
+      // only the requested episode, never every item in a full-season browse.
+      if (episodeNumber != null) {
+        final matchingIds = (data['Items'] as List<dynamic>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .where(
+              (item) =>
+                  item['IndexNumber'] == episodeNumber &&
+                  (seasonNumber == null ||
+                      item['ParentIndexNumber'] == seasonNumber),
+            )
+            .map((item) => '${item['Id'] ?? ''}')
+            .where((id) => id.isNotEmpty)
+            .toSet();
+        for (final id in matchingIds) {
+          page.addAll(_itemVersions(session, await _itemDataById(session, id)));
+        }
+      }
       final before = seen.length;
       for (final episode in page) {
-        if (seen.add(episode.id) &&
+        if (seen.add(episode.resourceKey) &&
             (seasonNumber == null || episode.seasonNumber == seasonNumber) &&
             (episodeNumber == null || episode.episodeNumber == episodeNumber)) {
           episodes.add(episode);
         }
       }
       if (seen.length == before) break;
-      startIndex += page.length;
+      // Pagination counts server items, not expanded playback versions.
+      final itemCount = (data['Items'] as List<dynamic>? ?? const []).length;
+      startIndex += itemCount;
       final total = (data['TotalRecordCount'] as num?)?.toInt();
       if (total != null && total > 0) {
         if (startIndex >= total) break;
-      } else if (page.length < pageSize) {
+      } else if (itemCount < pageSize) {
         break;
       }
     }
@@ -1019,6 +1053,27 @@ class EmbyClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_message(response.statusCode, '播放进度同步失败'));
     }
+  }
+
+  Iterable<MediaItem> _itemVersions(
+    EmbySession session,
+    Map<String, dynamic> item,
+  ) {
+    final versions = (item['MediaSources'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .where((version) => '${version['Id'] ?? ''}'.isNotEmpty)
+        .toList();
+    if (versions.isEmpty) return [_item(session, item)];
+    return versions.map(
+      (version) => _item(session, {
+        ...item,
+        if ('${version['ItemId'] ?? ''}'.isNotEmpty)
+          'Id': '${version['ItemId']}',
+        'MediaSources': [version],
+        if (version['RunTimeTicks'] != null)
+          'RunTimeTicks': version['RunTimeTicks'],
+      }),
+    );
   }
 
   MediaItem _item(EmbySession session, Map<String, dynamic> item) {

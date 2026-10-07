@@ -122,6 +122,17 @@ void main() {
       final requestedSeasons = <String?>[];
       final client = EmbyClient(
         client: MockClient((request) async {
+          if (request.url.path.endsWith('/Items/2')) {
+            return http.Response(
+              jsonEncode({
+                'Id': '2',
+                'Type': 'Episode',
+                'ParentIndexNumber': 25,
+                'IndexNumber': 2,
+              }),
+              200,
+            );
+          }
           requestedSeasons.add(request.url.queryParameters['Season']);
           return http.Response(
             jsonEncode({

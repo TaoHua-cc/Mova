@@ -33,6 +33,7 @@
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <condition_variable>
 
 namespace {
 
@@ -42,6 +43,7 @@ enum mpv_event_id {
   MPV_EVENT_SHUTDOWN = 1,
   MPV_EVENT_END_FILE = 7,
   MPV_EVENT_FILE_LOADED = 8,
+  MPV_EVENT_PLAYBACK_RESTART = 21,
   MPV_EVENT_PROPERTY_CHANGE = 22,
 };
 enum mpv_format {
@@ -143,6 +145,7 @@ constexpr UINT kSubtitleSearchUpdated = WM_APP + 9;
 constexpr UINT kEpisodeResolved = WM_APP + 10;
 constexpr UINT kEpisodeResourcesUpdated = WM_APP + 11;
 constexpr UINT kDanmakuStateChanged = WM_APP + 12;
+constexpr UINT kSeekPreviewReady = WM_APP + 13;
 // 判断「是不是真播完了」的容差：正常播完时 time-pos 和 duration 会差一点点，
 // 给几秒余量；差得更多的 EOF 就是中途断流被误报成播完。
 constexpr double kEofGraceSeconds = 3.0;
@@ -236,6 +239,11 @@ std::atomic<double> g_seek_hover{-1};
 // 进度条拖动只更新预览，松手时才向 mpv 提交一次。网络流每个 seek 都可能
 // 重建 Range 请求；按鼠标移动逐像素 seek 会把正常服务器也打成偶发中断。
 bool g_seek_dragging = false;
+bool g_seek_preview_enabled = true;
+bool g_always_on_top = false;
+bool g_show_skip_after_cancel = true;
+void UpdateSeekPreview();
+void HideSeekPreview();
 bool g_volume_dragging = false;
 double g_seek_drag_target = -1.0;
 // seek 后如果新 Range 请求中断，自动重开必须回到用户刚选的位置，而不是
@@ -661,6 +669,7 @@ struct SegmentItem {
   std::wstring provider;
   /// 已跳过 / 本次不跳过：不再重复触发。
   bool consumed = false;
+  bool auto_cancelled = false;
 };
 
 std::vector<SegmentItem> g_segments;
@@ -1417,6 +1426,7 @@ bool LoadPlaylistEntry(int64_t index) {
     return false;
   }
   if (!g_handle) return false;
+  HideSeekPreview();
   const int64_t previous_index = g_playlist_position.load();
   ApplyPlaylistHeaders(index);
   // 先切索引：loadfile(replace) 发出的旧文件结束事件可能很快到达，事件回调
@@ -1714,7 +1724,7 @@ void SkipSegment(size_t index, bool automatic) {
 // 自动跳过：位置落进某个片段后先提示、按设置里的秒数倒计时，到点才跳。
 // 倒计时期间用户可以在「片头片尾」面板里点「本次不跳过」取消。
 void UpdateAutoSkip(uint64_t now) {
-  if (!g_auto_skip_segments || g_paused.load()) {
+  if (!g_auto_skip_segments) {
     HideAutoSkipHint();
     g_skip_index = -1;
     return;
@@ -1730,6 +1740,26 @@ void UpdateAutoSkip(uint64_t now) {
   if (candidate < 0) {
     HideAutoSkipHint();
     g_skip_index = -1;
+    return;
+  }
+  if (g_paused.load() && !segments[candidate].auto_cancelled) {
+    HideAutoSkipHint();
+    g_skip_index = -1;
+    return;
+  }
+  if (segments[candidate].auto_cancelled) {
+    g_skip_index = candidate;
+    if (g_show_skip_after_cancel) {
+      if (g_skip_hint_shown != UINT64_MAX || !g_hint || !IsWindowVisible(g_hint)) {
+        g_skip_hint_shown = UINT64_MAX;
+        ShowHint(SegmentGlyphLabel(segments[candidate].kind), L"", 0,
+                 HintMode::Toast, -1.0f, 0, HintTone::Neutral,
+                 HintLayout::AutoSkip);
+      }
+    } else {
+      HideAutoSkipHint();
+      g_skip_hint_shown = 0;
+    }
     return;
   }
   if (candidate != g_skip_index) {
@@ -2438,6 +2468,16 @@ bool ApplyLiveOption(const std::string& name, const std::string& value) {
     }
     return true;
   }
+  if (name == "mova-seek-preview") {
+    g_seek_preview_enabled = LiveFlag(value);
+    if (!g_seek_preview_enabled) HideSeekPreview();
+    return true;
+  }
+  if (name == "mova-show-skip-after-cancel") {
+    g_show_skip_after_cancel = LiveFlag(value);
+    g_skip_hint_shown = 0;
+    return true;
+  }
   if (name == "mova-skip-delay-seconds") {
     g_skip_delay_seconds = std::clamp(
         std::strtod(value.c_str(), nullptr), 0.0, 30.0);
@@ -2483,6 +2523,7 @@ bool ApplyLiveOption(const std::string& name, const std::string& value) {
 /// mova-danmaku-file 是例外：那条带的是临时文件路径，由 stdin 单独处理。
 bool IsLiveSettingName(const std::string& name) {
   return name == "mova-auto-skip-segments" ||
+         name == "mova-seek-preview" || name == "mova-show-skip-after-cancel" ||
          name == "mova-skip-delay-seconds" ||
          name == "mova-seek-seconds" || name == "mova-volume-step" ||
          name == "mova-glass-blur" ||
@@ -4875,7 +4916,7 @@ LRESULT CALLBACK PanelProc(HWND window, UINT message, WPARAM wparam,
           if (g_skip_index >= 0) {
             std::lock_guard<std::mutex> guard(g_segments_mutex);
             if (g_skip_index < static_cast<int>(g_segments.size())) {
-              g_segments[static_cast<size_t>(g_skip_index)].consumed = true;
+              g_segments[static_cast<size_t>(g_skip_index)].auto_cancelled = true;
             }
           }
           g_skip_index = -1;
@@ -5513,6 +5554,7 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
       const double remaining = g_skip_deadline > countdown_now
           ? (g_skip_deadline - countdown_now) / 1000.0 : 0.0;
       float distance = length * static_cast<float>(std::clamp(
+          g_skip_hint_shown == UINT64_MAX ? 0.0 :
           remaining / std::max(.001, g_skip_delay_seconds), 0.0, 1.0));
       Gdiplus::Pen progress(Gdiplus::Color(255, 255, 255, 255), 1.5f);
       progress.SetStartCap(Gdiplus::LineCapRound);
@@ -5529,7 +5571,7 @@ void PaintHint(Gdiplus::Graphics& graphics, int width, int height, int icon,
       }
       auto action = MakeInterfaceFont(12.0f, Gdiplus::FontStyleRegular);
       format.SetAlignment(Gdiplus::StringAlignmentCenter);
-      graphics.DrawString(L"取消", -1, &action,
+      graphics.DrawString(g_skip_hint_shown == UINT64_MAX ? L"跳过" : L"取消", -1, &action,
           Gdiplus::RectF(body.GetRight() - 48, body.Y, 40, body.Height),
           &format, &ink);
     }
@@ -6798,13 +6840,17 @@ LRESULT CALLBACK HintProc(HWND window, UINT message, WPARAM wparam,
       return TRUE;
     case WM_LBUTTONUP: {
       if (g_hint_layout != HintLayout::AutoSkip || g_skip_index < 0) return 0;
+      if (g_skip_hint_shown == UINT64_MAX) {
+        SkipSegment(static_cast<size_t>(g_skip_index), false);
+        return 0;
+      }
       {
         std::lock_guard<std::mutex> lock(g_segments_mutex);
         if (static_cast<size_t>(g_skip_index) >= g_segments.size() ||
             !SegmentActive(g_segments[g_skip_index], g_position.load(),
                            g_duration.load()) ||
             GetTickCount64() >= g_skip_deadline) return 0;
-        g_segments[g_skip_index].consumed = true;
+        g_segments[g_skip_index].auto_cancelled = true;
       }
       g_skip_index = -1;
       ShowHint(L"本次不跳过", L"", 0, HintMode::Toast, -1.0f, 0,
@@ -6916,7 +6962,7 @@ void ToggleZeroVolume() {
 }
 
 int g_top_hover = 0;
-std::array<float, 4> g_top_hover_mix{};
+std::array<float, 5> g_top_hover_mix{};
 
 bool AnimateTopHover() {
   bool changed = false;
@@ -6937,7 +6983,285 @@ int TopHit(int x, int width) {
   if (x >= width - 52) return 3;
   if (x >= width - 104) return 2;
   if (x >= width - 156) return 1;
+  if (x >= width - 208) return 4;
   return 0;
+}
+
+void DrawPinGlyph(Gdiplus::Graphics& graphics, float x, float y,
+                  Gdiplus::Color ink, bool selected) {
+  // Iconsax has no pin. Use rounded linear artwork, not a codepoint from
+  // another font that would disappear in the tree-shaken bundled font.
+  const auto state = graphics.Save();
+  graphics.TranslateTransform(x, y);
+  graphics.RotateTransform(selected ? 0.0f : 35.0f);
+  Gdiplus::Pen pin(ink, 1.5f);
+  ConfigureControlPen(pin);
+  Gdiplus::GraphicsPath head;
+  head.AddLine(-3.0f, -7.0f, 3.0f, -7.0f);
+  head.AddLine(3.0f, -7.0f, 3.0f, -3.0f);
+  head.AddLine(3.0f, -3.0f, 5.0f, 0.0f);
+  head.AddLine(5.0f, 0.0f, 5.0f, 2.0f);
+  head.AddLine(5.0f, 2.0f, -5.0f, 2.0f);
+  head.AddLine(-5.0f, 2.0f, -5.0f, 0.0f);
+  head.AddLine(-5.0f, 0.0f, -3.0f, -3.0f);
+  head.AddLine(-3.0f, -3.0f, -3.0f, -7.0f);
+  head.CloseFigure();
+  graphics.DrawPath(&pin, &head);
+  graphics.DrawLine(&pin, 0.0f, 2.0f, 0.0f, 8.0f);
+  graphics.Restore(state);
+}
+
+struct SeekPreviewResult {
+  uint64_t id = 0;
+  int64_t index = -1;
+  double seconds = 0;
+  std::wstring path;
+  int x = 0, y = 0, width = 0, height = 0;
+  bool decoded = false;
+  std::unique_ptr<Gdiplus::Bitmap> bitmap;
+};
+HWND g_seek_preview_window = nullptr;
+std::unique_ptr<Gdiplus::Bitmap> g_seek_preview_bitmap;
+Gdiplus::Rect g_seek_preview_crop;
+uint64_t g_seek_preview_id = 0, g_seek_preview_requested_at = 0;
+uint64_t g_seek_preview_min_id = 0, g_seek_preview_displayed_id = 0;
+int g_seek_preview_image_second = -1;
+std::atomic<uint64_t> g_seek_preview_decode_generation{0};
+int64_t g_seek_preview_index = -1;
+int g_seek_preview_second = -1;
+std::thread g_seek_preview_worker;
+std::mutex g_seek_preview_mutex;
+std::condition_variable g_seek_preview_condition;
+struct PreviewDecodeJob {
+  uint64_t id;
+  uint64_t epoch;
+  int64_t index;
+  double seconds;
+  std::string url, headers, proxy;
+};
+std::unique_ptr<PreviewDecodeJob> g_seek_preview_job;
+
+void StartPreviewDecode(const SeekPreviewResult& result) {
+  if (result.index < 0 || result.index >= static_cast<int64_t>(g_media_urls.size())) return;
+  auto job = std::make_unique<PreviewDecodeJob>();
+  job->id = result.id; job->index = result.index; job->seconds = result.seconds;
+  job->epoch = g_seek_preview_decode_generation.load();
+  job->url = g_media_urls[result.index];
+  job->headers = g_default_http_headers;
+  if (result.index < static_cast<int64_t>(g_playlist_header_overrides.size()) && g_playlist_header_overrides[result.index]) {
+    job->headers = g_playlist_headers[result.index];
+  }
+  job->headers = MpvHeaderFields(job->headers);
+  char* proxy = g_mpv.get_property_string(g_handle, "http-proxy");
+  if (proxy) { job->proxy = proxy; g_mpv.free(proxy); }
+  {
+    std::lock_guard<std::mutex> lock(g_seek_preview_mutex);
+    g_seek_preview_job = std::move(job);
+  }
+  if (!g_seek_preview_worker.joinable()) {
+    g_seek_preview_worker = std::thread([] {
+      mpv_handle* handle = nullptr;
+      std::string source, headers, proxy;
+      std::map<int, std::unique_ptr<Gdiplus::Bitmap>> frames;
+      wchar_t temp[MAX_PATH]{};
+      GetTempPathW(MAX_PATH, temp);
+      const auto folder = std::filesystem::path(temp) / (L"mova-frame-session-" + std::to_wstring(GetCurrentProcessId()));
+      std::error_code error;
+      const auto release = [&] {
+        if (handle) g_mpv.terminate_destroy(handle);
+        handle = nullptr; source.clear(); headers.clear(); proxy.clear(); frames.clear();
+        std::filesystem::remove_all(folder, error);
+      };
+      while (g_running) {
+        std::unique_ptr<PreviewDecodeJob> job;
+        {
+          std::unique_lock<std::mutex> lock(g_seek_preview_mutex);
+          if (!g_seek_preview_condition.wait_for(lock, std::chrono::seconds(30), [] { return !g_running || g_seek_preview_job != nullptr; })) {
+            lock.unlock(); release(); continue;
+          }
+          if (!g_running) break;
+          job = std::move(g_seek_preview_job);
+        }
+        const bool same_source = handle && source == job->url && headers == job->headers && proxy == job->proxy;
+        if (!same_source) release();
+        std::filesystem::create_directory(folder, error);
+        if (error) continue;
+        auto result = std::make_unique<SeekPreviewResult>();
+        result->id = job->id; result->index = job->index; result->seconds = job->seconds; result->decoded = true;
+        const int second = static_cast<int>(job->seconds);
+        const auto cached = frames.find(second);
+        if (cached != frames.end()) {
+          auto& image = *cached->second;
+          result->bitmap.reset(image.Clone(0, 0, image.GetWidth(), image.GetHeight(), PixelFormat32bppARGB));
+        }
+        if (!handle) handle = g_mpv.create();
+        if (handle && !result->bitmap) {
+          if (!same_source) {
+          const auto option = [handle](const char* name, const std::string& value) { g_mpv.set_option_string(handle, name, value.c_str()); };
+          option("config", "no"); option("vo", "image"); option("ao", "null");
+          option("audio", "no"); option("sub", "no"); option("hwdec", "no");
+          option("vd-lavc-threads", "1"); option("vf", "lavfi=[scale=320:-2]");
+          option("pause", "yes"); option("keep-open", "yes"); option("start", std::to_string(job->seconds));
+          option("vo-image-format", "jpg"); option("vo-image-outdir", Utf8(folder.wstring()));
+          option("cache", "no"); option("demuxer-max-bytes", "4MiB");
+          option("network-timeout", "3"); option("terminal", "no");
+          option("resume-playback", "no");
+          option("http-header-fields", job->headers);
+          if (!job->proxy.empty()) option("http-proxy", job->proxy);
+          if (g_mpv.initialize(handle) >= 0) {
+            const char* command[] = {"loadfile", job->url.c_str(), nullptr};
+            g_mpv.command(handle, command);
+            source = job->url; headers = job->headers; proxy = job->proxy;
+          } else { release(); }
+          } else {
+            // Drain old restart/redraw events before issuing the next seek.
+            while (g_mpv.wait_event(handle, 0)->event_id != MPV_EVENT_NONE) {}
+            for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+              if (entry.path().extension() == L".jpg") std::filesystem::remove(entry.path(), error);
+            }
+            const auto target = std::to_string(job->seconds);
+            const char* command[] = {"seek", target.c_str(), "absolute+exact", nullptr};
+            g_mpv.command(handle, command);
+          }
+          if (handle) {
+            const auto started = GetTickCount64();
+            bool restarted = false;
+            while (g_running && g_seek_preview_decode_generation.load() == job->epoch && GetTickCount64() - started < 8000) {
+              auto* event = g_mpv.wait_event(handle, .05);
+              if (event->event_id == MPV_EVENT_END_FILE || event->event_id == MPV_EVENT_SHUTDOWN) break;
+              if (event->event_id == MPV_EVENT_PLAYBACK_RESTART) restarted = true;
+              if (!restarted) continue;
+              std::filesystem::path latest;
+              for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+                if (entry.path().extension() != L".jpg") continue;
+                if (latest.empty() || entry.path().filename() > latest.filename()) latest = entry.path();
+              }
+              if (!latest.empty()) {
+                Gdiplus::Bitmap image(latest.c_str());
+                if (image.GetLastStatus() == Gdiplus::Ok && image.GetWidth() > 0 && image.GetHeight() > 0) {
+                  result->bitmap.reset(image.Clone(0, 0, image.GetWidth(), image.GetHeight(), PixelFormat32bppARGB));
+                }
+              }
+              if (result->bitmap) break;
+            }
+          }
+          for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+            if (entry.path().extension() == L".jpg") std::filesystem::remove(entry.path(), error);
+          }
+          if (result->bitmap && g_seek_preview_decode_generation.load() == job->epoch) {
+            if (frames.size() >= 12) frames.erase(frames.begin());
+            auto& image = *result->bitmap;
+            frames[second].reset(image.Clone(0, 0, image.GetWidth(), image.GetHeight(), PixelFormat32bppARGB));
+          } else release();
+        }
+        if (g_running) {
+          auto* raw = result.release();
+          if (!PostMessageW(g_window, kSeekPreviewReady, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
+        }
+      }
+      release();
+    });
+  }
+  g_seek_preview_condition.notify_one();
+}
+
+LRESULT CALLBACK SeekPreviewProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_NCHITTEST) return HTTRANSPARENT;
+  if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+  if (message == WM_ERASEBKGND) return 1;
+  if (message != WM_PAINT) return DefWindowProcW(window, message, wparam, lparam);
+  PAINTSTRUCT paint{}; BeginPaint(window, &paint); EndPaint(window, &paint);
+  PanelSurface surface;
+  const int logical_height = g_seek_preview_bitmap ? 122 : 32;
+  if (!surface.Create(Scaled(172), Scaled(logical_height))) return 0;
+  {
+    Gdiplus::Graphics graphics(surface.target);
+    ConfigureGlassGraphics(graphics);
+    graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+    graphics.ScaleTransform(UiScale(), UiScale());
+    Gdiplus::RectF body(1, 1, 170, static_cast<float>(logical_height - 2));
+    Gdiplus::GraphicsPath path; AddRoundedRectPath(path, body, 12);
+    FillGlassSurface(graphics, path, body, GlassPanelAlpha(false), GlassPanelAlpha(true), true);
+    if (g_seek_preview_bitmap) {
+      const auto& crop = g_seek_preview_crop;
+      graphics.SetClip(&path);
+      const float image_scale = std::min(160.0f / crop.Width, 90.0f / crop.Height);
+      const float image_width = crop.Width * image_scale;
+      const float image_height = crop.Height * image_scale;
+      graphics.DrawImage(g_seek_preview_bitmap.get(), Gdiplus::RectF(6 + (160 - image_width) / 2, 6 + (90 - image_height) / 2, image_width, image_height),
+                         static_cast<float>(crop.X), static_cast<float>(crop.Y),
+                         static_cast<float>(crop.Width), static_cast<float>(crop.Height), Gdiplus::UnitPixel);
+      graphics.ResetClip();
+    }
+    StrokeGlassEdge(graphics, path);
+    wchar_t time[32]{};
+    const int shown_second = g_seek_preview_bitmap ? g_seek_preview_image_second : g_seek_preview_second;
+    swprintf_s(time, L"%02d:%02d", shown_second / 60, shown_second % 60);
+    auto font = MakeInterfaceFont(12, Gdiplus::FontStyleRegular);
+    Gdiplus::SolidBrush ink(Gdiplus::Color(255, 245, 247, 250));
+    Gdiplus::StringFormat format; format.SetAlignment(Gdiplus::StringAlignmentCenter);
+    graphics.DrawString(time, -1, &font, Gdiplus::RectF(6, g_seek_preview_bitmap ? 99.0f : 6.0f, 160, 20), &format, &ink);
+  }
+  RECT rect{}; GetWindowRect(window, &rect);
+  POINT position{rect.left, rect.top}, origin{0, 0};
+  SIZE size{surface.width, surface.height};
+  BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+  UpdateLayeredWindow(window, nullptr, &position, &size, surface.dc, &origin, 0, &blend, ULW_ALPHA);
+  return 0;
+}
+
+void HideSeekPreview() {
+  if (g_seek_preview_second < 0 && !g_seek_preview_bitmap) return;
+  if (g_seek_preview_window) ShowWindow(g_seek_preview_window, SW_HIDE);
+  if (g_seek_preview_second >= 0) ++g_seek_preview_id;
+  g_seek_preview_min_id = g_seek_preview_id;
+  ++g_seek_preview_decode_generation;
+  g_seek_preview_second = -1;
+  g_seek_preview_bitmap.reset();
+  g_seek_preview_displayed_id = 0;
+  g_seek_preview_image_second = -1;
+  std::lock_guard<std::mutex> lock(g_seek_preview_mutex);
+  g_seek_preview_job.reset();
+}
+
+void UpdateSeekPreview() {
+  if (!g_seek_preview_enabled || !g_seek_dragging || g_duration.load() <= 0 || !IsWindowVisible(g_controls)) {
+    HideSeekPreview(); return;
+  }
+  if (!g_seek_preview_window) {
+    WNDCLASSW cls{}; cls.hInstance = GetModuleHandleW(nullptr); cls.lpfnWndProc = SeekPreviewProc;
+    cls.lpszClassName = L"MovaSeekPreview"; RegisterClassW(&cls);
+    g_seek_preview_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+        cls.lpszClassName, L"", WS_POPUP, 0, 0, Scaled(172), Scaled(122), g_window, nullptr, cls.hInstance, nullptr);
+  }
+  const int second = static_cast<int>(g_duration.load() * std::clamp(g_seek_drag_target, 0.0, 1.0));
+  const int64_t index = g_playlist_position.load();
+  const auto now = GetTickCount64();
+  bool changed = false;
+  if ((second != g_seek_preview_second || index != g_seek_preview_index) && now - g_seek_preview_requested_at >= 150) {
+    ++g_seek_preview_id;
+    changed = true;
+    g_seek_preview_second = second; g_seek_preview_index = index;
+    // Keep the last completed real frame while the newest target is queued.
+    // A new cursor target is not a new resource: cancelling every 150ms starves
+    // decoders and servers whose first frame takes longer than that.
+    g_seek_preview_requested_at = now;
+    char text[128]{};
+    const int length = std::snprintf(text, sizeof(text), "MOVA_SEEK_PREVIEW_REQUEST=%llu|%lld|%d\r\n", g_seek_preview_id, index, second);
+    DWORD written = 0; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, length, &written, nullptr);
+  }
+  RECT controls{}, player{}; GetWindowRect(g_controls, &controls); GetWindowRect(g_window, &player);
+  const int width = Scaled(172), height = Scaled(g_seek_preview_bitmap ? 122 : 32);
+  const int x = std::clamp(controls.left + static_cast<int>((controls.right - controls.left) * g_seek_drag_target) - width / 2,
+                           player.left + 4, std::max(player.left + 4, player.right - width - 4));
+  RECT current{}; GetWindowRect(g_seek_preview_window, &current);
+  const int y = controls.top - height - Scaled(6);
+  if (!IsWindowVisible(g_seek_preview_window) || current.left != x || current.top != y || current.right - current.left != width || current.bottom - current.top != height) {
+    SetWindowPos(g_seek_preview_window, HWND_TOP, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    changed = true;
+  }
+  if (changed) InvalidateRect(g_seek_preview_window, nullptr, FALSE);
 }
 
 // Only the value is rendered: the chip draws the wifi glyph, so repeating the
@@ -7015,7 +7339,7 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         Gdiplus::RectF network_box;
         graphics.MeasureString(network.c_str(), -1, &network_font,
                                Gdiplus::PointF(0, 0), &chip_measure, &network_box);
-        const float network_reserved = 210.0f + network_box.Width;
+        const float network_reserved = 262.0f + network_box.Width;
         Gdiplus::StringFormat title_format;
         title_format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
         title_format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
@@ -7070,7 +7394,7 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         const float chip_width = chip_padding * 2.0f + chip_icon + chip_gap +
                                  network_box.Width + 2.0f;
         const Gdiplus::RectF chip = PixelSnapRect(Gdiplus::RectF(
-            static_cast<float>(rect.right) - 156.0f - chip_width,
+            static_cast<float>(rect.right) - 208.0f - chip_width,
             (rect.bottom - chip_height) / 2.0f, chip_width, chip_height));
         Gdiplus::GraphicsPath chip_path;
         AddRoundedRectPath(chip_path, chip, chip_height / 2.0f);
@@ -7092,8 +7416,9 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
             Gdiplus::RectF(chip.X + chip_padding + chip_icon + chip_gap, chip.Y,
                            network_box.Width + 4.0f, chip_height),
             &chip_format, &network_brush);
-        for (int button = 1; button <= 3; ++button) {
-          const float x = rect.right - (3 - button) * 52.0f - 26.0f;
+        for (int button = 1; button <= 4; ++button) {
+          const float x = button == 4 ? rect.right - 182.0f
+                                     : rect.right - (3 - button) * 52.0f - 26.0f;
           const float hover_amount = g_top_hover_mix[button];
           // 常驻的液态玻璃圆片：和控件条上的按钮同一套底。以前这里是 188 的实心
           // 深灰 + 一圈描边，压在画面上就是一排黑点 —— 用户说的「右上角几个控件
@@ -7105,6 +7430,10 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
           FillGlassSurface(graphics, disc_path, disc, GlassDiscAlpha(false),
                            GlassDiscAlpha(true), true);
           StrokeGlassEdge(graphics, disc_path);
+          if (button == 4 && g_always_on_top) {
+            Gdiplus::SolidBrush selected(Gdiplus::Color(220, 245, 245, 247));
+            graphics.FillEllipse(&selected, disc);
+          }
           if (hover_amount > 0.001f) {
             const BYTE alpha = static_cast<BYTE>(hover_amount *
                                                  (button == 3 ? 210 : 74));
@@ -7119,7 +7448,8 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
           }
           // 和应用标题栏 YingjiMotionIconButton 同一条规则：图标字号 = 直径 × 0.43。
           constexpr float kWindowIcon = 36.0f * 0.43f;
-          const Gdiplus::Color ink(BYTE{238}, 244, 244, 247);
+          const Gdiplus::Color ink = button == 4 && g_always_on_top
+              ? Gdiplus::Color(255, 38, 43, 48) : Gdiplus::Color(238, 244, 244, 247);
           if (button == 1) {
             DrawGlyph(graphics, L'\xEDAD', x, 29.0f, kWindowIcon, ink, false,
                       true);
@@ -7127,6 +7457,8 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
             const bool zoomed = IsZoomed(g_window) != 0;
             DrawGlyph(graphics, zoomed ? L'\xE9F6' : L'\xED57', x, 29.0f,
                       kWindowIcon, ink, false, true);
+          } else if (button == 4) {
+            DrawPinGlyph(graphics, x, 29.0f, ink, g_always_on_top);
           } else {
             DrawGlyph(graphics, L'\xEAB2', x, 29.0f, kWindowIcon, ink, false,
                       true);
@@ -7170,6 +7502,12 @@ LRESULT CALLBACK TopBarProc(HWND window, UINT message, WPARAM wparam,
         ShowWindow(g_window, IsZoomed(g_window) ? SW_RESTORE : SW_MAXIMIZE);
       } else if (hit == 3) {
         SendMessageW(g_window, WM_CLOSE, 0, 0);
+      } else if (hit == 4) {
+        g_always_on_top = !g_always_on_top;
+        SetWindowPos(g_window, g_always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        InvalidateRect(window, nullptr, FALSE);
+        ShowToast(g_always_on_top ? "播放器已置顶" : "已取消置顶");
       } else {
         ReleaseCapture();
         SendMessageW(g_window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
@@ -7317,7 +7655,7 @@ LRESULT CALLBACK ControlsProc(HWND window, UINT message, WPARAM wparam,
           &thumb, Gdiplus::RectF(played_x - thumb_size / 2,
                                  kSeekLineY - thumb_size / 2, thumb_size,
                                  thumb_size));
-      if (hover_fraction >= 0 && duration > 0) {
+      if (hover_fraction >= 0 && duration > 0 && !(g_seek_dragging && g_seek_preview_enabled)) {
         const float hover_x = width * static_cast<float>(hover_fraction);
         Gdiplus::Pen marker(Gdiplus::Color(190, 255, 255, 255), 1.0f);
         graphics.DrawLine(&marker, hover_x, kSeekLineY - 4.0f, hover_x,
@@ -7912,7 +8250,7 @@ void TickFrame() {
       }
     }
     const bool adjusting = g_seek_dragging || g_volume_dragging;
-    const bool expired = !adjusting && g_hint_mode == HintMode::Toast &&
+    const bool expired = !adjusting && g_hint_layout != HintLayout::AutoSkip && g_hint_mode == HintMode::Toast &&
                          GetTickCount64() > g_hint_until;
     if (expired) HideHint();
   }
@@ -7922,6 +8260,7 @@ void TickFrame() {
   // 它上面（提示浮层那边也用 GetTickCount64 比较），换成 QPC 会变成两套时间基准
   // 相减。它对精度的要求只是「几十毫秒级」，15.6ms 的粒度完全够用。
   UpdateAutoSkip(GetTickCount64());
+  UpdateSeekPreview();
   // 播放失败时中间那颗键是「重新播放」，图标就必须是播放三角：mpv 在 idle 时
   // pause 属性是 false，光看 g_paused 会画成双竖线（读作「点一下会暂停」），
   // 与它此刻真正会做的事正好相反。
@@ -8203,6 +8542,36 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         InvalidateRect(g_panel, nullptr, FALSE);
       }
       return 0;
+    case kSeekPreviewReady: {
+      std::unique_ptr<SeekPreviewResult> result(reinterpret_cast<SeekPreviewResult*>(lparam));
+      if (!result || result->id < g_seek_preview_min_id || result->id > g_seek_preview_id || result->id < g_seek_preview_displayed_id || result->index != g_playlist_position.load() ||
+          !g_seek_dragging || !g_seek_preview_enabled) return 0;
+      if (result->path.empty() && !result->decoded) {
+        StartPreviewDecode(*result);
+        return 0;
+      }
+      if (!result->bitmap && !result->path.empty()) {
+        Gdiplus::Bitmap image(result->path.c_str());
+        if (image.GetLastStatus() == Gdiplus::Ok && image.GetWidth() > 0 && image.GetHeight() > 0) {
+          result->bitmap.reset(image.Clone(0, 0, image.GetWidth(), image.GetHeight(), PixelFormat32bppARGB));
+        }
+      }
+      if (result->bitmap && result->bitmap->GetLastStatus() == Gdiplus::Ok && result->bitmap->GetWidth() > 0 && result->bitmap->GetHeight() > 0) {
+        const int width = static_cast<int>(result->bitmap->GetWidth());
+        const int height = static_cast<int>(result->bitmap->GetHeight());
+        const int crop_width = result->width > 0 ? result->width : width;
+        const int crop_height = result->height > 0 ? result->height : height;
+        if (result->x >= 0 && result->y >= 0 && crop_width > 0 && crop_height > 0 &&
+            result->x <= width - crop_width && result->y <= height - crop_height) {
+          g_seek_preview_crop = Gdiplus::Rect(result->x, result->y, crop_width, crop_height);
+          g_seek_preview_bitmap = std::move(result->bitmap);
+          g_seek_preview_displayed_id = result->id;
+          g_seek_preview_image_second = static_cast<int>(result->seconds);
+          if (g_seek_preview_window) InvalidateRect(g_seek_preview_window, nullptr, FALSE);
+        }
+      }
+      return 0;
+    }
     case kApplyLiveSettings: {
       // 播放期间设置页改的设置（见 stdin 的 MOVA_APPLY）。窗口操作必须在
       // 创建弹幕层的线程上做，所以排队到这里逐个应用。
@@ -9143,6 +9512,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
           g_network_bytes_per_second = std::max(
               0.0, std::strtod(line.c_str() + 13, nullptr));
           PostMessageW(g_window, kPlayerStateChanged, 0, 0);
+        } else if (line.rfind("MOVA_SEEK_PREVIEW=", 0) == 0) {
+          std::vector<std::string> fields;
+          const auto value = line.substr(18);
+          size_t start = 0;
+          while (true) {
+            const auto end = value.find('|', start);
+            fields.push_back(value.substr(start, end == std::string::npos ? end : end - start));
+            if (end == std::string::npos) break;
+            start = end + 1;
+          }
+          if (fields.size() == 8) {
+            try {
+              auto result = std::make_unique<SeekPreviewResult>();
+              result->id = std::stoull(fields[0]); result->index = std::stoll(fields[1]);
+              result->seconds = std::stod(fields[2]); result->path = Wide(PercentDecode(fields[3]));
+              result->x = std::stoi(fields[4]); result->y = std::stoi(fields[5]);
+              result->width = std::stoi(fields[6]); result->height = std::stoi(fields[7]);
+              auto* raw = result.release();
+              if (!PostMessageW(g_window, kSeekPreviewReady, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
+            } catch (...) {}
+          }
         } else if (line.rfind("MOVA_DANMAKU_STATUS=", 0) == 0) {
           const std::string value = line.substr(20);
           if (value.rfind("loading", 0) == 0) {
@@ -9499,6 +9889,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     }
   }
   g_running = false;
+  g_seek_preview_condition.notify_all();
+  if (g_seek_preview_worker.joinable()) g_seek_preview_worker.join();
+  g_seek_preview_bitmap.reset();
   // 节拍时钟也是内核对象，退出前要拆掉（DisarmPacingTimer 内部判空）。
   DisarmPacingTimer();
   if (frame_timer) {

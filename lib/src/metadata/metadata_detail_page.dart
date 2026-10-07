@@ -39,6 +39,21 @@ import 'episode_search_gate.dart';
 String _episodeKey(int? season, int? episode) =>
     '${season ?? 0}:${episode ?? 0}';
 
+/// Keep server order while showing the explicitly selected version of a server.
+List<MediaItem> serverResourceRepresentatives(
+  Iterable<MediaItem> resources,
+  MediaItem? selected,
+) {
+  final servers = <String, MediaItem>{};
+  for (final resource in resources) {
+    servers.putIfAbsent(resource.source.id, () => resource);
+    if (resource.resourceKey == selected?.resourceKey) {
+      servers[resource.source.id] = resource;
+    }
+  }
+  return servers.values.toList(growable: false);
+}
+
 class _PlaybackEpisodeOption {
   const _PlaybackEpisodeOption({
     this.seasonNumber,
@@ -561,7 +576,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       if (found.isEmpty || !mounted) return;
       results.addAll(found);
       final unique = <String, MediaItem>{
-        for (final row in results) '${row.source.id}:${row.id}': row,
+        for (final row in results) row.resourceKey: row,
       }.values.toList(growable: false);
       if (generation != _searchGeneration) return;
       setState(() {
@@ -709,7 +724,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
         }),
       );
       final unique = <String, MediaItem>{
-        for (final row in results) '${row.source.id}:${row.id}': row,
+        for (final row in results) row.resourceKey: row,
       }.values.toList(growable: false);
       if (_episodeSearchRevisions[_episodeKey(season, episode)] == generation) {
         _episodeSearchResults[_episodeKey(season, episode)] = (
@@ -1902,8 +1917,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
                       _ResourcePickerCard(
                         resource: resource,
                         selected:
-                            resource.id == _selectedResource?.id &&
-                            resource.source.id == _selectedResource?.source.id,
+                            resource.resourceKey ==
+                            _selectedResource?.resourceKey,
                         onTap: () => Navigator.pop(context, resource),
                       ),
                       const SizedBox(height: 9),
@@ -2186,9 +2201,8 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
   }
 
   /// 资源版本在「全部已连接服务器」聚合列表里的稳定标识。同一台服务器上的同一
-  /// 集，用来源 id 加条目 id 就能唯一定位 —— 服务器图标与名次都按它对齐。
-  String _resourceKey(MediaItem version) =>
-      '${version.source.id}|${version.id}';
+  /// 集，使用来源、条目与 MediaSourceId 区分版本；图标与名次按它对齐。
+  String _resourceKey(MediaItem version) => version.resourceKey;
 
   /// 原生资源面板的兜底标记编号，与 `ServerMark` 的配色一一对应：
   /// Emby 绿、Jellyfin 紫、WebDAV 蓝。图标文件取不到时才用得上。
@@ -2878,9 +2892,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
           // callback has already returned to playback.
           available = versions;
           final currentIndex = versions.indexWhere(
-            (version) =>
-                version.source.id == current.source.id &&
-                version.id == current.id,
+            (version) => version.resourceKey == current.resourceKey,
           );
           final revision = ++resourceRevision;
           unawaited(() async {
@@ -2940,9 +2952,7 @@ class _MetadataDetailPageState extends State<MetadataDetailPage> {
       while (true) {
         available = _resourceVersionsFor(activeResource);
         var activeIndex = available.indexWhere(
-          (candidate) =>
-              candidate.source.id == activeResource.source.id &&
-              candidate.id == activeResource.id,
+          (candidate) => candidate.resourceKey == activeResource.resourceKey,
         );
         if (activeIndex < 0) {
           available = <MediaItem>[activeResource, ...available];
@@ -5657,10 +5667,8 @@ class _ResourceSection extends StatefulWidget {
 
 class _ResourceSectionState extends State<_ResourceSection> {
   static const _sortPreferenceKey = 'yingji.detail.resource-sort';
-  static const _viewPreferenceKey = 'yingji.detail.resource-view';
   final _controller = ScrollController();
   String _sort = 'range';
-  String _viewMode = 'server';
 
   @override
   void initState() {
@@ -5671,13 +5679,11 @@ class _ResourceSectionState extends State<_ResourceSection> {
   Future<void> _restorePreferences() async {
     final prefs = await SharedPreferences.getInstance();
     final sort = prefs.getString(_sortPreferenceKey);
-    final view = prefs.getString(_viewPreferenceKey);
     if (!mounted) return;
     setState(() {
       if (const {'range', 'resolution', 'bitrate', 'size'}.contains(sort)) {
         _sort = sort!;
       }
-      if (const {'server', 'resource'}.contains(view)) _viewMode = view!;
     });
   }
 
@@ -5685,13 +5691,6 @@ class _ResourceSectionState extends State<_ResourceSection> {
     setState(() => _sort = value);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_sortPreferenceKey, value);
-  }
-
-  Future<void> _toggleViewMode() async {
-    final value = _viewMode == 'server' ? 'resource' : 'server';
-    setState(() => _viewMode = value);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_viewPreferenceKey, value);
   }
 
   @override
@@ -5719,14 +5718,8 @@ class _ResourceSectionState extends State<_ResourceSection> {
     return rows;
   }
 
-  List<MediaItem> get _displayed {
-    if (_viewMode == 'resource') return _sorted;
-    final bestByServer = <String, MediaItem>{};
-    for (final resource in _sorted) {
-      bestByServer.putIfAbsent(resource.source.id, () => resource);
-    }
-    return bestByServer.values.toList();
-  }
+  List<MediaItem> get _displayed =>
+      serverResourceRepresentatives(_sorted, widget.selected);
 
   @override
   Widget build(BuildContext context) => Column(
@@ -5780,15 +5773,6 @@ class _ResourceSectionState extends State<_ResourceSection> {
             active: _sort == 'size',
             onTap: () => _selectSort('size'),
           ),
-          YingjiMotionIconButton(
-            icon: _viewMode == 'server'
-                ? YingjiIcons.cloud
-                : YingjiIcons.rectangle_stack,
-            tooltip: _viewMode == 'server' ? '按服务器展示' : '按资源展示',
-            selected: true,
-            size: 38,
-            onPressed: _toggleViewMode,
-          ),
         ],
       ),
       const SizedBox(height: 14),
@@ -5817,10 +5801,13 @@ class _ResourceSectionState extends State<_ResourceSection> {
                   return _ResourceCard(
                     resource: resource,
                     selected:
-                        resource.id == widget.selected?.id &&
-                        resource.source.id == widget.selected?.source.id,
+                        resource.resourceKey == widget.selected?.resourceKey,
                     onSelect: () => widget.onSelect(resource),
-                    showPicker: _viewMode == 'server',
+                    versionCount: widget.resources
+                        .where((row) => row.source.id == resource.source.id)
+                        .map((row) => row.resourceKey)
+                        .toSet()
+                        .length,
                     rank: index < 3 ? index + 1 : null,
                     onPicker: () => widget.onPicker(resource),
                   );
@@ -6421,7 +6408,7 @@ class _ResourceCard extends StatelessWidget {
     required this.selected,
     required this.onSelect,
     required this.onPicker,
-    required this.showPicker,
+    required this.versionCount,
     required this.rank,
   });
 
@@ -6429,7 +6416,7 @@ class _ResourceCard extends StatelessWidget {
   final bool selected;
   final VoidCallback onSelect;
   final VoidCallback onPicker;
-  final bool showPicker;
+  final int versionCount;
   final int? rank;
 
   @override
@@ -6524,18 +6511,41 @@ class _ResourceCard extends StatelessWidget {
                         size: 18,
                         color: Colors.white,
                       ),
-                    if (showPicker) ...[
+                    ...[
                       const SizedBox(width: 4),
                       YingjiGlassTooltip(
-                        message: '切换该服务器资源',
+                        message: '$versionCount 个版本，点击切换',
                         child: InkResponse(
                           onTap: onPicker,
-                          radius: 20,
-                          child: const Padding(
-                            padding: EdgeInsets.all(5),
-                            child: Icon(
-                              YingjiIcons.slider_horizontal_3,
-                              size: 16,
+                          radius: 18,
+                          child: SizedBox(
+                            width:
+                                Theme.of(context).platform ==
+                                    TargetPlatform.android
+                                ? 44
+                                : 36,
+                            height:
+                                Theme.of(context).platform ==
+                                    TargetPlatform.android
+                                ? 44
+                                : 36,
+                            child: Center(
+                              child: YingjiGlassSurface(
+                                radius: 18,
+                                child: SizedBox(
+                                  width: 36,
+                                  height: 36,
+                                  child: Center(
+                                    child: Text(
+                                      '$versionCount',
+                                      style: const TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
                         ),
