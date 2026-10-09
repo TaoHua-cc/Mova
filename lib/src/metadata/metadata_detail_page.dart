@@ -22,6 +22,8 @@ import '../player/android_player.dart';
 import '../player/windows_native_player.dart';
 import '../playlists/playlist_store.dart';
 import '../sources/emby_client.dart';
+import '../sources/resource_selection.dart';
+export '../sources/resource_selection.dart' show sortedResourceVersions;
 import '../sources/media_source.dart';
 import '../sources/server_mark.dart';
 import '../sources/source_store.dart';
@@ -40,22 +42,6 @@ String _episodeKey(int? season, int? episode) =>
     '${season ?? 0}:${episode ?? 0}';
 
 const _resourceSortPreferenceKey = 'yingji.detail.resource-sort';
-
-List<MediaItem> sortedResourceVersions(
-  Iterable<MediaItem> resources,
-  String sort,
-) {
-  final rows = resources.toList();
-  rows.sort(
-    (a, b) => switch (sort) {
-      'resolution' => (b.width ?? 0).compareTo(a.width ?? 0),
-      'bitrate' => (b.bitrate ?? 0).compareTo(a.bitrate ?? 0),
-      'size' => (b.size ?? 0).compareTo(a.size ?? 0),
-      _ => (b.videoRange ?? '').compareTo(a.videoRange ?? ''),
-    },
-  );
-  return rows;
-}
 
 /// Keep server order while showing the explicitly selected version of a server.
 List<MediaItem> serverResourceRepresentatives(
@@ -661,13 +647,16 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
     if (mounted && generation == _searchGeneration && result != null) {
       setState(() {
         _resources = result.rows;
-        _selectedResource = result.rows.firstOrNull;
+        _selectedResource = bestResourceVersion(result.rows);
         _resourceError = result.error;
         _loadingResources = false;
       });
       unawaited(_refreshEpisodeProgress(result.rows, _searchGeneration));
       onResourcesPublished?.call(result.rows);
-      for (final row in result.rows.where((row) => row.playbackUrl != null)) {
+      for (final row in sortedResourceVersions(
+        result.rows.where((row) => row.playbackUrl != null),
+        'resolution',
+      )) {
         firstPlayable?.offer(row.source.id, row);
       }
     }
@@ -703,7 +692,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
       if (generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
-        _selectedResource ??= unique.firstOrNull;
+        _selectedResource ??= bestResourceVersion(unique);
       });
       onResourcesPublished?.call(unique);
       final playable = unique.where(
@@ -712,7 +701,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
             row.episodeNumber == episode &&
             row.playbackUrl != null,
       );
-      for (final row in playable) {
+      for (final row in sortedResourceVersions(playable, 'resolution')) {
         firstPlayable?.offer(row.source.id, row);
       }
     }
@@ -859,7 +848,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
       if (!mounted || generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
-        _selectedResource ??= unique.firstOrNull;
+        _selectedResource ??= bestResourceVersion(unique);
         _loadingResources = false;
         _resourceError = failedSources == 0
             ? null
@@ -1522,7 +1511,10 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
         metadata: metadata,
       );
     }
-    for (final resource in _resources) {
+    for (final resource in sortedResourceVersions(
+      _resources,
+      'resolution',
+    ).reversed) {
       include(
         season: resource.seasonNumber,
         episode: resource.episodeNumber,
@@ -1581,7 +1573,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
         if (season != 0) return season;
         final episode = (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0);
         if (episode != 0) return episode;
-        return a.source.name.compareTo(b.source.name);
+        return compareResourceQuality(a, b);
       });
     final history = (await WatchStateStore.create()).load();
     bool matches(WatchState state, MediaItem resource) =>
@@ -1592,11 +1584,21 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
           _mediaProgress(resource);
     }
 
+    MediaItem bestOfEpisode(MediaItem chosen) =>
+        bestResourceVersion(
+          resources.where(
+            (row) =>
+                row.seasonNumber == chosen.seasonNumber &&
+                row.episodeNumber == chosen.episodeNumber,
+          ),
+        ) ??
+        chosen;
+
     final resumable = ordered.where((resource) {
       final progress = progressFor(resource);
       return progress > 0 && progress < .92;
     }).toList()..sort((a, b) => progressFor(b).compareTo(progressFor(a)));
-    if (resumable.isNotEmpty) return resumable.first;
+    if (resumable.isNotEmpty) return bestOfEpisode(resumable.first);
     final played = <String>{};
     for (final resource in ordered) {
       final local = _localWatch(resource, history);
@@ -1613,20 +1615,23 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
         (resource) => matches(recentState, resource),
       );
       if (recentIndex >= 0 && recentState.progress < .92) {
-        return ordered[recentIndex];
+        return bestOfEpisode(ordered[recentIndex]);
       }
       for (var index = recentIndex + 1; index < ordered.length; index++) {
-        if (!played.contains(ordered[index].id)) return ordered[index];
+        if (!played.contains(ordered[index].id))
+          return bestOfEpisode(ordered[index]);
       }
     }
-    return ordered.firstWhere(
-      (resource) => !played.contains(resource.id),
-      orElse: () => recentState == null
-          ? ordered.first
-          : ordered.firstWhere(
-              (resource) => matches(recentState, resource),
-              orElse: () => ordered.last,
-            ),
+    return bestOfEpisode(
+      ordered.firstWhere(
+        (resource) => !played.contains(resource.id),
+        orElse: () => recentState == null
+            ? ordered.first
+            : ordered.firstWhere(
+                (resource) => matches(recentState, resource),
+                orElse: () => ordered.last,
+              ),
+      ),
     );
   }
 
@@ -2976,14 +2981,14 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
             episodeNumber: episode,
           );
           if (!mounted) return null;
-          final resource = rows
-              .where(
-                (row) =>
-                    row.playbackUrl != null &&
-                    row.seasonNumber == season &&
-                    row.episodeNumber == episode,
-              )
-              .firstOrNull;
+          final resource = bestResourceVersion(
+            rows.where(
+              (row) =>
+                  row.playbackUrl != null &&
+                  row.seasonNumber == season &&
+                  row.episodeNumber == episode,
+            ),
+          );
           final option = episodeOptions
               .where(
                 (option) =>
@@ -5840,10 +5845,12 @@ class _ResourceSectionState extends State<_ResourceSection> {
   }
 
   List<MediaItem> get _sorted =>
-      sortedResourceVersions(widget.resources, _sort);
+      sortedResourceVersions(widget.resources, 'resolution');
 
-  List<MediaItem> get _displayed =>
-      serverResourceRepresentatives(_sorted, widget.selected);
+  List<MediaItem> get _displayed => sortedResourceVersions(
+    serverResourceRepresentatives(_sorted, widget.selected),
+    _sort,
+  );
 
   @override
   Widget build(BuildContext context) => Column(

@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../platform/window_host.dart';
 import 'playback_progress.dart';
 import 'next_episode_preload.dart';
+import '../sources/resource_selection.dart';
 import 'playback_segments.dart';
 
 import '../brand.dart';
@@ -1787,14 +1788,14 @@ class _PlayerPageState extends State<PlayerPage> {
         seasonNumber: next.seasonNumber,
         episodeNumber: next.episodeNumber,
       );
-      final resource = rows
-          .where(
-            (row) =>
-                row.seasonNumber == next.seasonNumber &&
-                row.episodeNumber == next.episodeNumber &&
-                row.playbackUrl != null,
-          )
-          .firstOrNull;
+      final resource = bestResourceVersion(
+        rows.where(
+          (row) =>
+              row.seasonNumber == next.seasonNumber &&
+              row.episodeNumber == next.episodeNumber &&
+              row.playbackUrl != null,
+        ),
+      );
       if (resource == null) return next;
       return next.withResource(
         PlayerResourceOption(
