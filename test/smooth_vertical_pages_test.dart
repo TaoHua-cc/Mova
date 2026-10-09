@@ -142,7 +142,7 @@ void main() {
     () {
       final source = File('lib/src/metadata/metadata_detail_page.dart')
           .readAsStringSync();
-      final detail = classBody(source, '_MetadataDetailPageState');
+      final detail = classBody(source, '_MetadataDetailBodyState');
       expect(detail, contains('stableGlass: !WindowHost.isDesktop'));
       expect(detail, contains('ValueListenableBuilder<double>'));
       expect(

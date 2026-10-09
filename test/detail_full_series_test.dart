@@ -12,6 +12,66 @@ import 'package:yingji/src/sources/emby_client.dart';
 import 'package:yingji/src/sources/media_source.dart';
 
 void main() {
+  test('default selection advances completed history but preserves unfinished and explicit episodes', () {
+    const seasons = [
+      TmdbSeason(number: 1, name: 'Season 1', episodeCount: 8),
+      TmdbSeason(number: 2, name: 'Season 2', episodeCount: 3),
+    ];
+    WatchState history(
+      int season,
+      int episode, {
+      bool played = false,
+      int minutes = 10,
+    }) => WatchState(
+      mediaId: 'episode',
+      title: 'Show',
+      tmdbId: 55,
+      seasonNumber: season,
+      episodeNumber: episode,
+      position: Duration(minutes: minutes),
+      duration: const Duration(minutes: 20),
+      isPlayed: played,
+    );
+    expect(detailInitialEpisode(55, [history(1, 2)], seasons), (
+      season: 1,
+      episode: 2,
+    ));
+    expect(detailInitialEpisode(55, [history(1, 2, played: true)], seasons), (
+      season: 1,
+      episode: 3,
+    ));
+    expect(detailInitialEpisode(55, [history(1, 2, minutes: 19)], seasons), (
+      season: 1,
+      episode: 3,
+    ));
+    expect(detailInitialEpisode(55, [history(1, 8, played: true)], seasons), (
+      season: 2,
+      episode: 1,
+    ));
+    expect(detailInitialEpisode(55, [history(2, 3, played: true)], seasons), (
+      season: 2,
+      episode: 3,
+    ));
+    expect(
+      detailInitialEpisode(
+        55,
+        [history(1, 2, played: true)],
+        seasons,
+        initialSeason: 1,
+        initialEpisode: 2,
+      ),
+      (season: 1, episode: 2),
+    );
+    expect(
+      detailInitialEpisode(
+        55,
+        [history(1, 2, played: true)],
+        seasons,
+        initialSeason: 2,
+      ),
+      (season: 2, episode: null),
+    );
+  });
   final source = MediaSource(
     id: 'full-series-test',
     name: 'Test',

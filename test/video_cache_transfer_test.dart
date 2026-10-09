@@ -12,6 +12,9 @@ void main() {
   late Uint8List media;
   late List<String?> ranges;
   late bool supportsRanges;
+  late bool capRanges;
+  late bool interruptTail;
+  late bool rejectTail;
 
   setUp(() async {
     root = await Directory.systemTemp.createTemp('mova-transfer-test-');
@@ -21,16 +24,26 @@ void main() {
     media = Uint8List.fromList(List.generate(256 * 1024, (i) => i % 251));
     ranges = [];
     supportsRanges = true;
+    capRanges = false;
+    interruptTail = false;
+    rejectTail = false;
     origin.listen((request) async {
       final range = request.headers.value(HttpHeaders.rangeHeader);
       ranges.add(range);
+      if (rejectTail && range != null) {
+        request.response.statusCode = HttpStatus.serviceUnavailable;
+        await request.response.close();
+        return;
+      }
       final match = supportsRanges
           ? RegExp(r'^bytes=(\d+)-(\d*)$').firstMatch(range ?? '')
           : null;
       final start = int.tryParse(match?.group(1) ?? '') ?? 0;
-      final end = int.tryParse(match?.group(2) ?? '') ?? media.length - 1;
+      var end = int.tryParse(match?.group(2) ?? '') ?? media.length - 1;
+      if (capRanges && match != null) end = end.clamp(start, start + 65535);
       request.response.statusCode = match == null ? 200 : 206;
       request.response.contentLength = end - start + 1;
+      request.response.bufferOutput = false;
       request.response.headers.contentType = ContentType('video', 'mp4');
       if (match != null) {
         request.response.headers.set(
@@ -44,6 +57,12 @@ void main() {
             media.sublist(offset, (offset + 8192).clamp(0, end + 1)),
           );
           await request.response.flush();
+          if (interruptTail && start > 0) {
+            interruptTail = false;
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+            await request.response.close();
+            return;
+          }
           await Future<void>.delayed(const Duration(milliseconds: 5));
         }
         await request.response.close();
@@ -172,6 +191,64 @@ void main() {
       expect(response.statusCode, 206);
       expect(bytes, orderedEquals(media));
       expect(ranges, [null, 'bytes=65536-262143']);
+    },
+  );
+
+  test(
+    'preheated prefix continues across capped origin Range responses',
+    () async {
+      final job = store.download(
+        url: url(),
+        limitBytes: media.length,
+        targetBytes: 65536,
+      );
+      await job.done;
+      capRanges = true;
+      final (_, bytes) = await play(await store.playbackUrl(url()))
+          .timeout(const Duration(seconds: 10));
+      expect(bytes, orderedEquals(media));
+      expect(ranges, [
+        null,
+        'bytes=65536-262143',
+        'bytes=131072-262143',
+        'bytes=196608-262143',
+      ]);
+    },
+  );
+
+  test(
+    'preheated prefix resumes interrupted tail at bytes already delivered',
+    () async {
+      final job = store.download(
+        url: url(),
+        limitBytes: media.length,
+        targetBytes: 65536,
+      );
+      await job.done;
+      interruptTail = true;
+      final (_, bytes) = await play(await store.playbackUrl(url()))
+          .timeout(const Duration(seconds: 10));
+      expect(bytes, orderedEquals(media));
+      expect(ranges, [null, 'bytes=65536-262143', 'bytes=73728-262143']);
+    },
+  );
+
+  test(
+    'unavailable preheat tail closes response after bounded retries',
+    () async {
+      final job = store.download(
+        url: url(),
+        limitBytes: media.length,
+        targetBytes: 65536,
+      );
+      await job.done;
+      rejectTail = true;
+      await expectLater(
+        play(await store.playbackUrl(url()))
+            .timeout(const Duration(seconds: 5)),
+        throwsA(isA<IOException>()),
+      );
+      expect(ranges.length, 4);
     },
   );
 

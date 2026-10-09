@@ -15423,6 +15423,7 @@ class _FrostSurfaceState extends State<_FrostSurface> {
   @override
   Widget build(BuildContext context) {
     final hovered = widget.glass && _hovered;
+    final moveOnHover = hovered && ModalRoute.of(context) is! PopupRoute;
     Widget surface = Material(
       color: Colors.transparent,
       child: Padding(padding: widget.padding, child: widget.child),
@@ -15434,12 +15435,12 @@ class _FrostSurfaceState extends State<_FrostSurface> {
       onEnter: widget.glass ? (_) => setState(() => _hovered = true) : null,
       onExit: widget.glass ? (_) => setState(() => _hovered = false) : null,
       child: AnimatedScale(
-        scale: hovered ? 1.008 : 1,
+        scale: moveOnHover ? 1.008 : 1,
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOutCubic,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 180),
-          transform: Matrix4.translationValues(0, hovered ? -3 : 0, 0),
+          transform: Matrix4.translationValues(0, moveOnHover ? -3 : 0, 0),
           decoration: !widget.glass
               ? null
               : BoxDecoration(

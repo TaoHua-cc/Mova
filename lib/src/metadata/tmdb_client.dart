@@ -295,12 +295,16 @@ class TmdbExtras {
     this.recommendations = const [],
     this.seasons = const [],
     this.originalTitle,
+    this.collectionId,
+    this.collectionName,
   });
   final List<TmdbPerson> cast;
   final List<TmdbArtwork> artwork;
   final List<TmdbItem> recommendations;
   final List<TmdbSeason> seasons;
   final String? originalTitle;
+  final int? collectionId;
+  final String? collectionName;
 }
 
 class TmdbClient {
@@ -676,7 +680,35 @@ class TmdbClient {
       seasons: seasons,
       originalTitle:
           (data['original_name'] ?? data['original_title']) as String?,
+      collectionId: kind == '电影'
+          ? ((data['belongs_to_collection'] as Map?)?['id'] as num?)?.toInt()
+          : null,
+      collectionName: kind == '电影'
+          ? ((data['belongs_to_collection'] as Map?)?['name'] as String?)
+          : null,
     );
+  }
+
+  Future<List<TmdbItem>> collectionMovies(int id, {String apiKey = ''}) async {
+    if (id <= 0) return const [];
+    final data = await _get('/collection/$id', apiKey, {
+      'language': 'zh-CN',
+    }, minRefreshInterval: const Duration(hours: 6));
+    final rows = (data['parts'] as List<dynamic>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList();
+    rows.sort((a, b) {
+      final left = DateTime.tryParse('${a['release_date'] ?? ''}');
+      final right = DateTime.tryParse('${b['release_date'] ?? ''}');
+      if (left == null) return right == null ? 0 : 1;
+      if (right == null) return -1;
+      return left.compareTo(right);
+    });
+    final seen = <int>{};
+    return _items(
+      {'results': rows},
+      typeHint: 'movie',
+    ).where((item) => item.id > 0 && seen.add(item.id)).toList(growable: false);
   }
 
   Future<TmdbPersonDetails> personDetails(int id, {String apiKey = ''}) async {

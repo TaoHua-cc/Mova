@@ -31,9 +31,7 @@ void main() {
     );
     final blend = tester.widget<ValueListenableBuilder<double>>(blendFinder);
     final depth = blend.valueListenable as ValueNotifier<double>;
-    final clearFinder = find.byKey(
-      ValueKey('detail-clear-${item.backdropUrl}'),
-    );
+    final clearFinder = find.byKey(const ValueKey('detail-clear-backdrop'));
     final clear = tester.widget(clearFinder);
     final filter = tester.widget<PreblurredBackdrop>(
       find.byType(PreblurredBackdrop),
@@ -88,9 +86,7 @@ void main() {
       detail.indexOf('class _EpisodePreviewRailState'),
       detail.indexOf('class _EpisodeStat'),
     );
-    final list = previewRail.substring(
-      previewRail.indexOf('ListView.separated'),
-    );
+    final list = previewRail.substring(previewRail.indexOf('ListView.builder'));
     final poster = list.indexOf('height: 134,');
     final title = list.indexOf(r"'第 $effectiveEpisode 集 · $title'");
     final synopsis = list.indexOf('if (overview?.isNotEmpty == true) ...[');
@@ -111,9 +107,7 @@ void main() {
       detail.indexOf('class _CatalogEpisodeRailState'),
       detail.indexOf('class _EpisodePreviewRail'),
     );
-    final list = catalogRail.substring(
-      catalogRail.indexOf('ListView.separated'),
-    );
+    final list = catalogRail.substring(catalogRail.indexOf('ListView.builder'));
     final frame = list.indexOf('_DetailPosterHover(');
     final poster = list.indexOf('height: 134,', frame);
     final title = list.indexOf(

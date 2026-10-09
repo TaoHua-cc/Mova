@@ -511,8 +511,20 @@ class VideoCacheStore {
     } catch (_) {
       try {
         request.response.statusCode = HttpStatus.badGateway;
+      } catch (_) {
+        // Headers may already be sent with a full media Content-Length.
+        // Do not leave that incomplete response open forever on tail failure.
+      }
+      try {
         await request.response.close();
-      } catch (_) {}
+      } catch (_) {
+        try {
+          final socket = await request.response.detachSocket(
+            writeHeaders: false,
+          );
+          socket.destroy();
+        } catch (_) {}
+      }
     } finally {
       client?.close(force: true);
     }
@@ -579,6 +591,7 @@ class VideoCacheStore {
       );
     }
     var offset = start;
+    var tailFailures = 0;
     var stalledSince = DateTime.now();
     final trace = _TransferTrace('cacheProxy');
     RandomAccessFile? cachedInput;
@@ -700,6 +713,7 @@ class VideoCacheStore {
         }
         final client = _mediaClient(source.sourceId);
         final tailTrace = _TransferTrace('originTail');
+        final tailStart = offset;
         try {
           final tail = await client
               .getUrl(Uri.parse(source.url))
@@ -720,7 +734,9 @@ class VideoCacheStore {
           }
           var skip = partial ? 0 : offset;
           var remaining = end - offset + 1;
-          await for (final chunk in response) {
+          await for (final chunk in response.timeout(
+            const Duration(seconds: 15),
+          )) {
             if (skip >= chunk.length) {
               skip -= chunk.length;
               continue;
@@ -733,14 +749,23 @@ class VideoCacheStore {
             tailTrace.deliveryUs += deliveryClock.elapsedMicroseconds;
             tailTrace.bytes += count;
             trace.bytes += count;
+            offset += count;
             skip = 0;
             remaining -= count;
             if (remaining == 0) break;
           }
-          if (remaining != 0) {
+          // Some origins cap each Range response. Continue from bytes actually
+          // delivered, rather than treating that response as end-of-media.
+          if (offset == tailStart) {
             throw const HttpException('Playback cache tail ended early');
           }
-          offset = end + 1;
+          tailFailures = 0;
+        } on IOException {
+          if (offset > tailStart) tailFailures = 0;
+          if (++tailFailures >= 3) rethrow;
+        } on TimeoutException {
+          if (offset > tailStart) tailFailures = 0;
+          if (++tailFailures >= 3) rethrow;
         } finally {
           tailTrace.close();
           client.close(force: true);
