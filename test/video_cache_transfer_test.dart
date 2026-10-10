@@ -177,6 +177,8 @@ void main() {
   test(
     'finished next-episode preheat reuses prefix before fetching missing tail',
     () async {
+      final diagnostics = <String>[];
+      store.playbackDiagnostic = diagnostics.add;
       final job = store.download(
         url: url(),
         limitBytes: media.length,
@@ -191,6 +193,14 @@ void main() {
       expect(response.statusCode, 206);
       expect(bytes, orderedEquals(media));
       expect(ranges, [null, 'bytes=65536-262143']);
+      expect(
+        diagnostics,
+        contains('MOVA_CACHE_DIAGNOSTIC=tail-status|offset=65536|value=206'),
+      );
+      expect(
+        diagnostics,
+        contains('MOVA_CACHE_DIAGNOSTIC=tail-end|offset=262144|value=196608'),
+      );
     },
   );
 
@@ -236,6 +246,8 @@ void main() {
   test(
     'unavailable preheat tail closes response after bounded retries',
     () async {
+      final diagnostics = <String>[];
+      store.playbackDiagnostic = diagnostics.add;
       final job = store.download(
         url: url(),
         limitBytes: media.length,
@@ -249,6 +261,14 @@ void main() {
         throwsA(isA<IOException>()),
       );
       expect(ranges.length, 4);
+      expect(
+        diagnostics.where((line) => line.contains('tail-status')),
+        hasLength(3),
+      );
+      expect(
+        diagnostics,
+        contains('MOVA_CACHE_DIAGNOSTIC=proxy-error|offset=0|value=0'),
+      );
     },
   );
 

@@ -41,6 +41,7 @@ struct mpv_handle;
 enum mpv_event_id {
   MPV_EVENT_NONE = 0,
   MPV_EVENT_SHUTDOWN = 1,
+  MPV_EVENT_LOG_MESSAGE = 2,
   MPV_EVENT_END_FILE = 7,
   MPV_EVENT_FILE_LOADED = 8,
   MPV_EVENT_PLAYBACK_RESTART = 21,
@@ -63,6 +64,12 @@ struct mpv_event_property {
   const char* name;
   mpv_format format;
   void* data;
+};
+struct mpv_event_log_message {
+  const char* prefix;
+  const char* level;
+  const char* text;
+  int log_level;
 };
 enum mpv_end_file_reason {
   MPV_END_FILE_REASON_EOF = 0,
@@ -88,6 +95,7 @@ using ObservePropertyFn = int (*)(mpv_handle*, uint64_t, const char*, mpv_format
 using TerminateDestroyFn = void (*)(mpv_handle*);
 using GetPropertyStringFn = char* (*)(mpv_handle*, const char*);
 using MpvFreeFn = void (*)(void*);
+using RequestLogMessagesFn = int (*)(mpv_handle*, const char*);
 
 struct MpvApi {
   HMODULE module = nullptr;
@@ -100,6 +108,7 @@ struct MpvApi {
   TerminateDestroyFn terminate_destroy = nullptr;
   GetPropertyStringFn get_property_string = nullptr;
   MpvFreeFn free = nullptr;
+  RequestLogMessagesFn request_log_messages = nullptr;
 
   bool Load() {
     module = LoadLibraryW(L"libmpv-2.dll");
@@ -114,6 +123,8 @@ struct MpvApi {
     get_property_string = reinterpret_cast<GetPropertyStringFn>(
         GetProcAddress(module, "mpv_get_property_string"));
     free = reinterpret_cast<MpvFreeFn>(GetProcAddress(module, "mpv_free"));
+    request_log_messages = reinterpret_cast<RequestLogMessagesFn>(
+        GetProcAddress(module, "mpv_request_log_messages"));
     return create && initialize && set_option_string && command && wait_event &&
            observe_property && terminate_destroy && get_property_string && free;
   }
@@ -125,6 +136,7 @@ struct MpvApi {
 
 constexpr wchar_t kWindowClass[] = L"MovaNativePlayerWindow";
 constexpr UINT kMpvShutdown = WM_APP + 1;
+constexpr UINT kCancelPreparedSession = WM_APP + 90;
 constexpr UINT kPlayerStateChanged = WM_APP + 2;
 // 弹幕在播放过程中才拉到，stdin 线程收到后投递这条消息，由主线程建窗/重载。
 constexpr UINT kDanmakuReload = WM_APP + 3;
@@ -157,6 +169,13 @@ constexpr wchar_t kInterfaceFont[] = L"Alimama FangYuanTi VF";
 
 MpvApi g_mpv;
 mpv_handle* g_handle = nullptr;
+mpv_handle* g_prepared_handle = nullptr;
+int64_t g_prepared_index = -1;
+bool g_prepared_loaded = false;
+std::string g_prepared_url;
+std::string g_prepared_headers;
+std::map<std::string, std::string> g_player_options;
+std::mutex g_session_mutex;
 std::mutex g_subtitle_path_mutex;
 std::wstring g_pending_subtitle_path;
 struct EpisodeResolutionUpdate {
@@ -181,6 +200,8 @@ struct EpisodeResourcesUpdate {
 std::atomic<bool> g_live_episode_resolution{false};
 std::atomic<bool> g_live_resource_resolution{false};
 int g_pending_resource_choice = -1;
+int64_t g_stream_recovered_index = -1;
+bool g_stream_recovery_pending = false;
 std::atomic<bool> g_episode_search_pending{false};
 std::atomic<int64_t> g_episode_search_index{-1};
 std::atomic<bool> g_running{true};
@@ -1421,13 +1442,124 @@ void ApplyPlaylistHeaders(int64_t index) {
   }
 }
 
+void DiscardPreparedSession() {
+  if (g_prepared_handle) g_mpv.terminate_destroy(g_prepared_handle);
+  g_prepared_handle = nullptr;
+  g_prepared_index = -1;
+  g_prepared_loaded = false;
+  g_prepared_url.clear();
+  g_prepared_headers.clear();
+}
+
+void PrepareNativeSession(int64_t index) {
+  std::lock_guard<std::mutex> lock(g_session_mutex);
+  if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) return;
+  DiscardPreparedSession();
+  g_prepared_handle = g_mpv.create();
+  if (!g_prepared_handle) return;
+  for (const auto& option : g_player_options)
+    g_mpv.set_option_string(g_prepared_handle, option.first.c_str(), option.second.c_str());
+  const auto option = [](const char* name, const char* value) {
+    return g_mpv.set_option_string(g_prepared_handle, name, value);
+  };
+  option("config", "no"); option("terminal", "no");
+  option("vo", "null"); option("ao", "null");
+  option("pause", "yes"); option("mute", "yes"); option("start", "0");
+  option("cache", "yes"); option("cache-on-disk", "no");
+  option("demuxer-max-bytes", "128MiB");
+  for (const char* name : {"demuxer-readahead-secs", "cache-secs"}) {
+    const auto value = MpvString(name);
+    if (!value.empty()) option(name, value.c_str());
+  }
+  const auto headers = MpvHeaderFields(g_playlist_headers[static_cast<size_t>(index)]);
+  option("http-header-fields", headers.c_str());
+  if (g_mpv.initialize(g_prepared_handle) < 0) {
+    DiscardPreparedSession(); return;
+  }
+  g_prepared_index = index;
+  g_prepared_url = g_media_urls[static_cast<size_t>(index)];
+  g_prepared_headers = g_playlist_headers[static_cast<size_t>(index)];
+  const char* load[] = {"loadfile", g_prepared_url.c_str(), "replace", nullptr};
+  if (g_mpv.command(g_prepared_handle, load) < 0) DiscardPreparedSession();
+  else {
+    std::fprintf(stdout, "MOVA_SESSION=%lld|event=prepare\r\n", static_cast<long long>(index));
+    std::fflush(stdout);
+  }
+}
+
+void PollPreparedSession() {
+  std::lock_guard<std::mutex> lock(g_session_mutex);
+  if (!g_prepared_handle) return;
+  while (true) {
+    const auto* event = g_mpv.wait_event(g_prepared_handle, 0);
+    if (!event || event->event_id == MPV_EVENT_NONE) break;
+    if (event->event_id == MPV_EVENT_FILE_LOADED) {
+      g_prepared_loaded = true;
+      std::fprintf(stdout, "MOVA_SESSION=%lld|event=ready\r\n", static_cast<long long>(g_prepared_index));
+      std::fflush(stdout);
+    }
+    if (event->event_id == MPV_EVENT_END_FILE || event->event_id == MPV_EVENT_SHUTDOWN) {
+      std::fprintf(stdout, "MOVA_SESSION=%lld|event=failed\r\n", static_cast<long long>(g_prepared_index));
+      std::fflush(stdout);
+      DiscardPreparedSession(); return;
+    }
+  }
+}
+
+void ObserveActiveSession() {
+  g_mpv.observe_property(g_handle, 1, "time-pos", MPV_FORMAT_DOUBLE);
+  g_mpv.observe_property(g_handle, 2, "duration", MPV_FORMAT_DOUBLE);
+  g_mpv.observe_property(g_handle, 3, "pause", MPV_FORMAT_FLAG);
+  g_mpv.observe_property(g_handle, 4, "volume", MPV_FORMAT_DOUBLE);
+  g_mpv.observe_property(g_handle, 5, "mute", MPV_FORMAT_FLAG);
+  g_mpv.observe_property(g_handle, 6, "speed", MPV_FORMAT_DOUBLE);
+  g_mpv.observe_property(g_handle, 7, "paused-for-cache", MPV_FORMAT_FLAG);
+  g_mpv.observe_property(g_handle, 9, "brightness", MPV_FORMAT_DOUBLE);
+  if (g_mpv.request_log_messages) g_mpv.request_log_messages(g_handle, "warn");
+}
+
+bool PromotePreparedSession(int64_t index) {
+  if (!g_prepared_handle || !g_prepared_loaded || index != g_prepared_index ||
+      g_prepared_url != g_media_urls[static_cast<size_t>(index)] ||
+      g_prepared_headers != g_playlist_headers[static_cast<size_t>(index)]) return false;
+  // Reuse the actual demuxer/connection/cache; never loadfile or seek again.
+  const auto set = [](mpv_handle* handle, const char* name, const std::string& value) {
+    const char* command[] = {"set", name, value.c_str(), nullptr};
+    return g_mpv.command(handle, command);
+  };
+  for (const char* name : {"volume", "speed", "brightness", "audio-delay", "sub-delay", "audio-device", "video-aspect-override"})
+    set(g_prepared_handle, name, MpvString(name));
+  const auto ao = g_player_options.find("ao");
+  // An empty list selects mpv's default. "auto" is not an audio driver.
+  const std::string audio_output = ao == g_player_options.end()
+      ? MpvString("current-ao") : ao->second;
+  const char* stop[] = {"stop", nullptr};
+  g_mpv.command(g_handle, stop);
+  if (set(g_prepared_handle, "vo", "gpu-next") < 0 ||
+      set(g_prepared_handle, "ao", audio_output) < 0) return false;
+  auto* old = g_handle;
+  g_handle = g_prepared_handle;
+  g_prepared_handle = nullptr;
+  g_prepared_index = -1; g_prepared_loaded = false;
+  g_prepared_url.clear(); g_prepared_headers.clear();
+  ObserveActiveSession();
+  set(g_handle, "mute", "no");
+  set(g_handle, "pause", "no");
+  g_mpv.terminate_destroy(old);
+  std::fprintf(stdout, "MOVA_SESSION=%lld|event=promote\r\n", static_cast<long long>(index));
+  std::fflush(stdout);
+  return true;
+}
+
 bool LoadPlaylistEntry(int64_t index) {
+  std::lock_guard<std::mutex> session_lock(g_session_mutex);
   if (index < 0 || index >= static_cast<int64_t>(g_media_urls.size())) {
     return false;
   }
   if (!g_handle) return false;
   HideSeekPreview();
   const int64_t previous_index = g_playlist_position.load();
+  if (index != previous_index) g_stream_recovered_index = -1;
   ApplyPlaylistHeaders(index);
   // 先切索引：loadfile(replace) 发出的旧文件结束事件可能很快到达，事件回调
   // 必须已经知道新项；命令失败时再回滚索引。
@@ -1438,7 +1570,9 @@ bool LoadPlaylistEntry(int64_t index) {
   const char* args[] = {"loadfile",
                         g_media_urls[static_cast<size_t>(index)].c_str(),
                         "replace", nullptr};
-  if (g_mpv.command(g_handle, args) < 0) {
+  const bool promoted = PromotePreparedSession(index);
+  if (!promoted) DiscardPreparedSession();
+  if (!promoted && g_mpv.command(g_handle, args) < 0) {
     g_playlist_position = previous_index;
     return false;
   }
@@ -1446,15 +1580,26 @@ bool LoadPlaylistEntry(int64_t index) {
   g_episode_search_index = -1;
   g_cache_fraction = 0;
   g_native_network_input = g_playlist_native_network[static_cast<size_t>(index)];
+  std::fprintf(stdout, "MOVA_STREAM=%lld|native=%d|event=load\r\n",
+               static_cast<long long>(index), g_native_network_input.load() ? 1 : 0);
+  std::fflush(stdout);
   g_network_bytes_per_second = 0;
   g_buffered_seconds = 0;
   g_network_speed_available = true;
   g_playback_error = false;
   g_last_valid_position = 0;
+  g_position = 0;
+  g_duration = 0;
   // 换了一集：中断重试的预算重新给（见 kMaxInterruptRetries 的注释）。
   g_retry_count = 0;
   g_resume_seconds = 0;
   g_pending_seek_seconds = -1.0;
+  if (promoted) {
+    // FILE_LOADED was consumed while prepared: run the active-only UI hook now.
+    RefreshNativeResourceInfo();
+    g_retry_loading = false;
+    PostMessageW(g_window, kPlayerStateChanged, 0, 0);
+  }
   return true;
 }
 
@@ -1488,6 +1633,9 @@ bool RetryCurrentEpisode() {
   g_cache_fraction = 0;
   g_playback_error = false;
   g_retry_stamp = GetTickCount64();
+  std::fprintf(stdout, "MOVA_STREAM=%lld|native=%d|event=retry\r\n",
+               static_cast<long long>(index), g_native_network_input.load() ? 1 : 0);
+  std::fflush(stdout);
   char trace[96]{};
   std::snprintf(trace, sizeof(trace), "MOVA_RETRY=%lld|%.3f\r\n",
                 static_cast<long long>(index), g_resume_seconds.load());
@@ -8125,6 +8273,7 @@ bool RunShortcut(int key) {
 // 系统时钟节拍卡在 15.6ms 的整数倍上，请求 16ms 实际拿到 31.25ms ——
 // 弹幕层只有约 32fps，「一顿一顿」就是这么来的。
 void TickFrame() {
+  PollPreparedSession();
   AnimatePanelScroll();
   const double frame_now = NowMs();
   static double last_network_sample_ms = 0.0;
@@ -8629,12 +8778,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         const auto item = update->index;
         if (!g_episode_search_pending.load() && !update->url.empty() &&
             static_cast<int64_t>(item) == g_playlist_position.load() + 1 &&
-            item < g_media_urls.size() && !g_media_urls[item].empty()) {
+            item < g_media_urls.size()) {
           g_media_urls[item] = std::move(update->url);
           g_playlist_headers[item] = std::move(update->headers);
           g_playlist_header_overrides[item] = true;
           g_playlist_native_network[item] = update->native_network;
           g_playlist_resumes[item] = std::max(0.0, update->resume_seconds);
+          PrepareNativeSession(static_cast<int64_t>(item));
         }
         return 0;
       }
@@ -8642,6 +8792,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
           static_cast<int64_t>(update->index) != g_episode_search_index.load()) {
         return 0;
       }
+      const bool was_stream_recovery = g_stream_recovery_pending;
+      g_stream_recovery_pending = false;
       const auto index = static_cast<int64_t>(update->index);
       if (!update->error.empty() || update->url.empty()) {
         ShowToast(update->error.empty() ? "切换失败，请重试" : update->error,
@@ -8650,6 +8802,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
         g_pending_episode_resources.reset();
         g_episode_search_pending = false;
         g_episode_search_index = -1;
+        if (was_stream_recovery) {
+          g_playback_error = true;
+          ShowToast("连接恢复失败 · 点播放键重试", HintTone::Error);
+          ShowControls();
+          return 0;
+        }
         const auto current = g_playlist_position.load();
         if (current >= 0 &&
             current < static_cast<int64_t>(g_playlist_titles.size())) {
@@ -8723,8 +8881,36 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       ShowControls();
       return 0;
     }
+    case kCancelPreparedSession: {
+      std::lock_guard<std::mutex> lock(g_session_mutex);
+      if (g_prepared_handle) {
+        std::fprintf(stdout, "MOVA_SESSION=%lld|event=cancelled\r\n", static_cast<long long>(g_prepared_index));
+        std::fflush(stdout);
+        DiscardPreparedSession();
+      }
+      return 0;
+    }
     case kPlaybackInterrupted: {
       g_interruption_message_pending = false;
+      if (g_stream_recovery_pending) return 0;
+      // Cached prefixes must not trap playback in the same failing read bridge.
+      const auto recovery_index = g_playlist_position.load();
+      if (!g_native_network_input.load() && g_live_resource_resolution.load() &&
+          !g_episode_search_pending.load() &&
+          g_stream_recovered_index != recovery_index) {
+        g_stream_recovered_index = recovery_index;
+        g_stream_recovery_pending = true;
+        g_episode_search_pending = true;
+        g_episode_search_index = recovery_index;
+        const double pending = g_pending_seek_seconds.load();
+        const double resume = pending >= 0.0 ? pending : g_last_valid_position.load();
+        std::fprintf(stdout, "MOVA_RECOVER=%lld|%.3f\r\n",
+                     static_cast<long long>(recovery_index), resume);
+        std::fflush(stdout);
+        ShowToast("正在恢复连接…", HintTone::Loading);
+        ShowControls();
+        return 0;
+      }
       // 同一集先补一次再认输：源站在跳转那一刻新建连接，偶发抖动会让 mpv 把
       // 这一集判成结束，而地址本身通常还是好的。用户报的「自动跳过会存在播放
       // 失败」就是这条路径——自动跳片头会让播放器去要一段新的字节区间，正好
@@ -8834,6 +9020,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
 
 bool SetOption(mpv_handle* handle, const std::string& name,
                const std::string& value) {
+  if (handle == g_handle) g_player_options[name] = value;
   return g_mpv.set_option_string(handle, name.c_str(), value.c_str()) >= 0;
 }
 
@@ -9270,6 +9457,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   }
 
   g_mpv.observe_property(g_handle, 1, "time-pos", MPV_FORMAT_DOUBLE);
+  if (g_mpv.request_log_messages) {
+    g_mpv.request_log_messages(g_handle, "warn");
+  }
   g_mpv.observe_property(g_handle, 2, "duration", MPV_FORMAT_DOUBLE);
   g_mpv.observe_property(g_handle, 3, "pause", MPV_FORMAT_FLAG);
   g_mpv.observe_property(g_handle, 4, "volume", MPV_FORMAT_DOUBLE);
@@ -9300,6 +9490,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
     ApplyPlaylistStart(start_index);
     ApplyPlaylistHeaders(start_index);
     g_native_network_input = g_playlist_native_network[static_cast<size_t>(start_index)];
+    std::fprintf(stdout, "MOVA_STREAM=%d|native=%d|event=load\r\n",
+                 start_index, g_native_network_input.load() ? 1 : 0);
+    std::fflush(stdout);
     const char* load[] = {"loadfile",
                           g_media_urls[static_cast<size_t>(start_index)].c_str(),
                           "replace", nullptr};
@@ -9427,6 +9620,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
               // Ignore malformed incremental resource snapshots.
             }
           }
+        } else if (line == "MOVA_PREPARE_CANCEL") {
+          PostMessageW(g_window, kCancelPreparedSession, 0, 0);
         } else if (line.rfind("MOVA_EPISODE_RESOLVED=", 0) == 0 ||
                    line.rfind("MOVA_EPISODE_PREPARED=", 0) == 0) {
           const std::string value = line.substr(22);
@@ -9680,8 +9875,50 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
 
   std::thread events([window] {
     while (g_running) {
-      mpv_event* event = g_mpv.wait_event(g_handle, 0.1);
-      if (!event) continue;
+      // Handle exchange and event ownership are serialized. Never wait while
+      // holding a retired handle or process its events as the new episode.
+      std::unique_lock<std::mutex> session_lock(g_session_mutex);
+      mpv_event* event = g_mpv.wait_event(g_handle, 0);
+      if (!event || event->event_id == MPV_EVENT_NONE) {
+        session_lock.unlock(); Sleep(5); continue;
+      }
+      if (event->event_id == MPV_EVENT_LOG_MESSAGE && event->data) {
+        const auto* log = static_cast<mpv_event_log_message*>(event->data);
+        std::string text = log->text ? log->text : "";
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // Only fixed categories leave this scope. Never emit the original text.
+        std::string category = "other-warning";
+        if (text.find("timed out") != std::string::npos ||
+            text.find("timeout") != std::string::npos) category = "timeout";
+        else if (text.find("connection reset") != std::string::npos)
+          category = "connection-reset";
+        else if (text.find("connection refused") != std::string::npos)
+          category = "connection-refused";
+        else if (text.find("tls") != std::string::npos ||
+                 text.find("certificate") != std::string::npos)
+          category = "tls";
+        else if (text.find("premature") != std::string::npos ||
+                 text.find("end of file") != std::string::npos)
+          category = "premature-eof";
+        else if (text.find("decode") != std::string::npos)
+          category = "decode-error";
+        const auto status = text.find("http error ");
+        if (status != std::string::npos && status + 14 <= text.size()) {
+          const auto code = text.substr(status + 11, 3);
+          if ((code[0] == '4' || code[0] == '5') &&
+              std::isdigit(static_cast<unsigned char>(code[1])) &&
+              std::isdigit(static_cast<unsigned char>(code[2]))) {
+            category = "http-" + code;
+          }
+        }
+        static std::string previous_category;
+        if (category != previous_category) {
+          previous_category = category;
+          std::fprintf(stdout, "MOVA_DIAGNOSTIC=%s\r\n", category.c_str());
+          std::fflush(stdout);
+        }
+      }
       if (event->event_id == MPV_EVENT_SHUTDOWN) {
         EmitProgress(g_position.load(), g_duration.load());
         PostMessageW(window, kMpvShutdown, 0, 0);
@@ -9709,6 +9946,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
                      static_cast<int>(end->error),
                      end->reason == MPV_END_FILE_REASON_EOF ? 1 : 0,
                      end->reason == MPV_END_FILE_REASON_ERROR ? 1 : 0);
+        std::fflush(stdout);
         if (stale_retry_error) {
           // loadfile(replace) 已经开始后，mpv 才把被替换的旧请求错误送到事件队列。
           // 忽略此迟到通知，但不要屏蔽 pending seek 自己真正产生的 ERROR。
@@ -9904,6 +10142,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   // 本机其他程序的待机电耗会明显上升。
   timeEndPeriod(1);
   if (events.joinable()) events.join();
+  DiscardPreparedSession();
   if (g_handle) {
     g_mpv.terminate_destroy(g_handle);
     g_handle = nullptr;

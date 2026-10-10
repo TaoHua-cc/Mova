@@ -81,7 +81,9 @@ void main() {
         expect(dart, contains("'$name'"));
       }
       expect(dart, contains('session.reloadPreloadSettings(preferences);'));
-      expect(dart, contains('if (!preloadNext) nextEpisodePreload?.cancel();'));
+      final disable = dart.split('if (!preloadNext) {')[1].split('};')[0];
+      expect(disable, contains("sendLine('MOVA_PREPARE_CANCEL')"));
+      expect(disable, contains('preparedIndices.clear()'));
       expect(dart, contains('var preloadNext ='));
       expect(dart, isNot(contains('preload-lead-minutes')));
     },

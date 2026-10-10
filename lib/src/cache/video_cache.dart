@@ -262,6 +262,17 @@ class VideoCacheStore {
   static const String _folder = 'mova-video-cache';
 
   final Directory _root;
+  // Windows diagnostic session only. Never pass exceptions, URLs or headers.
+  void Function(String)? playbackDiagnostic;
+
+  void _diagnose(String event, int offset, int value) {
+    try {
+      playbackDiagnostic?.call(
+        'MOVA_CACHE_DIAGNOSTIC=$event|offset=$offset|value=$value',
+      );
+    } catch (_) {}
+  }
+
   HttpServer? _proxy;
   final Map<String, _ProxySource> _proxySources = <String, _ProxySource>{};
   final Map<String, VideoCacheDownload> _downloads = {};
@@ -509,6 +520,7 @@ class VideoCacheStore {
       }
       await request.response.close();
     } catch (_) {
+      _diagnose('proxy-error', 0, 0);
       try {
         request.response.statusCode = HttpStatus.badGateway;
       } catch (_) {
@@ -575,6 +587,7 @@ class VideoCacheStore {
                 start < job.state.startBytes + job.state.totalBytes));
     if (total <= start || (!cachedStart && !downloadingStart)) return false;
     final end = (range?.$2 ?? total - 1).clamp(start, total - 1);
+    _diagnose('begin', start, total);
     request.response.statusCode = range == null
         ? HttpStatus.ok
         : HttpStatus.partialContent;
@@ -723,6 +736,7 @@ class VideoCacheStore {
           final response = await tail.close().timeout(
             const Duration(seconds: 30),
           );
+          _diagnose('tail-status', offset, response.statusCode);
           final partial = response.statusCode == HttpStatus.partialContent;
           if ((!partial && response.statusCode != HttpStatus.ok) ||
               (partial &&
@@ -756,14 +770,17 @@ class VideoCacheStore {
           }
           // Some origins cap each Range response. Continue from bytes actually
           // delivered, rather than treating that response as end-of-media.
+          _diagnose('tail-end', offset, offset - tailStart);
           if (offset == tailStart) {
             throw const HttpException('Playback cache tail ended early');
           }
           tailFailures = 0;
         } on IOException {
+          _diagnose('tail-io', offset, tailFailures + 1);
           if (offset > tailStart) tailFailures = 0;
           if (++tailFailures >= 3) rethrow;
         } on TimeoutException {
+          _diagnose('tail-timeout', offset, tailFailures + 1);
           if (offset > tailStart) tailFailures = 0;
           if (++tailFailures >= 3) rethrow;
         } finally {

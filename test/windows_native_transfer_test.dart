@@ -7,6 +7,32 @@ import 'package:yingji/src/network/proxy_routing.dart';
 import 'package:yingji/src/player/windows_native_player.dart';
 
 void main() {
+  test('Windows next preparation uses a paused native session, not a prefix download', () {
+    final dart = File('lib/src/player/windows_native_player.dart')
+        .readAsStringSync();
+    final preparation = dart.substring(
+      dart.indexOf('Future<void> prepareNextEpisode('),
+      dart.indexOf(
+        'unawaited(',
+        dart.indexOf('Future<void> prepareNextEpisode('),
+      ),
+    );
+    expect(preparation, isNot(contains('.download(')));
+    expect(preparation, contains('MOVA_EPISODE_PREPARED='));
+    expect(preparation, contains('nextPreparationAllowed'));
+    final native = File('windows/native_player/main.cpp').readAsStringSync();
+    final promotion = native.substring(
+      native.indexOf('bool PromotePreparedSession('),
+      native.indexOf('bool LoadPlaylistEntry('),
+    );
+    expect(promotion, isNot(contains('{"loadfile"')));
+      expect(promotion, contains('g_handle = g_prepared_handle;'));
+      expect(promotion, contains('MpvString("current-ao")'));
+      expect(promotion, isNot(contains('? "auto"')));
+    expect(native, contains('option("pause", "yes")'));
+    expect(native, contains('option("start", "0")'));
+    expect(native, contains('case kCancelPreparedSession:'));
+  });
   setUp(() {
     SharedPreferences.setMockInitialValues({});
   });
@@ -39,6 +65,14 @@ void main() {
       );
       expect(playback, startsWith('http://127.0.0.1:'));
       expect(windowsNativeNetworkInput(url, playback), isFalse);
+      expect(
+        await windowsRecoveryUrl(url, cache: cache, sourceId: 'proxy-server'),
+        startsWith('http://127.0.0.1:'),
+      );
+      expect(
+        await windowsRecoveryUrl(url, cache: cache, sourceId: 'direct'),
+        url,
+      );
       expect(
         await windowsPlaybackUrl(url, cache: cache, sourceId: 'direct'),
         url,
@@ -94,6 +128,8 @@ void main() {
         expect(await File(playback).length(), 512);
         expect(windowsNativeNetworkInput(url, playback), isFalse);
         expect(requests, before);
+        expect(await windowsRecoveryUrl(url, cache: cache), url);
+        expect(requests, before);
       } finally {
         await cache.closePlaybackProxy();
         await server.close(force: true);
@@ -111,6 +147,15 @@ void main() {
           .readAsStringSync();
       expect(native, contains('ApplyPlaylistHeaders(start_index);'));
       expect(native, contains('ApplyPlaylistHeaders(index);'));
+      expect(native, contains('g_stream_recovered_index != recovery_index'));
+      expect(native, contains('g_stream_recovered_index = recovery_index;'));
+      expect(
+        native,
+        contains(
+          'g_playlist_resumes[item] = std::max(0.0, update->resume_seconds);',
+        ),
+      );
+      expect(dart, contains('final url = await windowsRecoveryUrl('));
       expect(native, contains('update->native_network'));
       expect(native, contains('frame_now - last_network_sample_ms >= 1000.0'));
       expect(native, contains('MpvString("cache-speed")'));

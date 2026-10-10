@@ -63,6 +63,12 @@ class WindowHost {
     await windowManager.minimize();
   }
 
+  /// Hide only the desktop window; keep routes and widget state alive.
+  static Future<void> hide() async {
+    if (!isDesktop) return;
+    await windowManager.hide();
+  }
+
   static Future<void> close() async {
     if (!isDesktop) return;
     await windowManager.close();

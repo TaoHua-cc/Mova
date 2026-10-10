@@ -6,6 +6,7 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../brand.dart';
+import '../platform/window_host.dart';
 import '../cache/danmaku_cache.dart';
 import '../cache/cache_retention.dart';
 import '../cache/video_cache.dart';
@@ -21,6 +22,7 @@ import 'next_episode_preload.dart';
 import 'playback_segments.dart';
 import 'subtitle_search_service.dart';
 import 'seek_preview.dart';
+import 'playback_diagnostic.dart';
 import '../network/network_http_client.dart';
 
 import 'package:http/http.dart' as http;
@@ -212,6 +214,21 @@ bool windowsNativeNetworkInput(String originalUrl, String playbackUrl) {
   final scheme = Uri.tryParse(originalUrl)?.scheme.toLowerCase();
   return originalUrl == playbackUrl && (scheme == 'http' || scheme == 'https');
 }
+
+/// Recovery bypasses optional local caches, never the user's server proxy.
+Future<String> windowsRecoveryUrl(
+  String url, {
+  required VideoCacheStore? cache,
+  Map<String, String> headers = const {},
+  String? sourceId,
+}) => windowsPlaybackUrl(
+  url,
+  cache: sourceId != null && ProxyRouting.serverUsesProxy(sourceId)
+      ? cache
+      : null,
+  headers: headers,
+  sourceId: sourceId,
+);
 
 Map<String, String> windowsPlaybackEnvironment(
   Map<String, String> environment,
@@ -478,6 +495,13 @@ class WindowsNativePlayer {
             ),
           ]
         : List<WindowsNativePlaylistEntry>.of(request.playlist);
+    var mainWindowHidden = false;
+    Future<void> restoreMainWindow() async {
+      if (!mainWindowHidden) return;
+      await WindowHost.bringToFront();
+      mainWindowHidden = false;
+    }
+
     final cacheLeases = <String, void Function()>{};
     void protectEpisode(int index) {
       final url = entries[index].url;
@@ -663,6 +687,30 @@ class WindowsNativePlayer {
         ...playbackUrls,
       ];
 
+      IOSink? diagnostic;
+      var diagnosticCount = 0;
+      try {
+        diagnostic = File(
+          '${Directory.systemTemp.path}/mova-playback-diagnostic.log',
+        ).openWrite();
+        unawaited(diagnostic.done.catchError((Object _) {}));
+      } catch (_) {}
+      void recordDiagnostic(String line) {
+        final safe = safePlaybackDiagnostic(line);
+        if (safe == null || diagnosticCount >= 256) return;
+        diagnosticCount++;
+        try {
+          diagnostic?.writeln(
+            '${DateTime.now().toUtc().toIso8601String()} $safe',
+          );
+          unawaited(
+            diagnostic?.flush().catchError((Object _) {}) ??
+                Future<void>.value(),
+          );
+        } catch (_) {}
+      }
+
+      cache?.playbackDiagnostic = recordDiagnostic;
       final process = await Process.start(
         executable.path,
         arguments,
@@ -671,6 +719,12 @@ class WindowsNativePlayer {
         environment: windowsPlaybackEnvironment(Platform.environment),
         includeParentEnvironment: false,
       );
+      mainWindowHidden = true;
+      try {
+        await WindowHost.hide();
+      } catch (_) {
+        // Window management failure must not abandon a running player.
+      }
       void sendCacheProgress(VideoCacheProgress progress) {
         process.stdin.writeln(
           'MOVA_CACHE=${progress.cachedEndBytes}|${progress.mediaTotalBytes}',
@@ -678,10 +732,10 @@ class WindowsNativePlayer {
       }
 
       StreamSubscription<VideoCacheProgress>? cacheProgress;
-      VideoCacheDownload? nextEpisodePreload;
       final preloadTasks = <int, Future<void>>{};
       final preloadAttempts = <int, int>{};
       final preparedIndices = <int>{};
+      var nextPreparationAllowed = true;
       final completedEpisodes = <int>{};
       final completedCacheUrls = <String>{};
       final manualEpisodeMarks = <int, bool>{};
@@ -786,16 +840,12 @@ class WindowsNativePlayer {
         cacheIndexSwitchPending = true;
         final generation = ++cacheSwitchGeneration;
         final previousDownload = download;
-        final previousPreload = nextEpisodePreload;
         final previousProgress = cacheProgress;
         previousDownload?.cancel();
-        previousPreload?.cancel();
-        nextEpisodePreload = null;
         cacheProgress = null;
         download = null;
         try {
           await previousDownload?.done;
-          await previousPreload?.done;
           await previousProgress?.cancel();
           if (generation != cacheSwitchGeneration ||
               index != activeCacheIndex ||
@@ -852,7 +902,7 @@ class WindowsNativePlayer {
       Future<void> prepareNextEpisode(int currentIndex) async {
         final index = currentIndex + 1;
         final store = cache;
-        if (store == null || limit <= 0 || index >= entries.length) return;
+        if (index >= entries.length) return;
         try {
           var entry = entries[index];
           if (entry.url.isEmpty) {
@@ -868,48 +918,39 @@ class WindowsNativePlayer {
             entry = resolved;
           }
           if (!preloadNext ||
+              !nextPreparationAllowed ||
               cacheSessionStopping ||
-              currentIndex != activeCacheIndex)
+              currentIndex != activeCacheIndex) {
             return;
+          }
           final uri = Uri.tryParse(entry.url);
           if (uri == null ||
               !const ['http', 'https'].contains(uri.scheme) ||
               (entry.resumeSeconds ?? 0) > 0) {
             return;
           }
-          final job = store.download(
-            url: entry.url,
-            limitBytes: limit,
-            targetBytes: 32 * 1024 * 1024,
+          final url = await windowsPlaybackUrl(
+            entry.url,
+            cache: store,
             headers: entry.headers,
-            title: entry.title,
             sourceId: entry.sourceId,
           );
-          nextEpisodePreload = job;
-          await job.done;
           if (!preloadNext ||
+              !nextPreparationAllowed ||
               cacheSessionStopping ||
-              currentIndex != activeCacheIndex ||
-              job.isCancelled ||
-              job.state.receivedBytes <= 0 ||
-              (!job.state.supportsRange &&
-                  job.state.status != VideoCacheStatus.complete)) {
+              currentIndex != activeCacheIndex) {
             return;
           }
-          final playback = await store.cachedFile(entry.url);
-          final url =
-              playback?.path ??
-              await store.playbackUrl(
-                entry.url,
-                headers: entry.headers,
-                sourceId: entry.sourceId,
-              );
-          if (cacheSessionStopping || currentIndex != activeCacheIndex) return;
           entries[index] = entry;
           playbackUrls[index] = url;
           preparedIndices.add(index);
+          final native = windowsNativeNetworkInput(entry.url, url);
+          final headers = (native ? entry.headers : const <String, String>{})
+              .entries
+              .map((header) => '${header.key}: ${header.value}')
+              .join('\n');
           sendLine(
-            'MOVA_EPISODE_PREPARED=$index|${Uri.encodeComponent(url)}||0|no',
+            'MOVA_EPISODE_PREPARED=$index|${Uri.encodeComponent(url)}|${Uri.encodeComponent(headers)}|0|${native ? 'yes' : 'no'}',
           );
         } catch (_) {
           // Optional preparation failure must not interrupt current playback.
@@ -1025,7 +1066,10 @@ class WindowsNativePlayer {
         reloadPreloadSettings: (preferences) {
           preloadNext =
               preferences.getBool('yingji.player.preload-next') ?? true;
-          if (!preloadNext) nextEpisodePreload?.cancel();
+          if (!preloadNext) {
+            sendLine('MOVA_PREPARE_CANCEL');
+            preparedIndices.clear();
+          }
         },
       );
 
@@ -1346,6 +1390,58 @@ class WindowsNativePlayer {
           .transform(const LineSplitter())
           .listen(
             (chunk) {
+              recordDiagnostic(chunk);
+              final session = RegExp(
+                r'^MOVA_SESSION=(\d+)\|event=(failed|cancelled)$',
+              ).firstMatch(chunk);
+              if (session != null) {
+                preparedIndices.remove(int.parse(session.group(1)!));
+              }
+              final recovery = RegExp(r'^MOVA_RECOVER=(\d+)\|(\d+\.\d+)$')
+                  .firstMatch(chunk);
+              if (recovery != null) {
+                final index = int.parse(recovery.group(1)!);
+                final at = double.parse(recovery.group(2)!);
+                final generation = ++episodeResolveGeneration;
+                unawaited(() async {
+                  try {
+                    if (index < 0 || index >= entries.length) {
+                      throw StateError('Invalid episode');
+                    }
+                    final entry = entries[index];
+                    sendLine('MOVA_PREPARE_CANCEL');
+                    preparedIndices.remove(index);
+                    final url = await windowsRecoveryUrl(
+                      entry.url,
+                      cache: cache,
+                      headers: entry.headers,
+                      sourceId: entry.sourceId,
+                    );
+                    if (generation != episodeResolveGeneration ||
+                        cacheSessionStopping) {
+                      return;
+                    }
+                    playbackUrls[index] = url;
+                    final native = windowsNativeNetworkInput(entry.url, url);
+                    final headers =
+                        (native ? entry.headers : const <String, String>{})
+                            .entries
+                            .map((header) => '${header.key}: ${header.value}')
+                            .join('\n');
+                    sendLine(
+                      'MOVA_EPISODE_RESOLVED=$index|${Uri.encodeComponent(url)}|${Uri.encodeComponent(headers)}|$at|${native ? 'yes' : 'no'}',
+                    );
+                  } catch (_) {
+                    if (generation == episodeResolveGeneration &&
+                        !cacheSessionStopping) {
+                      sendLine(
+                        'MOVA_EPISODE_RESOLVE_FAILED=$index|${Uri.encodeComponent('连接恢复失败')}',
+                      );
+                    }
+                  }
+                }());
+                return;
+              }
               if (chunk.startsWith('MOVA_SEEK_PREVIEW_REQUEST=')) {
                 final fields = chunk
                     .substring('MOVA_SEEK_PREVIEW_REQUEST='.length)
@@ -1360,10 +1456,21 @@ class WindowsNativePlayer {
                 final fields = chunk
                     .substring('MOVA_PRELOAD_STATE='.length)
                     .split('|');
-                if (fields.length == 6 && preloadNext && limit > 0) {
+                if (fields.length == 6 && preloadNext) {
                   final index = int.tryParse(fields[0]);
                   final buffering = fields[5] == '1';
-                  if (buffering) nextEpisodePreload?.cancel();
+                  nextPreparationAllowed = shouldPreloadNextEpisode(
+                    position: _seconds(fields[1]),
+                    duration: _seconds(fields[2]),
+                    bufferedEnd: _seconds(fields[3]),
+                    outroStart: _seconds(fields[4]),
+                    buffering: buffering,
+                  );
+                  if (!nextPreparationAllowed &&
+                      preparedIndices.contains(activeCacheIndex + 1)) {
+                    sendLine('MOVA_PREPARE_CANCEL');
+                    preparedIndices.remove(activeCacheIndex + 1);
+                  }
                   if (index != null &&
                       index == activeCacheIndex &&
                       index >= 0 &&
@@ -1371,13 +1478,7 @@ class WindowsNativePlayer {
                       !preloadTasks.containsKey(index + 1) &&
                       !preparedIndices.contains(index + 1) &&
                       (preloadAttempts[index + 1] ?? 0) < 2 &&
-                      shouldPreloadNextEpisode(
-                        position: _seconds(fields[1]),
-                        duration: _seconds(fields[2]),
-                        bufferedEnd: _seconds(fields[3]),
-                        outroStart: _seconds(fields[4]),
-                        buffering: buffering,
-                      )) {
+                      nextPreparationAllowed) {
                     preloadAttempts[index + 1] =
                         (preloadAttempts[index + 1] ?? 0) + 1;
                     preloadTasks[index + 1] = prepareNextEpisode(index)
@@ -1434,8 +1535,9 @@ class WindowsNativePlayer {
                           return;
                         }
                         entries[index] = entry;
-                        if (preparedUrl != entry.url)
+                        if (preparedUrl != entry.url) {
                           preparedIndices.remove(index);
+                        }
                         final playbackUrl = preparedIndices.contains(index)
                             ? playbackUrls[index]
                             : await windowsPlaybackUrl(
@@ -1726,6 +1828,11 @@ class WindowsNativePlayer {
           );
       await process.stderr.drain<void>();
       final exitCode = await process.exitCode;
+      try {
+        await restoreMainWindow();
+      } catch (_) {
+        // Retry in finally; don't delay progress persistence on a window error.
+      }
       previewClosed = true;
       previewClient?.close();
       while (previewBusy) {
@@ -1736,6 +1843,10 @@ class WindowsNativePlayer {
       } catch (_) {}
       speedTimer.cancel();
       await outputDone.future;
+      cache?.playbackDiagnostic = null;
+      try {
+        await diagnostic?.close();
+      } catch (_) {}
       await progressWrites;
       cacheSessionStopping = true;
       subtitleSearchGeneration++;
@@ -1748,7 +1859,6 @@ class WindowsNativePlayer {
       if (lastDanmakuFile != null) {
         await _deleteFileQuietly(lastDanmakuFile);
       }
-      nextEpisodePreload?.cancel();
       final savedStates = <WatchState>[];
       if (episodeDurations.isNotEmpty) {
         final store = await WatchStateStore.create();
@@ -1811,7 +1921,6 @@ class WindowsNativePlayer {
       }
       await output.cancel();
       await download?.done;
-      await nextEpisodePreload?.done;
       for (final release in cacheLeases.values) {
         release();
       }
@@ -1860,6 +1969,11 @@ class WindowsNativePlayer {
         episodePosition: requestedEpisodePosition,
       );
     } finally {
+      try {
+        await restoreMainWindow();
+      } catch (_) {
+        // The host can already be shutting down.
+      }
       for (final release in cacheLeases.values) {
         release();
       }

@@ -41,9 +41,13 @@ void main() {
       source.indexOf('bool RetryCurrentEpisode()'),
       source.indexOf('bool ReplayAfterPlaybackFailure()'),
     );
+    final eventStart = source.indexOf('MPV_EVENT_END_FILE && event->data');
     final events = source.substring(
-      source.indexOf('MPV_EVENT_END_FILE && event->data'),
-      source.indexOf('if (event->event_id == MPV_EVENT_FILE_LOADED)'),
+      eventStart,
+      source.indexOf(
+        'if (event->event_id == MPV_EVENT_FILE_LOADED)',
+        eventStart,
+      ),
     );
 
     expect(retry, contains('g_retry_loading = true'));
