@@ -418,7 +418,7 @@ abstract final class YingjiLayout {
       itemCount < 1 ? 1 : itemCount,
     );
     final width = (availableWidth - gap * (columns - 1)) / columns;
-    return compact ? width.clamp(0.0, preferred) : width;
+    return width.clamp(0.0, preferred);
   }
 }
 
@@ -1263,6 +1263,7 @@ class YingjiGlassMenu extends StatelessWidget {
     this.onOpen,
     this.onClose,
     this.borderRadius = 13,
+    this.decorateChild = true,
   });
   final List<Widget> entries;
   final Widget child;
@@ -1270,6 +1271,7 @@ class YingjiGlassMenu extends StatelessWidget {
   final VoidCallback? onOpen;
   final VoidCallback? onClose;
   final double borderRadius;
+  final bool decorateChild;
 
   @override
   Widget build(BuildContext context) => MenuAnchor(
@@ -1307,10 +1309,8 @@ class YingjiGlassMenu extends StatelessWidget {
         ),
       ),
     ],
-    builder: (context, controller, _) => YingjiMotionSurface(
-      borderRadius: borderRadius,
-      selected: controller.isOpen,
-      child: GestureDetector(
+    builder: (context, controller, _) {
+      final anchor = GestureDetector(
         onLongPressStart: secondaryOnly
             ? (details) => controller.open(position: details.localPosition)
             : null,
@@ -1325,8 +1325,15 @@ class YingjiGlassMenu extends StatelessWidget {
                     controller.isOpen ? controller.close() : controller.open(),
           child: child,
         ),
-      ),
-    ),
+      );
+      return decorateChild
+          ? YingjiMotionSurface(
+              borderRadius: borderRadius,
+              selected: controller.isOpen,
+              child: anchor,
+            )
+          : anchor;
+    },
   );
 }
 

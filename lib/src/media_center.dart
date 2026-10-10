@@ -15398,11 +15398,13 @@ class _FrostSurface extends StatefulWidget {
     this.padding = const EdgeInsets.all(18),
     required this.borderRadius,
     this.glass = true,
+    this.liftOnHover = true,
   });
   final Widget child;
   final EdgeInsetsGeometry padding;
   final double borderRadius;
   final bool glass;
+  final bool liftOnHover;
 
   @override
   State<_FrostSurface> createState() => _FrostSurfaceState();
@@ -15423,7 +15425,8 @@ class _FrostSurfaceState extends State<_FrostSurface> {
   @override
   Widget build(BuildContext context) {
     final hovered = widget.glass && _hovered;
-    final moveOnHover = hovered && ModalRoute.of(context) is! PopupRoute;
+    final moveOnHover =
+        hovered && widget.liftOnHover && ModalRoute.of(context) is! PopupRoute;
     Widget surface = Material(
       color: Colors.transparent,
       child: Padding(padding: widget.padding, child: widget.child),
@@ -15719,6 +15722,7 @@ class _SourceCardState extends State<_SourceCard> {
   @override
   Widget build(BuildContext context) => YingjiGlassMenu(
     secondaryOnly: true,
+    decorateChild: false,
     entries: [
       for (final endpoint in widget.source.endpoints)
         MenuItemButton(
@@ -15746,6 +15750,7 @@ class _SourceCardState extends State<_SourceCard> {
       width: double.infinity,
       child: _FrostSurface(
         borderRadius: 18,
+        liftOnHover: false,
         padding: const EdgeInsets.fromLTRB(14, 13, 12, 12),
         child: ConstrainedBox(
           constraints: const BoxConstraints(minHeight: 144),

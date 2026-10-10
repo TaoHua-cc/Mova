@@ -18,9 +18,10 @@ void main() {
     expect(YingjiLayout.sourceCardWidth(900, 2, compact: true), 340);
     expect(YingjiLayout.sourceCardWidth(240, 1, compact: true), 240);
   });
-  test('Windows still fills the row and wraps additional sources', () {
-    expect(YingjiLayout.sourceCardWidth(900, 1, compact: false), 900);
-    expect(YingjiLayout.sourceCardWidth(900, 2, compact: false), 444);
-    expect(YingjiLayout.sourceCardWidth(900, 8, compact: false), 444);
+  test('Windows cards keep their target width and wrap additional sources', () {
+    for (final count in [1, 2, 8]) {
+      expect(YingjiLayout.sourceCardWidth(900, count, compact: false), 388);
+    }
+    expect(YingjiLayout.sourceCardWidth(240, 1, compact: false), 240);
   });
 }
