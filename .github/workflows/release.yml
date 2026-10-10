@@ -319,25 +319,17 @@ jobs:
           overwrite_files: true
           prerelease: ${{ needs.meta.outputs.continuous == 'true' }}
           make_latest: ${{ needs.meta.outputs.continuous != 'true' }}
-          generate_release_notes: ${{ needs.meta.outputs.continuous != 'true' }}
+          generate_release_notes: false
           body: |
-            > 若此发布名为 `Mova Continuous`，它是随 main 更新的测试预发布；Android 包不保证可覆盖正式版，请优先使用正式标签 Release。
-
-            ## 下载
-
             ## 本次更新
 
+            - 双端详情页按季持久保存“已完结”状态，重新进入、断网或切换 Trakt 连接后保持显示；发现新季后更新播出安排。
             - Windows 下一集使用暂停在零秒的正式 libmpv 会话进行原生预读，切集复用该会话和内存缓存，不再使用独立 32 MiB 文件前缀预热。
             - 修复准备会话接管时错误的音频输出驱动导致立即播放失败；加入带音轨的受控交接测试。
             - Windows 播放时隐藏主窗口，播放器退出后恢复原页面；切集不重开主窗口。
-            - 增加不包含资源地址或鉴权信息的本地播放诊断与有界恢复；Android 播放实现保持不变。
-            - 原生会话交接已通过受控测试；真实服务器持续播放、音轨/HDR、观看记录隔离及至少 60 分钟长测仍未完成，持续 HTTP 403 等源站错误仍可能导致失败。
+            - 增加不包含资源地址或鉴权信息的本地播放诊断与有界恢复。
 
-            ## 本次预发布已知限制
-
-            Android Exo 播放期间剧集菜单滚动仍存在卡顿，尚未修复；mpv 可作为用户主动选择的兼容方案，但不保证杜比视界色彩正确。双端正式候选版长时间播放验收尚未完成，本构建不代表达到正式上架标准。
-
-            继续播放已修正服务器日期读取和单集预览图补全，但用户反馈“稳健115”记录展示仍不完整，正在复核；Windows同窗口切换资源已部署，实际切换验收尚未完成。
+            ## 下载
 
             **Windows**
             - `Mova-${{ needs.meta.outputs.version }}-Windows-x64-Setup.exe` — 安装程序（推荐）

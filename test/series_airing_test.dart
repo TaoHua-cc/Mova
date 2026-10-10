@@ -65,6 +65,134 @@ void main() {
   final now = DateTime(2026, 10, 4, 12);
   TmdbItem item(int id) => TmdbItem(id: id, title: '测试作品', kind: '剧集');
 
+  test('season completion survives restart, stale metadata and connection changes until a new season', () async {
+    SharedPreferences.setMockInitialValues({});
+    final tmdb = FakeTmdb()
+      ..metadata = {
+        'status': 'Returning Series',
+        'seasons': [
+          {'season_number': 1, 'episode_count': 3},
+        ],
+        'last_episode_to_air': {
+          'season_number': 1,
+          'episode_number': 3,
+          'air_date': '2026-10-03',
+          'name': '季终章',
+        },
+      };
+    final trakt = FakeTrakt();
+    final first = await SeriesAiringStore(
+      tmdb: tmdb,
+      trakt: trakt,
+    ).load(item(10101), credentials: disconnected, now: now);
+    expect(
+      first.completed,
+      false,
+    ); // Season finale is not a whole-series finale.
+    expect(first.completedSeason, 1);
+    expect(first.completedAt(now), true);
+    expect(SeriesAiringSnapshot.fromJson(first.toJson()).completedSeason, 1);
+    tmdb.metadata = {'status': 'Returning Series'};
+    final stale = await SeriesAiringStore(tmdb: tmdb, trakt: trakt).load(
+      item(10101),
+      credentials: disconnected,
+      now: now.add(const Duration(days: 8)),
+    );
+    expect(stale.completedAt(now.add(const Duration(days: 8))), true);
+    tmdb.fail = true;
+    final offline = await SeriesAiringStore(tmdb: tmdb, trakt: trakt).load(
+      item(10101),
+      credentials: connected,
+      now: now.add(const Duration(days: 9)),
+    );
+    expect(offline.completedSeason, 1);
+    tmdb.fail = false;
+    tmdb.metadata = {
+      'status': 'Returning Series',
+      'seasons': [
+        {'season_number': 1, 'episode_count': 3},
+        {'season_number': 2, 'episode_count': 0},
+      ],
+    };
+    final renewed = await SeriesAiringStore(tmdb: tmdb, trakt: trakt).load(
+      item(10101),
+      credentials: connected,
+      now: now.add(const Duration(days: 10)),
+    );
+    expect(renewed.completedAt(now.add(const Duration(days: 10))), false);
+    expect(
+      (await SharedPreferences.getInstance()).getInt(
+        'yingji.schedule.completed-season.v1.10101',
+      ),
+      isNull,
+    );
+    final otherConnection = await SeriesAiringStore(tmdb: tmdb, trakt: trakt)
+        .load(
+          item(10101),
+          credentials: disconnected,
+          now: now.add(const Duration(days: 10, minutes: 1)),
+        );
+    expect(
+      otherConnection.completedAt(now.add(const Duration(days: 10))),
+      false,
+    );
+    tmdb.dispose();
+    trakt.dispose();
+  });
+
+  test('future season last episode is not persisted as completed', () async {
+    SharedPreferences.setMockInitialValues({});
+    final tmdb = FakeTmdb()
+      ..metadata = {
+        'status': 'Returning Series',
+        'seasons': [
+          {'season_number': 1, 'episode_count': 3},
+        ],
+        'last_episode_to_air': {
+          'season_number': 1,
+          'episode_number': 3,
+          'air_date': '2026-10-05',
+        },
+      };
+    final trakt = FakeTrakt();
+    final result = await SeriesAiringStore(
+      tmdb: tmdb,
+      trakt: trakt,
+    ).load(item(10102), credentials: disconnected, now: now);
+    expect(result.completedSeason, isNull);
+    expect(result.completedAt(now), false);
+    tmdb.dispose();
+    trakt.dispose();
+  });
+
+  test(
+    'Trakt season finale persists without treating it as series finale',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final tmdb = FakeTmdb()..fail = true;
+      final trakt = FakeTrakt()
+        ..airing = (
+          show: {'status': 'returning series'},
+          next: null,
+          last: {
+            'season': 2,
+            'number': 10,
+            'first_aired': '2026-10-02T10:00:00Z',
+            'episode_type': 'season_finale',
+          },
+        );
+      final result = await SeriesAiringStore(
+        tmdb: tmdb,
+        trakt: trakt,
+      ).load(item(10103), credentials: connected, now: now);
+      expect(result.completedSeason, 2);
+      expect(result.completed, false);
+      expect(result.completedAt(now), true);
+      tmdb.dispose();
+      trakt.dispose();
+    },
+  );
+
   test(
     'persisted series snapshot avoids all requests after re-enter/restart',
     () async {
@@ -267,7 +395,7 @@ void main() {
       final client = TraktClient(
         client: MockClient((request) async {
           paths.add(request.url.path);
-          if (request.url.path.startsWith('/search/'))
+          if (request.url.path.startsWith('/search/')) {
             return http.Response(
               jsonEncode([
                 {
@@ -285,8 +413,10 @@ void main() {
               ]),
               200,
             );
-          if (request.url.path.endsWith('/next_episode'))
+          }
+          if (request.url.path.endsWith('/next_episode')) {
             return http.Response('', 204);
+          }
           return http.Response(
             jsonEncode({
               'season': 1,

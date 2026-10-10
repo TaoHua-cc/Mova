@@ -16,14 +16,20 @@ class SeriesAiringSnapshot {
     required this.savedAt,
     this.completed = false,
     this.traktResolved = false,
+    this.completedSeason,
+    this.latestSeason = 0,
   });
   final List<TraktEvent> events;
   final DateTime savedAt;
   final bool completed;
   final bool traktResolved;
+  final int? completedSeason;
+  final int latestSeason;
 
   bool completedAt(DateTime now) =>
-      (completed || calendarGroupCompleted(events, now: now)) &&
+      (completed ||
+          completedSeason != null ||
+          calendarGroupCompleted(events, now: now)) &&
       !events.any((event) => event.airDate.isAfter(now));
 
   TraktEvent? nextAt(DateTime now) {
@@ -65,12 +71,16 @@ class SeriesAiringSnapshot {
     'savedAt': savedAt.toIso8601String(),
     'completed': completed,
     'traktResolved': traktResolved,
+    'completedSeason': completedSeason,
+    'latestSeason': latestSeason,
     'events': events.map((event) => event.toJson()).toList(),
   };
   factory SeriesAiringSnapshot.fromJson(Map data) => SeriesAiringSnapshot(
     savedAt: DateTime.parse('${data['savedAt']}'),
     completed: data['completed'] == true,
     traktResolved: data['traktResolved'] == true,
+    completedSeason: (data['completedSeason'] as num?)?.toInt(),
+    latestSeason: (data['latestSeason'] as num?)?.toInt() ?? 0,
     events: (data['events'] as List)
         .whereType<Map>()
         .map((event) => TraktEvent.fromJson(Map<String, dynamic>.from(event)))
@@ -115,6 +125,10 @@ class SeriesAiringStore {
     DateTime now,
   ) async {
     final prefs = await SharedPreferences.getInstance();
+    final completionKey = 'yingji.schedule.completed-season.v1.${item.id}';
+    var completedSeason = prefs.getInt(completionKey);
+    final latestKey = 'yingji.schedule.latest-season.v1.${item.id}';
+    final knownSeason = prefs.getInt(latestKey) ?? 0;
     final stored = await WindowsMetadataCache.read(
       WindowsMetadataCache.schedule,
       key,
@@ -128,7 +142,28 @@ class SeriesAiringStore {
     } catch (_) {
       /* Corrupt data is replaced without touching other metadata. */
     }
-    if (cached?.freshAt(now) == true) return cached!;
+    if (cached != null && knownSeason > cached.latestSeason) cached = null;
+    completedSeason ??= cached?.completedSeason;
+    if (completedSeason == null && cached?.completedAt(now) == true) {
+      for (final event in cached!.events) {
+        if ((event.seasonNumber ?? 0) > (completedSeason ?? 0)) {
+          completedSeason = event.seasonNumber;
+        }
+      }
+      if (completedSeason != null) {
+        await prefs.setInt(completionKey, completedSeason);
+      }
+    }
+    SeriesAiringSnapshot preserveCompletion(SeriesAiringSnapshot value) =>
+        SeriesAiringSnapshot(
+          events: value.events,
+          savedAt: value.savedAt,
+          completed: value.completed,
+          traktResolved: value.traktResolved,
+          completedSeason: completedSeason,
+          latestSeason: knownSeason,
+        );
+    if (cached?.freshAt(now) == true) return preserveCompletion(cached!);
     final traktFuture = () async {
       if (!session.isConnected) return null;
       try {
@@ -145,6 +180,7 @@ class SeriesAiringStore {
     final events = <TraktEvent>[];
     Map<String, dynamic>? metadata;
     var localSucceeded = false;
+    var newestSeason = knownSeason;
     try {
       metadata = await _tmdb.seriesAiringMetadata(item);
       final upcoming = await _tmdb.upcomingEpisodes(item);
@@ -163,6 +199,7 @@ class SeriesAiringStore {
       final lastSeason = seasons.lastOrNull;
       final finalSeason = (lastSeason?['season_number'] as num?)?.toInt();
       final finalNumber = (lastSeason?['episode_count'] as num?)?.toInt();
+      if ((finalSeason ?? 0) > newestSeason) newestSeason = finalSeason!;
       for (final next in upcoming) {
         events.add(
           TraktEvent(
@@ -192,11 +229,19 @@ class SeriesAiringStore {
       final date = last is Map
           ? DateTime.tryParse('${last['air_date']}')
           : null;
-      if (ended &&
-          last is Map &&
+      if (last is Map &&
           date != null &&
           last['season_number'] == finalSeason &&
           last['episode_number'] == finalNumber) {
+        if (!date.isAfter(now) &&
+            (finalNumber ?? 0) > 0 &&
+            !upcoming.any(
+              (episode) =>
+                  episode.seasonNumber == finalSeason &&
+                  episode.airDate.isAfter(now),
+            )) {
+          completedSeason = finalSeason;
+        }
         events.add(
           TraktEvent(
             tmdbId: item.id,
@@ -208,7 +253,7 @@ class SeriesAiringStore {
             airDate: date,
             timeKnown: false,
             source: 'TMDB',
-            seriesFinale: true,
+            seriesFinale: ended,
             posterUrl: item.posterUrl,
             backdropUrl: item.backdropUrl,
           ),
@@ -229,6 +274,7 @@ class SeriesAiringStore {
             final date = DateTime.tryParse(stamp);
             final season = (episode['season'] as num?)?.toInt();
             final number = (episode['number'] as num?)?.toInt();
+            if ((season ?? 0) > newestSeason) newestSeason = season!;
             if (date == null || (season ?? 0) <= 0 || (number ?? 0) <= 0) {
               continue;
             }
@@ -237,7 +283,15 @@ class SeriesAiringStore {
                 (identical(episode, airing.last) &&
                     airing.next == null &&
                     airing.show['status'] == 'ended');
-            if (identical(episode, airing.last) && !finale) continue;
+            final seasonFinale = episode['episode_type'] == 'season_finale';
+            if (identical(episode, airing.last) &&
+                (finale || seasonFinale) &&
+                !date.isAfter(now)) {
+              completedSeason = season;
+            }
+            if (identical(episode, airing.last) && !finale && !seasonFinale) {
+              continue;
+            }
             events.add(
               TraktEvent(
                 tmdbId: item.id,
@@ -264,7 +318,14 @@ class SeriesAiringStore {
       }
     }
     if (!localSucceeded && !traktResolved) {
-      if (cached != null) return cached;
+      if (cached != null) return preserveCompletion(cached);
+      if (completedSeason != null) {
+        return SeriesAiringSnapshot(
+          events: const [],
+          savedAt: now,
+          completedSeason: completedSeason,
+        );
+      }
       throw Exception('播出安排暂时无法获取');
     }
     if (session.isConnected && !traktResolved && cached != null) {
@@ -308,6 +369,18 @@ class SeriesAiringStore {
       events,
       preferTrakt: session.isConnected,
     );
+    for (final event in merged) {
+      if ((event.seasonNumber ?? 0) > newestSeason) {
+        newestSeason = event.seasonNumber!;
+      }
+    }
+    if (completedSeason != null && newestSeason > completedSeason) {
+      completedSeason = null;
+      await prefs.remove(completionKey);
+    } else if (completedSeason != null) {
+      await prefs.setInt(completionKey, completedSeason);
+    }
+    if (newestSeason > knownSeason) await prefs.setInt(latestKey, newestSeason);
     final result = SeriesAiringSnapshot(
       events: merged,
       savedAt: now,
@@ -315,6 +388,8 @@ class SeriesAiringStore {
           calendarGroupCompleted(merged, now: now) &&
           !merged.any((event) => event.airDate.isAfter(now)),
       traktResolved: traktResolved,
+      completedSeason: completedSeason,
+      latestSeason: newestSeason,
     );
     final body = jsonEncode(result.toJson());
     if (Platform.isWindows) {
