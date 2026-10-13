@@ -6270,7 +6270,7 @@ class _RankingPosterCard extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(fontWeight: FontWeight.w800),
         ),
-        MediaRatingRow(item: item),
+        SizedBox(height: 28, child: MediaRatingRow(item: item)),
         const SizedBox(height: 4),
         Row(
           children: [
@@ -6979,7 +6979,11 @@ class _SourceHubState extends State<_SourceHub>
                   iconUrl: source.iconUrl,
                   customIcon: source.customIcon,
                 );
-                await store.updateIfPresent(current, token);
+                await store.updateIfPresent(
+                  current,
+                  token,
+                  observedSource: source,
+                );
               }
             } catch (_) {
               // An authenticated media session can work when info is private.
@@ -7023,11 +7027,8 @@ class _SourceHubState extends State<_SourceHub>
     // before publishing its snapshot, otherwise a slow probe can resurrect a
     // server that was removed while its request was in flight.
     final currentSources = store.load();
-    final refreshedById = {for (final source in updated) source.id: source};
     final currentIds = currentSources.map((source) => source.id).toSet();
-    final visibleSources = currentSources
-        .map((source) => refreshedById[source.id] ?? source)
-        .toList(growable: false);
+    final visibleSources = currentSources;
     stats.removeWhere((id, _) => !currentIds.contains(id));
     offline.removeWhere((id) => !currentIds.contains(id));
     setState(() {
@@ -7051,18 +7052,7 @@ class _SourceHubState extends State<_SourceHub>
     if (source.customIcon || source.kind == SourceKind.webdav) {
       return source;
     }
-    // Legacy records did not distinguish a selected icon-pack image from a
-    // detected server icon. Clear those values before probing so a stale,
-    // unrelated image cannot keep masking the connected server's identity.
-    final baseline = MediaSource(
-      id: source.id,
-      name: source.name,
-      kind: source.kind,
-      endpoint: source.endpoint,
-      userId: source.userId,
-      serverId: source.serverId,
-      alternateEndpoints: source.alternateEndpoints,
-    );
+    // Failed discovery preserves saved images, including legacy records.
     final candidates = [
       source.endpoint.resolve('web/assets/img/icon-transparent.png'),
       source.endpoint.resolve('web/assets/img/icon.png'),
@@ -7098,7 +7088,11 @@ class _SourceHubState extends State<_SourceHub>
               customIcon: false,
             );
             if (token != null && token.isNotEmpty) {
-              await store.upsert(updated, token);
+              await store.updateIfPresent(
+                updated,
+                token,
+                observedSource: source,
+              );
             }
             return updated;
           }
@@ -7109,10 +7103,7 @@ class _SourceHubState extends State<_SourceHub>
     } finally {
       http.close(force: true);
     }
-    if (source.iconUrl != null && token != null && token.isNotEmpty) {
-      await store.updateIfPresent(baseline, token);
-    }
-    return baseline;
+    return source;
   }
 
   Future<void> _remove(MediaSource source) async {
@@ -7184,20 +7175,9 @@ class _SourceHubState extends State<_SourceHub>
       builder: (_) => _ServerIconDialog(source: source, token: token),
     );
     if (icon == null) return;
-    await store.upsert(
-      MediaSource(
-        id: source.id,
-        name: source.name,
-        kind: source.kind,
-        endpoint: source.endpoint,
-        userId: source.userId,
-        serverId: source.serverId,
-        alternateEndpoints: source.alternateEndpoints,
-        iconUrl: icon.isEmpty ? null : icon,
-        customIcon: icon.isNotEmpty,
-      ),
-      token,
-    );
+    await store.setIcon(source.id, icon.isEmpty ? null : icon);
+    final saved = store.load().where((value) => value.id == source.id);
+    if (saved.isNotEmpty) await cacheServerMarkFile(saved.first, token);
     await _load();
     if (icon.isEmpty) unawaited(_refresh(manual: true));
   }

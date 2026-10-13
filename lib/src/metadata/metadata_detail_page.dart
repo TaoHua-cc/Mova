@@ -647,7 +647,10 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
     if (mounted && generation == _searchGeneration && result != null) {
       setState(() {
         _resources = result.rows;
-        _selectedResource = bestResourceVersion(result.rows);
+        _selectedResource = preferredResourceForSort(
+          result.rows,
+          _resourceSort,
+        );
         _resourceError = result.error;
         _loadingResources = false;
       });
@@ -692,7 +695,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
       if (generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
-        _selectedResource ??= bestResourceVersion(unique);
+        _selectedResource = preferredResourceForSort(unique, _resourceSort);
       });
       onResourcesPublished?.call(unique);
       final playable = unique.where(
@@ -848,7 +851,7 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
       if (!mounted || generation != _searchGeneration) return;
       setState(() {
         _resources = unique;
-        _selectedResource ??= bestResourceVersion(unique);
+        _selectedResource = preferredResourceForSort(unique, _resourceSort);
         _loadingResources = false;
         _resourceError = failedSources == 0
             ? null
@@ -1206,7 +1209,16 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
         setState(() {
           _resources = matches;
           _seasonPosters = seasonPosters;
-          _selectedResource = preferred;
+          _selectedResource =
+              preferredResourceForSort(
+                matches.where(
+                  (row) =>
+                      row.seasonNumber == preferred?.seasonNumber &&
+                      row.episodeNumber == preferred?.episodeNumber,
+                ),
+                _resourceSort,
+              ) ??
+              preferred;
           _completedResourceIds = derived.completed;
           _episodeProgress = derived.progress;
           _selectedSeason =
@@ -1996,7 +2008,10 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
   }
 
   Future<void> _selectResourceSort(String value) async {
-    setState(() => _resourceSort = value);
+    setState(() {
+      _resourceSort = value;
+      _selectedResource = preferredResourceForSort(_visibleResources, value);
+    });
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_resourceSortPreferenceKey, value);
   }
@@ -5845,7 +5860,7 @@ class _ResourceSectionState extends State<_ResourceSection> {
   }
 
   List<MediaItem> get _sorted =>
-      sortedResourceVersions(widget.resources, 'resolution');
+      sortedResourceVersions(widget.resources, _sort);
 
   List<MediaItem> get _displayed => sortedResourceVersions(
     serverResourceRepresentatives(_sorted, widget.selected),
@@ -6551,7 +6566,8 @@ class _ResourceCard extends StatelessWidget {
   final int? rank;
 
   @override
-  Widget build(BuildContext context) => _DetailCardMotion(
+  Widget build(BuildContext context) => _DetailPosterHover(
+    borderRadius: 16,
     selected: selected,
     child: ClipRRect(
       borderRadius: BorderRadius.circular(16),
@@ -6568,19 +6584,6 @@ class _ResourceCard extends StatelessWidget {
             decoration: BoxDecoration(
               color: Colors.transparent,
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(
-                color: selected ? Colors.white : YingjiGlass.line(),
-                width: selected ? 2.2 : 1,
-              ),
-              boxShadow: selected
-                  ? const [
-                      BoxShadow(
-                        color: Color(0x73000000),
-                        blurRadius: 28,
-                        offset: Offset(0, 14),
-                      ),
-                    ]
-                  : null,
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -6636,12 +6639,6 @@ class _ResourceCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                    if (selected)
-                      const Icon(
-                        YingjiIcons.checkmark_circle_fill,
-                        size: 18,
-                        color: Colors.white,
-                      ),
                     ...[
                       const SizedBox(width: 4),
                       YingjiGlassTooltip(
@@ -6817,39 +6814,28 @@ class _ResourcePickerCard extends StatelessWidget {
                     style: const TextStyle(fontWeight: FontWeight.w800),
                   ),
                   const SizedBox(height: 3),
-                  Text(
-                    _resourcePickerSummary(resource),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: YingjiColors.muted,
-                      fontSize: 12,
-                    ),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final detail in resourceVersionDetails(resource))
+                        _ResourceBadge(detail),
+                    ],
                   ),
                 ],
               ),
             ),
-            Icon(
-              selected
-                  ? YingjiIcons.checkmark_circle_fill
-                  : YingjiIcons.chevron_right,
-              color: selected ? Colors.white : YingjiColors.muted,
-            ),
+            if (selected)
+              const Icon(
+                YingjiIcons.checkmark_circle_fill,
+                color: Colors.white,
+              ),
           ],
         ),
       ),
     ),
   );
 }
-
-String _resourcePickerSummary(MediaItem resource) => [
-  if (resource.width != null)
-    resource.width! >= 3800 ? '4K' : '${resource.width}p',
-  if (resource.videoRange?.isNotEmpty == true) resource.videoRange!,
-  if (resource.container?.isNotEmpty == true) resource.container!.toUpperCase(),
-  if (resource.size != null)
-    '${(resource.size! / 1073741824).toStringAsFixed(2)} GB',
-].join(' · ');
 
 class _ResourceBadge extends StatelessWidget {
   const _ResourceBadge(this.text);

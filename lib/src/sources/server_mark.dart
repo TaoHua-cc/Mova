@@ -6,9 +6,12 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as image_lib;
 import 'package:path_provider/path_provider.dart';
+import 'package:crypto/crypto.dart';
 
 import '../brand.dart';
 import '../images/icon_background.dart';
+import '../network/network_http_client.dart';
+import '../network/proxy_routing.dart';
 import 'media_source.dart';
 
 final Map<String, Future<Uint8List?>> _backgroundFreeIconCache = {};
@@ -53,20 +56,15 @@ class ServerMark extends StatelessWidget {
           borderRadius: BorderRadius.circular(size * .29),
           child: !hasImage
               ? fallback
-              : source.customIcon
-              ? BackgroundFreeNetworkIcon(
-                  url: icon.toString(),
-                  fallback: fallback,
-                )
-              : Image.network(
-                  icon.toString(),
-                  headers:
-                      icon.host == source.endpoint.host &&
-                          token?.isNotEmpty == true
-                      ? {'X-Emby-Token': token!}
-                      : null,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, _, _) => fallback,
+              : FutureBuilder<String?>(
+                  future: cacheServerMarkFile(source, token),
+                  builder: (context, snapshot) => snapshot.data == null
+                      ? fallback
+                      : Image.file(
+                          File(snapshot.data!),
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, _, _) => fallback,
+                        ),
                 ),
         ),
       ),
@@ -169,37 +167,63 @@ Future<String?> cacheServerMarkFile(MediaSource source, String? token) {
   final iconUrl = source.iconUrl;
   if (iconUrl == null || iconUrl.isEmpty) return Future<String?>.value();
   final uri = Uri.tryParse(iconUrl);
-  if (uri == null || !uri.hasScheme) return Future<String?>.value();
+  if (uri == null || !['http', 'https'].contains(uri.scheme)) {
+    return Future<String?>.value();
+  }
+  final key = '${source.id}|${source.customIcon ? 'c' : 's'}|$iconUrl';
   return _markFileCache.putIfAbsent(
-    '${source.customIcon ? 'c' : 's'}|$iconUrl',
-    () => _cacheMark(
-      uri,
-      customIcon: source.customIcon,
-      token: token,
-      sameHost: uri.host == source.endpoint.host,
-    ),
+    key,
+    () =>
+        _cacheMark(
+          uri,
+          cacheKey: key,
+          customIcon: source.customIcon,
+          token: token,
+          sameHost: uri.origin == source.endpoint.origin,
+          proxy:
+              uri.origin != source.endpoint.origin ||
+              ProxyRouting.serverUsesProxy(source.id),
+        ).then((path) {
+          if (path == null) _markFileCache.remove(key);
+          return path;
+        }),
   );
 }
 
 Future<String?> _cacheMark(
   Uri uri, {
+  required String cacheKey,
   required bool customIcon,
   required bool sameHost,
+  required bool proxy,
   String? token,
 }) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+  client.findProxy = proxy ? findNetworkProxy : (_) => 'DIRECT';
   try {
+    final base = await getApplicationSupportDirectory();
+    final folder = Directory(
+      '${base.path}${Platform.pathSeparator}$_markFolder',
+    );
+    final name = sha256.convert(utf8.encode(cacheKey)).toString();
+    final file = File('${folder.path}${Platform.pathSeparator}$name.png');
+    if (await file.exists()) {
+      final cached = await file.readAsBytes();
+      if (image_lib.decodeImage(cached) != null) return file.path;
+    }
     final request = await client.getUrl(uri);
     if (!customIcon && sameHost && token != null && token.isNotEmpty) {
       request.headers.set('X-Emby-Token', token);
     }
-    final response = await request.close();
+    final response = await request.close().timeout(const Duration(seconds: 8));
     if (response.statusCode < 200 || response.statusCode >= 300) return null;
     final output = BytesBuilder(copy: false);
-    await for (final chunk in response) {
+    await for (final chunk in response.timeout(const Duration(seconds: 8))) {
       output.add(chunk);
+      if (output.length > 8 * 1024 * 1024) return null;
     }
     var bytes = output.takeBytes();
+    if (image_lib.decodeImage(bytes) == null) return null;
     if (customIcon) {
       final decoded = image_lib.decodeImage(bytes);
       if (decoded == null) return null;
@@ -209,16 +233,7 @@ Future<String?> _cacheMark(
       removeFlatIconBackground(rgba);
       bytes = Uint8List.fromList(image_lib.encodePng(rgba));
     }
-    final base = await getApplicationSupportDirectory();
-    final folder = Directory(
-      '${base.path}${Platform.pathSeparator}$_markFolder',
-    );
     if (!await folder.exists()) await folder.create(recursive: true);
-    final digest = base64Url
-        .encode(utf8.encode(uri.toString()))
-        .replaceAll('=', '');
-    final name = digest.length > 48 ? digest.substring(0, 48) : digest;
-    final file = File('${folder.path}${Platform.pathSeparator}$name.png');
     await file.writeAsBytes(bytes, flush: true);
     return file.path;
   } catch (_) {

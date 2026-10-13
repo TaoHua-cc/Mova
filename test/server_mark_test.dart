@@ -5,7 +5,7 @@ import 'package:yingji/src/sources/media_source.dart';
 import 'package:yingji/src/sources/server_mark.dart';
 
 void main() {
-  testWidgets('server mark renders the saved server icon with auth', (
+  testWidgets('server mark uses persistent lookup for saved icons', (
     tester,
   ) async {
     final source = MediaSource(
@@ -24,13 +24,11 @@ void main() {
       ),
     );
 
-    final image = tester.widget<Image>(find.byType(Image));
-    final provider = image.image as NetworkImage;
-    expect(provider.url, source.iconUrl);
-    expect(provider.headers, {'X-Emby-Token': 'secret'});
+    expect(find.byType(FutureBuilder<String?>), findsOneWidget);
+    expect(find.byType(Image), findsNothing);
   });
 
-  testWidgets('server mark does not leak auth to an icon pack host', (
+  testWidgets('remote icon lookup keeps a visible fallback while loading', (
     tester,
   ) async {
     final source = MediaSource(
@@ -49,8 +47,7 @@ void main() {
       ),
     );
 
-    final provider =
-        tester.widget<Image>(find.byType(Image)).image as NetworkImage;
-    expect(provider.headers, isNull);
+    expect(find.byType(FutureBuilder<String?>), findsOneWidget);
+    expect(find.byType(Icon), findsOneWidget);
   });
 }

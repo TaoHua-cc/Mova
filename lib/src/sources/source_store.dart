@@ -57,21 +57,64 @@ class SourceStore {
 
   /// Update a server discovered by a background refresh, but never recreate it
   /// if the user removed it while that refresh was in flight.
-  Future<bool> updateIfPresent(MediaSource source, String token) => _serialize(
-    () async {
-      final rows = load();
-      if (!rows.any((item) => item.id == source.id)) return false;
-      final updated = rows.map((item) => item.id == source.id ? source : item);
-      if (!await _prefs.setStringList(
-        _key,
-        updated.map((item) => jsonEncode(item.toJson())).toList(),
-      )) {
-        throw StateError('服务器列表写入失败');
-      }
-      await _vault.saveSecret('source.${source.id}', token);
-      return true;
-    },
-  );
+  Future<bool> updateIfPresent(
+    MediaSource source,
+    String token, {
+    MediaSource? observedSource,
+  }) => _serialize(() async {
+    final rows = load();
+    if (!rows.any((item) => item.id == source.id)) return false;
+    final current = rows.firstWhere((item) => item.id == source.id);
+    final iconChanged =
+        observedSource != null &&
+        (current.iconUrl != observedSource.iconUrl ||
+            current.customIcon != observedSource.customIcon);
+    final replacement = current.customIcon || iconChanged
+        ? _withIcon(source, current.iconUrl, current.customIcon)
+        : source;
+    final updated = rows.map(
+      (item) => item.id == source.id ? replacement : item,
+    );
+    if (!await _prefs.setStringList(
+      _key,
+      updated.map((item) => jsonEncode(item.toJson())).toList(),
+    )) {
+      throw StateError('服务器列表写入失败');
+    }
+    await _vault.saveSecret('source.${source.id}', token);
+    return true;
+  });
+
+  Future<void> setIcon(String id, String? url) => _serialize(() async {
+    final rows = load();
+    if (!rows.any((item) => item.id == id)) return;
+    if (!await _prefs.setStringList(
+      _key,
+      rows
+          .map(
+            (item) => jsonEncode(
+              (item.id == id ? _withIcon(item, url, url != null) : item)
+                  .toJson(),
+            ),
+          )
+          .toList(),
+    )) {
+      throw StateError('服务器图标写入失败');
+    }
+  });
+
+  static MediaSource _withIcon(MediaSource source, String? url, bool custom) =>
+      MediaSource(
+        id: source.id,
+        name: source.name,
+        kind: source.kind,
+        endpoint: source.endpoint,
+        userId: source.userId,
+        serverId: source.serverId,
+        alternateEndpoints: source.alternateEndpoints,
+        iconUrl: url,
+        customIcon: custom,
+      );
 
   String? tokenFor(MediaSource source) =>
       _vault.readSecret('source.${source.id}');

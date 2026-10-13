@@ -62,6 +62,43 @@ void main() {
     expect(rows.map((row) => row.id), ['a', 'b', 'c', 'missing']);
     expect(sortedResourceVersions([], 'range'), isEmpty);
   });
+  test('selection follows current criterion and later better results', () {
+    expect(preferredResourceForSort(rows, 'resolution')?.id, 'a');
+    expect(preferredResourceForSort(rows, 'range')?.id, 'c');
+    expect(preferredResourceForSort(rows, 'bitrate')?.id, 'b');
+    expect(preferredResourceForSort(rows, 'size')?.id, 'c');
+    expect(preferredResourceForSort([rows[0]], 'bitrate')?.id, 'a');
+    expect(preferredResourceForSort(rows, 'bitrate')?.id, 'b');
+    expect(preferredResourceForSort([rows.last], 'range'), isNull);
+    expect(preferredResourceForSort([], 'range'), isNull);
+  });
+  test('version summary shows real technical details without private data', () {
+    final resource = MediaItem(
+      id: 'technical',
+      title: 'Technical',
+      type: 'Movie',
+      source: source,
+      playbackUrl: Uri.parse('http://localhost/private?token=secret'),
+      width: 3840,
+      height: 2160,
+      videoRange: 'HDR10',
+      container: 'mkv',
+      bitrate: 20000000,
+      size: 1073741824,
+      videoCodec: 'hevc',
+      bitDepth: 10,
+      frameRate: 23.976,
+    );
+    expect(
+      resourceVersionSummary(resource),
+      '3840×2160 · HDR10 · MKV · 20.0 Mbps · 1.00 GB · HEVC · 10 bit · 23.98 fps',
+    );
+    expect(resourceVersionSummary(rows.last), isEmpty);
+    expect(resourceVersionDetails(rows.last), isEmpty);
+    expect(resourceVersionDetails(resource), hasLength(8));
+    expect(resourceVersionDetails(resource), contains('20.0 Mbps'));
+    expect(resourceVersionSummary(resource), isNot(contains('secret')));
+  });
   test(
     'range ranking is semantic and default quality does not follow API order',
     () {

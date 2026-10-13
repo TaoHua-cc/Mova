@@ -20,7 +20,7 @@ void main() {
       expect('GlassPanel('.allMatches(picker), hasLength(1));
       final row = source.substring(
         source.indexOf('class _ResourcePickerCard'),
-        source.indexOf('String _resourcePickerSummary'),
+        source.indexOf('class _ResourceBadge'),
       );
       expect(row, contains('selected ? 2.2 : 1'));
       expect(row, contains('YingjiIcons.checkmark_circle_fill'));
