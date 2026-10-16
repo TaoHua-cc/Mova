@@ -3905,11 +3905,9 @@ class _SeasonRailState extends State<_SeasonRail> {
                 controller: _controller,
                 scrollDirection: Axis.horizontal,
 
-                physics:
-                    yingjiWheelPhysics ??
-                    const BouncingScrollPhysics(
-                      parent: AlwaysScrollableScrollPhysics(),
-                    ),
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
                 padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
                 itemCount: seasons.length,
                 separatorBuilder: (_, _) => const SizedBox(width: 16),
@@ -4989,11 +4987,9 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
               controller: _controller,
               scrollDirection: Axis.horizontal,
 
-              physics:
-                  yingjiWheelPhysics ??
-                  const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
-                  ),
+              physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics(),
+              ),
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
               itemExtent: 256,
               itemCount: widget.resources.length,
@@ -5935,11 +5931,9 @@ class _ResourceSectionState extends State<_ResourceSection> {
                 controller: _controller,
                 scrollDirection: Axis.horizontal,
 
-                physics:
-                    yingjiWheelPhysics ??
-                    const BouncingScrollPhysics(
-                      parent: AlwaysScrollableScrollPhysics(),
-                    ),
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
                 itemCount: _displayed.length,
                 separatorBuilder: (_, _) => const SizedBox(width: 14),
                 itemBuilder: (_, index) {

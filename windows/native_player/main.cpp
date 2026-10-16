@@ -9228,8 +9228,40 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
   SetShortcut("exit", L"Escape");
   int argc = 0;
   wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  std::vector<std::wstring> launch_arguments;
   for (int index = 1; index < argc; ++index) {
-    std::wstring argument = argv[index];
+    const std::wstring argument = argv[index];
+    const std::wstring prefix = L"--mova-args-file=";
+    if (argument.rfind(prefix, 0) != 0) {
+      launch_arguments.push_back(argument);
+      continue;
+    }
+    const std::filesystem::path path(argument.substr(prefix.size()));
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > 32 * 1024 * 1024) {
+      LocalFree(argv);
+      return 10;
+    }
+    std::ifstream input(path, std::ios::binary);
+    std::string line;
+    if (!std::getline(input, line) || line != "MOVA_ARGS_V1") {
+      LocalFree(argv);
+      return 10;
+    }
+    while (std::getline(input, line)) {
+      if (launch_arguments.size() >= 100000) {
+        LocalFree(argv);
+        return 10;
+      }
+      launch_arguments.push_back(Wide(PercentDecode(line)));
+    }
+    if (input.bad()) { LocalFree(argv); return 10; }
+    input.close();
+    std::filesystem::remove(path, error);
+  }
+  LocalFree(argv);
+  for (const auto& argument : launch_arguments) {
     if (argument.rfind(L"--", 0) == 0) {
       const auto equals = argument.find(L'=');
       if (equals != std::wstring::npos) {
@@ -9372,7 +9404,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show_command) {
       g_media_urls.push_back(Utf8(argument));
     }
   }
-  LocalFree(argv);
   while (g_playlist_titles.size() < g_media_urls.size()) {
     g_playlist_titles.push_back(g_media_title);
   }

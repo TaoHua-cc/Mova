@@ -64,6 +64,22 @@ void main() {
     await tester.tap(find.text('one'));
     await tester.pumpAndSettle();
     // Both button and menu retain fixed frost without backdrop sampling.
+    final options = tester
+        .widgetList<MenuItemButton>(find.byType(MenuItemButton))
+        .toList();
+    expect(
+      options.first.style!.backgroundColor!.resolve({}),
+      YingjiGlass.accent,
+    );
+    expect(
+      options.first.style!.foregroundColor!.resolve({}),
+      YingjiColors.canvas,
+    );
+    expect(
+      options.last.style!.backgroundColor!.resolve({}),
+      Colors.transparent,
+    );
+    expect(options.last.style!.foregroundColor!.resolve({}), Colors.white);
     expect(find.byType(BackdropFilter), findsNothing);
     final menuGlass = find.descendant(
       of: find.byType(GlassPanel),

@@ -8367,7 +8367,14 @@ class _PlaylistsPageState extends State<_PlaylistsPage>
             detail: '在媒体详情页点击“加入待看”，即可保存到这里。',
           )
         else
-          _PosterStrip(items: _watchlist),
+          _PosterStrip(
+            items: _watchlist,
+            onRemove: (item) async {
+              final store = await WatchlistStore.create();
+              await store.remove(item.id);
+              await _load();
+            },
+          ),
         const SizedBox(height: 38),
         _SectionHeader(title: '自定义片单', subtitle: '本地保存，可继续扩展为 Trakt 同步'),
         const SizedBox(height: 14),
@@ -12771,9 +12778,10 @@ Widget _withoutScrollbars(BuildContext context, Widget child) =>
     );
 
 class _PosterStrip extends StatefulWidget {
-  const _PosterStrip({required this.items, this.shelf});
+  const _PosterStrip({required this.items, this.shelf, this.onRemove});
   final List<TmdbItem> items;
   final _ShelfNavigator? shelf;
+  final Future<void> Function(TmdbItem)? onRemove;
 
   @override
   State<_PosterStrip> createState() => _PosterStripState();
@@ -12812,7 +12820,18 @@ class _PosterStripState extends State<_PosterStrip> {
           ),
           itemCount: widget.items.length,
           separatorBuilder: (_, _) => const SizedBox(width: 14),
-          itemBuilder: (_, i) => _PosterTile(item: widget.items[i]),
+          itemBuilder: (_, i) {
+            final item = widget.items[i];
+            final tile = _PosterTile(item: item);
+            final remove = widget.onRemove;
+            return remove == null
+                ? tile
+                : PlaylistItemMenu(
+                    label: '从待看移除',
+                    onRemove: () => remove(item),
+                    child: tile,
+                  );
+          },
         ),
       ),
     ),

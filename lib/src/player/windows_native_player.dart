@@ -23,6 +23,7 @@ import 'playback_segments.dart';
 import 'subtitle_search_service.dart';
 import 'seek_preview.dart';
 import 'playback_diagnostic.dart';
+import 'native_launch_arguments.dart';
 import '../network/network_http_client.dart';
 
 import 'package:http/http.dart' as http;
@@ -509,6 +510,7 @@ class WindowsNativePlayer {
     }
 
     protectEpisode(request.playlistIndex.clamp(0, entries.length - 1));
+    Directory? launchDirectory;
     try {
       final playbackUrls = <String>[];
       for (final entry in entries) {
@@ -711,14 +713,25 @@ class WindowsNativePlayer {
       }
 
       cache?.playbackDiagnostic = recordDiagnostic;
-      final process = await Process.start(
-        executable.path,
-        arguments,
-        workingDirectory: executable.parent.path,
-        mode: ProcessStartMode.normal,
-        environment: windowsPlaybackEnvironment(Platform.environment),
-        includeParentEnvironment: false,
+      launchDirectory = await Directory.systemTemp.createTemp('mova-launch-');
+      final launchFile = File('${launchDirectory.path}/arguments.txt');
+      await launchFile.writeAsString(
+        encodeNativeLaunchArguments(arguments),
+        flush: true,
       );
+      late final Process process;
+      try {
+        process = await Process.start(
+          executable.path,
+          ['--mova-args-file=${launchFile.path}'],
+          workingDirectory: executable.parent.path,
+          mode: ProcessStartMode.normal,
+          environment: windowsPlaybackEnvironment(Platform.environment),
+          includeParentEnvironment: false,
+        );
+      } on ProcessException catch (error) {
+        throw StateError(nativeLaunchFailure(error));
+      }
       mainWindowHidden = true;
       try {
         await WindowHost.hide();
@@ -1974,6 +1987,9 @@ class WindowsNativePlayer {
       } catch (_) {
         // The host can already be shutting down.
       }
+      try {
+        await launchDirectory?.delete(recursive: true);
+      } catch (_) {}
       for (final release in cacheLeases.values) {
         release();
       }

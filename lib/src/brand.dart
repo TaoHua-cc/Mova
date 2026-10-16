@@ -1214,6 +1214,27 @@ class YingjiGlassChoiceButton<T> extends StatelessWidget {
         .map(
           (item) => MenuItemButton(
             onPressed: () => onChanged(item),
+            style: ButtonStyle(
+              backgroundColor: WidgetStateProperty.resolveWith(
+                (states) => item == value
+                    ? YingjiGlass.accent
+                    : states.contains(WidgetState.hovered) ||
+                          states.contains(WidgetState.focused)
+                    ? Colors.white.withValues(alpha: .16)
+                    : Colors.transparent,
+              ),
+              foregroundColor: WidgetStatePropertyAll(
+                item == value ? YingjiColors.canvas : Colors.white,
+              ),
+              shape: WidgetStatePropertyAll(
+                RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  side: BorderSide(
+                    color: item == value ? Colors.white : Colors.transparent,
+                  ),
+                ),
+              ),
+            ),
             child: Row(
               children: [
                 Expanded(

@@ -65,6 +65,15 @@ void main() {
           .readAsStringSync();
       expect(detail, isNot(contains('YingjiDirectionalArrow(')));
       expect(detail, contains("tooltip: '全部剧集'"));
+      for (final rail in [
+        '_SeasonRailState',
+        '_EpisodePreviewRailState',
+        '_ResourceSectionState',
+      ]) {
+        final body = detail.split('class $rail ').last.split('\nclass ').first;
+        expect(body, contains('MovaHorizontalDrag('));
+        expect(body, isNot(contains('yingjiWheelPhysics')));
+      }
       expect(main, contains('notification.metrics.extentAfter < 240'));
     },
   );
