@@ -183,7 +183,7 @@ void main() {
     );
     expect(posterHover, contains('AnimatedScale('));
     expect(posterHover, contains('MovaMotion.pressScaleCard'));
-    expect(posterHover, contains('MovaMotion.spring'));
+    expect(posterHover, contains('Curves.easeOutCubic'));
     expect(posterHover, isNot(contains('Matrix4.translationValues')));
     expect(posterHover, contains('Colors.transparent'));
     expect(rankTile, contains('_dismissPreviewWhileScrolling'));

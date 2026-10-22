@@ -13563,7 +13563,7 @@ class _RankTileState extends State<_RankTile>
           showWhenUnlinked: false,
           targetAnchor: showOnRight ? Alignment.topLeft : Alignment.topRight,
           followerAnchor: showOnRight ? Alignment.topLeft : Alignment.topRight,
-          offset: Offset(showOnRight ? 36 : 0, 0),
+          offset: Offset.zero,
           child: UnconstrainedBox(
             alignment: showOnRight ? Alignment.topLeft : Alignment.topRight,
             child: AnimatedBuilder(
@@ -13623,56 +13623,46 @@ class _RankTileState extends State<_RankTile>
   }
 
   @override
-  Widget build(BuildContext context) => CompositedTransformTarget(
-    link: _link,
-    child: MouseRegion(
-      onEnter: (_) {
-        _pointerInside = true;
-        if (yingjiScrollInProgress.value) return;
-        setState(() => _hovered = true);
-        _showPreview();
-      },
-      onExit: (_) {
-        _pointerInside = false;
-        if (_hovered) setState(() => _hovered = false);
-        if (!yingjiScrollInProgress.value) unawaited(_hidePreview());
-      },
-      child: SizedBox(
-        width: 166,
-        child: InkWell(
-          onTap: () => MetadataDetailPage.open(context, item: widget.item),
-          child: Stack(
-            children: [
-              Positioned(
-                left: 0,
-                bottom: 0,
-                child: Text(
-                  '${widget.index}',
-                  style: TextStyle(
-                    fontSize: 104,
-                    height: .8,
-                    fontWeight: FontWeight.w900,
-                    color: Colors.white.withValues(alpha: .18),
-                  ),
+  Widget build(BuildContext context) => MouseRegion(
+    onEnter: (_) {
+      _pointerInside = true;
+      if (yingjiScrollInProgress.value) return;
+      setState(() => _hovered = true);
+      _showPreview();
+    },
+    onExit: (_) {
+      _pointerInside = false;
+      if (_hovered) setState(() => _hovered = false);
+      if (!yingjiScrollInProgress.value) unawaited(_hidePreview());
+    },
+    child: SizedBox(
+      width: 166,
+      child: InkWell(
+        onTap: () => MetadataDetailPage.open(context, item: widget.item),
+        child: Stack(
+          children: [
+            Positioned(
+              left: 0,
+              bottom: 0,
+              child: Text(
+                '${widget.index}',
+                style: TextStyle(
+                  fontSize: 104,
+                  height: .8,
+                  fontWeight: FontWeight.w900,
+                  color: Colors.white.withValues(alpha: .18),
                 ),
               ),
-              Positioned(
-                left: 36,
-                top: 0,
-                bottom: 0,
-                right: 0,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 160),
-                  curve: Curves.easeOutCubic,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                      color: Colors.white.withValues(
-                        alpha: _hovered ? .76 : .12,
-                      ),
-                      width: _hovered ? 2.2 : 1,
-                    ),
-                  ),
+            ),
+            Positioned(
+              left: 36,
+              top: 0,
+              bottom: 0,
+              right: 0,
+              child: _MediaHover(
+                borderRadius: 14,
+                child: CompositedTransformTarget(
+                  link: _link,
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(13),
                     child: Stack(
@@ -13721,8 +13711,8 @@ class _RankTileState extends State<_RankTile>
                   ),
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     ),
@@ -14804,35 +14794,45 @@ class _MediaHoverState extends State<_MediaHover> {
       onPointerUp: (_) => setState(() => _pressed = false),
       onPointerCancel: (_) => setState(() => _pressed = false),
       child: AnimatedScale(
-        scale: _pressed ? MovaMotion.pressScaleCard : 1,
-        duration: _pressed ? MovaMotion.tapDown : MovaMotion.tapUp,
-        curve: _pressed ? MovaMotion.press : MovaMotion.spring,
-        child: AnimatedContainer(
-          duration: MovaMotion.quick,
-          curve: MovaMotion.standardEase,
-          decoration: BoxDecoration(
-            // 不透明底托住圆角海报，合成时不会透出流动背景。
-            color: const Color(0xFF1A1D25),
-            borderRadius: BorderRadius.circular(widget.borderRadius),
-            border: Border.all(
-              color: _hovered
-                  ? Colors.white.withValues(alpha: .72)
-                  : Colors.transparent,
-              width: 1,
+        scale: _pressed ? MovaMotion.pressScaleCard : (_hovered ? 1.018 : 1),
+        duration: _pressed
+            ? MovaMotion.tapDown
+            : const Duration(milliseconds: 180),
+        curve: _pressed ? MovaMotion.press : Curves.easeOutCubic,
+        child: AnimatedSlide(
+          offset: _hovered ? const Offset(0, -.015) : Offset.zero,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          child: AnimatedContainer(
+            duration: MovaMotion.quick,
+            curve: MovaMotion.standardEase,
+            decoration: BoxDecoration(
+              // 不透明底托住圆角海报，合成时不会透出流动背景。
+              color: const Color(0xFF1A1D25),
+              borderRadius: BorderRadius.circular(widget.borderRadius),
+              boxShadow: _hovered
+                  ? const [
+                      BoxShadow(
+                        color: Color(0x8A000000),
+                        blurRadius: 28,
+                        offset: Offset(0, 14),
+                      ),
+                    ]
+                  : const [],
             ),
-            boxShadow: _hovered
-                ? const [
-                    BoxShadow(
-                      color: Color(0x99000000),
-                      blurRadius: 24,
-                      offset: Offset(0, 12),
-                    ),
-                  ]
-                : const [],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(widget.borderRadius),
-            child: widget.child,
+            foregroundDecoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(widget.borderRadius),
+              border: Border.all(
+                color: _hovered
+                    ? Colors.white.withValues(alpha: .58)
+                    : Colors.transparent,
+                width: _hovered ? 1.4 : 1,
+              ),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(widget.borderRadius),
+              child: widget.child,
+            ),
           ),
         ),
       ),
@@ -16708,12 +16708,6 @@ class _ProxyServerCardState extends State<_ProxyServerCard> {
                 ? Colors.white.withValues(alpha: .12)
                 : Colors.white.withValues(alpha: _hovered ? .075 : .045),
             borderRadius: BorderRadius.circular(18),
-            border: Border.all(
-              color: selected
-                  ? Colors.white.withValues(alpha: .72)
-                  : Colors.white.withValues(alpha: _hovered ? .22 : .1),
-              width: selected ? 1.4 : 1,
-            ),
             boxShadow: selected
                 ? [
                     BoxShadow(
@@ -16723,6 +16717,15 @@ class _ProxyServerCardState extends State<_ProxyServerCard> {
                     ),
                   ]
                 : null,
+          ),
+          foregroundDecoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: selected
+                  ? Colors.white.withValues(alpha: .72)
+                  : Colors.white.withValues(alpha: _hovered ? .22 : .1),
+              width: selected ? 1.4 : 1,
+            ),
           ),
           child: Material(
             color: Colors.transparent,

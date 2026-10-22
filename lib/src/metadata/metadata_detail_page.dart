@@ -382,6 +382,8 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
   Map<String, double> _episodeProgress = const <String, double>{};
   List<WatchState> _episodeWatchHistory = const [];
   Map<int, Uri> _seasonPosters = const {};
+  final Map<int, Map<String, Uri>> _serverEpisodeArtwork = {};
+  final Map<String, Future<void>> _episodeArtworkTasks = {};
   Map<String, TmdbEpisode> _episodeMetadata = const {};
   List<TmdbSeason> _catalogSeasons = const [];
   int? _selectedEpisodeNumber;
@@ -573,6 +575,54 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
     } catch (_) {
       // The catalog stays visible even when one season fails to load.
     }
+  }
+
+  Future<void> _loadServerEpisodeArtwork(
+    EmbySession session,
+    String seriesId,
+    int season,
+  ) {
+    final tmdbId = widget.item.id;
+    final taskKey = '$tmdbId|${session.source.id}|$seriesId|$season';
+    final existing = _episodeArtworkTasks[taskKey];
+    if (existing != null) return existing;
+
+    late final Future<void> task;
+    task = () async {
+      final client = EmbyClient(
+        proxy: ProxyRouting.serverUsesProxy(session.source.id),
+      );
+      try {
+        final artwork = await client.episodeArtworkForSeries(
+          session,
+          seriesId,
+          seasonNumber: season,
+        );
+        if (artwork.isEmpty) return;
+        final images = _serverEpisodeArtwork.putIfAbsent(
+          tmdbId,
+          () => <String, Uri>{},
+        );
+        var changed = false;
+        for (final entry in artwork.entries) {
+          final key = _episodeKey(season, entry.key);
+          if (images.containsKey(key)) continue;
+          images[key] = entry.value;
+          changed = true;
+        }
+        if (changed && mounted && widget.item.id == tmdbId) {
+          setState(() {});
+        }
+      } catch (_) {
+        if (identical(_episodeArtworkTasks[taskKey], task)) {
+          _episodeArtworkTasks.remove(taskKey);
+        }
+      } finally {
+        client.dispose();
+      }
+    }();
+    _episodeArtworkTasks[taskKey] = task;
+    return task;
   }
 
   Future<void> _searchSelectedEpisode({bool force = false}) {
@@ -820,6 +870,9 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
             }
             final sourceResults = <MediaItem>[];
             for (final seriesId in seriesIds) {
+              // Load lightweight image metadata in the background. It must not
+              // delay the selected episode's resource search or playback.
+              unawaited(_loadServerEpisodeArtwork(session, seriesId, season));
               sourceResults.addAll(
                 await client.episodesForSeries(
                   session,
@@ -2624,6 +2677,11 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
                               if (_catalogEpisodeChoices.isNotEmpty)
                                 _CatalogEpisodeRail(
                                   episodes: _catalogEpisodeChoices,
+                                  serverArtwork:
+                                      _serverEpisodeArtwork[widget.item.id] ??
+                                      const <String, Uri>{},
+                                  backdropUrl: item.backdropUrl,
+                                  posterUrl: item.posterUrl,
                                   selectedEpisode: _selectedEpisodeNumber,
                                   progress: _episodeProgress,
                                   timings: {
@@ -2650,6 +2708,11 @@ class _MetadataDetailBodyState extends State<_MetadataDetailBody> {
                                   selected: _selectedResource,
                                   completedResourceIds: _completedResourceIds,
                                   metadata: _episodeMetadata,
+                                  serverArtwork:
+                                      _serverEpisodeArtwork[widget.item.id] ??
+                                      const <String, Uri>{},
+                                  backdropUrl: item.backdropUrl,
+                                  posterUrl: item.posterUrl,
                                   episodeProgress: _episodeProgress,
                                   onMarkPlayed: _setEpisodeCompleted,
                                   onSelect: _selectEpisode,
@@ -3827,6 +3890,9 @@ class _SeasonRail extends StatefulWidget {
 }
 
 class _SeasonRailState extends State<_SeasonRail> {
+  static const _cardWidth = 140.0;
+  static const _cardGap = 16.0;
+  static const _railInset = 3.0;
   final ScrollController _controller = ScrollController();
 
   List<int> get _seasons => [
@@ -3842,10 +3908,11 @@ class _SeasonRailState extends State<_SeasonRail> {
       final index = _seasons.indexOf(selectedSeason);
       if (index < 0) return;
       final viewport = _controller.position.viewportDimension;
-      final target = (index * 126.0 - (viewport - 112) / 2).clamp(
-        0.0,
-        _controller.position.maxScrollExtent,
-      );
+      final target =
+          (_railInset +
+                  index * (_cardWidth + _cardGap) -
+                  (viewport - _cardWidth) / 2)
+              .clamp(0.0, _controller.position.maxScrollExtent);
       _controller.animateTo(
         target,
         duration: const Duration(milliseconds: 440),
@@ -3908,9 +3975,12 @@ class _SeasonRailState extends State<_SeasonRail> {
                 physics: const BouncingScrollPhysics(
                   parent: AlwaysScrollableScrollPhysics(),
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 4),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: _railInset,
+                  vertical: 4,
+                ),
                 itemCount: seasons.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 16),
+                separatorBuilder: (_, _) => const SizedBox(width: _cardGap),
                 itemBuilder: (context, index) {
                   final season = seasons[index];
                   final active = season == widget.selectedSeason;
@@ -3922,7 +3992,7 @@ class _SeasonRailState extends State<_SeasonRail> {
                       selected: active,
                       borderRadius: 14,
                       child: SizedBox(
-                        width: 140,
+                        width: _cardWidth,
                         child: Column(
                           children: [
                             Expanded(
@@ -4155,6 +4225,9 @@ class _EpisodeProgressOverlay extends StatelessWidget {
 class _CatalogEpisodeRail extends StatefulWidget {
   const _CatalogEpisodeRail({
     required this.episodes,
+    required this.serverArtwork,
+    required this.backdropUrl,
+    required this.posterUrl,
     required this.selectedEpisode,
     required this.progress,
     required this.timings,
@@ -4164,6 +4237,9 @@ class _CatalogEpisodeRail extends StatefulWidget {
   });
 
   final List<TmdbEpisode> episodes;
+  final Map<String, Uri> serverArtwork;
+  final Uri? backdropUrl;
+  final Uri? posterUrl;
   final int? selectedEpisode;
   final Map<String, double> progress;
   final Map<String, WatchState?> timings;
@@ -4459,20 +4535,17 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                                                 child: ClipRRect(
                                                   borderRadius:
                                                       BorderRadius.circular(8),
-                                                  child:
-                                                      episode.stillUrl == null
-                                                      ? const _EpisodeArtworkFallback()
-                                                      : CachedNetworkImage(
-                                                          imageUrl: episode
-                                                              .stillUrl
-                                                              .toString(),
-                                                          fit: BoxFit.cover,
-                                                          errorWidget: (
-                                                            _,
-                                                            _,
-                                                            _,
-                                                          ) => const _EpisodeArtworkFallback(),
-                                                        ),
+                                                  child: _EpisodeArtworkImage(
+                                                    episodeUrl:
+                                                        episode.stillUrl,
+                                                    episodeAirDate:
+                                                        episode.airDate,
+                                                    serverEpisodeUrl: widget
+                                                        .serverArtwork[key],
+                                                    backdropUrl:
+                                                        widget.backdropUrl,
+                                                    posterUrl: widget.posterUrl,
+                                                  ),
                                                 ),
                                               ),
                                               title: Text(
@@ -4732,16 +4805,25 @@ class _CatalogEpisodeRailState extends State<_CatalogEpisodeRail> {
                                       child: Stack(
                                         fit: StackFit.expand,
                                         children: [
-                                          if (episode.stillUrl != null)
-                                            CachedNetworkImage(
-                                              imageUrl: episode.stillUrl
-                                                  .toString(),
-                                              fit: BoxFit.cover,
-                                              errorWidget: (_, _, _) =>
-                                                  const _EpisodeArtworkFallback(),
-                                            )
-                                          else
-                                            const _EpisodeArtworkFallback(),
+                                          _EpisodeArtworkImage(
+                                            episodeUrl: episode.stillUrl,
+                                            episodeAirDate: episode.airDate,
+                                            serverEpisodeUrl:
+                                                widget
+                                                    .serverArtwork[_episodeKey(
+                                                  episode.seasonNumber,
+                                                  episode.episodeNumber,
+                                                )],
+                                            backdropUrl: widget.backdropUrl,
+                                            posterUrl: widget.posterUrl,
+                                            memCacheWidth:
+                                                (320 *
+                                                        MediaQuery.devicePixelRatioOf(
+                                                          context,
+                                                        ))
+                                                    .clamp(1.0, 512.0)
+                                                    .round(),
+                                          ),
                                           Positioned(
                                             top: 9,
                                             right: 9,
@@ -4855,6 +4937,9 @@ class _EpisodePreviewRail extends StatefulWidget {
     required this.completedResourceIds,
     required this.episodeProgress,
     required this.metadata,
+    required this.serverArtwork,
+    required this.backdropUrl,
+    required this.posterUrl,
     required this.onMarkPlayed,
     required this.onSelect,
   });
@@ -4863,6 +4948,9 @@ class _EpisodePreviewRail extends StatefulWidget {
   final Set<String> completedResourceIds;
   final Map<String, double> episodeProgress;
   final Map<String, TmdbEpisode> metadata;
+  final Map<String, Uri> serverArtwork;
+  final Uri? backdropUrl;
+  final Uri? posterUrl;
   final Future<void> Function(MediaItem resource, bool completed) onMarkPlayed;
   final ValueChanged<MediaItem> onSelect;
 
@@ -5005,7 +5093,6 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                   episodeMetadata,
                   index + 1,
                 );
-                final image = _episodeImage(resource, episodeMetadata);
                 final overview = resource.overview?.trim().isNotEmpty == true
                     ? resource.overview!
                     : episodeMetadata?.overview;
@@ -5103,27 +5190,28 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                                       child: Stack(
                                         fit: StackFit.expand,
                                         children: [
-                                          image == null
-                                              ? const _EpisodeArtworkFallback()
-                                              : CachedNetworkImage(
-                                                  fadeInDuration:
-                                                      const Duration(
-                                                        milliseconds: 150,
-                                                      ),
-                                                  imageUrl: image.toString(),
-                                                  fit: BoxFit.cover,
-                                                  // 剧集静帧显示宽 ~238，按物理像素解码即可，
-                                                  // 避免几十张原图在进页面时批量解码卡住转场末帧。
-                                                  memCacheWidth:
-                                                      (320 *
-                                                              MediaQuery.devicePixelRatioOf(
-                                                                context,
-                                                              ))
-                                                          .clamp(1.0, 512.0)
-                                                          .round(),
-                                                  errorWidget: (_, _, _) =>
-                                                      const _EpisodeArtworkFallback(),
-                                                ),
+                                          _EpisodeArtworkImage(
+                                            episodeUrl:
+                                                episodeMetadata?.stillUrl,
+                                            episodeAirDate:
+                                                episodeMetadata?.airDate ??
+                                                resource.premiereDate,
+                                            serverEpisodeUrl:
+                                                widget
+                                                    .serverArtwork[_episodeKey(
+                                                  effectiveSeason,
+                                                  effectiveEpisode,
+                                                )],
+                                            backdropUrl: widget.backdropUrl,
+                                            posterUrl: widget.posterUrl,
+                                            memCacheWidth:
+                                                (320 *
+                                                        MediaQuery.devicePixelRatioOf(
+                                                          context,
+                                                        ))
+                                                    .clamp(1.0, 512.0)
+                                                    .round(),
+                                          ),
                                           Positioned(
                                             right: 10,
                                             top: 10,
@@ -5408,7 +5496,6 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                           metadata,
                           index + 1,
                         );
-                        final image = _episodeImage(episode, metadata);
                         final published =
                             episode.premiereDate ?? metadata?.airDate;
                         final runtime =
@@ -5431,7 +5518,17 @@ class _EpisodePreviewRailState extends State<_EpisodePreviewRail> {
                           episode: episode,
                           index: index,
                           title: title,
-                          image: image,
+                          artwork: _EpisodeArtworkImage(
+                            episodeUrl: metadata?.stillUrl,
+                            episodeAirDate: published,
+                            serverEpisodeUrl:
+                                widget.serverArtwork[_episodeKey(
+                                  episode.seasonNumber,
+                                  episode.episodeNumber,
+                                )],
+                            backdropUrl: widget.backdropUrl,
+                            posterUrl: widget.posterUrl,
+                          ),
                           published: published,
                           runtime: runtime,
                           progress: progress,
@@ -5536,7 +5633,7 @@ class _AllEpisodeRow extends StatelessWidget {
     required this.episode,
     required this.index,
     required this.title,
-    required this.image,
+    required this.artwork,
     required this.published,
     required this.runtime,
     required this.progress,
@@ -5551,7 +5648,7 @@ class _AllEpisodeRow extends StatelessWidget {
   final MediaItem episode;
   final int index;
   final String title;
-  final Uri? image;
+  final Widget artwork;
   final DateTime? published;
   final int? runtime;
   final double progress;
@@ -5606,14 +5703,7 @@ class _AllEpisodeRow extends StatelessWidget {
                               child: Stack(
                                 fit: StackFit.expand,
                                 children: [
-                                  image == null
-                                      ? const _EpisodeArtworkFallback()
-                                      : CachedNetworkImage(
-                                          imageUrl: image.toString(),
-                                          fit: BoxFit.cover,
-                                          errorWidget: (_, _, _) =>
-                                              const _EpisodeArtworkFallback(),
-                                        ),
+                                  artwork,
                                   if (progress > 0 || completed)
                                     _EpisodeProgressOverlay(
                                       progress: completed ? 1 : progress,
@@ -5731,6 +5821,49 @@ class _EpisodeArtworkFallback extends StatelessWidget {
       ),
     ),
   );
+}
+
+class _EpisodeArtworkImage extends StatelessWidget {
+  const _EpisodeArtworkImage({
+    this.episodeUrl,
+    this.episodeAirDate,
+    this.serverEpisodeUrl,
+    this.backdropUrl,
+    this.posterUrl,
+    this.memCacheWidth,
+  });
+
+  final Uri? episodeUrl;
+  final DateTime? episodeAirDate;
+  final Uri? serverEpisodeUrl;
+  final Uri? backdropUrl;
+  final Uri? posterUrl;
+  final int? memCacheWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final episodeHasAired =
+        episodeAirDate == null || !episodeAirDate!.isAfter(DateTime.now());
+    final urls = <Uri>[
+      if (episodeHasAired) ?episodeUrl,
+      if (episodeHasAired) ?serverEpisodeUrl,
+      ?backdropUrl,
+      ?posterUrl,
+    ];
+
+    Widget imageAt(int index) {
+      if (index >= urls.length) return const _EpisodeArtworkFallback();
+      return CachedNetworkImage(
+        key: ValueKey(urls[index]),
+        imageUrl: urls[index].toString(),
+        fit: BoxFit.cover,
+        memCacheWidth: memCacheWidth,
+        errorWidget: (_, _, _) => imageAt(index + 1),
+      );
+    }
+
+    return imageAt(0);
+  }
 }
 
 /// Detail imagery shares one physical hover response: a subtle lift, a soft
@@ -5922,7 +6055,7 @@ class _ResourceSectionState extends State<_ResourceSection> {
       if (widget.error != null) _ResourceMessage(message: widget.error!),
       if (widget.resources.isNotEmpty)
         SizedBox(
-          height: 144,
+          height: 164,
           child: YingjiSmoothWheel(
             controller: _controller,
             stableGlass: true,
@@ -5935,6 +6068,10 @@ class _ResourceSectionState extends State<_ResourceSection> {
                   parent: AlwaysScrollableScrollPhysics(),
                 ),
                 itemCount: _displayed.length,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 6,
+                  vertical: 10,
+                ),
                 separatorBuilder: (_, _) => const SizedBox(width: 14),
                 itemBuilder: (_, index) {
                   final resource = _displayed[index];
@@ -6250,6 +6387,9 @@ class _TrackPickerOption extends StatelessWidget {
               color: selected
                   ? YingjiGlass.surface(strength: 1.14)
                   : YingjiGlass.surface(strength: .72),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            foregroundDecoration: BoxDecoration(
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
                 color: selected ? Colors.white : YingjiGlass.line(),
@@ -6785,6 +6925,9 @@ class _ResourcePickerCard extends StatelessWidget {
           color: selected
               ? YingjiGlass.surface(strength: 1.2)
               : YingjiGlass.surface(strength: .82),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        foregroundDecoration: BoxDecoration(
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: selected ? Colors.white : YingjiGlass.line(),

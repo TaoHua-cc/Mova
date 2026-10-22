@@ -81,6 +81,52 @@ void main() {
   );
   final session = EmbySession(source: source, token: 'test-token');
 
+  test('season artwork includes only episode-specific server images', () async {
+    final client = EmbyClient(
+      client: MockClient((request) async {
+        expect(request.url.path, '/Shows/series/Episodes');
+        expect(request.url.queryParameters['Season'], '1');
+        expect(
+          request.url.queryParameters['Fields'],
+          contains('ImageTags,ParentIndexNumber,IndexNumber'),
+        );
+        return http.Response(
+          jsonEncode({
+            'TotalRecordCount': 3,
+            'Items': [
+              {
+                'Id': 'episode-1',
+                'ParentIndexNumber': 1,
+                'IndexNumber': 1,
+                'ImageTags': {'Primary': 'episode-tag'},
+              },
+              {
+                'Id': 'episode-2',
+                'SeriesId': 'series',
+                'SeriesPrimaryImageTag': 'series-tag',
+                'ParentIndexNumber': 1,
+                'IndexNumber': 2,
+              },
+              {'Id': 'episode-3', 'ParentIndexNumber': 1, 'IndexNumber': 3},
+            ],
+          }),
+          200,
+        );
+      }),
+    );
+    addTearDown(client.dispose);
+
+    final artwork = await client.episodeArtworkForSeries(
+      session,
+      'series',
+      seasonNumber: 1,
+    );
+    expect(artwork.keys.toSet(), {1});
+    expect(artwork[1]?.path, '/Items/episode-1/Images/Primary');
+    expect(artwork.containsKey(2), isFalse);
+    expect(artwork[1]?.queryParameters['api_key'], 'test-token');
+  });
+
   test(
     'WebDAV filenames match only the requested show, season, and episode',
     () {

@@ -59,6 +59,7 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
   @override
   Widget build(BuildContext context) {
     final playlist = _playlist;
+    final compact = MediaQuery.sizeOf(context).width < 600;
     return Scaffold(
       backgroundColor: YingjiColors.canvas,
       body: Stack(
@@ -92,10 +93,10 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                               scrollController: _scroll,
                               physics: yingjiWheelPhysics,
                               buildDefaultDragHandles: false,
-                              padding: const EdgeInsets.fromLTRB(
-                                54,
+                              padding: EdgeInsets.fromLTRB(
+                                compact ? 16 : 54,
                                 24,
-                                54,
+                                compact ? 16 : 54,
                                 52,
                               ),
                               header: _PlaylistHeader(playlist: playlist),
@@ -123,7 +124,7 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                                           item: item,
                                         ),
                                         child: SizedBox(
-                                          height: 92,
+                                          height: compact ? 112 : 92,
                                           child: Row(
                                             children: [
                                               const SizedBox(width: 16),
@@ -197,6 +198,9 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage> {
                                                     MediaRatingRow(item: item),
                                                     Text(
                                                       '${item.year ?? '年份未知'} · ${item.kind}',
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
                                                       style: const TextStyle(
                                                         color:
                                                             YingjiColors.muted,

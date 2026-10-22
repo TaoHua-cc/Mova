@@ -768,6 +768,85 @@ class EmbyClient {
     return episodes;
   }
 
+  /// Reads only episode-number and own-image tags for one season.
+  /// Series posters are deliberately excluded: the detail page uses title
+  /// artwork when an episode-specific preview is unavailable.
+  Future<Map<int, Uri>> episodeArtworkForSeries(
+    EmbySession session,
+    String seriesId, {
+    required int seasonNumber,
+  }) async {
+    final userId = session.source.userId;
+    if (userId == null || userId.isEmpty || seriesId.isEmpty) {
+      return const {};
+    }
+    const pageSize = 200;
+    final artwork = <int, Uri>{};
+    final seen = <String>{};
+    var startIndex = 0;
+    while (true) {
+      final response = await _client
+          .get(
+            session.source.endpoint
+                .resolve('Shows/$seriesId/Episodes')
+                .replace(
+                  queryParameters: {
+                    'UserId': userId,
+                    'Season': '$seasonNumber',
+                    'SortBy': 'IndexNumber',
+                    'SortOrder': 'Ascending',
+                    'Limit': '$pageSize',
+                    'StartIndex': '$startIndex',
+                    'Fields': 'ImageTags,ParentIndexNumber,IndexNumber',
+                    'api_key': session.token,
+                  },
+                ),
+            headers: {
+              'Accept': 'application/json',
+              'X-Emby-Token': session.token,
+            },
+          )
+          .timeout(const Duration(seconds: 15));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception(_message(response.statusCode, '剧集图片读取失败'));
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final items = (data['Items'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList(growable: false);
+      if (items.isEmpty) break;
+      var added = 0;
+      for (final item in items) {
+        final id = '${item['Id'] ?? ''}';
+        if (id.isEmpty || !seen.add(id)) continue;
+        added++;
+        final season = (item['ParentIndexNumber'] as num?)?.toInt();
+        final episode = (item['IndexNumber'] as num?)?.toInt();
+        if (season != seasonNumber || episode == null || episode <= 0) {
+          continue;
+        }
+        final imageTags =
+            item['ImageTags'] as Map<String, dynamic>? ?? const {};
+        if ('${imageTags['Primary'] ?? ''}'.isEmpty) continue;
+        artwork.putIfAbsent(
+          episode,
+          () => session.source.endpoint
+              .resolve('Items/$id/Images/Primary')
+              .replace(queryParameters: {'api_key': session.token}),
+        );
+      }
+      if (added == 0) break;
+      startIndex += items.length;
+      final total = (data['TotalRecordCount'] as num?)?.toInt();
+      if (total != null && total > 0) {
+        if (startIndex >= total) break;
+      } else if (items.length < pageSize) {
+        break;
+      }
+    }
+    return artwork;
+  }
+
   Future<List<MediaItem>> seasonsForSeries(
     EmbySession session,
     String seriesId,

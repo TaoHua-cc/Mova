@@ -43,4 +43,32 @@ void main() {
       ),
     );
   });
+
+  test('episode previews prefer aired episode art then title artwork', () {
+    final normalized = source.replaceAll(RegExp(r'\s+'), ' ');
+    expect(normalized, contains('required this.serverArtwork'));
+    expect(normalized, contains('episodeUrl: episode.stillUrl'));
+    expect(normalized, contains('episodeAirDate: episode.airDate'));
+    expect(normalized, contains('serverArtwork['));
+    expect(normalized, contains('backdropUrl: widget.backdropUrl'));
+    expect(normalized, contains('posterUrl: widget.posterUrl'));
+    expect(
+      normalized,
+      contains(
+        'episodeAirDate == null || !episodeAirDate!.isAfter(DateTime.now())',
+      ),
+    );
+    expect(normalized, contains('if (episodeHasAired) ?episodeUrl'));
+    expect(normalized, contains('if (episodeHasAired) ?serverEpisodeUrl'));
+    expect(normalized, contains('?backdropUrl'));
+    expect(normalized, contains('?posterUrl'));
+    expect(
+      normalized,
+      contains('errorWidget: (_, _, _) => imageAt(index + 1)'),
+    );
+    expect(
+      normalized,
+      contains('_loadServerEpisodeArtwork(session, seriesId, season)'),
+    );
+  });
 }

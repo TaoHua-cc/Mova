@@ -4,7 +4,6 @@ import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:iconsax_flutter/iconsax_flutter.dart';
 
@@ -1908,9 +1907,10 @@ Future<String?> showYingjiContextMenu({
     transitionDuration: MovaMotion.quick,
     pageBuilder: (dialogContext, _, _) {
       final size = MediaQuery.sizeOf(dialogContext);
+      final menuWidth = math.min(width, math.max(0.0, size.width - 24));
       final left = position.dx.clamp(
         12.0,
-        math.max(12.0, size.width - width - 12).toDouble(),
+        math.max(12.0, size.width - menuWidth - 12).toDouble(),
       );
       final top = position.dy.clamp(
         12.0,
@@ -1927,7 +1927,7 @@ Future<String?> showYingjiContextMenu({
           Positioned(
             left: left,
             top: top,
-            width: width,
+            width: menuWidth,
             child: Material(
               type: MaterialType.transparency,
               child: DefaultTextStyle.merge(
@@ -1942,16 +1942,23 @@ Future<String?> showYingjiContextMenu({
                   child: GlassPanel(
                     radius: 17,
                     padding: const EdgeInsets.all(7),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        for (final action in actions)
-                          _YingjiContextActionTile(
-                            action: action,
-                            onTap: () =>
-                                Navigator.pop(dialogContext, action.value),
-                          ),
-                      ],
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: math.max(0.0, size.height - top - 26),
+                      ),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            for (final action in actions)
+                              _YingjiContextActionTile(
+                                action: action,
+                                onTap: () =>
+                                    Navigator.pop(dialogContext, action.value),
+                              ),
+                          ],
+                        ),
+                      ),
                     ),
                   ),
                 ),

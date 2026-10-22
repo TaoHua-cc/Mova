@@ -7,6 +7,72 @@ import 'package:yingji/src/brand.dart';
 import 'package:yingji/src/motion.dart';
 
 void main() {
+  testWidgets(
+    'context menu remains inside a short narrow viewport with scaled text',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(260, 240));
+      tester.view.physicalSize = const Size(260, 240);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: TextScaler.linear(1.5)),
+            child: child!,
+          ),
+          home: Scaffold(
+            body: Builder(
+              builder: (context) => TextButton(
+                onPressed: () => showYingjiContextMenu(
+                  context: context,
+                  position: const Offset(250, 230),
+                  actions: const [
+                    YingjiContextAction(
+                      value: 'a',
+                      label: '从这个名字非常长的自定义片单中移除影片',
+                      icon: YingjiIcons.trash,
+                    ),
+                    YingjiContextAction(
+                      value: 'b',
+                      label: '将当前影视标记为已经播放完成',
+                      icon: YingjiIcons.checkmark_circle_fill,
+                    ),
+                    YingjiContextAction(
+                      value: 'c',
+                      label: '将当前影视标记为尚未播放',
+                      icon: YingjiIcons.refresh,
+                    ),
+                  ],
+                ),
+                child: const Text('菜单'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('菜单'));
+      await tester.pumpAndSettle();
+      final panel = tester.getRect(find.byType(GlassPanel));
+      expect(panel.left, greaterThanOrEqualTo(0));
+      expect(panel.right, lessThanOrEqualTo(260));
+      expect(panel.bottom, lessThanOrEqualTo(240));
+      await tester.drag(
+        find.descendant(
+          of: find.byType(GlassPanel),
+          matching: find.byType(SingleChildScrollView),
+        ),
+        const Offset(0, -300),
+      );
+      await tester.pumpAndSettle();
+      final last = tester.getRect(find.text('将当前影视标记为尚未播放'));
+      expect(last.bottom, lessThanOrEqualTo(panel.bottom));
+      expect(last.top, greaterThanOrEqualTo(panel.top));
+      expect(tester.takeException(), isNull);
+    },
+  );
   testWidgets('motion surface responds to hover and press without relayout', (
     tester,
   ) async {
