@@ -7,12 +7,12 @@ $ErrorActionPreference = 'Stop'
 
 # mpv.io lists shinchiro's Windows builds. The dev archive contains libmpv and
 # is pinned here so a supply-chain change cannot silently alter release output.
-$asset = 'mpv-dev-x86_64-20260903-git-69e63f425a.7z'
-$url = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/$asset"
-$expectedSha256 = 'fac135c68a35b7639e39d72c0c365104edbaebdea39a0dfdd8c36e8c8e80faef'
+$asset = 'mpv-dev-x86_64-20261021-git-e471496c56.7z'
+$url = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261021/$asset"
+$expectedSha256 = 'efc719eff3dc5954b4a5efc800632808bcec01cc9034940dd14e5eb7fe9ea633'
 $cache = Join-Path $PSScriptRoot '..\build\native-libs'
 $archive = Join-Path $cache $asset
-$extract = Join-Path $cache 'mpv-dev-x86_64-20260903'
+$extract = Join-Path $cache 'mpv-dev-x86_64-20261021'
 
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
 if (-not (Test-Path $archive)) {
