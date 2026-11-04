@@ -26,24 +26,27 @@ void main() {
           .setMockMethodCallHandler(channel, null);
     }
   });
-  test('hide follows successful launch; restore precedes cleanup with finally guard', () {
+  test('native playback keeps the app visible and focuses it after exit', () {
     final source = File('lib/src/player/windows_native_player.dart')
         .readAsStringSync()
         .replaceAll('\r\n', '\n');
+    expect(source, isNot(contains('await WindowHost.hide()')));
     expect(
-      source.indexOf('await WindowHost.hide()'),
+      source.indexOf('playerStarted = true;'),
       greaterThan(source.indexOf('await Process.start(')),
     );
     expect(
       source.indexOf(
-        'await restoreMainWindow();',
+        'await focusMainWindowAfterPlayback();',
         source.indexOf('final exitCode = await process.exitCode;'),
       ),
       lessThan(source.indexOf('previewClosed = true;')),
     );
     expect(
       source,
-      contains('} finally {\n      try {\n        await restoreMainWindow();'),
+      contains(
+        '} finally {\n      try {\n        await focusMainWindowAfterPlayback();',
+      ),
     );
   });
 }

@@ -496,11 +496,11 @@ class WindowsNativePlayer {
             ),
           ]
         : List<WindowsNativePlaylistEntry>.of(request.playlist);
-    var mainWindowHidden = false;
-    Future<void> restoreMainWindow() async {
-      if (!mainWindowHidden) return;
+    var playerStarted = false;
+    Future<void> focusMainWindowAfterPlayback() async {
+      if (!playerStarted) return;
       await WindowHost.bringToFront();
-      mainWindowHidden = false;
+      playerStarted = false;
     }
 
     final cacheLeases = <String, void Function()>{};
@@ -732,12 +732,7 @@ class WindowsNativePlayer {
       } on ProcessException catch (error) {
         throw StateError(nativeLaunchFailure(error));
       }
-      mainWindowHidden = true;
-      try {
-        await WindowHost.hide();
-      } catch (_) {
-        // Window management failure must not abandon a running player.
-      }
+      playerStarted = true;
       void sendCacheProgress(VideoCacheProgress progress) {
         process.stdin.writeln(
           'MOVA_CACHE=${progress.cachedEndBytes}|${progress.mediaTotalBytes}',
@@ -1842,7 +1837,7 @@ class WindowsNativePlayer {
       await process.stderr.drain<void>();
       final exitCode = await process.exitCode;
       try {
-        await restoreMainWindow();
+        await focusMainWindowAfterPlayback();
       } catch (_) {
         // Retry in finally; don't delay progress persistence on a window error.
       }
@@ -1983,7 +1978,7 @@ class WindowsNativePlayer {
       );
     } finally {
       try {
-        await restoreMainWindow();
+        await focusMainWindowAfterPlayback();
       } catch (_) {
         // The host can already be shutting down.
       }
